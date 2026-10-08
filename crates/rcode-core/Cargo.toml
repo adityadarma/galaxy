@@ -1,0 +1,28 @@
+[package]
+name = "rcode-core"
+description = "RustCode editor core: documents, workspace, syntax, LSP."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+ropey.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+# Atomic save: same-directory temp file + rename.
+tempfile.workspace = true
+# Grapheme-aware backspace/delete and cursor movement.
+unicode-segmentation.workspace = true
+# Lazy, gitignore-aware directory listing for the explorer.
+ignore.workspace = true
+# Find/replace in the current file.
+regex.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,39 @@
+//! RustCode editor core.
+//!
+//! This crate is UI-agnostic. The Swift/AppKit frontend talks to it through
+//! `rcode-ffi`. All heavy work (parsing, indexing, LSP) will live here so the
+//! main thread only renders viewport snapshots.
+
+pub mod change;
+pub mod clipboard;
+pub mod composition;
+pub mod document;
+pub mod edit;
+pub mod find;
+pub mod grapheme;
+pub mod history;
+pub mod logging;
+pub mod movement;
+pub mod multicursor;
+pub mod position;
+pub mod selection;
+pub mod viewport;
+pub mod workspace;
+
+/// Semantic version of the core, exposed to the UI for diagnostics.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Returns the core version string.
+pub fn version() -> &'static str {
+    VERSION
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_matches_manifest() {
+        assert_eq!(version(), env!("CARGO_PKG_VERSION"));
+    }
+}

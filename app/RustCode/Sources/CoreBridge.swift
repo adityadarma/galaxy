@@ -1,0 +1,67 @@
+import Foundation
+import os
+
+/// Owns the Rust `Core` and converts core events into main-actor updates.
+///
+/// Core callbacks arrive on background threads. `EventSink` forwards them to
+/// the main actor so UI code never runs off the main thread.
+@MainActor
+final class CoreBridge {
+    let core: Core
+    private(set) var lastEvent: CoreEvent?
+    var onEvent: ((CoreEvent) -> Void)?
+
+    init() {
+        core = Core()
+    }
+
+    var version: String { coreVersion() }
+
+    func start() {
+        do {
+            let level = ProcessInfo.processInfo.environment["RCODE_LOG"] ?? "info"
+            _ = try initLogging(dir: Log.directory.path, level: level)
+        } catch {
+            Log.core.error("core logging init failed: \(String(describing: error), privacy: .public)")
+        }
+        core.setListener(listener: EventSink(bridge: self))
+    }
+
+    func ping(_ message: String) {
+        core.ping(message: message)
+    }
+
+    func newDocument() -> DocumentHandle {
+        core.newDocument()
+    }
+
+    func openDocument(path: String) throws -> DocumentHandle {
+        try core.openDocument(path: path)
+    }
+
+    fileprivate func deliver(_ event: CoreEvent) {
+        lastEvent = event
+        if case let .pong(message) = event {
+            Log.core.debug("pong: \(message, privacy: .public)")
+        }
+        onEvent?(event)
+    }
+}
+
+/// Listener passed to Rust. Holds the bridge weakly to avoid a retain cycle
+/// (bridge -> core -> listener -> bridge).
+/// `@unchecked Sendable`: the only state is a weak reference that is set once
+/// in `init` and only dereferenced on the main actor.
+private final class EventSink: CoreListener, @unchecked Sendable {
+    private weak var bridge: CoreBridge?
+
+    init(bridge: CoreBridge) {
+        self.bridge = bridge
+    }
+
+    func onEvent(event: CoreEvent) {
+        Task { @MainActor [weak bridge] in
+            bridge?.deliver(event)
+        }
+    }
+}

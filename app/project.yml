@@ -1,0 +1,108 @@
+name: RustCode
+options:
+  bundleIdPrefix: dev.rustcode
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: true
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    DEAD_CODE_STRIPPING: YES
+    SWIFT_STRICT_CONCURRENCY: complete
+  configs:
+    Release:
+      SWIFT_OPTIMIZATION_LEVEL: -O
+      SWIFT_COMPILATION_MODE: wholemodule
+
+targets:
+  RustCode:
+    type: application
+    platform: macOS
+    sources:
+      - path: RustCode/Sources
+      - path: RustCode/Generated
+        optional: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.rustcode.RustCode
+        PRODUCT_NAME: RustCode
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_NSPrincipalClass: NSApplication
+        INFOPLIST_KEY_CFBundleDisplayName: RustCode
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+        INFOPLIST_KEY_NSHumanReadableCopyright: ""
+        ENABLE_HARDENED_RUNTIME: YES
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
+        SWIFT_INCLUDE_PATHS: $(PROJECT_DIR)/RustCode/FFI/include
+        HEADER_SEARCH_PATHS: $(PROJECT_DIR)/RustCode/FFI/include
+        LIBRARY_SEARCH_PATHS: $(PROJECT_DIR)/RustCode/FFI
+        OTHER_LDFLAGS: -lrcode_ffi
+    preBuildScripts:
+      - name: Build Rust Core
+        script: |
+          "${PROJECT_DIR}/../scripts/build-core.sh"
+        basedOnDependencyAnalysis: false
+        outputFiles:
+          - $(PROJECT_DIR)/RustCode/FFI/librcode_ffi.a
+          - $(PROJECT_DIR)/RustCode/Generated/rcode_ffi.swift
+
+  RustCodeTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: RustCodeTests
+    dependencies:
+      - target: RustCode
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: dev.rustcode.RustCodeTests
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/RustCode.app/Contents/MacOS/RustCode
+        BUNDLE_LOADER: $(TEST_HOST)
+        SWIFT_INCLUDE_PATHS: $(PROJECT_DIR)/RustCode/FFI/include
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
+
+  RustCodeUITests:
+    type: bundle.ui-testing
+    platform: macOS
+    sources:
+      - path: RustCodeUITests
+    dependencies:
+      - target: RustCode
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: dev.rustcode.RustCodeUITests
+        TEST_TARGET_NAME: RustCode
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
+
+schemes:
+  RustCode:
+    build:
+      targets:
+        RustCode: all
+        RustCodeTests: [test]
+    test:
+      targets:
+        - RustCodeTests
+
+  # Drives the real app through the accessibility API. Kept out of the
+  # default scheme because it needs a GUI session and Accessibility
+  # permission; run it with scripts/ui-test.sh.
+  RustCodeUI:
+    build:
+      targets:
+        RustCode: all
+        RustCodeUITests: [test]
+    test:
+      targets:
+        - RustCodeUITests

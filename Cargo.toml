@@ -1,0 +1,48 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/rcode-core",
+    "crates/rcode-ffi",
+    "crates/rcode-bench",
+    "tools/uniffi-bindgen",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "UNLICENSED"
+publish = false
+
+[workspace.dependencies]
+rcode-core = { path = "crates/rcode-core" }
+# `unicode_lines` is off so only `\n` breaks lines (CR is normalized on load).
+# This matches LSP, which does not treat U+2028/U+0085/VT/FF as line breaks.
+ropey = { version = "=1.6.1", default-features = false, features = ["simd"] }
+tracing = "=0.1.41"
+tracing-subscriber = { version = "=0.3.20", default-features = false, features = ["fmt", "std", "registry"] }
+tracing-appender = "=0.2.3"
+uniffi = "=0.29.4"
+criterion = { version = "=0.7.0", default-features = false, features = ["cargo_bench_support"] }
+tempfile = "=3.23.0"
+unicode-segmentation = "=1.13.3"
+# Workspace walking: gitignore-aware, same engine as ripgrep.
+ignore = "=0.4.33"
+# In-file find/replace. Linear-time matching, no backtracking blowups.
+regex = "=1.13.1"
+proptest = { version = "=1.11.0", default-features = false, features = ["std"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
+
+[profile.bench]
+inherits = "release"

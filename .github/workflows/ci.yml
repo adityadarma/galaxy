@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (fmt, clippy, test)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  app:
+    name: macOS app (build, test)
+    runs-on: macos-15
+    needs: rust
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Install xcodegen
+        run: brew install xcodegen
+      - name: Generate project
+        working-directory: app
+        run: xcodegen generate
+      - name: Build and test
+        run: |
+          xcodebuild -project app/RustCode.xcodeproj -scheme RustCode \
+            -configuration Debug -derivedDataPath app/build test
+
+  bench:
+    name: Benchmarks
+    runs-on: macos-15
+    needs: rust
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Install xcodegen
+        run: brew install xcodegen
+      - name: Core benchmarks
+        run: cargo bench -p rcode-bench --locked
+      - name: App startup and RAM
+        run: scripts/measure-app.sh 5 --json target/app-metrics.json
+      - name: Collect results
+        run: |
+          python3 scripts/bench-compare.py collect \
+            --criterion target/criterion --app target/app-metrics.json \
+            --out target/bench/current.json
+      # Baseline is the latest result from main. Caches written on main are
+      # readable from PR branches; the key prefix match picks the newest.
+      - name: Restore baseline
+        if: github.ref != 'refs/heads/main'
+        uses: actions/cache/restore@v4
+        with:
+          path: target/bench-baseline
+          key: bench-baseline-${{ github.sha }}
+          restore-keys: bench-baseline-
+      - name: Compare against baseline (fail on > 10% regression)
+        if: github.ref != 'refs/heads/main'
+        run: |
+          python3 scripts/bench-compare.py compare \
+            target/bench-baseline/current.json target/bench/current.json \
+            --threshold 0.10
+      - name: Store baseline
+        if: github.ref == 'refs/heads/main'
+        run: mkdir -p target/bench-baseline && cp target/bench/current.json target/bench-baseline/
+      - name: Save baseline
+        if: github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: target/bench-baseline
+          key: bench-baseline-${{ github.sha }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-results
+          path: |
+            target/criterion
+            target/app-metrics.json
+            target/bench/current.json

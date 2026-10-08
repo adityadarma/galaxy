@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 6456901647fa44c8cda49b1ea0da119bb716ba9a3c41b9461f91cadbd2d23743 # shrinks to text = "aaaaa日本aaa\n\na", raw = [(14, 0, "a")]
+cc 919aa9b0388b01477956fb5706c137953ba3c4f459e30d1c1a67f6fe3639c316 # shrinks to text = "", seeds = [(0, 0)], cfg = IndentConfig { use_tabs: false, tab_size: 1 }, ops = [Insert(")"), Newline, Select([(13279, 28329)]), Insert("a")]
+cc 482568f80cb8beb03539590f67199648537a2c5199f1d9076d844118c2fa5208 # shrinks to text = "    a\t日本a", seeds = [(0, 1350)], cfg = IndentConfig { use_tabs: false, tab_size: 1 }, typed = ["a"], deletes = 0
