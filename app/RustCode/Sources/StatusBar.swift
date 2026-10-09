@@ -1,10 +1,9 @@
 import AppKit
 
-/// Bottom status bar: a sidebar toggle and a message on the left, document
-/// facts (cursor, indentation, line ending, encoding) on the right.
+/// Bottom status bar: a message on the left, document facts (cursor,
+/// indentation, line ending, encoding) on the right.
 @MainActor
 final class StatusBar: NSView {
-    let sidebarButton = NSButton()
     let message = NSTextField(labelWithString: "")
     let largeFileBadge = NSTextField(labelWithString: "Large file")
     let cursor = StatusBar.label("status-cursor")
@@ -12,22 +11,11 @@ final class StatusBar: NSView {
     let lineEnding = StatusBar.label("status-eol")
     let encoding = StatusBar.label("status-encoding")
 
-    var onToggleSidebar: (() -> Void)?
-
     override init(frame: NSRect) {
         super.init(frame: frame)
         setAccessibilityRole(.group)
         setAccessibilityLabel("Status bar")
         setAccessibilityIdentifier("status-bar")
-
-        sidebarButton.image = NSImage(systemSymbolName: "sidebar.left", accessibilityDescription: "Toggle Sidebar")
-        sidebarButton.isBordered = false
-        sidebarButton.imagePosition = .imageOnly
-        sidebarButton.contentTintColor = .secondaryLabelColor
-        sidebarButton.toolTip = "Toggle Sidebar (⌘B)"
-        sidebarButton.setAccessibilityIdentifier("toggle-sidebar")
-        sidebarButton.target = self
-        sidebarButton.action = #selector(toggleSidebar(_:))
 
         message.font = Theme.statusFont
         message.textColor = .secondaryLabelColor
@@ -42,7 +30,7 @@ final class StatusBar: NSView {
         largeFileBadge.setAccessibilityIdentifier("large-file-banner")
         largeFileBadge.isHidden = true
 
-        let left = NSStackView(views: [sidebarButton, message, largeFileBadge])
+        let left = NSStackView(views: [message, largeFileBadge])
         left.spacing = 8
         let right = NSStackView(views: [cursor, indent, lineEnding, encoding])
         right.spacing = 14
@@ -67,7 +55,7 @@ final class StatusBar: NSView {
             separator.topAnchor.constraint(equalTo: topAnchor),
             separator.leadingAnchor.constraint(equalTo: leadingAnchor),
             separator.trailingAnchor.constraint(equalTo: trailingAnchor),
-            row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
             row.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
             row.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
@@ -79,7 +67,7 @@ final class StatusBar: NSView {
     // Own background, so the bar never shows through to whatever is behind
     // it (a window snapshot, or a transparent title bar later on).
     override func draw(_ dirtyRect: NSRect) {
-        NSColor.windowBackgroundColor.setFill()
+        Theme.chrome.setFill()
         // Views do not clip to bounds by default since macOS 14, so the
         // dirty rect can reach past the bar and over the editor.
         dirtyRect.intersection(bounds).fill()
@@ -120,8 +108,6 @@ final class StatusBar: NSView {
         if count > 1 { text += " (\(count) cursors)" }
         cursor.stringValue = text
     }
-
-    @objc private func toggleSidebar(_ sender: Any?) { onToggleSidebar?() }
 
     private static func label(_ id: String) -> NSTextField {
         let label = NSTextField(labelWithString: "")

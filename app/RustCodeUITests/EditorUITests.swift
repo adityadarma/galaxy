@@ -183,14 +183,14 @@ final class EditorUITests: XCTestCase {
         attachScreenshot("explorer")
     }
 
-    func testStatusBarButtonTogglesTheSidebar() throws {
+    func testTitleBarButtonTogglesTheSidebar() throws {
         try write("a.txt", "a")
         launch(open: workDir)
         let explorer = app.outlines["explorer"]
         XCTAssertTrue(explorer.waitForExistence(timeout: 5))
 
-        let navigator = app.descendants(matching: .any).matching(identifier: "navigator").firstMatch
-        XCTAssertTrue(navigator.exists, "navigator switcher at the top of the sidebar")
+        let activity = app.descendants(matching: .any).matching(identifier: "activity-explorer").firstMatch
+        XCTAssertTrue(activity.exists, "activity bar on the left")
         let button = app.descendants(matching: .any).matching(identifier: "toggle-sidebar").firstMatch
         XCTAssertTrue(button.exists)
         button.click()

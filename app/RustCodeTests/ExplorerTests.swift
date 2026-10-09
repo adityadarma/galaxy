@@ -99,36 +99,47 @@ final class ExplorerTests: XCTestCase {
 
     // MARK: Layout
 
-    func testSidebarHasANavigatorAndTheStatusBarTogglesIt() throws {
+    func testActivityBarSidebarAndStatusBarLayout() throws {
         let controller = MainWindowController(bridge: CoreBridge())
         controller.showWindow(nil)
         defer { controller.window?.orderOut(nil) }
         RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        let window = try XCTUnwrap(controller.window)
+        let content = try XCTUnwrap(window.contentView)
+        func frame(_ v: NSView) -> NSRect { content.convert(v.bounds, from: v) }
 
         XCTAssertTrue(controller.isSidebarVisible, "sidebar is open by default")
         XCTAssertFalse(controller.emptyState.isHidden, "prompt to open a folder before one is open")
         XCTAssertTrue(controller.explorer.scrollView.isHidden)
         XCTAssertGreaterThan(controller.sidebar.frame.width, 150)
 
-        // Navigator: Explorer selected, the others not built yet.
-        XCTAssertEqual(controller.navigator.selected, .explorer)
-        XCTAssertTrue(controller.navigator.isEnabled(.explorer))
-        XCTAssertFalse(controller.navigator.isEnabled(.search), "not built yet")
-        XCTAssertFalse(controller.navigator.isEnabled(.sourceControl), "not built yet")
-        XCTAssertTrue(controller.navigator.isDescendant(of: controller.sidebar), "lives inside the sidebar")
+        // Activity bar on the far left, under the title bar, above the status bar.
+        let activity = controller.activityBar
+        XCTAssertEqual(frame(activity).minX, 0)
+        XCTAssertEqual(frame(activity).width, ActivityBar.width)
+        XCTAssertEqual(frame(activity).maxY, frame(controller.titleBar).minY, accuracy: 0.5)
+        XCTAssertEqual(frame(activity).minY, frame(controller.statusBar).maxY, accuracy: 0.5)
+        XCTAssertEqual(frame(controller.sidebar).minX, ActivityBar.width, accuracy: 0.5)
+        XCTAssertEqual(activity.active, .explorer)
+        XCTAssertTrue(activity.isEnabled(.explorer))
+        XCTAssertFalse(activity.isEnabled(.search), "not built yet")
+        XCTAssertFalse(activity.isEnabled(.sourceControl), "not built yet")
 
         // Status bar along the bottom, full width.
-        let window = try XCTUnwrap(controller.window)
         let bar = controller.statusBar
         XCTAssertEqual(bar.frame.height, Theme.statusHeight)
         XCTAssertEqual(bar.frame.minY, 0, "at the bottom of the window")
-        XCTAssertEqual(bar.frame.width, window.contentView?.bounds.width ?? 0, accuracy: 0.5)
+        XCTAssertEqual(bar.frame.width, content.bounds.width, accuracy: 0.5)
 
-        bar.sidebarButton.performClick(nil)
+        // Clicking the active item collapses the sidebar; again brings it back.
+        let explorerButton = try XCTUnwrap(activity.buttons[.explorer])
+        explorerButton.performClick(nil)
         XCTAssertFalse(controller.isSidebarVisible)
+        XCTAssertNil(activity.active)
         let editorWide = controller.editorView.frame.width
-        bar.sidebarButton.performClick(nil)
+        controller.titleBar.sidebarButton.performClick(nil)
         XCTAssertTrue(controller.isSidebarVisible)
+        XCTAssertEqual(activity.active, .explorer)
         RunLoop.current.run(until: Date().addingTimeInterval(0.2))
         XCTAssertGreaterThan(editorWide, controller.editorView.frame.width - 1, "editor regains space when hidden")
     }
@@ -161,7 +172,7 @@ final class ExplorerTests: XCTestCase {
         XCTAssertTrue(bar.cursor.stringValue.hasSuffix("(2 cursors)"), bar.cursor.stringValue)
     }
 
-    func testTitleBarIsUnifiedAndThePathBarFollowsTheDocument() throws {
+    func testTitleBarShowsProjectAndFileAndTabsSitBelowIt() throws {
         let root = try makeTree()
         defer { try? FileManager.default.removeItem(at: root) }
         let controller = MainWindowController(bridge: CoreBridge())
@@ -180,14 +191,24 @@ final class ExplorerTests: XCTestCase {
         XCTAssertEqual(bar.components, [root.lastPathComponent, "src", "main.rs"])
         XCTAssertTrue(window.title.hasPrefix("main.rs"), "the hidden title is still kept for the Window menu")
 
-        // The sidebar reaches the top edge; the tabs fill the title bar and
-        // the path bar sits right under them.
+        // Title bar: full width, fills the window's title bar area, shows
+        // the project and the file.
         let content = try XCTUnwrap(window.contentView)
-        let sidebarTop = content.convert(controller.sidebar.bounds, from: controller.sidebar).maxY
-        XCTAssertEqual(sidebarTop, content.bounds.maxY, accuracy: 0.5)
+        let titleFrame = content.convert(controller.titleBar.bounds, from: controller.titleBar)
+        XCTAssertEqual(titleFrame.maxY, content.bounds.maxY, accuracy: 0.5)
+        XCTAssertEqual(titleFrame.width, content.bounds.width, accuracy: 0.5)
+        XCTAssertEqual(titleFrame.minY, window.contentLayoutRect.maxY, accuracy: 0.5, "ends where the title bar ends")
+        XCTAssertEqual(controller.titleBar.projectButton.title, root.lastPathComponent)
+        XCTAssertEqual(controller.titleBar.titleLabel.stringValue, window.title)
+        XCTAssertEqual(controller.titleBar.titleLabel.frame.midX, controller.titleBar.bounds.midX, accuracy: 1,
+                       "file name centered")
+        XCTAssertGreaterThan(controller.titleBar.titleLabel.frame.width, 20, "a long project name must not squeeze the title out")
+        XCTAssertLessThanOrEqual(controller.titleBar.projectButton.frame.width, 220)
+
+        // Tabs at the top of the editor column; breadcrumb right under them.
         let tabsFrame = content.convert(controller.tabBar.bounds, from: controller.tabBar)
-        XCTAssertEqual(tabsFrame.maxY, content.bounds.maxY, accuracy: 0.5)
-        XCTAssertEqual(tabsFrame.minY, window.contentLayoutRect.maxY, accuracy: 0.5, "ends where the title bar ends")
+        XCTAssertEqual(tabsFrame.maxY, titleFrame.minY, accuracy: 0.5)
+        XCTAssertEqual(tabsFrame.height, Theme.tabHeight)
         let barFrame = content.convert(bar.bounds, from: bar)
         XCTAssertEqual(barFrame.maxY, tabsFrame.minY, accuracy: 0.5)
 
@@ -195,10 +216,6 @@ final class ExplorerTests: XCTestCase {
         controller.editorView.insertText("x", replacementRange: NSRange(location: NSNotFound, length: 0))
         controller.editorView.flushPendingUpdates()
         XCTAssertTrue(bar.isEdited)
-
-        XCTAssertFalse(controller.tabBar.clearsTrafficLights)
-        controller.toggleSidebar(nil)
-        XCTAssertTrue(controller.tabBar.clearsTrafficLights, "makes room for the window buttons")
     }
 
     func testOpeningAFolderReplacesTheEmptyState() throws {

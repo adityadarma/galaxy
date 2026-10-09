@@ -3,7 +3,7 @@ import AppKit
 /// RustCode's own look. Everything else uses system colors, so light and
 /// dark mode, increased contrast and the user's selection color still work.
 enum Theme {
-    /// Soft copper: caret, find matches, the active navigator and tab.
+    /// Soft copper: caret, find matches, the active activity item and tab.
     static let accent = NSColor(name: "RustCodeAccent") { appearance in
         let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         return dark
@@ -27,6 +27,23 @@ enum Theme {
     static let gutterText = NSColor.secondaryLabelColor
     /// Space above the first line, so text does not touch the path bar.
     static let editorTopInset: CGFloat = 6
+
+    /// Title bar, activity bar, tab strip and status bar: one tone, a step
+    /// away from the editor so the text area reads as the main surface.
+    static let chrome = NSColor(name: "RustCodeChrome") { appearance in
+        let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        return dark
+            ? NSColor(srgbRed: 0.145, green: 0.141, blue: 0.137, alpha: 1)
+            : NSColor(srgbRed: 0.949, green: 0.945, blue: 0.937, alpha: 1)
+    }
+    /// Sidebar: between chrome and editor.
+    static let sidebar = NSColor(name: "RustCodeSidebar") { appearance in
+        let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        return dark
+            ? NSColor(srgbRed: 0.125, green: 0.122, blue: 0.118, alpha: 1)
+            : NSColor(srgbRed: 0.969, green: 0.965, blue: 0.957, alpha: 1)
+    }
+    static let tabHeight: CGFloat = 34
 
     /// Status bar: compact, secondary text.
     static var statusFont: NSFont { .systemFont(ofSize: 11) }

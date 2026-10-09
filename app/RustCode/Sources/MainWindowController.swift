@@ -1,15 +1,23 @@
 import AppKit
 import os
 
-/// Main window: sidebar (with a navigator switcher on top) | editor, and a
-/// status bar along the bottom. The title bar is transparent: the sidebar
-/// runs up under the traffic lights, the tabs take the title's place above
-/// the editor, and a path bar sits under the tabs.
+/// Main window, a mix of VSCode and the JetBrains New UI:
+///
+///     [ traffic lights | project ·       file — project       · ⌘B ]  title bar
+///     [ activity | sidebar   | tabs                               ]
+///     [   bar    | explorer  | breadcrumb                         ]
+///     [          |           | editor                             ]
+///     [ status bar                                                ]
+///
+/// The window's own title bar is transparent and hidden; `TitleBar` draws
+/// in its place.
 @MainActor
 final class MainWindowController: NSWindowController, NSWindowDelegate {
     private let bridge: CoreBridge
     let statusBar = StatusBar()
     let pathBar = PathBar()
+    let titleBar = TitleBar()
+    let activityBar = ActivityBar()
     let tabBar = TabBar()
     /// Open documents, in tab order (M2-06).
     private(set) var tabs: [EditorTab] = []
@@ -42,10 +50,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// Shown for files over 20 MB (M1-14).
     var largeFileBanner: NSTextField { statusBar.largeFileBadge }
     private var findBarHeight: NSLayoutConstraint!
-    /// Sidebar: navigator switcher, folder name, then the explorer or an
+    /// Sidebar: "EXPLORER" header, folder name, then the explorer or an
     /// empty state.
-    let sidebar = NSVisualEffectView()
-    let navigator = NavigatorBar()
+    let sidebar = SidebarView()
     private let folderTitle = NSTextField(labelWithString: "")
     let emptyState = NSStackView()
     let explorer = ExplorerController()
@@ -92,7 +99,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         )
         window.title = "RustCode"
         // The title stays set (Window menu, Mission Control, VoiceOver) but
-        // is drawn by the path bar instead.
+        // `TitleBar` draws it.
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         window.setFrameAutosaveName("MainWindow")
@@ -136,7 +143,18 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
         statusLabel.stringValue = "Core \(bridge.version) starting…"
         statusBar.translatesAutoresizingMaskIntoConstraints = false
-        statusBar.onToggleSidebar = { [weak self] in self?.toggleSidebar(nil) }
+        titleBar.translatesAutoresizingMaskIntoConstraints = false
+        titleBar.sidebarButton.target = self
+        titleBar.sidebarButton.action = #selector(toggleSidebar(_:))
+        titleBar.projectButton.target = self
+        titleBar.projectButton.action = #selector(openFolder(_:))
+        activityBar.translatesAutoresizingMaskIntoConstraints = false
+        activityBar.setActive(.explorer)
+        activityBar.onSelect = { [weak self] item in
+            guard let self, item == .explorer else { return }
+            // Clicking the active item collapses the sidebar, as in VSCode.
+            self.setSidebarVisible(!self.isSidebarVisible)
+        }
 
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = false
@@ -193,46 +211,52 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         splitView.addArrangedSubview(detailView)
         splitView.setHoldingPriority(.defaultHigh, forSubviewAt: 0)
 
+        content.addSubview(titleBar)
+        content.addSubview(activityBar)
         content.addSubview(splitView)
         content.addSubview(statusBar)
         NSLayoutConstraint.activate([
-            splitView.topAnchor.constraint(equalTo: content.topAnchor),
-            splitView.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            titleBar.topAnchor.constraint(equalTo: content.topAnchor),
+            titleBar.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            titleBar.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            activityBar.topAnchor.constraint(equalTo: titleBar.bottomAnchor),
+            activityBar.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            activityBar.bottomAnchor.constraint(equalTo: statusBar.topAnchor),
+            splitView.topAnchor.constraint(equalTo: titleBar.bottomAnchor),
+            splitView.leadingAnchor.constraint(equalTo: activityBar.trailingAnchor),
             splitView.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             splitView.bottomAnchor.constraint(equalTo: statusBar.topAnchor),
             statusBar.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             statusBar.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             statusBar.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-            // Only valid once both views are in the window.
-            tabBar.bottomAnchor.constraint(equalTo: titleBarBottom),
-            navigator.topAnchor.constraint(equalTo: titleBarBottom, constant: 4),
+            // Only valid once the bar is in the window.
+            titleBar.bottomAnchor.constraint(equalTo: titleBarBottom),
         ])
     }
 
     private func buildSidebar() {
         sidebar.setAccessibilityIdentifier("sidebar")
-        sidebar.material = .sidebar
-        sidebar.blendingMode = .behindWindow
-        sidebar.state = .followsWindowActiveState
         sidebar.translatesAutoresizingMaskIntoConstraints = false
         sidebar.widthAnchor.constraint(greaterThanOrEqualToConstant: 160).isActive = true
 
-        navigator.translatesAutoresizingMaskIntoConstraints = false
-        navigator.onSelect = { [weak self] item in
-            if item == .explorer { self?.setSidebarVisible(true) }
-        }
-        let navigatorRule = NSBox()
-        navigatorRule.boxType = .separator
-        navigatorRule.translatesAutoresizingMaskIntoConstraints = false
+        // VSCode's view title, JetBrains' tool window name.
+        let viewTitle = NSTextField(labelWithString: "")
+        viewTitle.attributedStringValue = NSAttributedString(string: "EXPLORER", attributes: [
+            .font: NSFont.systemFont(ofSize: 10.5, weight: .semibold),
+            .foregroundColor: NSColor.secondaryLabelColor,
+            .kern: 0.6,
+        ])
+        viewTitle.setAccessibilityIdentifier("sidebar-title")
 
         folderTitle.font = .systemFont(ofSize: 12, weight: .semibold)
         folderTitle.textColor = .labelColor
         folderTitle.lineBreakMode = .byTruncatingMiddle
         folderTitle.isHidden = true
         folderTitle.setAccessibilityIdentifier("folder-title")
-        let header = NSStackView(views: [folderTitle])
+        let header = NSStackView(views: [viewTitle, folderTitle])
         header.orientation = .vertical
         header.alignment = .leading
+        header.spacing = 8
         header.translatesAutoresizingMaskIntoConstraints = false
 
         // Shown until a folder is opened.
@@ -258,18 +282,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             self?.openWorkspaceFile(workspace, entry, preview: false)
         }
 
-        sidebar.addSubview(navigator)
-        sidebar.addSubview(navigatorRule)
         sidebar.addSubview(header)
         sidebar.addSubview(explorer.scrollView)
         sidebar.addSubview(emptyState)
         NSLayoutConstraint.activate([
-            navigator.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor),
-            navigator.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor),
-            navigatorRule.topAnchor.constraint(equalTo: navigator.bottomAnchor, constant: 4),
-            navigatorRule.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor),
-            navigatorRule.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor),
-            header.topAnchor.constraint(equalTo: navigatorRule.bottomAnchor, constant: 8),
+            header.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: 11),
             header.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 14),
             header.trailingAnchor.constraint(lessThanOrEqualTo: sidebar.trailingAnchor, constant: -8),
             explorer.scrollView.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 6),
@@ -297,7 +314,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     func setSidebarVisible(_ visible: Bool) {
         guard visible != isSidebarVisible else { return }
         sidebar.isHidden = !visible
-        tabBar.clearsTrafficLights = !visible
+        activityBar.setActive(visible ? .explorer : nil)
         if visible {
             splitView.layoutSubtreeIfNeeded()
             if sidebar.frame.width < 160 { splitView.setPosition(Self.sidebarWidth, ofDividerAt: 0) }
@@ -633,6 +650,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     func updateEditedState() {
         let title = activeTab?.windowTitle ?? workspace?.name() ?? "RustCode"
         if window?.title != title { window?.title = title }
+        titleBar.setTitle(title)
         if let i = activeIndex {
             let tab = tabs[i]
             let edited = tab.doc.isModified()
@@ -775,6 +793,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         emptyState.isHidden = true
         folderTitle.stringValue = ws.name()
         folderTitle.isHidden = false
+        titleBar.setProject(ws.name())
         setSidebarVisible(true)
         if tabs.isEmpty { pathBar.show([ws.name()]) }
         updateEditedState()
@@ -828,5 +847,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private func report(_ error: Error, while action: String) {
         Log.ui.error("\(action, privacy: .public) failed: \(String(describing: error), privacy: .public)")
         if let window { NSAlert(error: error).beginSheetModal(for: window) }
+    }
+}
+
+/// Solid sidebar background (no vibrancy): matches the flat chrome.
+@MainActor
+final class SidebarView: NSView {
+    override func draw(_ dirtyRect: NSRect) {
+        Theme.sidebar.setFill()
+        dirtyRect.intersection(bounds).fill()
     }
 }

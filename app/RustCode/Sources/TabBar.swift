@@ -46,9 +46,6 @@ final class TabBar: NSView {
         var isEdited: Bool
     }
 
-    /// Room for the traffic lights while the sidebar is hidden.
-    static let trafficLightInset: CGFloat = 78
-    static let normalInset: CGFloat = 0
     static let minTabWidth: CGFloat = 72
     static let maxTabWidth: CGFloat = 220
 
@@ -62,7 +59,6 @@ final class TabBar: NSView {
     var onMove: ((Int, Int) -> Void)?
 
     private let stack = NSStackView()
-    private var leading: NSLayoutConstraint!
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -79,9 +75,17 @@ final class TabBar: NSView {
         stack.setHuggingPriority(.defaultHigh, for: .horizontal)
         addSubview(stack)
 
-        leading = stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: Self.normalInset)
+        let rule = NSBox()
+        rule.boxType = .separator
+        rule.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(rule, positioned: .below, relativeTo: stack)
+
         NSLayoutConstraint.activate([
-            leading,
+            heightAnchor.constraint(equalToConstant: Theme.tabHeight),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
+            rule.bottomAnchor.constraint(equalTo: bottomAnchor),
+            rule.leadingAnchor.constraint(equalTo: leadingAnchor),
+            rule.trailingAnchor.constraint(equalTo: trailingAnchor),
             stack.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor),
             stack.topAnchor.constraint(equalTo: topAnchor),
             stack.bottomAnchor.constraint(equalTo: bottomAnchor),
@@ -92,13 +96,8 @@ final class TabBar: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
     override func draw(_ dirtyRect: NSRect) {
-        NSColor.windowBackgroundColor.setFill()
+        Theme.chrome.setFill()
         dirtyRect.intersection(bounds).fill()
-    }
-
-    var clearsTrafficLights: Bool {
-        get { leading.constant == Self.trafficLightInset }
-        set { leading.constant = newValue ? Self.trafficLightInset : Self.normalInset }
     }
 
     /// Replaces all tabs. Cheap enough: tab counts are small, and per-key
