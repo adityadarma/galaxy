@@ -205,6 +205,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         tabBar.onSelect = { [weak self] i in self?.selectTab(i, fromTabBar: true) }
         tabBar.onClose = { [weak self] i in self?.closeTab(at: i) }
         tabBar.onMove = { [weak self] from, to in self?.moveTab(from: from, to: to) }
+        tabBar.titleBar = titleBar
         pathBar.translatesAutoresizingMaskIntoConstraints = false
         pathBar.show([])
         findBarSlot.translatesAutoresizingMaskIntoConstraints = false

@@ -60,6 +60,56 @@ final class ExplorerTests: XCTestCase {
         XCTAssertEqual(opened, ["src/main.rs"])
     }
 
+    func testEveryClickOnAFolderOpensOrClosesIt() throws {
+        let root = try makeTree()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let controller = MainWindowController(bridge: CoreBridge())
+        controller.showWindow(nil)
+        defer { controller.window?.orderOut(nil) }
+        controller.open(url: root)
+        let explorer = controller.explorer
+        let outline = explorer.outlineView
+        outline.layoutSubtreeIfNeeded()
+        let window = try XCTUnwrap(controller.window)
+
+        func click(row: Int, count: Int) {
+            let rect = outline.rect(ofRow: row)
+            let p = outline.convert(NSPoint(x: rect.midX, y: rect.midY), to: nil)
+            let e = NSEvent.mouseEvent(with: .leftMouseDown, location: p, modifierFlags: [],
+                                       timestamp: ProcessInfo.processInfo.systemUptime,
+                                       windowNumber: window.windowNumber, context: nil, eventNumber: 0,
+                                       clickCount: count, pressure: 1)!
+            outline.mouseDown(with: e)
+        }
+        let src = try XCTUnwrap(outline.item(atRow: 1))
+        click(row: 1, count: 1)
+        XCTAssertTrue(outline.isItemExpanded(src), "one click opens")
+        click(row: 1, count: 2)
+        XCTAssertFalse(outline.isItemExpanded(src), "a quick second click closes, not swallowed as a double-click")
+        click(row: 1, count: 1)
+        XCTAssertTrue(outline.isItemExpanded(src), "clicking the selected folder again toggles too")
+        XCTAssertEqual(outline.selectedRow, 1)
+        click(row: 1, count: 1)
+        XCTAssertFalse(outline.isItemExpanded(src))
+    }
+
+    func testDoubleClickingTheTitleBarFillsTheScreenAndRestores() throws {
+        let controller = MainWindowController(bridge: CoreBridge())
+        controller.showWindow(nil)
+        defer { controller.window?.orderOut(nil) }
+        let window = try XCTUnwrap(controller.window)
+        let screen = try XCTUnwrap(window.screen ?? NSScreen.main)
+        let small = NSRect(x: screen.visibleFrame.minX + 40, y: screen.visibleFrame.minY + 40, width: 800, height: 500)
+        window.setFrame(small, display: true)
+
+        controller.titleBar.toggleFill()
+        XCTAssertEqual(window.frame, screen.visibleFrame, "fills the usable screen area")
+        XCTAssertFalse(window.styleMask.contains(.fullScreen), "not full screen")
+        controller.titleBar.toggleFill()
+        XCTAssertEqual(window.frame, small, "second double-click restores")
+        XCTAssertFalse(controller.titleBar.mouseDownCanMoveWindow, "the bar drags itself so double-clicks reach it")
+    }
+
     func testWindowOpensAFolderAndShowsAFileFromTheSidebar() throws {
         let root = try makeTree()
         defer { try? FileManager.default.removeItem(at: root) }

@@ -52,8 +52,8 @@ final class TabBar: NSView {
         var isEdited: Bool
     }
 
-    static let minTabWidth: CGFloat = 72
-    static let maxTabWidth: CGFloat = 220
+    static let minTabWidth: CGFloat = 96
+    static let maxTabWidth: CGFloat = 240
 
     private(set) var items: [Item] = []
     private(set) var selectedIndex: Int?
@@ -104,6 +104,17 @@ final class TabBar: NSView {
     override func draw(_ dirtyRect: NSRect) {
         Theme.chrome.setFill()
         dirtyRect.intersection(bounds).fill()
+    }
+
+    /// Set by the window: the empty strip after the tabs acts as title bar.
+    weak var titleBar: TitleBar?
+
+    override func mouseDown(with event: NSEvent) {
+        if event.clickCount == 1 { window?.performDrag(with: event) }
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if let titleBar { titleBar.mouseUp(with: event) } else { super.mouseUp(with: event) }
     }
 
     /// Replaces all tabs. Cheap enough: tab counts are small, and per-key
@@ -179,6 +190,8 @@ final class TabItemView: NSView {
     var isSelected = false { didSet { if isSelected != oldValue { refresh() } } }
 
     let label = NSTextField(labelWithString: "")
+    /// File-type glyph, as in the explorer.
+    let icon = NSImageView()
     let closeButton = NSButton()
     let editedDot = NSTextField(labelWithString: "●")
     private var isHovered = false { didSet { if isHovered != oldValue { refresh() } } }
@@ -190,12 +203,15 @@ final class TabItemView: NSView {
         setAccessibilityRole(.radioButton)
         setAccessibilityIdentifier("tab")
 
+        icon.imageScaling = .scaleNone
+        icon.setAccessibilityElement(false)
+        icon.translatesAutoresizingMaskIntoConstraints = false
         label.lineBreakMode = .byTruncatingMiddle
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         label.translatesAutoresizingMaskIntoConstraints = false
 
         closeButton.image = NSImage(systemSymbolName: "xmark", accessibilityDescription: "Close")
-        closeButton.symbolConfiguration = .init(pointSize: 9, weight: .semibold)
+        closeButton.symbolConfiguration = .init(pointSize: 11, weight: .regular)
         closeButton.isBordered = false
         closeButton.imagePosition = .imageOnly
         closeButton.contentTintColor = .secondaryLabelColor
@@ -210,14 +226,17 @@ final class TabItemView: NSView {
         editedDot.setAccessibilityElement(false)
         editedDot.translatesAutoresizingMaskIntoConstraints = false
 
-        for view in [label, closeButton, editedDot] { addSubview(view) }
+        for view in [icon, label, closeButton, editedDot] { addSubview(view) }
         NSLayoutConstraint.activate([
             widthAnchor.constraint(greaterThanOrEqualToConstant: TabBar.minTabWidth),
             widthAnchor.constraint(lessThanOrEqualToConstant: TabBar.maxTabWidth),
-            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+            icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            icon.centerYAnchor.constraint(equalTo: centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 16),
+            label.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 6),
             label.centerYAnchor.constraint(equalTo: centerYAnchor),
             closeButton.leadingAnchor.constraint(equalTo: label.trailingAnchor, constant: 6),
-            closeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            closeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             closeButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             closeButton.widthAnchor.constraint(equalToConstant: 16),
             closeButton.heightAnchor.constraint(equalToConstant: 16),
@@ -234,14 +253,18 @@ final class TabItemView: NSView {
     var showsEditedDot: Bool { item.isEdited && !isHovered }
 
     private func refresh() {
-        let size: CGFloat = 12
-        var font = NSFont.systemFont(ofSize: size, weight: isSelected ? .medium : .regular)
+        let size: CGFloat = 13
+        var font = NSFont.systemFont(ofSize: size, weight: .regular)
         if item.isPreview {
             font = NSFontManager.shared.convert(font, toHaveTrait: .italicFontMask)
         }
         label.font = font
         label.stringValue = item.title
         label.textColor = isSelected ? .labelColor : .secondaryLabelColor
+        let glyph = FileGlyph.for(name: item.title)
+        icon.image = glyph.image
+        icon.contentTintColor = glyph.color
+        icon.alphaValue = isSelected ? 1 : 0.8
         editedDot.isHidden = !showsEditedDot
         closeButton.isHidden = showsEditedDot || !(isSelected || isHovered)
         closeButton.setAccessibilityLabel("Close \(item.title)")
@@ -265,9 +288,9 @@ final class TabItemView: NSView {
             NSColor.labelColor.withAlphaComponent(0.04).setFill()
             bounds.fill()
         }
-        // Hairline between tabs.
+        // Full-height divider between tabs, as in VSCode.
         NSColor.separatorColor.setFill()
-        NSRect(x: bounds.maxX - 1, y: 6, width: 1, height: max(0, bounds.height - 12)).fill()
+        NSRect(x: bounds.maxX - 1, y: 0, width: 1, height: bounds.height).fill()
     }
 
     override var isFlipped: Bool { false }

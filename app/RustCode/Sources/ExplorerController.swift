@@ -39,9 +39,9 @@ final class ExplorerController: NSObject {
     var dirtyPaths: Set<String> = [] {
         didSet { if dirtyPaths != oldValue { refreshDirtyMarks() } }
     }
-    /// A folder already toggled by the mouse-down selection of this click,
-    /// so the click action does not toggle it back.
-    private var toggledOnMouseDown = false
+    /// Set while a folder click selects its row, so the selection change
+    /// does not toggle the folder a second time.
+    private var selectingFromClick = false
 
     override init() {
         super.init()
@@ -60,8 +60,8 @@ final class ExplorerController: NSObject {
         outlineView.dataSource = self
         outlineView.delegate = self
         outlineView.target = self
-        outlineView.action = #selector(clicked(_:))
         outlineView.doubleAction = #selector(doubleClicked(_:))
+        outlineView.onFolderClick = { [weak self] row in self?.folderClicked(row: row) ?? false }
         outlineView.setAccessibilityLabel("File explorer")
         outlineView.setAccessibilityIdentifier("explorer")
 
@@ -134,14 +134,18 @@ final class ExplorerController: NSObject {
         }
     }
 
-    /// Mouse up. Clicking an already selected folder does not change the
-    /// selection, so it is toggled here instead.
-    @objc private func clicked(_ sender: Any?) {
-        defer { toggledOnMouseDown = false }
-        let row = outlineView.clickedRow
-        guard row >= 0, let node = outlineView.item(atRow: row) as? ExplorerNode,
-              node.entry.isDir, !toggledOnMouseDown else { return }
+    /// Mouse down on a row. Every click on a folder opens or closes it,
+    /// however fast the clicks come (a quick second click is not swallowed
+    /// as a double-click), as in VSCode. Returns `false` for files, which
+    /// keep the normal table click handling.
+    func folderClicked(row: Int) -> Bool {
+        guard let node = outlineView.item(atRow: row) as? ExplorerNode, node.entry.isDir else { return false }
+        outlineView.window?.makeFirstResponder(outlineView)
+        selectingFromClick = true
+        outlineView.selectRowIndexes([row], byExtendingSelection: false)
+        selectingFromClick = false
         toggle(node)
+        return true
     }
 
     @objc private func doubleClicked(_ sender: Any?) {
@@ -218,9 +222,9 @@ extension ExplorerController: NSOutlineViewDelegate {
         let event = NSApp.currentEvent?.type
         if node.entry.isDir {
             // Arrow keys only move, as in VSCode (← and → open and close).
-            guard event != .keyDown else { return }
+            // Mouse clicks toggle in `folderClicked`.
+            guard event != .keyDown, !selectingFromClick else { return }
             toggle(node)
-            if event == .leftMouseDown { toggledOnMouseDown = true }
         } else if let workspace {
             onOpenFile?(workspace, node.entry)
         }
@@ -235,6 +239,16 @@ extension ExplorerController: NSOutlineViewDelegate {
 final class ExplorerOutlineView: NSOutlineView {
     static let baseInset: CGFloat = 8
     static let indent: CGFloat = 12
+
+    /// Handles a left click on `row`; returns `true` when it did.
+    var onFolderClick: ((Int) -> Bool)?
+
+    override func mouseDown(with event: NSEvent) {
+        let row = row(at: convert(event.locationInWindow, from: nil))
+        let plain = event.modifierFlags.intersection([.command, .shift, .control, .option]).isEmpty
+        if row >= 0, plain, onFolderClick?(row) == true { return }
+        super.mouseDown(with: event)
+    }
 
     override func frameOfOutlineCell(atRow row: Int) -> NSRect { .zero }
 

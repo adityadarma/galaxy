@@ -18,7 +18,7 @@ final class PathBar: NSView {
         super.init(frame: frame)
         setAccessibilityElement(false)
 
-        label.font = .systemFont(ofSize: 12)
+        label.font = .systemFont(ofSize: 13)
         label.lineBreakMode = .byTruncatingHead
         label.setAccessibilityIdentifier("path-bar")
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -60,24 +60,51 @@ final class PathBar: NSView {
         dirtyRect.intersection(bounds).fill()
     }
 
-    /// Leading parts are dimmed, the last one (the file) is not.
+    /// Folders, then the file with its type glyph, split by chevrons as in
+    /// VSCode's breadcrumbs.
     func show(_ components: [String]) {
         self.components = components
+        let font = NSFont.systemFont(ofSize: 13)
         let text = NSMutableAttributedString()
         for (i, part) in components.enumerated() {
             let last = i == components.count - 1
             if i > 0 {
-                text.append(NSAttributedString(string: "  ›  ", attributes: [
-                    .foregroundColor: NSColor.tertiaryLabelColor, .font: label.font!,
-                ]))
+                text.append(NSAttributedString(string: " ", attributes: [.font: font]))
+                text.append(Self.symbol("chevron.right", size: 9, weight: .medium,
+                                        color: .tertiaryLabelColor, font: font))
+                text.append(NSAttributedString(string: " ", attributes: [.font: font]))
+            }
+            if last {
+                let glyph = FileGlyph.for(name: part)
+                if let image = glyph.image {
+                    text.append(Self.attachment(image, color: glyph.color, font: font))
+                    text.append(NSAttributedString(string: " ", attributes: [.font: font]))
+                }
             }
             text.append(NSAttributedString(string: part, attributes: [
                 .foregroundColor: last ? NSColor.labelColor : NSColor.secondaryLabelColor,
-                .font: last ? NSFont.systemFont(ofSize: 12, weight: .medium) : label.font!,
+                .font: font,
             ]))
         }
         label.attributedStringValue = text
         label.setAccessibilityLabel(components.joined(separator: " / "))
+    }
+
+    private static func symbol(_ name: String, size: CGFloat, weight: NSFont.Weight,
+                               color: NSColor, font: NSFont) -> NSAttributedString {
+        guard let image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: size, weight: weight)) else { return NSAttributedString() }
+        return attachment(image, color: color, font: font)
+    }
+
+    /// Inline image, tinted and centered on the text's x-height.
+    private static func attachment(_ image: NSImage, color: NSColor, font: NSFont) -> NSAttributedString {
+        let tinted = image.withSymbolConfiguration(.init(paletteColors: [color])) ?? image
+        let a = NSTextAttachment()
+        a.image = tinted
+        let size = tinted.size
+        a.bounds = NSRect(x: 0, y: (font.capHeight - size.height) / 2, width: size.width, height: size.height)
+        return NSAttributedString(attachment: a)
     }
 
     func setEdited(_ edited: Bool) {

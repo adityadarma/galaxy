@@ -115,6 +115,17 @@ final class TabTests: XCTestCase {
         XCTAssertTrue(tab.closeButton.isHidden, "the dot takes the close button's place")
     }
 
+    func testTabsAndBreadcrumbShowTheFileTypeGlyph() throws {
+        let c = makeController()
+        defer { c.window?.orderOut(nil) }
+        try c.openFile(at: file("a.txt"))
+        let tab = try XCTUnwrap(c.tabBar.tabViews.first)
+        XCTAssertNotNil(tab.icon.image, "tab shows the file glyph")
+        XCTAssertLessThan(tab.icon.frame.maxX, tab.label.frame.minX + 1, "glyph before the name")
+        XCTAssertTrue(c.pathBar.label.attributedStringValue.containsAttachments, "breadcrumb has chevrons and glyph")
+        XCTAssertEqual(c.pathBar.label.accessibilityLabel(), c.pathBar.components.joined(separator: " / "))
+    }
+
     func testUndoingBackToTheSavedTextClearsTheDots() throws {
         let c = makeController()
         defer { c.window?.orderOut(nil) }
