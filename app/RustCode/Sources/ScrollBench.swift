@@ -83,8 +83,10 @@ final class ScrollBench {
         let intervalP50 = LatencyProbe.percentile(interval, 0.5)
         let intervalP95 = LatencyProbe.percentile(interval, 0.95)
         print(String(
-            format: "scroll_frames=%d scroll_draw_p50_ms=%.2f scroll_draw_p95_ms=%.2f scroll_interval_p50_ms=%.2f scroll_interval_p95_ms=%.2f",
-            completed, drawP50, drawP95, intervalP50, intervalP95
+            format: "scroll_frames=%d scroll_draw_p50_ms=%.2f scroll_draw_p95_ms=%.2f scroll_interval_p50_ms=%.2f scroll_interval_p95_ms=%.2f scroll_last_line=%d scroll_line_count=%d",
+            completed, drawP50, drawP95, intervalP50, intervalP95,
+            // Proves the run really scrolled through the document.
+            view.lastDrawnLines.upperBound, view.lineCount
         ))
         fflush(stdout)
         exit(completed == frames ? 0 : 1)

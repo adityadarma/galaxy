@@ -9,7 +9,25 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private let scrollView = NSScrollView()
     private let splitView = NSSplitView()
     private let detailView = NSView()
-    let findBar = FindBar()
+    /// Holds the find bar's place in the layout. The bar itself is built on
+    /// first use (⌘F): it costs about 20 ms, a tenth of the startup budget.
+    private let findBarSlot = NSView()
+    private var loadedFindBar: FindBar?
+    var findBar: FindBar {
+        if let bar = loadedFindBar { return bar }
+        let bar = FindBar()
+        bar.translatesAutoresizingMaskIntoConstraints = false
+        findBarSlot.addSubview(bar)
+        NSLayoutConstraint.activate([
+            bar.topAnchor.constraint(equalTo: findBarSlot.topAnchor),
+            bar.bottomAnchor.constraint(equalTo: findBarSlot.bottomAnchor),
+            bar.leadingAnchor.constraint(equalTo: findBarSlot.leadingAnchor),
+            bar.trailingAnchor.constraint(equalTo: findBarSlot.trailingAnchor),
+        ])
+        loadedFindBar = bar
+        wireFindBar()
+        return bar
+    }
     /// Shown for files over 20 MB (M1-14).
     let largeFileBanner = NSTextField(labelWithString: "Large file mode: lines over 10,000 characters are shown cut off.")
     private var findBarHeight: NSLayoutConstraint!
@@ -111,10 +129,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         scrollView.documentView = editorView
 
         detailView.translatesAutoresizingMaskIntoConstraints = false
-        findBar.translatesAutoresizingMaskIntoConstraints = false
-        findBar.isHidden = true
-        findBarHeight = findBar.heightAnchor.constraint(equalToConstant: 0)
-        wireFindBar()
+        findBarSlot.translatesAutoresizingMaskIntoConstraints = false
+        findBarSlot.isHidden = true
+        findBarHeight = findBarSlot.heightAnchor.constraint(equalToConstant: 0)
         largeFileBanner.font = .systemFont(ofSize: 11)
         largeFileBanner.textColor = .systemOrange
         largeFileBanner.lineBreakMode = .byTruncatingTail
@@ -124,7 +141,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         largeFileBanner.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         detailView.addSubview(statusLabel)
         detailView.addSubview(largeFileBanner)
-        detailView.addSubview(findBar)
+        detailView.addSubview(findBarSlot)
         detailView.addSubview(scrollView)
         NSLayoutConstraint.activate([
             statusLabel.leadingAnchor.constraint(equalTo: detailView.leadingAnchor, constant: 12),
@@ -132,11 +149,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             largeFileBanner.firstBaselineAnchor.constraint(equalTo: statusLabel.firstBaselineAnchor),
             largeFileBanner.trailingAnchor.constraint(lessThanOrEqualTo: detailView.trailingAnchor, constant: -12),
             statusLabel.topAnchor.constraint(equalTo: detailView.topAnchor, constant: 8),
-            findBar.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 8),
-            findBar.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
-            findBar.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
+            findBarSlot.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 8),
+            findBarSlot.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
+            findBarSlot.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
             findBarHeight,
-            scrollView.topAnchor.constraint(equalTo: findBar.bottomAnchor),
+            scrollView.topAnchor.constraint(equalTo: findBarSlot.bottomAnchor),
             scrollView.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
             scrollView.bottomAnchor.constraint(equalTo: detailView.bottomAnchor),
@@ -289,7 +306,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     // MARK: Find and replace (M1-13)
 
-    var isFindVisible: Bool { !findBar.isHidden }
+    /// Does not build the bar: this is checked on every edit.
+    var isFindVisible: Bool { loadedFindBar != nil && !findBarSlot.isHidden }
 
     /// Background match count in flight, if any. Only the newest one may
     /// update the bar; older ones are cancelled.
@@ -330,7 +348,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func setFindVisible(_ visible: Bool) {
-        findBar.isHidden = !visible
+        findBarSlot.isHidden = !visible
         findBarHeight.constant = visible ? findBar.preferredHeight : 0
     }
 

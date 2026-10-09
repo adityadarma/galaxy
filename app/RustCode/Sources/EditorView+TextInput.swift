@@ -42,7 +42,10 @@ extension EditorView: @preconcurrency NSTextInputClient {
         case #selector(NSResponder.deleteBackward(_:)): document.edit(command: .backspace)
         case #selector(NSResponder.deleteForward(_:)): document.edit(command: .deleteForward)
         default:
+            // Cursor moves change no text, so skip the whole-document
+            // listeners (modified flag, find count) that edits trigger.
             guard performNavigation(selector) else { return }
+            return didChangeSelection()
         }
         didChangeDocument()
     }

@@ -298,4 +298,18 @@ final class EditorViewTests: XCTestCase {
             XCTAssertGreaterThan(strongest, 0.5, "text must contrast with the background in \(name.rawValue)")
         }
     }
+
+    func testAccessibilityCountNeverExceedsTheExposedValue() throws {
+        let c = MainWindowController(bridge: CoreBridge())
+        c.showWindow(nil)
+        defer { c.window?.orderOut(nil) }
+        c.newDocument(nil)
+        let v = c.editorView
+        v.document?.edit(command: .insertText(text: String(repeating: "a", count: EditorView.accessibilityTextLimit + 10)))
+        v.didChangeDocument()
+        v.flushPendingUpdates()
+        let value = try XCTUnwrap(v.accessibilityValue() as? String)
+        XCTAssertEqual(value.utf16.count, EditorView.accessibilityTextLimit)
+        XCTAssertEqual(v.accessibilityNumberOfCharacters(), value.utf16.count)
+    }
 }

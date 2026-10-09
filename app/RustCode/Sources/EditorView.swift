@@ -268,6 +268,10 @@ final class EditorView: NSView {
             hasPendingChange = false
             frameFlushes += 1
             onChange?()
+            // Once per frame, not per key: a client that reacts by reading
+            // the whole value should not do so for every keystroke.
+            NSAccessibility.post(element: self, notification: .valueChanged)
+            NSAccessibility.post(element: self, notification: .selectedTextChanged)
         }
         // A burst that skipped direct draws gets one visual update here.
         // This path is also used by tests and hidden windows, where waiting

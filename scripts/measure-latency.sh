@@ -21,8 +21,9 @@ APP_BIN="$DERIVED/Build/Products/Release/RustCode.app/Contents/MacOS/RustCode"
 xcodebuild -project "$ROOT/app/RustCode.xcodeproj" -scheme RustCode \
   -configuration Release -derivedDataPath "$DERIVED" build -quiet
 
-FIXTURE="$(mktemp -t rcode-latency).rs"
-trap 'rm -f "$FIXTURE"' EXIT
+BASE="$(mktemp -t rcode-latency)"
+FIXTURE="$BASE.rs"
+trap 'rm -f "$BASE" "$FIXTURE"' EXIT
 python3 - "$FIXTURE" "$LINES" <<'PY'
 import sys
 path, n = sys.argv[1], int(sys.argv[2])

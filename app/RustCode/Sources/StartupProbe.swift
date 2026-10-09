@@ -11,9 +11,20 @@ enum StartupProbe {
         ProcessInfo.processInfo.environment["RCODE_BENCH"] == "1"
     }
 
+    /// Phase marks, in ms since process start, printed with the total.
+    nonisolated(unsafe) private static var marks: [(String, Double)] = []
+
+    /// Records a phase boundary (only when benchmarking).
+    static func mark(_ name: String) {
+        guard isEnabled, let ms = millisecondsSinceProcessStart() else { return }
+        marks.append((name, ms))
+    }
+
     static func reportWindowReady() {
         guard isEnabled, let ms = millisecondsSinceProcessStart() else { return }
-        print(String(format: "startup_ms=%.1f", ms))
+        mark("first_frame")
+        let phases = marks.map { String(format: "%@=%.1f", $0.0, $0.1) }.joined(separator: " ")
+        print(String(format: "startup_ms=%.1f ", ms) + phases)
         fflush(stdout)
     }
 

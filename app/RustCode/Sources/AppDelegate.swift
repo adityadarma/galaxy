@@ -18,12 +18,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        StartupProbe.mark("did_finish_launching")
         Log.app.info("launch started")
         bridge.start()
+        StartupProbe.mark("core_started")
 
         NSApp.mainMenu = MainMenu.build()
+        StartupProbe.mark("menu")
         let controller = MainWindowController(bridge: bridge)
+        StartupProbe.mark("window_built")
         controller.showWindow(nil)
+        StartupProbe.mark("window_shown")
         windowController = controller
         // `RustCode -OpenPath <file or folder>`; UI tests use this instead of
         // driving the open panel.
@@ -38,6 +43,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             controller.newDocument(nil)
         }
 
+        StartupProbe.mark("document_open")
         NSApp.activate()
         Log.app.info("window ready, core \(self.bridge.version, privacy: .public)")
 

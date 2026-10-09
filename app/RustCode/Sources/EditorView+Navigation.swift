@@ -184,6 +184,8 @@ extension EditorView {
     func didChangeSelection() {
         noteDocumentRefreshFromInput()
         requestDocumentRefresh(scrollCaret: true)
+        // VoiceOver reads the new caret line or selection.
+        NSAccessibility.post(element: self, notification: .selectedTextChanged)
     }
 
     // MARK: Clipboard
@@ -243,8 +245,10 @@ extension EditorView {
         return document.textInRange(range: Utf16Range(location: 0, length: UInt64(length)))
     }
 
+    /// Matches `accessibilityValue`: clients index into that string, so a
+    /// larger count would point past its end on huge files.
     override func accessibilityNumberOfCharacters() -> Int {
-        Int(document?.lenUtf16() ?? 0)
+        min(Int(document?.lenUtf16() ?? 0), Self.accessibilityTextLimit)
     }
 
     override func accessibilitySelectedTextRange() -> NSRange {

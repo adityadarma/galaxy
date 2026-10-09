@@ -122,7 +122,9 @@ impl WorkspaceIndex {
     pub fn estimated_memory_bytes(&self) -> usize {
         use std::mem::size_of;
 
-        let component_bytes = self
+        // Each unique name is stored twice: in `components` and as its own
+        // key in `component_ids`.
+        let component_bytes = 2 * self
             .arena
             .components
             .iter()
@@ -267,6 +269,11 @@ impl Workspace {
         let mut index = WorkspaceIndex::default();
         for entry in walker.filter_map(Result::ok) {
             if entry.depth() == 0 || entry.file_type().is_some_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            // Links are not followed, so a link to a folder arrives here as
+            // a non-directory entry. It is not a file: leave it out.
+            if entry.path_is_symlink() && entry.path().is_dir() {
                 continue;
             }
             if let Ok(rel) = entry.path().strip_prefix(&self.root) {
@@ -449,8 +456,30 @@ mod tests {
         assert!(paths.contains(&"src/other/mod.rs".to_string()));
         assert!(!paths.iter().any(|path| path.starts_with("node_modules/")));
         assert!(!paths.iter().any(|path| path == "ignored.log"));
-        // `src`, `other`, and `main.rs` are each stored only once.
-        assert!(index.component_count() < paths.iter().map(|path| path.split('/').count()).sum());
+        // Every distinct name (`src`, `other`, `main.rs`, ...) is stored once.
+        let unique: std::collections::HashSet<&str> =
+            paths.iter().flat_map(|path| path.split('/')).collect();
+        assert_eq!(index.component_count(), unique.len());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_index_skips_links_to_folders_but_keeps_links_to_files() {
+        let (dir, ws) = tree();
+        std::os::unix::fs::symlink(dir.path().join("src"), dir.path().join("src-link")).unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("src/main.rs"),
+            dir.path().join("main-link.rs"),
+        )
+        .unwrap();
+        let index = ws.build_file_index();
+        let paths: Vec<String> = (0..index.len()).map(|i| index.path(i).unwrap()).collect();
+        assert!(!paths.iter().any(|p| p == "src-link"), "{paths:?}");
+        assert!(
+            !paths.iter().any(|p| p.starts_with("src-link/")),
+            "links are not followed"
+        );
+        assert!(paths.iter().any(|p| p == "main-link.rs"));
     }
 
     #[test]

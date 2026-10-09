@@ -445,4 +445,25 @@ final class LatencyProbeTests: XCTestCase {
         probe.reset()
         XCTAssertNil(probe.summary)
     }
+
+    func testArrowKeysDoNotRunWholeDocumentListeners() throws {
+        let c = MainWindowController(bridge: CoreBridge())
+        c.showWindow(nil)
+        defer { c.window?.orderOut(nil) }
+        c.newDocument(nil)
+        let v = c.editorView
+        v.document?.edit(command: .insertText(text: "abc\ndef"))
+        v.didChangeDocument()
+        v.flushPendingUpdates()
+        var notified = 0
+        v.onChange = { notified += 1 }
+        v.doCommand(by: #selector(NSResponder.moveLeft(_:)))
+        v.doCommand(by: #selector(NSResponder.moveUp(_:)))
+        v.flushPendingUpdates()
+        XCTAssertEqual(notified, 0, "moving the caret is not an edit")
+        XCTAssertEqual(v.selectedRange().location, 2, "but the caret did move")
+        v.doCommand(by: #selector(NSResponder.deleteBackward(_:)))
+        v.flushPendingUpdates()
+        XCTAssertEqual(notified, 1, "an edit still notifies")
+    }
 }
