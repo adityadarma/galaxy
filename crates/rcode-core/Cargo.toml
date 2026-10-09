@@ -22,6 +22,8 @@ ignore.workspace = true
 regex.workspace = true
 # Fuzzy file search for Go to File.
 nucleo-matcher.workspace = true
+# Workspace file watcher (FSEvents).
+notify.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

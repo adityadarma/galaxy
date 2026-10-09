@@ -84,7 +84,29 @@ final class ExplorerController: NSObject {
         outlineView.reloadData()
     }
 
-    /// Lists everything again, keeping open folders open.
+    /// Relists after the watcher reported `paths` (M2-02), but only when
+    /// one of them is in a folder that has been listed. Returns whether it
+    /// relisted.
+    @discardableResult
+    func refresh(changed paths: [String]) -> Bool {
+        guard workspace != nil, roots != nil else { return false }
+        var listed: Set<String> = [""]
+        var stack = roots ?? []
+        while let node = stack.popLast() {
+            if let children = node.children {
+                listed.insert(node.entry.relPath)
+                stack.append(contentsOf: children)
+            }
+        }
+        let touched = paths.contains { listed.contains(($0 as NSString).deletingLastPathComponent) }
+            || paths.contains { listed.contains($0) }
+        guard touched else { return false }
+        refresh()
+        return true
+    }
+
+    /// Lists everything again, keeping open folders open and the selected
+    /// row selected (without opening it again).
     func refresh() {
         guard workspace != nil else { return }
         var open = Set<String>()
@@ -93,7 +115,11 @@ final class ExplorerController: NSObject {
                 open.insert(node.entry.relPath)
             }
         }
+        let selected = selectedEntry?.relPath
+        let scroll = scrollView.contentView.bounds.origin
         roots = nil
+        quietSelection = true
+        defer { quietSelection = false }
         outlineView.reloadData()
         // Expanding adds rows below, so walk forward as the list grows.
         var row = 0
@@ -103,6 +129,11 @@ final class ExplorerController: NSObject {
             }
             row += 1
         }
+        if let selected, let row = self.row(forRelPath: selected) {
+            outlineView.selectRowIndexes([row], byExtendingSelection: false)
+        }
+        scrollView.contentView.scroll(to: scroll)
+        scrollView.reflectScrolledClipView(scrollView.contentView)
     }
 
     func isDirty(_ entry: FileEntry) -> Bool {

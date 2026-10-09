@@ -32,6 +32,8 @@ ignore = "=0.4.33"
 regex = "=1.13.1"
 # Go to File (M2-07). The matcher half of helix's nucleo; MPL-2.0.
 nucleo-matcher = "=0.3.1"
+# File watcher (M2-02): FSEvents on macOS. 8.x is the latest stable line.
+notify = { version = "=8.2.0", default-features = false, features = ["macos_fsevent"] }
 proptest = { version = "=1.11.0", default-features = false, features = ["std"] }
 
 [workspace.lints.rust]

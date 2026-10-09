@@ -14,7 +14,7 @@
 //! The built-in excludes from the PRD (`.git`, `node_modules`, `target`,
 //! `dist`, `build`) are hidden when they are directories.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -148,6 +148,15 @@ impl WorkspaceIndex {
         let id = self.arena.intern(rel);
         self.files.push(id);
     }
+}
+
+/// How the Go to File index changes after some paths changed on disk.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IndexDelta {
+    /// Drop these paths and everything under them (`p` and `p/...`).
+    pub removed: Vec<String>,
+    /// Then add these files. Sorted, unique.
+    pub added: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -304,6 +313,99 @@ impl Workspace {
                 .then_with(|| a.name.cmp(&b.name))
         });
         Ok(entries)
+    }
+
+    /// Works out how the file index changes after `changed` (relative
+    /// paths reported by the watcher) changed on disk. Every changed path
+    /// is removed with everything under it, then whatever exists now and
+    /// is visible (not ignored, not under an ignored folder) is added back:
+    /// a file as itself, a folder with all its files.
+    pub fn index_delta(&self, changed: &[String]) -> IndexDelta {
+        // Directory listings, cached: one `list_dir` per parent.
+        let mut listings: HashMap<String, Option<HashSet<String>>> = HashMap::new();
+        let mut visible = |rel: &str| -> bool {
+            let mut parent = String::new();
+            for part in rel.split('/') {
+                let names = listings.entry(parent.clone()).or_insert_with(|| {
+                    self.list_dir(&parent)
+                        .ok()
+                        .map(|list| list.into_iter().map(|e| e.name).collect())
+                });
+                if !names.as_ref().is_some_and(|n| n.contains(part)) {
+                    return false;
+                }
+                if !parent.is_empty() {
+                    parent.push('/');
+                }
+                parent.push_str(part);
+            }
+            true
+        };
+
+        let mut removed: Vec<String> = Vec::new();
+        let mut added = BTreeSet::new();
+        // A changed folder covers its own changed children.
+        let changed: BTreeSet<&str> = changed.iter().map(String::as_str).collect();
+        for rel in changed.iter().copied() {
+            let covered = removed.last().is_some_and(|r| {
+                rel.strip_prefix(r.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
+            });
+            if covered || rel.is_empty() {
+                continue;
+            }
+            removed.push(rel.to_owned());
+            let Ok(path) = self.resolve(rel) else {
+                continue;
+            };
+            // `symlink_metadata`: a link to a folder is not walked, as in
+            // `build_file_index`.
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue; // gone
+            };
+            if !visible(rel) {
+                continue;
+            }
+            if meta.is_dir() {
+                added.extend(self.files_under(&path));
+            } else if !(meta.file_type().is_symlink() && path.is_dir()) {
+                added.insert(rel.to_owned());
+            }
+        }
+        IndexDelta {
+            removed,
+            added: added.into_iter().collect(),
+        }
+    }
+
+    /// Relative paths of the files under `dir`, with the same rules as
+    /// `build_file_index`.
+    fn files_under(&self, dir: &Path) -> Vec<String> {
+        let walker = WalkBuilder::new(dir)
+            .hidden(false)
+            .ignore(true)
+            .git_ignore(true)
+            .git_global(false)
+            .git_exclude(false)
+            .require_git(false)
+            .parents(true)
+            .follow_links(false)
+            .filter_entry(|e| e.depth() == 0 || !is_default_excluded(e))
+            .build();
+        walker
+            .filter_map(Result::ok)
+            .filter(|e| e.depth() > 0 && !e.file_type().is_some_and(|k| k.is_dir()))
+            .filter(|e| !(e.path_is_symlink() && e.path().is_dir()))
+            .filter_map(|e| {
+                let rel = e.path().strip_prefix(&self.root).ok()?;
+                Some(
+                    rel.components()
+                        .map(|c| c.as_os_str().to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join("/"),
+                )
+            })
+            .collect()
     }
 
     /// Walks the workspace once and builds a compact, gitignore-aware file
@@ -501,6 +603,52 @@ mod tests {
             "parent is a file"
         );
         assert!(!dir.path().parent().unwrap().join("x").exists());
+    }
+
+    #[test]
+    fn index_delta_adds_visible_files_and_removes_gone_ones() {
+        let (dir, ws) = tree();
+        let r = dir.path();
+        fs::write(r.join(".gitignore"), "*.log\nout/\n").unwrap();
+        fs::write(r.join("src/new.rs"), "x").unwrap();
+        fs::write(r.join("debug.log"), "x").unwrap();
+        fs::create_dir_all(r.join("out")).unwrap();
+        fs::write(r.join("out/a.txt"), "x").unwrap();
+        fs::remove_file(r.join("README.md")).unwrap();
+        let changed: Vec<String> = ["src/new.rs", "debug.log", "out/a.txt", "README.md"]
+            .map(String::from)
+            .to_vec();
+        let delta = ws.index_delta(&changed);
+        assert_eq!(
+            delta.added,
+            ["src/new.rs"],
+            "ignored files and files in ignored folders stay out"
+        );
+        assert_eq!(
+            delta.removed,
+            ["README.md", "debug.log", "out/a.txt", "src/new.rs"],
+            "sorted"
+        );
+    }
+
+    #[test]
+    fn index_delta_walks_new_folders_and_drops_renamed_ones() {
+        let (dir, ws) = tree();
+        let r = dir.path();
+        // `git mv src lib`: the old folder is gone, the new one appears.
+        fs::rename(r.join("src"), r.join("lib")).unwrap();
+        let delta = ws.index_delta(&["src".into(), "lib".into(), "lib/main.rs".into()]);
+        assert_eq!(
+            delta.removed,
+            ["lib", "src"],
+            "lib/main.rs is covered by lib"
+        );
+        assert_eq!(delta.added, ["lib/deep/mod.rs", "lib/main.rs"]);
+        assert!(
+            ws.index_delta(&["node_modules/pkg/index.js".into()])
+                .added
+                .is_empty()
+        );
     }
 
     #[test]

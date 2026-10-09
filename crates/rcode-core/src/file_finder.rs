@@ -18,7 +18,7 @@ use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use unicode_segmentation::UnicodeSegmentation;
 
-use crate::workspace::WorkspaceIndex;
+use crate::workspace::{IndexDelta, WorkspaceIndex};
 
 /// Below this many candidates one thread is faster than spawning several.
 const PARALLEL_THRESHOLD: usize = 8_192;
@@ -103,6 +103,63 @@ impl FileFinder {
 
     pub fn len(&self) -> usize {
         self.ends.len()
+    }
+
+    /// Applies a watcher delta (M2-02): drops `removed` paths and
+    /// everything under them, then adds `added`. Ranking context (current
+    /// file, recent files) is kept. Returns `false` when nothing changed.
+    /// Rebuilds the packed path list: about 20 ms for 100k files, so call
+    /// it off the main thread.
+    pub fn apply_delta(&mut self, delta: &IndexDelta) -> bool {
+        let removed: HashSet<&str> = delta.removed.iter().map(String::as_str).collect();
+        let is_removed = |path: &str| {
+            removed.contains(path)
+                || path
+                    .match_indices('/')
+                    .any(|(i, _)| removed.contains(&path[..i]))
+        };
+        let mut kept: Vec<&str> = Vec::with_capacity(self.ends.len() + delta.added.len());
+        let mut dropped = 0usize;
+        for i in 0..self.ends.len() as u32 {
+            let path = path_at(&self.text, &self.ends, i);
+            if is_removed(path) {
+                dropped += 1;
+            } else {
+                kept.push(path);
+            }
+        }
+        let present: HashSet<&str> = kept.iter().copied().collect();
+        let new: Vec<&str> = delta
+            .added
+            .iter()
+            .map(String::as_str)
+            .filter(|p| !present.contains(p))
+            .collect();
+        if dropped == 0 && new.is_empty() {
+            return false;
+        }
+
+        // Recent ranks are by index; carry them over by path.
+        let mut recent: Vec<(u32, String)> = self
+            .recent
+            .iter()
+            .map(|(&i, &rank)| (rank, path_at(&self.text, &self.ends, i).to_owned()))
+            .collect();
+        recent.sort_unstable();
+        let current_dir = std::mem::take(&mut self.current_dir);
+
+        let mut next = Self::from_paths(kept.into_iter().chain(new));
+        next.current_dir = current_dir;
+        let wanted: HashMap<&str, u32> = recent.iter().map(|(r, p)| (p.as_str(), *r)).collect();
+        if !wanted.is_empty() {
+            for i in 0..next.ends.len() as u32 {
+                if let Some(&rank) = wanted.get(path_at(&next.text, &next.ends, i)) {
+                    next.recent.insert(i, rank);
+                }
+            }
+        }
+        *self = next;
+        true
     }
 
     pub fn is_empty(&self) -> bool {
@@ -373,6 +430,54 @@ mod tests {
 
     fn paths(results: &[FileMatch]) -> Vec<&str> {
         results.iter().map(|m| m.path.as_str()).collect()
+    }
+
+    #[test]
+    fn apply_delta_adds_and_removes_and_keeps_recent_files() {
+        let mut f = finder(&[
+            "src/main.rs",
+            "src/net/tcp.rs",
+            "src/net/udp.rs",
+            "README.md",
+        ]);
+        f.set_context(Some("src/main.rs"), &["README.md".into()]);
+        let changed = f.apply_delta(&IndexDelta {
+            removed: vec!["src/net".into(), "gone.txt".into()],
+            added: vec!["src/lib.rs".into(), "README.md".into()],
+        });
+        assert!(changed);
+        assert_eq!(
+            f.len(),
+            3,
+            "folder removed with its files; README not duplicated"
+        );
+        assert_eq!(paths(&f.search("lib", 10)), ["src/lib.rs"]);
+        assert!(f.search("tcp", 10).is_empty());
+        let empty = f.search("", 10);
+        assert_eq!(paths(&empty), ["README.md"], "still the recent file");
+        assert!(empty[0].is_recent);
+
+        // A prefix that is not a folder boundary does not remove anything.
+        assert!(!f.apply_delta(&IndexDelta {
+            removed: vec!["src/ma".into()],
+            added: vec![],
+        }));
+        assert_eq!(f.len(), 3);
+    }
+
+    #[test]
+    fn apply_delta_resets_the_narrowing_cache() {
+        let mut f = finder(&["alpha.rs"]);
+        assert_eq!(f.search("al", 10).len(), 1);
+        f.apply_delta(&IndexDelta {
+            removed: vec![],
+            added: vec!["alpine.rs".into()],
+        });
+        assert_eq!(
+            f.search("alp", 10).len(),
+            2,
+            "new file found when typing on"
+        );
     }
 
     #[test]

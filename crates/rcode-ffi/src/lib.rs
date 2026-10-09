@@ -21,6 +21,7 @@ use rcode_core::navigation::{self, Location, NavHistory};
 use rcode_core::position::Utf16Position;
 use rcode_core::selection::{Selection, SelectionSet};
 use rcode_core::viewport;
+use rcode_core::watcher::WorkspaceWatcher;
 use rcode_core::workspace::Workspace as CoreWorkspace;
 
 uniffi::setup_scaffolding!();
@@ -373,6 +374,24 @@ impl Workspace {
         Ok(rel)
     }
 
+    /// Starts watching the workspace for changes on disk (M2-02). Batches
+    /// arrive on a background thread until the returned handle is stopped
+    /// or dropped.
+    pub fn watch(
+        &self,
+        listener: Arc<dyn WorkspaceListener>,
+    ) -> Result<Arc<WorkspaceWatch>, CoreError> {
+        let watcher = WorkspaceWatcher::start(self.inner.root(), move |batch| {
+            listener.on_changes(WatchBatch {
+                paths: batch.paths,
+                rescan: batch.rescan,
+            });
+        })?;
+        Ok(Arc::new(WorkspaceWatch {
+            inner: Mutex::new(Some(watcher)),
+        }))
+    }
+
     /// Walks the whole workspace and returns a Go to File searcher. Takes
     /// about 0.6 s on 100k files: call it off the main thread.
     pub fn build_file_finder(&self) -> Arc<FileFinder> {
@@ -395,6 +414,34 @@ impl Workspace {
         let doc = Document::load(&path)?;
         tracing::info!(path = %path.display(), lines = doc.line_count(), "opened workspace file");
         Ok(Arc::new(DocumentHandle::new(doc, path)))
+    }
+}
+
+/// Paths that changed on disk since the previous batch (M2-02).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct WatchBatch {
+    /// Relative, `/`-separated, sorted. Empty when `rescan` is set.
+    pub paths: Vec<String>,
+    /// Events were lost: treat everything as changed.
+    pub rescan: bool,
+}
+
+/// Implemented in Swift. Called on the watcher thread.
+#[uniffi::export(with_foreign)]
+pub trait WorkspaceListener: Send + Sync {
+    fn on_changes(&self, batch: WatchBatch);
+}
+
+/// A running watcher; stops when stopped or dropped.
+#[derive(uniffi::Object)]
+pub struct WorkspaceWatch {
+    inner: Mutex<Option<WorkspaceWatcher>>,
+}
+
+#[uniffi::export]
+impl WorkspaceWatch {
+    pub fn stop(&self) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
 }
 
@@ -427,6 +474,23 @@ impl FileFinder {
     /// opened relative paths, most recent first.
     pub fn set_context(&self, current: Option<String>, recent: Vec<String>) {
         self.lock().set_context(current.as_deref(), &recent);
+    }
+
+    /// Updates the index for paths the watcher reported. Checks the disk,
+    /// so call it off the main thread. Returns `true` if the file list
+    /// changed.
+    pub fn apply_changes(&self, workspace: Arc<Workspace>, changed: Vec<String>) -> bool {
+        let start = Instant::now();
+        let delta = workspace.inner.index_delta(&changed);
+        let updated = self.lock().apply_delta(&delta);
+        tracing::debug!(
+            changed = changed.len(),
+            added = delta.added.len(),
+            removed = delta.removed.len(),
+            ms = start.elapsed().as_millis() as u64,
+            "updated file finder"
+        );
+        updated
     }
 
     /// Best `limit` files for `query`; recent files for an empty query.
@@ -2176,6 +2240,46 @@ mod tests {
         assert!(doc.is_modified(), "committed text is an edit");
         doc.undo();
         assert!(!doc.is_modified());
+    }
+
+    struct Collect(std::sync::mpsc::Sender<WatchBatch>);
+    impl WorkspaceListener for Collect {
+        fn on_changes(&self, batch: WatchBatch) {
+            let _ = self.0.send(batch);
+        }
+    }
+
+    #[test]
+    fn watching_feeds_the_file_finder() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "x").unwrap();
+        let ws = Core::new()
+            .open_workspace(dir.path().to_string_lossy().into_owned())
+            .unwrap();
+        let finder = ws.build_file_finder();
+        assert_eq!(finder.file_count(), 1);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let watch = ws.watch(Arc::new(Collect(tx))).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        std::fs::write(dir.path().join("b.rs"), "x").unwrap();
+        let mut paths = Vec::new();
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while !paths.iter().any(|p: &String| p == "b.rs") && Instant::now() < deadline {
+            if let Ok(b) = rx.recv_timeout(std::time::Duration::from_millis(500)) {
+                paths.extend(b.paths);
+            }
+        }
+        assert!(finder.apply_changes(Arc::clone(&ws), paths));
+        assert_eq!(finder.file_count(), 2);
+        assert_eq!(finder.search("b.rs".into(), 5)[0].rel_path, "b.rs");
+
+        watch.stop();
+        std::fs::write(dir.path().join("c.rs"), "x").unwrap();
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(800))
+                .is_err()
+        );
     }
 
     #[test]

@@ -21,6 +21,7 @@ pub mod navigation;
 pub mod position;
 pub mod selection;
 pub mod viewport;
+pub mod watcher;
 pub mod workspace;
 
 /// Semantic version of the core, exposed to the UI for diagnostics.

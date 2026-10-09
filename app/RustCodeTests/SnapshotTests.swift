@@ -39,11 +39,11 @@ final class SnapshotTests: XCTestCase {
             try render(view, to: dir, name: "window-\(name)")
 
             // Go to File over the same window.
-            let ready = expectation(description: "index \(name)")
-            c.onFileFinderReady = { ready.fulfill() }
+            let deadline = Date().addingTimeInterval(5)
+            while c.fileFinder == nil, Date() < deadline {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+            }
             c.showGoToFile(nil)
-            wait(for: [ready], timeout: 5)
-            c.onFileFinderReady = nil
             c.quickOpen.setQuery("mars")
             RunLoop.current.run(until: Date().addingTimeInterval(0.2))
             view.layoutSubtreeIfNeeded()

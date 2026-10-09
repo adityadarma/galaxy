@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use rcode_bench::Rng;
 use rcode_core::file_finder::FileFinder;
-use rcode_core::workspace::Workspace;
+use rcode_core::workspace::{IndexDelta, Workspace};
 
 const IDENTS: &[&str] = &[
     "buffer",
@@ -102,9 +102,20 @@ fn main() -> std::io::Result<()> {
     }
     times.sort_by(f64::total_cmp);
     first_key.sort_by(f64::total_cmp);
+
+    // A watcher batch (M2-02): ten files removed, ten added.
+    let delta = IndexDelta {
+        removed: (0..10)
+            .filter_map(|i| finder.path(i * 7_919).map(str::to_owned))
+            .collect(),
+        added: (0..10).map(|i| format!("src/added/new_{i}.rs")).collect(),
+    };
+    let t = Instant::now();
+    finder.apply_delta(&delta);
+    let delta_ms = t.elapsed().as_secs_f64() * 1e3;
     println!(
         "finder_files={} finder_build_ms={build_ms:.1} finder_mb={:.2} keystrokes={} \
-         key_p50_ms={:.2} key_p95_ms={:.2} key_max_ms={:.2} first_key_max_ms={:.2}",
+         key_p50_ms={:.2} key_p95_ms={:.2} key_max_ms={:.2} first_key_max_ms={:.2} delta_ms={delta_ms:.1}",
         finder.len(),
         finder.estimated_memory_bytes() as f64 / (1024.0 * 1024.0),
         times.len(),

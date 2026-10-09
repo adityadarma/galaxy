@@ -451,6 +451,36 @@ final class ExplorerTests: XCTestCase {
         XCTAssertEqual(try String(contentsOf: root.appendingPathComponent("README.md"), encoding: .utf8), "# hi\n")
     }
 
+    func testTheExplorerFollowsChangesOnDisk() throws {
+        let root = try makeTree()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let controller = MainWindowController(bridge: CoreBridge())
+        controller.showWindow(nil)
+        defer { controller.window?.orderOut(nil) }
+        controller.open(url: root)
+        let explorer = controller.explorer
+        explorer.outlineView.expandItem(explorer.outlineView.item(atRow: 1)) // src
+        explorer.reveal(relPath: "src/main.rs")
+        RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+
+        func waitFor(_ ok: () -> Bool) {
+            let deadline = Date().addingTimeInterval(5)
+            while !ok(), Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.02)) }
+        }
+        try "x".write(to: root.appendingPathComponent("src/added.rs"), atomically: true, encoding: .utf8)
+        try FileManager.default.removeItem(at: root.appendingPathComponent("docs"))
+        waitFor { names(explorer).contains("added.rs") && !names(explorer).contains("docs") }
+        XCTAssertEqual(names(explorer), ["src", "deep", "added.rs", "main.rs", "README.md"])
+        XCTAssertEqual(explorer.selectedEntry?.relPath, "src/main.rs", "selection kept")
+        XCTAssertTrue(explorer.outlineView.isItemExpanded(explorer.outlineView.item(atRow: 0)), "src still open")
+
+        // Changes in folders never listed do not relist the tree.
+        let calls = explorer.listCalls
+        try "x".write(to: root.appendingPathComponent("src/deep/inner.rs"), atomically: true, encoding: .utf8)
+        RunLoop.current.run(until: Date().addingTimeInterval(1))
+        XCTAssertEqual(explorer.listCalls, calls, "src/deep is collapsed and was never listed")
+    }
+
     func testExplorerRowsAreCompact() throws {
         let root = try makeTree()
         defer { try? FileManager.default.removeItem(at: root) }

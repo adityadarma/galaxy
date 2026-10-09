@@ -60,6 +60,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// Go to File index of `workspace`, built in the background.
     private(set) var fileFinder: FileFinder?
     private var finderGeneration = 0
+    /// Watches the open folder (M2-02).
+    private var workspaceWatch: WorkspaceWatch?
+    /// Bumped per workspace, so a late batch from the previous folder is
+    /// dropped.
+    private var watchGeneration = 0
+    /// Called after a watcher batch has been applied (tests wait on it).
+    var onWorkspaceChangesApplied: ((WatchBatch) -> Void)?
     /// Called when a (re)built index is installed (tests wait on it).
     var onFileFinderReady: (() -> Void)?
     /// Files opened in this workspace, most recent first, relative paths.
@@ -664,7 +671,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 : try workspace.createFile(parentRelPath: parent, name: name)
             explorer.refresh()
             explorer.reveal(relPath: rel)
-            rebuildFileFinder()
+            // The watcher reports it too, a moment later.
+            updateFileFinder(changed: [rel])
             if !folder {
                 let entry = FileEntry(name: (rel as NSString).lastPathComponent, relPath: rel, isDir: false)
                 openWorkspaceFile(workspace, entry, preview: false)
@@ -902,9 +910,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         panel.isHidden = false
         panel.reset()
         panel.focus()
-        // Files may have been added since the last index; there is no file
-        // watcher yet (M2-02), so refresh it each time the panel opens.
-        rebuildFileFinder()
     }
 
     func closeGoToFile() {
@@ -937,6 +942,55 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 self.loadedQuickOpen?.finder = finder
                 self.onFileFinderReady?()
             }
+        }
+    }
+
+    /// Updates the Go to File index for changed paths, off the main thread.
+    private func updateFileFinder(changed paths: [String], then done: (@MainActor @Sendable () -> Void)? = nil) {
+        guard let workspace else { done?(); return }
+        // Still being built: the walk will see the change, or a restart will.
+        guard let finder = fileFinder else {
+            rebuildFileFinder()
+            done?()
+            return
+        }
+        let token = finderGeneration
+        Task.detached(priority: .utility) { [weak self] in
+            let updated = finder.applyChanges(workspace: workspace, changed: paths)
+            await MainActor.run {
+                defer { done?() }
+                guard let self, self.finderGeneration == token, updated, self.isQuickOpenVisible else { return }
+                self.quickOpen.runSearch(keepSelection: true)
+            }
+        }
+    }
+
+    /// Starts watching `workspace`; batches come back on the main actor.
+    private func startWatching(_ workspace: Workspace) {
+        workspaceWatch?.stop()
+        workspaceWatch = nil
+        watchGeneration += 1
+        let sink = WatchSink(controller: self, generation: watchGeneration)
+        do {
+            workspaceWatch = try workspace.watch(listener: sink)
+        } catch {
+            // Not fatal: the explorer and ⌘P still work, refreshed by hand.
+            Log.ui.error("watch failed: \(String(describing: error), privacy: .public)")
+        }
+    }
+
+    /// A watcher batch (M2-02): update the explorer and the file index.
+    fileprivate func workspaceChanged(_ batch: WatchBatch, generation: Int) {
+        guard generation == watchGeneration, workspace != nil else { return }
+        if batch.rescan {
+            explorer.refresh()
+            rebuildFileFinder()
+            onWorkspaceChangesApplied?(batch)
+            return
+        }
+        explorer.refresh(changed: batch.paths)
+        updateFileFinder(changed: batch.paths) { [weak self] in
+            self?.onWorkspaceChangesApplied?(batch)
         }
     }
 
@@ -1252,6 +1306,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
         keyMonitor = nil
+        workspaceWatch?.stop()
+        workspaceWatch = nil
     }
 
     /// ⌘O: pick a file or a folder.
@@ -1302,6 +1358,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         loadedQuickOpen?.finder = nil
         // Ready by the time ⌘P is pressed in all but huge folders.
         rebuildFileFinder()
+        startWatching(ws)
         explorer.setWorkspace(ws)
         explorer.scrollView.isHidden = false
         emptyState.isHidden = true
@@ -1514,6 +1571,27 @@ extension MainWindowController: NSMenuItemValidation {
         case #selector(navigateBack(_:)): return navHistory.canGoBack()
         case #selector(navigateForward(_:)): return navHistory.canGoForward()
         default: return true
+        }
+    }
+}
+
+/// Receives watcher batches on the watcher thread and hands them to the
+/// window on the main actor. Holds the window weakly.
+/// `@unchecked Sendable`: the state is set once in `init`; the weak
+/// reference is only dereferenced on the main actor.
+private final class WatchSink: WorkspaceListener, @unchecked Sendable {
+    private weak var controller: MainWindowController?
+    private let generation: Int
+
+    init(controller: MainWindowController, generation: Int) {
+        self.controller = controller
+        self.generation = generation
+    }
+
+    func onChanges(batch: WatchBatch) {
+        let generation = generation
+        Task { @MainActor [weak controller] in
+            controller?.workspaceChanged(batch, generation: generation)
         }
     }
 }
