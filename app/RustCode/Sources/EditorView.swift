@@ -364,7 +364,7 @@ final class EditorView: NSView {
 
             // Current line: lines with a caret and no selection on them.
             if hasCaret, line.selections.isEmpty {
-                context.setFillColor(NSColor.labelColor.withAlphaComponent(0.06).cgColor)
+                context.setFillColor(Theme.currentLine.cgColor)
                 context.fill(CGRect(x: 0, y: top, width: bounds.width, height: lineHeight))
             }
 
@@ -415,10 +415,10 @@ final class EditorView: NSView {
                 }
             }
 
-            // Gutter: right-aligned line number, brighter on caret lines.
+            // Gutter: right-aligned line number, copper on caret lines.
             let number = layout(for: String(line.line + 1))
             let width = CGFloat(CTLineGetTypographicBounds(number, nil, nil, nil))
-            context.setFillColor((hasCaret ? NSColor.labelColor : NSColor.secondaryLabelColor).cgColor)
+            context.setFillColor((hasCaret ? Theme.accent : Theme.gutterText).cgColor)
             context.textPosition = CGPoint(x: gutterRight - width, y: top + metrics.ascent)
             CTLineDraw(number, context)
         }

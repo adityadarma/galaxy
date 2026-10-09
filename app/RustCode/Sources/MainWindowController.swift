@@ -138,6 +138,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = false
+        // Thin scroller over the text instead of a gutter on the right.
+        scrollView.scrollerStyle = .overlay
+        scrollView.autohidesScrollers = true
+        // A little air above line 1.
+        scrollView.automaticallyAdjustsContentInsets = false
+        scrollView.contentInsets = NSEdgeInsets(top: Theme.editorTopInset, left: 0, bottom: 0, right: 0)
         scrollView.drawsBackground = true
         scrollView.backgroundColor = .textBackgroundColor
         scrollView.borderType = .noBorder
@@ -295,8 +301,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private func show(_ doc: DocumentHandle, title: String, path: [String], status: String) {
         pathBar.show(path)
         editorView.document = doc
-        scrollView.contentView.scroll(to: .zero)
-        scrollView.reflectScrolledClipView(scrollView.contentView)
+        scrollToTop()
         statusLabel.stringValue = status
         statusBar.show(document: doc)
         baseTitle = title
@@ -306,6 +311,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         } else {
             window?.makeFirstResponder(editorView)
         }
+    }
+
+    /// Top of the document, inset included.
+    func scrollToTop() {
+        scrollView.contentView.scroll(to: NSPoint(x: 0, y: -scrollView.contentInsets.top))
+        scrollView.reflectScrolledClipView(scrollView.contentView)
     }
 
     // MARK: Latency (M1-16)

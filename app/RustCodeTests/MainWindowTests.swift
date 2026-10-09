@@ -25,6 +25,22 @@ final class MainWindowTests: XCTestCase {
         XCTAssertEqual(view.document?.lines(first: 0, count: 1), ["hello"])
     }
 
+    func testEditorHasTopInsetOverlayScrollerAndCopperCaretLine() throws {
+        let controller = MainWindowController(bridge: CoreBridge())
+        controller.showWindow(nil)
+        defer { controller.window?.orderOut(nil) }
+        controller.newDocument(nil)
+        settle()
+        let view = controller.editorView
+        let scroll = try XCTUnwrap(view.enclosingScrollView)
+        XCTAssertEqual(scroll.scrollerStyle, .overlay)
+        XCTAssertEqual(scroll.contentInsets.top, Theme.editorTopInset)
+        // Line 1 starts below the inset, not flush with the path bar.
+        let top = scroll.convert(view.bounds.origin, from: view).y
+        XCTAssertEqual(top, Theme.editorTopInset, accuracy: 0.5)
+        XCTAssertEqual(view.lastDrawnLines.lowerBound, 0)
+    }
+
     func testOpenedDocumentIsDrawnInTheRealWindow() throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("rcode-\(UUID().uuidString).txt")
