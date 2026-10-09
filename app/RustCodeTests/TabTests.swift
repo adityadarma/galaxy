@@ -115,6 +115,27 @@ final class TabTests: XCTestCase {
         XCTAssertTrue(tab.closeButton.isHidden, "the dot takes the close button's place")
     }
 
+    func testUndoingBackToTheSavedTextClearsTheDots() throws {
+        let c = makeController()
+        defer { c.window?.orderOut(nil) }
+        let (ws, e) = try entry(c, "a.txt")
+        c.openWorkspaceFile(ws, e, preview: false)
+        type(c, "X")
+        XCTAssertEqual(c.tabBar.items.map(\.isEdited), [true])
+        XCTAssertEqual(c.explorer.dirtyPaths, ["a.txt"])
+
+        c.editorView.undoEdit(nil)
+        c.editorView.flushPendingUpdates()
+        XCTAssertEqual(c.tabBar.items.map(\.isEdited), [false], "tab dot goes away")
+        XCTAssertFalse(c.pathBar.isEdited)
+        XCTAssertEqual(c.explorer.dirtyPaths, [], "sidebar dot goes away")
+        XCTAssertEqual(c.window?.isDocumentEdited, false)
+
+        c.editorView.redoEdit(nil)
+        c.editorView.flushPendingUpdates()
+        XCTAssertEqual(c.tabBar.items.map(\.isEdited), [true], "redo makes it dirty again")
+    }
+
     func testClosingTabsPromptsOnlyForUnsavedOnesAndPicksANeighbour() throws {
         let c = makeController()
         defer { c.window?.orderOut(nil) }

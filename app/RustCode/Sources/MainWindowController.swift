@@ -109,6 +109,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     /// Default sidebar width.
     static let sidebarWidth: CGFloat = 240
+    static let minSidebarWidth: CGFloat = 160
+    /// The editor keeps at least this much room when the sidebar grows.
+    static let minEditorWidth: CGFloat = 240
 
     var isSidebarVisible: Bool { !sidebar.isHidden }
 
@@ -198,7 +201,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         editorView.autoresizingMask = [.width]
         scrollView.documentView = editorView
 
-        detailView.translatesAutoresizingMaskIntoConstraints = false
         tabBar.translatesAutoresizingMaskIntoConstraints = false
         tabBar.onSelect = { [weak self] i in self?.selectTab(i, fromTabBar: true) }
         tabBar.onClose = { [weak self] i in self?.closeTab(at: i) }
@@ -234,9 +236,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         splitView.isVertical = true
         splitView.dividerStyle = .thin
         splitView.translatesAutoresizingMaskIntoConstraints = false
-        splitView.addArrangedSubview(sidebar)
-        splitView.addArrangedSubview(detailView)
-        splitView.setHoldingPriority(.defaultHigh, forSubviewAt: 0)
+        // Frame-based panes: NSSplitView sizes them itself, which keeps the
+        // divider draggable. The delegate sets the limits and keeps the
+        // sidebar's width when the window resizes.
+        splitView.delegate = self
+        sidebar.autoresizingMask = [.height]
+        detailView.autoresizingMask = [.width, .height]
+        splitView.addSubview(sidebar)
+        splitView.addSubview(detailView)
 
         content.addSubview(titleBar)
         content.addSubview(activityBar)
@@ -263,8 +270,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     private func buildSidebar() {
         sidebar.setAccessibilityIdentifier("sidebar")
-        sidebar.translatesAutoresizingMaskIntoConstraints = false
-        sidebar.widthAnchor.constraint(greaterThanOrEqualToConstant: 160).isActive = true
 
         // View title, as in VSCode.
         let viewTitle = NSTextField(labelWithString: "")
@@ -346,7 +351,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         activityBar.setActive(visible ? .explorer : nil)
         if visible {
             splitView.layoutSubtreeIfNeeded()
-            if sidebar.frame.width < 160 { splitView.setPosition(Self.sidebarWidth, ofDividerAt: 0) }
+            if sidebar.frame.width < Self.minSidebarWidth { splitView.setPosition(Self.sidebarWidth, ofDividerAt: 0) }
         }
     }
 
@@ -1417,6 +1422,25 @@ final class SidebarSectionHeader: NSView {
 
     @objc private func refresh(_ sender: Any?) { onRefresh?() }
     @objc private func collapseAll(_ sender: Any?) { onCollapseAll?() }
+}
+
+extension MainWindowController: NSSplitViewDelegate {
+    func splitView(_ splitView: NSSplitView, constrainMinCoordinate proposedMinimumPosition: CGFloat,
+                   ofSubviewAt dividerIndex: Int) -> CGFloat {
+        Self.minSidebarWidth
+    }
+
+    func splitView(_ splitView: NSSplitView, constrainMaxCoordinate proposedMaximumPosition: CGFloat,
+                   ofSubviewAt dividerIndex: Int) -> CGFloat {
+        max(Self.minSidebarWidth, splitView.bounds.width - Self.minEditorWidth)
+    }
+
+    /// Window resizes go to the editor; the sidebar keeps its width.
+    func splitView(_ splitView: NSSplitView, shouldAdjustSizeOfSubview view: NSView) -> Bool {
+        view !== sidebar
+    }
+
+    func splitView(_ splitView: NSSplitView, canCollapseSubview subview: NSView) -> Bool { false }
 }
 
 extension MainWindowController: NSMenuItemValidation {

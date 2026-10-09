@@ -61,6 +61,8 @@ impl Default for HistoryConfig {
 
 #[derive(Debug, Clone)]
 struct Entry {
+    /// Identifies the text state this entry leads to (see `state_id`).
+    id: u64,
     /// Change sets in recording order; reverting applies them in reverse.
     steps: Vec<ChangeSet>,
     sel_before: SelectionSet,
@@ -72,6 +74,7 @@ struct Entry {
 
 impl Entry {
     fn new(
+        id: u64,
         step: ChangeSet,
         before: SelectionSet,
         after: SelectionSet,
@@ -80,6 +83,7 @@ impl Entry {
     ) -> Self {
         let bytes = step.heap_size() + sel_size(&before) + sel_size(&after);
         Self {
+            id,
             steps: vec![step],
             sel_before: before,
             sel_after: after,
@@ -95,7 +99,9 @@ impl Entry {
         let bytes = mirror.iter().map(ChangeSet::heap_size).sum::<usize>()
             + sel_size(&self.sel_before)
             + sel_size(&self.sel_after);
+        // The mirror keeps the id: redo returns to the same state.
         Entry {
+            id: self.id,
             steps: mirror,
             sel_before: self.sel_after,
             sel_after: self.sel_before,
@@ -118,6 +124,11 @@ pub struct History {
     undo_bytes: usize,
     /// Set by `break_group`; the next record starts a new entry.
     sealed: bool,
+    /// Last id handed out; 0 is the initial text.
+    last_id: u64,
+    /// State with an empty undo stack: the initial text, or the state left
+    /// behind by the oldest dropped entry.
+    base_id: u64,
 }
 
 impl History {
@@ -143,6 +154,18 @@ impl History {
     /// Approximate bytes held by the undo stack.
     pub fn undo_bytes(&self) -> usize {
         self.undo_bytes
+    }
+
+    /// Identifies the current text state. Undoing back to a state returns
+    /// its id again, so comparing with the id saved at load/save tells
+    /// whether the text differs from disk. Any new edit gets a fresh id.
+    pub fn state_id(&self) -> u64 {
+        self.undo.back().map_or(self.base_id, |e| e.id)
+    }
+
+    fn next_id(&mut self) -> u64 {
+        self.last_id += 1;
+        self.last_id
     }
 
     /// Ends the current group so the next edit starts a new undo step.
@@ -180,13 +203,17 @@ impl History {
                 last.steps.push(inverse);
                 last.sel_after = sel_after;
                 last.last_edit = now;
+                // Merged text is a new state.
+                self.last_id += 1;
+                last.id = self.last_id;
                 self.undo_bytes = self.undo_bytes - old_bytes + last.bytes;
                 self.enforce_limits();
                 return;
             }
         }
 
-        let entry = Entry::new(inverse, sel_before, sel_after, kind, now);
+        let id = self.next_id();
+        let entry = Entry::new(id, inverse, sel_before, sel_after, kind, now);
         self.undo_bytes += entry.bytes;
         self.undo.push_back(entry);
         self.enforce_limits();
@@ -234,7 +261,9 @@ impl History {
         let bytes = steps.iter().map(ChangeSet::heap_size).sum::<usize>()
             + sel_size(&sel_before)
             + sel_size(&sel_after);
+        let id = self.next_id();
         self.undo.push_back(Entry {
+            id,
             steps,
             sel_before,
             sel_after,
@@ -252,6 +281,8 @@ impl History {
         self.redo.clear();
         self.undo_bytes = 0;
         self.sealed = false;
+        // A fresh state: callers re-read `state_id` (e.g. after a reload).
+        self.base_id = self.next_id();
     }
 
     fn enforce_limits(&mut self) {
@@ -260,6 +291,7 @@ impl History {
         {
             if let Some(old) = self.undo.pop_front() {
                 self.undo_bytes -= old.bytes;
+                self.base_id = old.id;
             }
         }
     }
@@ -373,6 +405,62 @@ mod tests {
     fn backspace(ed: &mut Editor, clock: &mut Clock) {
         let tx = edit::backspace(&ed.doc, &ed.sel, &CFG);
         ed.apply(tx, EditKind::Delete, clock.tick(100));
+    }
+
+    #[test]
+    fn state_id_returns_when_undoing_and_redoing() {
+        let (mut ed, mut clock) = editor("");
+        let start = ed.history.state_id();
+        type_str(&mut ed, &mut clock, "ab");
+        let ab = ed.history.state_id();
+        assert_ne!(ab, start);
+        clock.tick(600);
+        type_str(&mut ed, &mut clock, "c");
+        assert_ne!(ed.history.state_id(), ab);
+        ed.undo();
+        assert_eq!(ed.history.state_id(), ab);
+        ed.undo();
+        assert_eq!(ed.history.state_id(), start);
+        ed.redo();
+        assert_eq!(ed.history.state_id(), ab);
+        // A different edit from the same text is a new state.
+        type_str(&mut ed, &mut clock, "x");
+        let abx = ed.history.state_id();
+        ed.undo();
+        assert_eq!(ed.history.state_id(), ab);
+        assert_ne!(abx, ab);
+    }
+
+    #[test]
+    fn merged_typing_changes_the_state_id() {
+        let (mut ed, mut clock) = editor("");
+        type_str(&mut ed, &mut clock, "a");
+        let a = ed.history.state_id();
+        type_str(&mut ed, &mut clock, "b");
+        assert_eq!(ed.history.undo_len(), 1);
+        assert_ne!(ed.history.state_id(), a, "merged edit is new text");
+    }
+
+    #[test]
+    fn dropped_entries_keep_the_base_state() {
+        let mut ed = Editor::with_history(
+            Document::from_text(""),
+            HistoryConfig {
+                max_steps: 2,
+                ..HistoryConfig::default()
+            },
+        );
+        let mut clock = Clock(Instant::now());
+        let mut ids = vec![ed.history.state_id()];
+        for ch in ["a", "b", "c"] {
+            clock.tick(600);
+            type_str(&mut ed, &mut clock, ch);
+            ids.push(ed.history.state_id());
+        }
+        assert_eq!(ed.history.undo_len(), 2);
+        while ed.undo() {}
+        assert_eq!(ed.doc.text(), "a");
+        assert_eq!(ed.history.state_id(), ids[1]);
     }
 
     #[test]

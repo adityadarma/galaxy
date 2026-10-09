@@ -144,6 +144,49 @@ final class ExplorerTests: XCTestCase {
         XCTAssertGreaterThan(editorWide, controller.editorView.frame.width - 1, "editor regains space when hidden")
     }
 
+    func testDraggingTheDividerResizesTheSidebar() throws {
+        let controller = MainWindowController(bridge: CoreBridge())
+        controller.showWindow(nil)
+        defer { controller.window?.orderOut(nil) }
+        RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        let window = try XCTUnwrap(controller.window)
+        let content = try XCTUnwrap(window.contentView)
+        let sidebar = controller.sidebar
+        let start = sidebar.frame.width
+        // The point on the divider, in window coordinates.
+        let edge = sidebar.convert(NSPoint(x: sidebar.bounds.maxX, y: sidebar.bounds.midY), to: nil)
+        let down = NSPoint(x: edge.x + 0.5, y: edge.y)
+        let hit = content.hitTest(content.convert(down, from: nil))
+        XCTAssertTrue(hit is NSSplitView, "divider gets the click, got \(String(describing: hit))")
+
+        func mouse(_ type: NSEvent.EventType, _ p: NSPoint) -> NSEvent {
+            NSEvent.mouseEvent(with: type, location: p, modifierFlags: [], timestamp: ProcessInfo.processInfo.systemUptime,
+                               windowNumber: window.windowNumber, context: nil, eventNumber: 0,
+                               clickCount: 1, pressure: type == .leftMouseUp ? 0 : 1)!
+        }
+        // NSSplitView tracks the drag in its own loop; queue the rest first.
+        for dx in stride(from: 10.0, through: 80.0, by: 10.0) {
+            window.postEvent(mouse(.leftMouseDragged, NSPoint(x: down.x + dx, y: down.y)), atStart: false)
+        }
+        window.postEvent(mouse(.leftMouseUp, NSPoint(x: down.x + 80, y: down.y)), atStart: false)
+        (hit ?? content).mouseDown(with: mouse(.leftMouseDown, down))
+        content.layoutSubtreeIfNeeded()
+        XCTAssertEqual(sidebar.frame.width, start + 80, accuracy: 4, "sidebar follows the divider")
+        XCTAssertEqual(start, MainWindowController.sidebarWidth, accuracy: 1, "starts at the default width")
+
+        // Growing the window widens the editor, not the sidebar.
+        var f = window.frame
+        f.size.width += 100
+        window.setFrame(f, display: true)
+        content.layoutSubtreeIfNeeded()
+        XCTAssertEqual(sidebar.frame.width, start + 80, accuracy: 4)
+
+        // Limits: never narrower than the minimum.
+        let split = try XCTUnwrap(sidebar.superview as? NSSplitView)
+        XCTAssertEqual(controller.splitView(split, constrainMinCoordinate: 0, ofSubviewAt: 0),
+                       MainWindowController.minSidebarWidth)
+    }
+
     func testStatusBarShowsDocumentFactsAndFollowsTheCursor() throws {
         let controller = MainWindowController(bridge: CoreBridge())
         controller.showWindow(nil)

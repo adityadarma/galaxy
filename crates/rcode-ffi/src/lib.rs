@@ -751,8 +751,8 @@ struct State {
     editor: Editor,
     path: PathBuf,
     indent: IndentConfig,
-    /// `Document::revision` at the last load or save, for `is_modified`.
-    saved_revision: u64,
+    /// `History::state_id` at the last load or save, for `is_modified`.
+    saved_state: u64,
     /// Active search, if the find bar has a usable pattern.
     finder: Option<Finder>,
     /// Why the current pattern is unusable.
@@ -863,10 +863,11 @@ impl DocumentHandle {
     }
 
     /// `true` when the text differs from what was last loaded or saved.
-    /// Undoing back to the saved text still counts as modified.
+    /// Undoing (or redoing) back to the saved text clears it again.
     pub fn is_modified(&self) -> bool {
         let st = self.lock();
-        st.editor.doc.revision() != st.saved_revision
+        // Marked IME text is in the buffer but not yet in the history.
+        st.editor.has_marked_text() || st.editor.history.state_id() != st.saved_state
     }
 
     pub fn encoding(&self) -> TextEncoding {
@@ -1341,7 +1342,7 @@ impl DocumentHandle {
         }
         st.editor.doc.save(&st.path)?;
         st.editor.history.break_group();
-        st.saved_revision = st.editor.doc.revision();
+        st.saved_state = st.editor.history.state_id();
         tracing::info!(path = %st.path.display(), "saved document");
         Ok(())
     }
@@ -1353,7 +1354,7 @@ impl DocumentHandle {
         st.editor.doc.save(&path)?;
         st.editor.history.break_group();
         tracing::info!(path = %path.display(), "saved document as");
-        st.saved_revision = st.editor.doc.revision();
+        st.saved_state = st.editor.history.state_id();
         st.path = path;
         Ok(())
     }
@@ -1363,7 +1364,7 @@ impl DocumentHandle {
     fn new(doc: Document, path: PathBuf) -> Self {
         Self {
             state: Mutex::new(State {
-                saved_revision: doc.revision(),
+                saved_state: 0,
                 editor: Editor::new(doc),
                 path,
                 indent: IndentConfig::default(),
@@ -1918,8 +1919,8 @@ mod tests {
         );
         assert!(doc.undo());
         assert_eq!(doc.lines(0, 1), vec!["a1 a2 a3"]);
-        // Modified is tracked by revision, so undoing back to the loaded text still counts.
-        assert!(doc.is_modified());
+        // Undoing back to the loaded text is clean again.
+        assert!(!doc.is_modified());
         assert_eq!(doc.replace_all("x".into()), 3);
         doc.clear_find();
         assert_eq!(doc.replace_all("y".into()), 0, "no search, no replacement");
@@ -2106,6 +2107,9 @@ mod tests {
 
         doc.undo();
         assert!(doc.is_modified(), "undo past the save differs from disk");
+        doc.redo();
+        assert!(!doc.is_modified(), "redo back to the saved text is clean");
+        doc.undo();
         doc.select_all();
         assert!(doc.is_modified());
         let other = dir.path().join("b.txt");
@@ -2118,6 +2122,41 @@ mod tests {
         assert!(!fresh.is_modified());
         fresh.edit(EditCommand::InsertText { text: "x".into() });
         assert!(fresh.is_modified());
+    }
+
+    #[test]
+    fn undoing_back_to_the_saved_text_is_not_modified() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "hi").unwrap();
+        let doc = Core::new()
+            .open_document(path.to_string_lossy().into_owned())
+            .unwrap();
+        doc.move_cursors(CursorMotion::DocEnd, false);
+        doc.edit(EditCommand::InsertText { text: "!".into() });
+        doc.edit(EditCommand::Backspace);
+        assert!(doc.is_modified(), "same text by editing is still an edit");
+        while doc.undo() {}
+        assert!(!doc.is_modified(), "undo back to the loaded text is clean");
+        doc.redo();
+        assert!(doc.is_modified());
+        doc.undo();
+        assert!(!doc.is_modified());
+
+        // Marked IME text counts until it is committed or cancelled.
+        doc.set_marked_text(
+            "k".into(),
+            Utf16Range {
+                location: 1,
+                length: 0,
+            },
+            None,
+        );
+        assert!(doc.is_modified());
+        doc.unmark_text();
+        assert!(doc.is_modified(), "committed text is an edit");
+        doc.undo();
+        assert!(!doc.is_modified());
     }
 
     #[test]
