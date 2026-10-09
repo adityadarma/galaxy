@@ -272,24 +272,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private func buildSidebar() {
         sidebar.setAccessibilityIdentifier("sidebar")
 
-        // View title, as in VSCode.
-        let viewTitle = NSTextField(labelWithString: "")
-        viewTitle.attributedStringValue = NSAttributedString(string: "EXPLORER", attributes: [
-            .font: NSFont.systemFont(ofSize: 11, weight: .regular),
-            .foregroundColor: NSColor.secondaryLabelColor,
-            .kern: 0.4,
-        ])
-        viewTitle.setAccessibilityIdentifier("sidebar-title")
-        viewTitle.translatesAutoresizingMaskIntoConstraints = false
-
-        // Folder section: click to fold, buttons on the right.
-        sectionHeader.isHidden = true
+        // One header row, as in VSCode with a single folder open: the
+        // folder name (or EXPLORER) and the explorer actions.
         sectionHeader.translatesAutoresizingMaskIntoConstraints = false
-        sectionHeader.onToggle = { [weak self] expanded in
-            self?.explorer.scrollView.isHidden = !expanded
-        }
-        sectionHeader.onRefresh = { [weak self] in self?.explorer.refresh() }
-        sectionHeader.onCollapseAll = { [weak self] in self?.explorer.collapseAll() }
+        sectionHeader.onNewFile = { [weak self] in self?.explorerNewFile(nil) }
+        sectionHeader.onNewFolder = { [weak self] in self?.explorerNewFolder(nil) }
+        sectionHeader.onRefresh = { [weak self] in self?.refreshExplorer(nil) }
+        sectionHeader.onCollapseAll = { [weak self] in self?.collapseExplorerFolders(nil) }
+        sectionHeader.moreMenu = { [weak self] in self?.explorerMoreMenu() ?? NSMenu() }
+        sectionHeader.showsTools = false
 
         // Shown until a folder is opened.
         let message = NSTextField(wrappingLabelWithString: "No folder open")
@@ -314,14 +305,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             self?.openWorkspaceFile(workspace, entry, preview: false)
         }
 
-        sidebar.addSubview(viewTitle)
         sidebar.addSubview(sectionHeader)
         sidebar.addSubview(explorer.scrollView)
         sidebar.addSubview(emptyState)
         NSLayoutConstraint.activate([
-            viewTitle.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 20),
-            viewTitle.centerYAnchor.constraint(equalTo: sidebar.topAnchor, constant: Theme.tabHeight / 2),
-            sectionHeader.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: Theme.tabHeight),
+            sectionHeader.topAnchor.constraint(equalTo: sidebar.topAnchor),
             sectionHeader.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor),
             sectionHeader.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor),
             explorer.scrollView.topAnchor.constraint(equalTo: sectionHeader.bottomAnchor),
@@ -644,6 +632,83 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     @objc func collapseExplorerFolders(_ sender: Any?) {
         guard workspace != nil else { return NSSound.beep() }
         explorer.collapseAll()
+    }
+
+    /// Asks for a new item's name; `nil` cancels. Tests replace it.
+    var askNewName: (_ title: String, _ folder: String) -> String? = { title, folder in
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = folder.isEmpty ? "In the workspace root." : "In \(folder)."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
+        field.placeholderString = "Name (use / for subfolders)"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Create")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        return alert.runModal() == .alertFirstButtonReturn ? field.stringValue : nil
+    }
+
+    @objc func explorerNewFile(_ sender: Any?) { createExplorerItem(folder: false) }
+    @objc func explorerNewFolder(_ sender: Any?) { createExplorerItem(folder: true) }
+
+    /// Creates a file or folder in the selected folder (or the selected
+    /// file's folder, else the root), shows it, and opens a new file.
+    private func createExplorerItem(folder: Bool) {
+        guard let workspace else { return NSSound.beep() }
+        let parent = explorer.targetFolder
+        guard let name = askNewName(folder ? "New Folder" : "New File", parent),
+              !name.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+        do {
+            let rel = folder
+                ? try workspace.createFolder(parentRelPath: parent, name: name)
+                : try workspace.createFile(parentRelPath: parent, name: name)
+            explorer.refresh()
+            explorer.reveal(relPath: rel)
+            rebuildFileFinder()
+            if !folder {
+                let entry = FileEntry(name: (rel as NSString).lastPathComponent, relPath: rel, isDir: false)
+                openWorkspaceFile(workspace, entry, preview: false)
+            }
+        } catch {
+            report(error, while: folder ? "create folder" : "create file")
+        }
+    }
+
+    /// The selected item's absolute URL, else the workspace root.
+    private var explorerSelectionURL: URL? {
+        guard let workspace else { return nil }
+        let root = URL(fileURLWithPath: workspace.root())
+        guard let rel = explorer.selectedEntry?.relPath else { return root }
+        return root.appendingPathComponent(rel)
+    }
+
+    @objc func revealInFinder(_ sender: Any?) {
+        guard let url = explorerSelectionURL else { return NSSound.beep() }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    @objc func copyExplorerPath(_ sender: Any?) {
+        guard let url = explorerSelectionURL else { return NSSound.beep() }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(url.path, forType: .string)
+    }
+
+    /// The header's "…" menu.
+    func explorerMoreMenu() -> NSMenu {
+        let menu = NSMenu()
+        func add(_ title: String, _ action: Selector) {
+            menu.addItem(withTitle: title, action: action, keyEquivalent: "").target = self
+        }
+        add("New File…", #selector(explorerNewFile(_:)))
+        add("New Folder…", #selector(explorerNewFolder(_:)))
+        add("Open Folder…", #selector(openFolder(_:)))
+        menu.addItem(.separator())
+        add("Refresh Explorer", #selector(refreshExplorer(_:)))
+        add("Collapse Folders in Explorer", #selector(collapseExplorerFolders(_:)))
+        menu.addItem(.separator())
+        add("Reveal in Finder", #selector(revealInFinder(_:)))
+        add("Copy Path", #selector(copyExplorerPath(_:)))
+        return menu
     }
 
     // MARK: Go to Line and back/forward (M2-08)
@@ -1241,8 +1306,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         explorer.scrollView.isHidden = false
         emptyState.isHidden = true
         sectionHeader.title = ws.name()
-        sectionHeader.isHidden = false
-        sectionHeader.isExpanded = true
+        sectionHeader.showsTools = true
         setSidebarVisible(true)
         if tabs.isEmpty { pathBar.show([]) }
         updateEditedState()
@@ -1310,71 +1374,69 @@ final class SidebarView: NSView {
     }
 }
 
-/// Collapsible section header in the sidebar, as in VSCode: chevron and
-/// folder name in caps; refresh and collapse-all buttons show on hover.
+/// Sidebar header, as in VSCode with one folder open: the folder name in
+/// caps (EXPLORER before a folder is open) and, on the right, New File,
+/// New Folder, Refresh, Collapse Folders and a "…" menu. Same height as the
+/// tab strip, with a rule underneath.
 @MainActor
 final class SidebarSectionHeader: NSView {
-    static let height: CGFloat = 22
+    static var height: CGFloat { Theme.tabHeight }
 
-    let chevron = NSImageView()
-    let label = NSTextField(labelWithString: "")
+    let label = NSTextField(labelWithString: "EXPLORER")
+    let newFileButton = SidebarSectionHeader.tool("doc.badge.plus", "New File…")
+    let newFolderButton = SidebarSectionHeader.tool("folder.badge.plus", "New Folder…")
     let refreshButton = SidebarSectionHeader.tool("arrow.clockwise", "Refresh Explorer")
-    let collapseButton = SidebarSectionHeader.tool("rectangle.compress.vertical", "Collapse Folders in Explorer")
-    var onToggle: ((Bool) -> Void)?
+    let collapseButton = SidebarSectionHeader.tool("rectangle.stack.badge.minus", "Collapse Folders in Explorer")
+    let moreButton = SidebarSectionHeader.tool("ellipsis", "More Actions…")
+    var tools: [NSButton] { [newFileButton, newFolderButton, refreshButton, collapseButton, moreButton] }
+
+    var onNewFile: (() -> Void)?
+    var onNewFolder: (() -> Void)?
     var onRefresh: (() -> Void)?
     var onCollapseAll: (() -> Void)?
+    var moreMenu: (() -> NSMenu)?
 
+    /// Folder name; empty shows EXPLORER.
     var title = "" {
         didSet {
-            label.stringValue = title.uppercased()
-            setAccessibilityLabel(title)
+            label.stringValue = title.isEmpty ? "EXPLORER" : title.uppercased()
+            setAccessibilityLabel(title.isEmpty ? "Explorer" : title)
         }
     }
-    var isExpanded = true {
-        didSet {
-            chevron.image = NSImage(systemSymbolName: isExpanded ? "chevron.down" : "chevron.right",
-                                    accessibilityDescription: nil)?
-                .withSymbolConfiguration(.init(pointSize: 9, weight: .bold))
-            setAccessibilityExpanded(isExpanded)
-        }
-    }
-    private var isHovered = false {
-        didSet { [refreshButton, collapseButton].forEach { $0.isHidden = !isHovered } }
+
+    /// The buttons only make sense with a folder open.
+    var showsTools = true {
+        didSet { tools.forEach { $0.isHidden = !showsTools } }
     }
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         setAccessibilityElement(true)
-        setAccessibilityRole(.disclosureTriangle)
+        setAccessibilityRole(.group)
+        setAccessibilityLabel("Explorer")
         setAccessibilityIdentifier("folder-title")
 
-        chevron.imageScaling = .scaleNone
-        chevron.contentTintColor = .labelColor
-        label.font = .systemFont(ofSize: 11, weight: .bold)
+        label.font = .systemFont(ofSize: 12, weight: .medium)
         label.textColor = .labelColor
         label.lineBreakMode = .byTruncatingTail
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        refreshButton.target = self
-        refreshButton.action = #selector(refresh(_:))
-        collapseButton.target = self
-        collapseButton.action = #selector(collapseAll(_:))
-        // Observers do not run for assignments in a class's own init, so
-        // set the initial state directly.
-        isExpanded = true
-        chevron.image = NSImage(systemSymbolName: "chevron.down", accessibilityDescription: nil)?
-            .withSymbolConfiguration(.init(pointSize: 9, weight: .bold))
-        refreshButton.isHidden = true
-        collapseButton.isHidden = true
+        label.setContentHuggingPriority(.init(1), for: .horizontal)
+        for (button, action) in [(newFileButton, #selector(newFile(_:))), (newFolderButton, #selector(newFolder(_:))),
+                                 (refreshButton, #selector(refresh(_:))), (collapseButton, #selector(collapseAll(_:))),
+                                 (moreButton, #selector(more(_:)))] {
+            button.target = self
+            button.action = action
+        }
 
-        let row = NSStackView(views: [chevron, label, NSView(), refreshButton, collapseButton])
-        row.spacing = 4
+        let row = NSStackView(views: [label] + tools)
+        row.spacing = 6
+        row.setCustomSpacing(10, after: label)
         row.translatesAutoresizingMaskIntoConstraints = false
         addSubview(row)
         NSLayoutConstraint.activate([
             heightAnchor.constraint(equalToConstant: Self.height),
-            chevron.widthAnchor.constraint(equalToConstant: 16),
-            row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
-            row.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 20),
+            row.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             row.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
     }
@@ -1382,47 +1444,34 @@ final class SidebarSectionHeader: NSView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.separatorColor.setFill()
+        NSRect(x: 0, y: 0, width: bounds.width, height: 1).intersection(dirtyRect).fill()
+    }
+
     private static func tool(_ symbol: String, _ title: String) -> NSButton {
         let b = NSButton()
         b.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)?
-            .withSymbolConfiguration(.init(pointSize: 11, weight: .regular))
+            .withSymbolConfiguration(.init(pointSize: 14, weight: .regular))
         b.isBordered = false
         b.imagePosition = .imageOnly
         b.contentTintColor = .secondaryLabelColor
         b.toolTip = title
-        b.widthAnchor.constraint(equalToConstant: 20).isActive = true
+        b.setAccessibilityLabel(title)
+        b.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        b.heightAnchor.constraint(equalToConstant: 24).isActive = true
         return b
     }
 
-    override func mouseUp(with event: NSEvent) {
-        guard bounds.contains(convert(event.locationInWindow, from: nil)) else { return }
-        toggle()
-    }
-
-    override func accessibilityPerformPress() -> Bool {
-        toggle()
-        return true
-    }
-
-    func toggle() {
-        isExpanded.toggle()
-        onToggle?(isExpanded)
-    }
-
-    override func mouseDown(with event: NSEvent) {}
-
-    override func updateTrackingAreas() {
-        super.updateTrackingAreas()
-        trackingAreas.forEach(removeTrackingArea)
-        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
-                                       owner: self, userInfo: nil))
-    }
-
-    override func mouseEntered(with event: NSEvent) { isHovered = true }
-    override func mouseExited(with event: NSEvent) { isHovered = false }
-
+    @objc private func newFile(_ sender: Any?) { onNewFile?() }
+    @objc private func newFolder(_ sender: Any?) { onNewFolder?() }
     @objc private func refresh(_ sender: Any?) { onRefresh?() }
     @objc private func collapseAll(_ sender: Any?) { onCollapseAll?() }
+
+    @objc private func more(_ sender: Any?) {
+        guard let menu = moreMenu?() else { return }
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: moreButton.bounds.maxY + 4), in: moreButton)
+    }
 }
 
 extension MainWindowController: NSSplitViewDelegate {
@@ -1454,7 +1503,9 @@ extension MainWindowController: NSMenuItemValidation {
              #selector(showFind(_:)), #selector(showFindAndReplace(_:)),
              #selector(findNext(_:)), #selector(findPrevious(_:)), #selector(useSelectionForFind(_:)):
             return hasDocument
-        case #selector(refreshExplorer(_:)), #selector(collapseExplorerFolders(_:)):
+        case #selector(refreshExplorer(_:)), #selector(collapseExplorerFolders(_:)),
+             #selector(explorerNewFile(_:)), #selector(explorerNewFolder(_:)),
+             #selector(revealInFinder(_:)), #selector(copyExplorerPath(_:)):
             return workspace != nil
         case #selector(closeTab(_:)):
             return true

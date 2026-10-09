@@ -42,6 +42,8 @@ final class ExplorerController: NSObject {
     /// Set while a folder click selects its row, so the selection change
     /// does not toggle the folder a second time.
     private var selectingFromClick = false
+    /// Set while `reveal` selects a row: no opening, no toggling.
+    private var quietSelection = false
 
     override init() {
         super.init()
@@ -119,6 +121,45 @@ final class ExplorerController: NSObject {
                   let cell = outlineView.view(atColumn: 0, row: row, makeIfNecessary: false) as? ExplorerCell
             else { continue }
             cell.isDirty = isDirty(node.entry)
+        }
+    }
+
+    /// The selected row's entry, if any.
+    var selectedEntry: FileEntry? {
+        let row = outlineView.selectedRow
+        return row >= 0 ? (outlineView.item(atRow: row) as? ExplorerNode)?.entry : nil
+    }
+
+    /// Where New File / New Folder go: the selected folder, the selected
+    /// file's folder, or the root (`""`).
+    var targetFolder: String {
+        guard let entry = selectedEntry else { return "" }
+        if entry.isDir { return entry.relPath }
+        return (entry.relPath as NSString).deletingLastPathComponent
+    }
+
+    /// Expands the folders down to `relPath` and selects it, without
+    /// opening or toggling anything.
+    func reveal(relPath: String) {
+        let parts = relPath.split(separator: "/").map(String.init)
+        var prefix = ""
+        for (i, part) in parts.enumerated() {
+            prefix = prefix.isEmpty ? part : prefix + "/" + part
+            guard let row = row(forRelPath: prefix) else { return }
+            if i < parts.count - 1, let node = outlineView.item(atRow: row) {
+                outlineView.expandItem(node)
+            } else {
+                quietSelection = true
+                outlineView.selectRowIndexes([row], byExtendingSelection: false)
+                quietSelection = false
+                outlineView.scrollRowToVisible(row)
+            }
+        }
+    }
+
+    private func row(forRelPath rel: String) -> Int? {
+        (0..<outlineView.numberOfRows).first {
+            (outlineView.item(atRow: $0) as? ExplorerNode)?.entry.relPath == rel
         }
     }
 
@@ -218,7 +259,7 @@ extension ExplorerController: NSOutlineViewDelegate {
 
     func outlineViewSelectionDidChange(_ notification: Notification) {
         let row = outlineView.selectedRow
-        guard row >= 0, let node = outlineView.item(atRow: row) as? ExplorerNode else { return }
+        guard row >= 0, let node = outlineView.item(atRow: row) as? ExplorerNode, !quietSelection else { return }
         let event = NSApp.currentEvent?.type
         if node.entry.isDir {
             // Arrow keys only move, as in VSCode (← and → open and close).

@@ -255,13 +255,18 @@ final class ExplorerTests: XCTestCase {
         v.insertText("ab\ncd", replacementRange: NSRange(location: NSNotFound, length: 0))
         v.flushPendingUpdates()
         v.display()
-        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        // The label is set on the main queue right after the draw.
+        func waitFor(_ ok: () -> Bool) {
+            let deadline = Date().addingTimeInterval(2)
+            while !ok(), Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.01)) }
+        }
+        waitFor { bar.cursor.stringValue == "Ln 2, Col 3" }
         XCTAssertEqual(bar.cursor.stringValue, "Ln 2, Col 3", "updated from the drawn frame")
 
         v.document?.addCursorVertical(above: true)
         v.didChangeSelection()
         v.display()
-        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        waitFor { bar.cursor.stringValue.hasSuffix("(2 cursors)") }
         XCTAssertTrue(bar.cursor.stringValue.hasSuffix("(2 cursors)"), bar.cursor.stringValue)
     }
 
@@ -367,21 +372,83 @@ final class ExplorerTests: XCTestCase {
         XCTAssertEqual(names(explorer), ["docs", "src", "deep", "main.rs", "new.rs", "README.md"])
     }
 
-    func testFolderSectionFoldsTheTree() throws {
+    func testSidebarHeaderShowsTheFolderAndItsActions() throws {
         let root = try makeTree()
         defer { try? FileManager.default.removeItem(at: root) }
         let controller = MainWindowController(bridge: CoreBridge())
         controller.showWindow(nil)
         defer { controller.window?.orderOut(nil) }
-        XCTAssertTrue(controller.sectionHeader.isHidden, "no section before a folder is open")
+        let header = controller.sectionHeader
+        XCTAssertEqual(header.label.stringValue, "EXPLORER", "before a folder is open")
+        XCTAssertTrue(header.tools.allSatisfy(\.isHidden), "no actions without a folder")
+
         controller.open(url: root)
-        XCTAssertFalse(controller.sectionHeader.isHidden)
-        XCTAssertTrue(controller.sectionHeader.refreshButton.isHidden, "tools show on hover only")
-        XCTAssertTrue(controller.sectionHeader.collapseButton.isHidden)
-        controller.sectionHeader.toggle()
-        XCTAssertTrue(controller.explorer.scrollView.isHidden)
-        controller.sectionHeader.toggle()
-        XCTAssertFalse(controller.explorer.scrollView.isHidden)
+        controller.window?.contentView?.layoutSubtreeIfNeeded()
+        XCTAssertEqual(header.label.stringValue, root.lastPathComponent.uppercased())
+        XCTAssertEqual(header.tools.map(\.toolTip), ["New File…", "New Folder…", "Refresh Explorer",
+                                                      "Collapse Folders in Explorer", "More Actions…"])
+        XCTAssertTrue(header.tools.allSatisfy { !$0.isHidden && $0.image != nil }, "always visible")
+
+        // One row at the top of the sidebar, as tall as the tab strip; the tree below it.
+        let content = try XCTUnwrap(controller.window?.contentView)
+        let headerFrame = content.convert(header.bounds, from: header)
+        let tabsFrame = content.convert(controller.tabBar.bounds, from: controller.tabBar)
+        XCTAssertEqual(headerFrame.maxY, tabsFrame.maxY, accuracy: 0.5)
+        XCTAssertEqual(headerFrame.height, Theme.tabHeight, accuracy: 0.5)
+        let tree = controller.explorer.scrollView
+        XCTAssertEqual(content.convert(tree.bounds, from: tree).maxY, headerFrame.minY, accuracy: 0.5)
+
+        // The buttons do what they say.
+        controller.explorer.outlineView.expandItem(controller.explorer.outlineView.item(atRow: 1))
+        header.collapseButton.performClick(nil)
+        XCTAssertEqual(names(controller.explorer), ["docs", "src", "README.md"])
+        try "x".write(to: root.appendingPathComponent("added.txt"), atomically: true, encoding: .utf8)
+        header.refreshButton.performClick(nil)
+        XCTAssertTrue(names(controller.explorer).contains("added.txt"))
+
+        let more = controller.explorerMoreMenu().items.map(\.title).filter { !$0.isEmpty }
+        XCTAssertEqual(more, ["New File…", "New Folder…", "Open Folder…", "Refresh Explorer",
+                              "Collapse Folders in Explorer", "Reveal in Finder", "Copy Path"])
+    }
+
+    func testNewFileAndFolderGoIntoTheSelectedFolder() throws {
+        let root = try makeTree()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let controller = MainWindowController(bridge: CoreBridge())
+        controller.showWindow(nil)
+        defer { controller.window?.orderOut(nil) }
+        controller.open(url: root)
+        let explorer = controller.explorer
+        var asked: [String] = []
+        var answer: String? = "lib.rs"
+        controller.askNewName = { _, folder in asked.append(folder); return answer }
+
+        // Nothing selected: root.
+        controller.sectionHeader.newFileButton.performClick(nil)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("lib.rs").path))
+        XCTAssertEqual(controller.tabBar.items.last?.title, "lib.rs", "a new file opens")
+        XCTAssertEqual(explorer.selectedEntry?.relPath, "lib.rs", "and is selected in the tree")
+
+        // Folder selected: inside it. A selected file means its folder.
+        explorer.reveal(relPath: "src")
+        answer = "net"
+        controller.sectionHeader.newFolderButton.performClick(nil)
+        var isDir: ObjCBool = false
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("src/net").path, isDirectory: &isDir))
+        XCTAssertTrue(isDir.boolValue)
+        explorer.reveal(relPath: "src/main.rs")
+        answer = "util.rs"
+        controller.explorerNewFile(nil)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("src/util.rs").path))
+        XCTAssertEqual(asked, ["", "src", "src"])
+
+        // Cancel creates nothing; an existing name is refused, not overwritten.
+        answer = nil
+        let before = try FileManager.default.contentsOfDirectory(atPath: root.path).sorted()
+        controller.explorerNewFile(nil)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path).sorted(), before)
+        XCTAssertThrowsError(try controller.workspace!.createFile(parentRelPath: "", name: "README.md"))
+        XCTAssertEqual(try String(contentsOf: root.appendingPathComponent("README.md"), encoding: .utf8), "# hi\n")
     }
 
     func testExplorerRowsAreCompact() throws {

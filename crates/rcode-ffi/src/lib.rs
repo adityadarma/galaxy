@@ -354,6 +354,25 @@ impl Workspace {
             .collect())
     }
 
+    /// Creates an empty file `name` in folder `parent_rel_path` and returns
+    /// its relative path. `name` may contain `/`. Never overwrites.
+    pub fn create_file(&self, parent_rel_path: String, name: String) -> Result<String, CoreError> {
+        let rel = self.inner.create_file(&parent_rel_path, &name)?;
+        tracing::info!(path = %rel, "created file");
+        Ok(rel)
+    }
+
+    /// Creates folder `name` in `parent_rel_path`; returns its relative path.
+    pub fn create_folder(
+        &self,
+        parent_rel_path: String,
+        name: String,
+    ) -> Result<String, CoreError> {
+        let rel = self.inner.create_dir(&parent_rel_path, &name)?;
+        tracing::info!(path = %rel, "created folder");
+        Ok(rel)
+    }
+
     /// Walks the whole workspace and returns a Go to File searcher. Takes
     /// about 0.6 s on 100k files: call it off the main thread.
     pub fn build_file_finder(&self) -> Arc<FileFinder> {

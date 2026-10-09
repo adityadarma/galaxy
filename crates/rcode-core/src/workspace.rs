@@ -197,6 +197,63 @@ impl Workspace {
         Ok(out)
     }
 
+    /// Creates an empty file `name` inside folder `parent` (both relative)
+    /// and returns its relative path. `name` may contain `/` to create
+    /// missing folders on the way, as in VSCode. Never overwrites.
+    pub fn create_file(&self, parent: &str, name: &str) -> io::Result<String> {
+        let (rel, path) = self.new_entry_path(parent, name)?;
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        Ok(rel)
+    }
+
+    /// Creates folder `name` (and missing parents) inside `parent`.
+    /// Fails if it already exists.
+    pub fn create_dir(&self, parent: &str, name: &str) -> io::Result<String> {
+        let (rel, path) = self.new_entry_path(parent, name)?;
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        fs::create_dir(&path)?;
+        Ok(rel)
+    }
+
+    /// Validates a new name and returns `(relative path, absolute path)`.
+    fn new_entry_path(&self, parent: &str, name: &str) -> io::Result<(String, PathBuf)> {
+        let invalid = |why: &str| io::Error::new(io::ErrorKind::InvalidInput, why.to_string());
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(invalid("a name is required"));
+        }
+        if name.contains('\0') {
+            return Err(invalid("names cannot contain NUL"));
+        }
+        if name.starts_with('/') {
+            return Err(invalid("names cannot start with /"));
+        }
+        let mut parts: Vec<&str> = parent.split('/').filter(|p| !p.is_empty()).collect();
+        for part in name.split('/').filter(|p| !p.is_empty()) {
+            if part == "." || part == ".." {
+                return Err(invalid("names cannot contain . or .. folders"));
+            }
+            parts.push(part);
+        }
+        let rel = parts.join("/");
+        let path = self.resolve(&rel)?;
+        if !fs::metadata(self.resolve(parent)?)?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                "not a directory",
+            ));
+        }
+        Ok((rel, path))
+    }
+
     /// Lists one directory: folders first, then files, each sorted
     /// case-insensitively. Unreadable entries are skipped.
     pub fn list_dir(&self, rel: &str) -> io::Result<Vec<DirEntry>> {
@@ -402,6 +459,48 @@ mod tests {
 
         assert!(!names(&ws.list_dir("src").unwrap()).contains(&"generated.rs"));
         assert!(!names(&ws.list_dir("").unwrap()).contains(&"Cargo.toml"));
+    }
+
+    #[test]
+    fn creates_files_and_folders_inside_the_workspace() {
+        let (dir, ws) = tree();
+        assert_eq!(ws.create_file("src", "lib.rs").unwrap(), "src/lib.rs");
+        assert!(dir.path().join("src/lib.rs").is_file());
+        assert_eq!(
+            ws.create_file("", " notes.md ").unwrap(),
+            "notes.md",
+            "trimmed"
+        );
+        assert_eq!(ws.create_dir("src", "net").unwrap(), "src/net");
+        assert!(dir.path().join("src/net").is_dir());
+        // Slashes create the folders on the way, as in VSCode.
+        assert_eq!(ws.create_file("", "a/b/c.txt").unwrap(), "a/b/c.txt");
+        assert!(dir.path().join("a/b/c.txt").is_file());
+    }
+
+    #[test]
+    fn create_never_overwrites_and_rejects_bad_names() {
+        let (dir, ws) = tree();
+        fs::write(dir.path().join("src/main.rs"), "keep").unwrap();
+        let err = ws.create_file("src", "main.rs").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("src/main.rs")).unwrap(),
+            "keep"
+        );
+        assert_eq!(
+            ws.create_dir("", "src").unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        for bad in ["", "  ", "../x", "a/../b", "/etc/x", "./x", "a\0b"] {
+            assert!(ws.create_file("", bad).is_err(), "{bad:?} must be refused");
+        }
+        assert!(ws.create_file("../", "x").is_err(), "parent outside");
+        assert!(
+            ws.create_file("README.md", "x").is_err(),
+            "parent is a file"
+        );
+        assert!(!dir.path().parent().unwrap().join("x").exists());
     }
 
     #[test]

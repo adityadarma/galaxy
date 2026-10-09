@@ -369,6 +369,25 @@ const BUILTIN: &[(&str, &str, &str, &[&str])] = &[
         &["editor", "recent"],
     ),
     (
+        "explorer.newFile",
+        "Explorer",
+        "New File…",
+        &["create", "add"],
+    ),
+    (
+        "explorer.newFolder",
+        "Explorer",
+        "New Folder…",
+        &["create", "add", "directory"],
+    ),
+    (
+        "revealFileInOS",
+        "Explorer",
+        "Reveal in Finder",
+        &["show", "open folder"],
+    ),
+    ("copyFilePath", "Explorer", "Copy Path", &["clipboard"]),
+    (
         "workbench.files.action.refreshFilesExplorer",
         "Explorer",
         "Refresh",
