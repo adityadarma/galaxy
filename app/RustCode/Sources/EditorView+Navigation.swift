@@ -180,6 +180,22 @@ extension EditorView {
         didChangeSelection()
     }
 
+    /// Scrolls `line` to the middle of the view if it is not on screen
+    /// (Go to Line, back/forward), as VSCode does. A visible line stays put.
+    func revealLine(_ line: Int) {
+        guard let scrollView = enclosingScrollView else { return }
+        let clip = scrollView.contentView
+        let height = metrics.lineHeight
+        let top = CGFloat(line) * height
+        let visible = clip.bounds
+        if top >= visible.minY, top + height <= visible.maxY { return }
+        let inset = scrollView.contentInsets.top
+        let maxY = max(-inset, frame.height - visible.height)
+        let y = min(max(top + height / 2 - visible.height / 2, -inset), maxY)
+        clip.scroll(to: NSPoint(x: visible.minX, y: y))
+        scrollView.reflectScrolledClipView(clip)
+    }
+
     /// Selection-only change: redraw and keep the primary caret in view.
     func didChangeSelection() {
         noteDocumentRefreshFromInput()

@@ -16,6 +16,7 @@ pub mod history;
 pub mod logging;
 pub mod movement;
 pub mod multicursor;
+pub mod navigation;
 pub mod position;
 pub mod selection;
 pub mod viewport;

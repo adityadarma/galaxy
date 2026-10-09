@@ -16,6 +16,7 @@ use rcode_core::find::{FindError, FindOptions, Finder};
 use rcode_core::history::{EditKind, Editor};
 use rcode_core::movement::{self, Motion};
 use rcode_core::multicursor;
+use rcode_core::navigation::{self, Location, NavHistory};
 use rcode_core::position::Utf16Position;
 use rcode_core::selection::{Selection, SelectionSet};
 use rcode_core::viewport;
@@ -70,6 +71,98 @@ pub fn core_version() -> String {
 #[uniffi::export]
 pub fn init_logging(dir: String, level: String) -> Result<bool, CoreError> {
     Ok(rcode_core::logging::init(&PathBuf::from(dir), &level)?)
+}
+
+/// Where Go to Line goes: zero-based line, optional zero-based char column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct LineTarget {
+    pub line: u64,
+    pub col: Option<u64>,
+}
+
+/// Parses Go to Line input (`42`, `42:7`, `-1`). `None` if it is not one.
+#[uniffi::export]
+pub fn parse_line_target(input: String, line_count: u64) -> Option<LineTarget> {
+    navigation::parse_line_target(&input, clamp_usize(line_count)).map(|t| LineTarget {
+        line: t.line as u64,
+        col: t.col.map(|c| c as u64),
+    })
+}
+
+/// A cursor position in a document for back/forward navigation. `key`
+/// identifies the document (resolved path, or an id for Untitled);
+/// `col` counts chars.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct NavLocation {
+    pub key: String,
+    pub line: u64,
+    pub col: u64,
+}
+
+impl From<NavLocation> for Location {
+    fn from(l: NavLocation) -> Self {
+        Location::new(l.key, clamp_usize(l.line), clamp_usize(l.col))
+    }
+}
+
+impl From<Location> for NavLocation {
+    fn from(l: Location) -> Self {
+        NavLocation {
+            key: l.key,
+            line: l.line as u64,
+            col: l.col as u64,
+        }
+    }
+}
+
+/// Back/forward history for one window (M2-08).
+#[derive(uniffi::Object, Default)]
+pub struct NavigationHistory {
+    inner: Mutex<NavHistory>,
+}
+
+#[uniffi::export]
+impl NavigationHistory {
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Records `from` as a place to come back to.
+    pub fn record(&self, from: NavLocation) {
+        self.lock().record(from.into());
+    }
+
+    /// Records `from` only if `to` is in another document or far away.
+    pub fn record_jump(&self, from: NavLocation, to: NavLocation) -> bool {
+        self.lock().record_jump(from.into(), &to.into())
+    }
+
+    pub fn back(&self, current: Option<NavLocation>) -> Option<NavLocation> {
+        self.lock().back(current.map(Into::into)).map(Into::into)
+    }
+
+    pub fn forward(&self, current: Option<NavLocation>) -> Option<NavLocation> {
+        self.lock().forward(current.map(Into::into)).map(Into::into)
+    }
+
+    pub fn forget(&self, key: String) {
+        self.lock().forget(&key);
+    }
+
+    pub fn can_go_back(&self) -> bool {
+        self.lock().can_go_back()
+    }
+
+    pub fn can_go_forward(&self) -> bool {
+        self.lock().can_go_forward()
+    }
+}
+
+impl NavigationHistory {
+    fn lock(&self) -> std::sync::MutexGuard<'_, NavHistory> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 /// Root object owned by the app for its whole lifetime.
@@ -827,6 +920,35 @@ impl DocumentHandle {
         ed.history.break_group();
     }
 
+    /// Go to Line and history navigation: one caret at `line` (clamped),
+    /// at char column `col` (clamped to the line), or at the first
+    /// non-blank char when `col` is `None`.
+    pub fn go_to_line(&self, line: u64, col: Option<u64>) {
+        let mut st = self.lock();
+        let ed = &mut st.editor;
+        let line = clamp_usize(line).min(ed.doc.line_count() - 1);
+        let start = ed.doc.line_to_char(line);
+        let len = ed.doc.line_len_chars(line);
+        let offset = match col {
+            Some(c) => clamp_usize(c).min(len),
+            None => navigation::first_non_blank_col(&ed.doc, line),
+        };
+        let next = movement::set_caret(&ed.doc, start + offset);
+        ed.set_selections(next);
+        ed.history.break_group();
+    }
+
+    /// Primary caret as `(line, char column)`, for the history.
+    pub fn caret_location(&self, key: String) -> NavLocation {
+        let st = self.lock();
+        let pos = st.editor.doc.char_to_position(st.editor.sel.primary().head);
+        NavLocation {
+            key,
+            line: pos.line as u64,
+            col: pos.col as u64,
+        }
+    }
+
     // --- Find and replace (M1-13) ---
 
     /// Sets the search. An empty pattern clears it. An invalid regex keeps
@@ -1227,6 +1349,39 @@ mod tests {
         fn on_event(&self, event: CoreEvent) {
             let _ = self.0.lock().unwrap().send(event);
         }
+    }
+
+    #[test]
+    fn go_to_line_and_history() {
+        let doc = Core::new().new_document();
+        doc.edit(EditCommand::InsertText {
+            text: "one\n    two\nthree".into(),
+        });
+        assert_eq!(
+            parse_line_target("2:3".into(), doc.line_count()),
+            Some(LineTarget {
+                line: 1,
+                col: Some(2)
+            })
+        );
+        doc.go_to_line(1, None);
+        let here = doc.caret_location("k".into());
+        assert_eq!((here.line, here.col), (1, 4), "first non-blank char");
+        doc.go_to_line(99, Some(99));
+        let end = doc.caret_location("k".into());
+        assert_eq!((end.line, end.col), (2, 5), "clamped");
+
+        let h = NavigationHistory::new();
+        h.record(here.clone());
+        assert!(h.can_go_back());
+        assert_eq!(
+            h.back(Some(NavLocation {
+                key: "j".into(),
+                ..end
+            })),
+            Some(here)
+        );
+        assert!(h.can_go_forward());
     }
 
     #[test]

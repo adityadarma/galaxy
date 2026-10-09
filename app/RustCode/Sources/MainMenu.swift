@@ -64,6 +64,14 @@ enum MainMenu {
         let goItem = NSMenuItem()
         let goMenu = NSMenu(title: "Go")
         goMenu.addItem(withTitle: "Go to File…", action: #selector(MainWindowController.showGoToFile(_:)), keyEquivalent: "p")
+        let line = goMenu.addItem(withTitle: "Go to Line…", action: #selector(MainWindowController.showGoToLine(_:)), keyEquivalent: "g")
+        line.keyEquivalentModifierMask = [.control]
+        goMenu.addItem(.separator())
+        // The window's key monitor handles both keys; these show them.
+        let back = goMenu.addItem(withTitle: "Back", action: #selector(MainWindowController.navigateBack(_:)), keyEquivalent: "-")
+        back.keyEquivalentModifierMask = [.control]
+        let forward = goMenu.addItem(withTitle: "Forward", action: #selector(MainWindowController.navigateForward(_:)), keyEquivalent: "-")
+        forward.keyEquivalentModifierMask = [.control, .shift]
         goItem.submenu = goMenu
 
         let viewItem = NSMenuItem()

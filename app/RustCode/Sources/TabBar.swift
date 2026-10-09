@@ -22,6 +22,10 @@ final class EditorTab {
     var isEdited = false
     /// Resolved path, to find the tab of a file that is already open.
     var fileKey: String?
+    /// Identifies an Untitled buffer in the back/forward history.
+    private let untitledKey = "untitled:" + UUID().uuidString
+    /// Document key for the back/forward history (M2-08).
+    var navKey: String { fileKey ?? untitledKey }
 
     init(doc: DocumentHandle, title: String, pathComponents: [String], windowTitle: String,
          isPreview: Bool, status: String) {

@@ -65,6 +65,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// Files opened in this workspace, most recent first, relative paths.
     private(set) var recentFiles: [String] = []
     private var loadedQuickOpen: QuickOpen?
+    private var loadedGoToLine: GoToLine?
+    /// Back/forward history (M2-08).
+    let navHistory = NavigationHistory()
+    /// Set while back/forward shows a location, so that move is not
+    /// itself recorded as a jump.
+    private var isNavigating = false
+    private var keyMonitor: Any?
     let editorView = EditorView(frame: .zero)
 
     enum SaveChoice { case save, discard, cancel }
@@ -127,6 +134,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         if window.frameAutosaveName.isEmpty || !window.setFrameUsingName("MainWindow") {
             window.center()
         }
+
+        installKeyMonitor()
 
         bridge.onEvent = { [weak self] event in
             if case let .pong(message) = event {
@@ -341,6 +350,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// explorer selection is cleared so clicking that file again opens it.
     func selectTab(_ index: Int, fromTabBar: Bool = false) {
         guard tabs.indices.contains(index) else { return }
+        if let old = activeTab, old !== tabs[index] { noteLeaving(old) }
         if let old = activeTab {
             old.scrollY = scrollView.contentView.bounds.origin.y
             old.status = statusLabel.stringValue
@@ -394,6 +404,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             guard confirmDiscardActive() else { return false }
         }
         let wasActive = activeIndex == index
+        // A closed file can be reopened by Back; an Untitled buffer cannot.
+        if tabs[index].fileKey == nil {
+            navHistory.forget(key: tabs[index].navKey)
+        } else if wasActive {
+            noteLeaving(tabs[index])
+        }
         tabs.remove(at: index)
         if let a = activeIndex {
             activeIndex = a > index ? a - 1 : (a == index ? nil : a)
@@ -426,7 +442,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// `replacing`, and shows it.
     private func add(_ tab: EditorTab, replacing: Int?) {
         if let r = replacing {
-            if activeIndex == r { activeIndex = nil }
+            if activeIndex == r {
+                noteLeaving(tabs[r])
+                activeIndex = nil
+            }
             tabs[r] = tab
             selectTab(r)
         } else {
@@ -469,6 +488,138 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         window?.makeFirstResponder(workspace != nil ? explorer.outlineView : nil)
     }
 
+    // MARK: Go to Line and back/forward (M2-08)
+
+    var isGoToLineVisible: Bool { loadedGoToLine.map { !$0.isHidden } ?? false }
+
+    /// Built on first ⌃G, like the other panels.
+    var goToLine: GoToLine {
+        if let panel = loadedGoToLine { return panel }
+        let panel = GoToLine()
+        panel.isHidden = true
+        panel.translatesAutoresizingMaskIntoConstraints = false
+        panel.onGo = { [weak self] target in self?.goTo(target) }
+        panel.onClose = { [weak self] in self?.closeGoToLine() }
+        window?.contentView?.addSubview(panel)
+        let preferred = panel.widthAnchor.constraint(equalToConstant: GoToLine.width)
+        preferred.priority = .defaultHigh
+        NSLayoutConstraint.activate([
+            panel.topAnchor.constraint(equalTo: tabBar.topAnchor, constant: 6),
+            panel.centerXAnchor.constraint(equalTo: detailView.centerXAnchor),
+            panel.widthAnchor.constraint(lessThanOrEqualTo: detailView.widthAnchor, constant: -24),
+            preferred,
+        ])
+        loadedGoToLine = panel
+        return panel
+    }
+
+    /// ⌃G.
+    @objc func showGoToLine(_ sender: Any?) {
+        guard let doc = editorView.document else {
+            statusLabel.stringValue = "Open a file to use Go to Line."
+            return NSSound.beep()
+        }
+        if isQuickOpenVisible { closeGoToFile() }
+        editorView.flushPendingUpdates()
+        let panel = goToLine
+        panel.reset(lineCount: doc.lineCount(), current: doc.viewport(firstLine: 0, count: 0).primary.line)
+        panel.isHidden = false
+        panel.focus()
+    }
+
+    func closeGoToLine() {
+        guard isGoToLineVisible else { return }
+        goToLine.isHidden = true
+        window?.makeFirstResponder(editorView)
+    }
+
+    private func goTo(_ target: LineTarget) {
+        closeGoToLine()
+        guard let tab = activeTab else { return }
+        let from = location(of: tab)
+        _ = navHistory.recordJump(from: from, to: NavLocation(key: tab.navKey, line: target.line, col: target.col ?? 0))
+        move(tab, toLine: target.line, col: target.col)
+    }
+
+    /// ⌃-.
+    @objc func navigateBack(_ sender: Any?) { navigate(forward: false) }
+
+    /// ⌃⇧-.
+    @objc func navigateForward(_ sender: Any?) { navigate(forward: true) }
+
+    /// Steps through the history, skipping places that can no longer be
+    /// shown (a closed Untitled buffer, a deleted file).
+    private func navigate(forward: Bool) {
+        if isQuickOpenVisible { closeGoToFile() }
+        if isGoToLineVisible { closeGoToLine() }
+        let current = activeTab.map(location(of:))
+        while let loc = forward ? navHistory.forward(current: current) : navHistory.back(current: current) {
+            if show(loc) { return }
+            navHistory.forget(key: loc.key)
+        }
+        NSSound.beep()
+    }
+
+    /// Shows `loc`, reopening its file if its tab was closed.
+    private func show(_ loc: NavLocation) -> Bool {
+        isNavigating = true
+        defer { isNavigating = false }
+        if let i = tabs.firstIndex(where: { $0.navKey == loc.key }) {
+            if i != activeIndex { selectTab(i) }
+        } else {
+            guard !loc.key.hasPrefix("untitled:"), FileManager.default.fileExists(atPath: loc.key) else { return false }
+            if let workspace, let rel = relativePath(loc.key) {
+                let name = (rel as NSString).lastPathComponent
+                openWorkspaceFile(workspace, FileEntry(name: name, relPath: rel, isDir: false), preview: false)
+            } else {
+                try? openFile(at: URL(fileURLWithPath: loc.key))
+            }
+        }
+        guard let tab = activeTab, tab.navKey == loc.key else { return false }
+        move(tab, toLine: loc.line, col: loc.col)
+        return true
+    }
+
+    private func move(_ tab: EditorTab, toLine line: UInt64, col: UInt64?) {
+        tab.doc.goToLine(line: line, col: col)
+        editorView.didChangeSelection()
+        editorView.revealLine(Int(min(line, tab.doc.lineCount() - 1)))
+        window?.makeFirstResponder(editorView)
+    }
+
+    func location(of tab: EditorTab) -> NavLocation {
+        tab.doc.caretLocation(key: tab.navKey)
+    }
+
+    /// Records the place being left, unless back/forward is moving.
+    private func noteLeaving(_ tab: EditorTab) {
+        guard !isNavigating else { return }
+        navHistory.record(from: location(of: tab))
+    }
+
+    /// ⌃- and ⌃⇧- go to the menu items, whatever the Shift key does to
+    /// the character: Shift turns `-` into `_` on US keyboards, which a
+    /// menu key equivalent of `-` would not match.
+    private func installKeyMonitor() {
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            // Only plain values cross into the main-actor closure.
+            guard event.keyCode == 27 else { return event }  // kVK_ANSI_Minus
+            let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+                .subtracting([.capsLock, .numericPad, .function])
+            let windowNumber = event.windowNumber
+            let handled = MainActor.assumeIsolated { () -> Bool in
+                guard let self, windowNumber == self.window?.windowNumber else { return false }
+                switch mods {
+                case [.control]: self.navigateBack(nil)
+                case [.control, .shift]: self.navigateForward(nil)
+                default: return false
+                }
+                return true
+            }
+            return handled ? nil : event
+        }
+    }
+
     // MARK: Go to File (M2-07)
 
     var isQuickOpenVisible: Bool { loadedQuickOpen.map { !$0.isHidden } ?? false }
@@ -502,6 +653,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             return
         }
         if isQuickOpenVisible { return quickOpen.move(by: 1) }
+        if isGoToLineVisible { closeGoToLine() }
         let panel = quickOpen
         fileFinder?.setContext(current: activeTab.flatMap { relativePath($0.doc.path()) }, recent: recentFiles)
         panel.finder = fileFinder
@@ -844,6 +996,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         confirmDiscardChanges()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
+        keyMonitor = nil
     }
 
     /// ⌘O: pick a file or a folder.
