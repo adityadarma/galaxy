@@ -1,8 +1,9 @@
 import AppKit
 
 /// Full-width bar in the (transparent) title bar, in the JetBrains "New UI"
-/// style: project widget on the left after the traffic lights, the current
-/// file centered like VSCode's command center, layout toggles on the right.
+/// style: project widget on the left after the traffic lights, layout
+/// toggles on the right. The file name is not repeated here: the tab and
+/// the breadcrumb already show it.
 @MainActor
 final class TitleBar: NSView {
     /// Room for the traffic lights.
@@ -10,8 +11,6 @@ final class TitleBar: NSView {
 
     /// Project name; clicking it opens a folder.
     let projectButton = NSButton()
-    /// "main.rs — workspace", centered.
-    let titleLabel = NSTextField(labelWithString: "")
     let sidebarButton = NSButton()
 
     override init(frame: NSRect) {
@@ -32,14 +31,6 @@ final class TitleBar: NSView {
         projectButton.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         setProject(nil)
 
-        titleLabel.font = .systemFont(ofSize: 12)
-        titleLabel.textColor = .secondaryLabelColor
-        titleLabel.alignment = .center
-        titleLabel.lineBreakMode = .byTruncatingMiddle
-        titleLabel.setAccessibilityIdentifier("window-title")
-        titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        titleLabel.translatesAutoresizingMaskIntoConstraints = false
-
         sidebarButton.image = NSImage(systemSymbolName: "sidebar.left", accessibilityDescription: "Toggle Sidebar")
         sidebarButton.isBordered = false
         sidebarButton.imagePosition = .imageOnly
@@ -48,23 +39,18 @@ final class TitleBar: NSView {
         sidebarButton.setAccessibilityIdentifier("toggle-sidebar")
         sidebarButton.translatesAutoresizingMaskIntoConstraints = false
 
-        for view in [projectButton, titleLabel, sidebarButton] { addSubview(view) }
+        for view in [projectButton, sidebarButton] { addSubview(view) }
 
         let separator = NSBox()
         separator.boxType = .separator
         separator.translatesAutoresizingMaskIntoConstraints = false
         addSubview(separator)
 
-        let centered = titleLabel.centerXAnchor.constraint(equalTo: centerXAnchor)
-        centered.priority = .defaultHigh
         NSLayoutConstraint.activate([
             projectButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: Self.trafficLightInset),
             projectButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             projectButton.widthAnchor.constraint(lessThanOrEqualToConstant: 220),
-            centered,
-            titleLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
-            titleLabel.leadingAnchor.constraint(greaterThanOrEqualTo: projectButton.trailingAnchor, constant: 16),
-            titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: sidebarButton.leadingAnchor, constant: -16),
+            projectButton.trailingAnchor.constraint(lessThanOrEqualTo: sidebarButton.leadingAnchor, constant: -16),
             sidebarButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
             sidebarButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             separator.bottomAnchor.constraint(equalTo: bottomAnchor),
@@ -87,9 +73,5 @@ final class TitleBar: NSView {
     func setProject(_ name: String?) {
         projectButton.title = name ?? "Open Folder…"
         projectButton.setAccessibilityLabel(name.map { "Project \($0)" } ?? "Open Folder")
-    }
-
-    func setTitle(_ title: String) {
-        if titleLabel.stringValue != title { titleLabel.stringValue = title }
     }
 }

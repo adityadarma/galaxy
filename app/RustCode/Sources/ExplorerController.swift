@@ -1,5 +1,4 @@
 import AppKit
-import UniformTypeIdentifiers
 import os
 
 /// One row in the explorer. Children are `nil` until the folder is first
@@ -14,15 +13,17 @@ final class ExplorerNode {
     }
 }
 
-/// File explorer sidebar (M2-04): an `NSOutlineView` that lists one
-/// directory at a time through the Rust `Workspace`.
+/// File explorer sidebar (M2-04), drawn like VSCode's: a chevron for
+/// folders (no folder icon), small colored file-type glyphs, indent guides,
+/// and a full-width selection. Lists one directory at a time through the
+/// Rust `Workspace`.
 @MainActor
 final class ExplorerController: NSObject {
     /// Row height in points.
     static let rowHeight: CGFloat = 22
 
     let scrollView = NSScrollView()
-    let outlineView = NSOutlineView()
+    let outlineView = ExplorerOutlineView()
 
     private(set) var workspace: Workspace?
     /// Number of `listDir` calls so far. Tests use it to prove laziness.
@@ -33,7 +34,9 @@ final class ExplorerController: NSObject {
     var onPinFile: ((Workspace, FileEntry) -> Void)?
 
     private var roots: [ExplorerNode]?
-    private var iconCache: [String: NSImage] = [:]
+    /// A folder already toggled by the mouse-down selection of this click,
+    /// so the click action does not toggle it back.
+    private var toggledOnMouseDown = false
 
     override init() {
         super.init()
@@ -42,23 +45,25 @@ final class ExplorerController: NSObject {
         outlineView.addTableColumn(column)
         outlineView.outlineTableColumn = column
         outlineView.headerView = nil
-        // Compact VSCode-like rows; the source-list style would force ~28 pt.
         outlineView.style = .fullWidth
         outlineView.rowSizeStyle = .custom
         outlineView.rowHeight = Self.rowHeight
         outlineView.intercellSpacing = .zero
-        outlineView.indentationPerLevel = 12
+        outlineView.backgroundColor = .clear
         outlineView.autoresizesOutlineColumn = false
         outlineView.allowsEmptySelection = true
         outlineView.dataSource = self
         outlineView.delegate = self
         outlineView.target = self
+        outlineView.action = #selector(clicked(_:))
         outlineView.doubleAction = #selector(doubleClicked(_:))
         outlineView.setAccessibilityLabel("File explorer")
         outlineView.setAccessibilityIdentifier("explorer")
 
         scrollView.documentView = outlineView
         scrollView.hasVerticalScroller = true
+        scrollView.scrollerStyle = .overlay
+        scrollView.autohidesScrollers = true
         scrollView.drawsBackground = false
         scrollView.borderType = .noBorder
     }
@@ -70,6 +75,49 @@ final class ExplorerController: NSObject {
         roots = nil
         listCalls = 0
         outlineView.reloadData()
+    }
+
+    /// Lists everything again, keeping open folders open.
+    func refresh() {
+        guard workspace != nil else { return }
+        var open = Set<String>()
+        for row in 0..<outlineView.numberOfRows {
+            if let node = outlineView.item(atRow: row) as? ExplorerNode, outlineView.isItemExpanded(node) {
+                open.insert(node.entry.relPath)
+            }
+        }
+        roots = nil
+        outlineView.reloadData()
+        // Expanding adds rows below, so walk forward as the list grows.
+        var row = 0
+        while row < outlineView.numberOfRows {
+            if let node = outlineView.item(atRow: row) as? ExplorerNode, open.contains(node.entry.relPath) {
+                outlineView.expandItem(node)
+            }
+            row += 1
+        }
+    }
+
+    func collapseAll() {
+        outlineView.collapseItem(nil, collapseChildren: true)
+    }
+
+    private func toggle(_ node: ExplorerNode) {
+        if outlineView.isItemExpanded(node) {
+            outlineView.collapseItem(node)
+        } else {
+            outlineView.expandItem(node)
+        }
+    }
+
+    /// Mouse up. Clicking an already selected folder does not change the
+    /// selection, so it is toggled here instead.
+    @objc private func clicked(_ sender: Any?) {
+        defer { toggledOnMouseDown = false }
+        let row = outlineView.clickedRow
+        guard row >= 0, let node = outlineView.item(atRow: row) as? ExplorerNode,
+              node.entry.isDir, !toggledOnMouseDown else { return }
+        toggle(node)
     }
 
     @objc private func doubleClicked(_ sender: Any?) {
@@ -97,16 +145,12 @@ final class ExplorerController: NSObject {
         return list
     }
 
-    private func icon(for entry: FileEntry) -> NSImage {
-        let key = entry.isDir ? "/dir" : (entry.name as NSString).pathExtension.lowercased()
-        if let cached = iconCache[key] { return cached }
-        let type: UTType = entry.isDir
-            ? .folder
-            : (UTType(filenameExtension: key) ?? .data)
-        let image = NSWorkspace.shared.icon(for: type)
-        image.size = NSSize(width: 16, height: 16)
-        iconCache[key] = image
-        return image
+    private func updateChevron(of notification: Notification) {
+        guard let node = notification.userInfo?["NSObject"] as? ExplorerNode else { return }
+        let row = outlineView.row(forItem: node)
+        guard row >= 0 else { return }
+        (outlineView.view(atColumn: 0, row: row, makeIfNecessary: false) as? ExplorerCell)?
+            .isExpanded = outlineView.isItemExpanded(node)
     }
 }
 
@@ -127,50 +171,222 @@ extension ExplorerController: NSOutlineViewDataSource {
 extension ExplorerController: NSOutlineViewDelegate {
     func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
         guard let node = item as? ExplorerNode else { return nil }
-        let id = NSUserInterfaceItemIdentifier("cell")
-        let cell: NSTableCellView
-        if let reused = outlineView.makeView(withIdentifier: id, owner: self) as? NSTableCellView {
-            cell = reused
-        } else {
-            cell = NSTableCellView()
-            cell.identifier = id
-            let image = NSImageView()
-            let text = NSTextField(labelWithString: "")
-            text.lineBreakMode = .byTruncatingMiddle
-            text.font = .systemFont(ofSize: 13)
-            image.translatesAutoresizingMaskIntoConstraints = false
-            text.translatesAutoresizingMaskIntoConstraints = false
-            cell.addSubview(image)
-            cell.addSubview(text)
-            cell.imageView = image
-            cell.textField = text
-            NSLayoutConstraint.activate([
-                image.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 2),
-                image.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-                image.widthAnchor.constraint(equalToConstant: 16),
-                image.heightAnchor.constraint(equalToConstant: 16),
-                text.leadingAnchor.constraint(equalTo: image.trailingAnchor, constant: 6),
-                text.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
-                text.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
-            ])
-        }
-        cell.textField?.stringValue = node.entry.name
-        cell.imageView?.image = icon(for: node.entry)
+        let cell = outlineView.makeView(withIdentifier: ExplorerCell.reuseID, owner: self) as? ExplorerCell
+            ?? ExplorerCell()
+        cell.show(node.entry, expanded: outlineView.isItemExpanded(node))
         return cell
     }
+
+    func outlineView(_ outlineView: NSOutlineView, rowViewForItem item: Any) -> NSTableRowView? {
+        let row = outlineView.makeView(withIdentifier: ExplorerRowView.reuseID, owner: self) as? ExplorerRowView
+            ?? ExplorerRowView()
+        row.level = outlineView.level(forItem: item)
+        return row
+    }
+
+    func outlineViewItemDidExpand(_ notification: Notification) { updateChevron(of: notification) }
+    func outlineViewItemDidCollapse(_ notification: Notification) { updateChevron(of: notification) }
 
     func outlineViewSelectionDidChange(_ notification: Notification) {
         let row = outlineView.selectedRow
         guard row >= 0, let node = outlineView.item(atRow: row) as? ExplorerNode else { return }
+        let event = NSApp.currentEvent?.type
         if node.entry.isDir {
-            // Clicking a folder toggles it, like VSCode.
-            if outlineView.isItemExpanded(node) {
-                outlineView.collapseItem(node)
-            } else {
-                outlineView.expandItem(node)
-            }
+            // Arrow keys only move, as in VSCode (← and → open and close).
+            guard event != .keyDown else { return }
+            toggle(node)
+            if event == .leftMouseDown { toggledOnMouseDown = true }
         } else if let workspace {
             onOpenFile?(workspace, node.entry)
+        }
+    }
+}
+
+// MARK: - Views
+
+/// Places cells by depth itself and hides the system disclosure triangle;
+/// cells draw their own chevron.
+@MainActor
+final class ExplorerOutlineView: NSOutlineView {
+    static let baseInset: CGFloat = 8
+    static let indent: CGFloat = 12
+
+    override func frameOfOutlineCell(atRow row: Int) -> NSRect { .zero }
+
+    override func frameOfCell(atColumn column: Int, row: Int) -> NSRect {
+        let frame = super.frameOfCell(atColumn: column, row: row)
+        let x = Self.baseInset + CGFloat(level(forRow: row)) * Self.indent
+        return NSRect(x: x, y: frame.minY, width: max(0, bounds.width - x), height: frame.height)
+    }
+
+    /// x of the indent guide for depth `level`: under that level's chevron.
+    static func guideX(level: Int) -> CGFloat {
+        baseInset + CGFloat(level) * indent + ExplorerCell.chevronSize / 2
+    }
+}
+
+@MainActor
+final class ExplorerCell: NSTableCellView {
+    static let reuseID = NSUserInterfaceItemIdentifier("explorer-cell")
+    static let chevronSize: CGFloat = 16
+
+    let chevron = NSImageView()
+    let icon = NSImageView()
+    let label = NSTextField(labelWithString: "")
+    private(set) var isFolder = false
+
+    var isExpanded = false {
+        didSet { if isFolder, isExpanded != oldValue { updateChevron() } }
+    }
+
+    init() {
+        super.init(frame: .zero)
+        identifier = Self.reuseID
+        chevron.imageScaling = .scaleNone
+        chevron.contentTintColor = .secondaryLabelColor
+        chevron.setAccessibilityElement(false)
+        icon.imageScaling = .scaleNone
+        icon.setAccessibilityElement(false)
+        label.font = .systemFont(ofSize: 13)
+        label.lineBreakMode = .byTruncatingMiddle
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        imageView = icon
+        textField = label
+
+        let row = NSStackView(views: [chevron, icon, label])
+        row.orientation = .horizontal
+        row.spacing = 4
+        row.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(row)
+        NSLayoutConstraint.activate([
+            chevron.widthAnchor.constraint(equalToConstant: Self.chevronSize),
+            icon.widthAnchor.constraint(equalToConstant: 16),
+            row.leadingAnchor.constraint(equalTo: leadingAnchor),
+            row.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -6),
+            row.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    /// Folders: chevron and name. Files: an empty chevron slot (so names
+    /// line up as in VSCode), then the file-type glyph and name.
+    func show(_ entry: FileEntry, expanded: Bool) {
+        label.stringValue = entry.name
+        isFolder = entry.isDir
+        isExpanded = expanded
+        icon.isHidden = entry.isDir
+        if entry.isDir {
+            updateChevron()
+        } else {
+            chevron.image = nil
+            let glyph = FileGlyph.for(name: entry.name)
+            icon.image = glyph.image
+            icon.contentTintColor = glyph.color
+        }
+    }
+
+    private func updateChevron() {
+        chevron.image = NSImage(systemSymbolName: isExpanded ? "chevron.down" : "chevron.right",
+                                accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 10, weight: .semibold))
+    }
+}
+
+/// Full-width selection and hover, plus indent guides.
+@MainActor
+final class ExplorerRowView: NSTableRowView {
+    static let reuseID = NSUserInterfaceItemIdentifier("explorer-row")
+    var level = 0 { didSet { if level != oldValue { needsDisplay = true } } }
+    private var isHovered = false { didSet { if isHovered != oldValue { needsDisplay = true } } }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        identifier = Self.reuseID
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override func drawBackground(in dirtyRect: NSRect) {
+        if isHovered, !isSelected {
+            NSColor.labelColor.withAlphaComponent(0.05).setFill()
+            bounds.fill()
+        }
+        NSColor.labelColor.withAlphaComponent(0.12).setFill()
+        for l in 0..<level {
+            NSRect(x: ExplorerOutlineView.guideX(level: l), y: 0, width: 1, height: bounds.height).fill()
+        }
+    }
+
+    override func drawSelection(in dirtyRect: NSRect) {
+        if isEmphasized {
+            Theme.accent.withAlphaComponent(0.22).setFill()
+            bounds.fill()
+            // Focused row outline, as VSCode marks keyboard focus.
+            Theme.accent.withAlphaComponent(0.7).setStroke()
+            let outline = NSBezierPath(rect: bounds.insetBy(dx: 0.5, dy: 0.5))
+            outline.lineWidth = 1
+            outline.stroke()
+        } else {
+            NSColor.labelColor.withAlphaComponent(0.09).setFill()
+            bounds.fill()
+        }
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
+                                       owner: self, userInfo: nil))
+    }
+
+    override func mouseEntered(with event: NSEvent) { isHovered = true }
+    override func mouseExited(with event: NSEvent) { isHovered = false }
+}
+
+/// Small colored glyph per file type, in the spirit of VSCode's Seti icons.
+@MainActor
+enum FileGlyph {
+    struct Glyph {
+        let image: NSImage?
+        let color: NSColor
+    }
+
+    private static var cache: [String: Glyph] = [:]
+
+    static func `for`(name: String) -> Glyph {
+        let ext = (name as NSString).pathExtension.lowercased()
+        let key = name.hasPrefix(".git") ? ".git" : ext
+        if let hit = cache[key] { return hit }
+        let (symbol, color) = style(for: key)
+        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 11, weight: .medium))
+        let glyph = Glyph(image: image, color: color)
+        cache[key] = glyph
+        return glyph
+    }
+
+    private static func style(for key: String) -> (String, NSColor) {
+        switch key {
+        case "rs": ("gearshape.fill", Theme.accent)
+        case "swift": ("swift", .systemOrange)
+        case "md", "markdown": ("info.circle.fill", .systemBlue)
+        case "json": ("curlybraces", .systemYellow)
+        case "toml", "lock", "yml", "yaml", "ini", "cfg", "plist", "xcconfig":
+            ("slider.horizontal.3", .secondaryLabelColor)
+        case "sh", "zsh", "bash", "fish": ("terminal", .systemGreen)
+        case "js", "mjs", "cjs", "jsx": ("j.square.fill", .systemYellow)
+        case "ts", "tsx": ("t.square.fill", .systemBlue)
+        case "html", "htm", "xml": ("chevron.left.forwardslash.chevron.right", .systemOrange)
+        case "css", "scss": ("number", .systemBlue)
+        case "py": ("p.square.fill", .systemTeal)
+        case "c", "h", "cpp", "hpp", "m", "mm": ("c.square.fill", .systemIndigo)
+        case "png", "jpg", "jpeg", "gif", "svg", "webp", "icns": ("photo", .systemPurple)
+        case ".git": ("arrow.triangle.branch", .systemRed)
+        case "txt", "log": ("doc.text", .secondaryLabelColor)
+        default: ("doc", .secondaryLabelColor)
         }
     }
 }

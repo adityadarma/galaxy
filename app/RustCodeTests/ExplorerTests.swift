@@ -188,22 +188,21 @@ final class ExplorerTests: XCTestCase {
         controller.explorer.outlineView.selectRowIndexes([3], byExtendingSelection: false) // src/main.rs
         window.contentView?.layoutSubtreeIfNeeded()
         let bar = controller.pathBar
-        XCTAssertEqual(bar.components, [root.lastPathComponent, "src", "main.rs"])
+        XCTAssertEqual(bar.components, ["src", "main.rs"], "path inside the folder; the folder is named elsewhere")
         XCTAssertTrue(window.title.hasPrefix("main.rs"), "the hidden title is still kept for the Window menu")
 
         // Title bar: full width, fills the window's title bar area, shows
-        // the project and the file.
+        // the project.
         let content = try XCTUnwrap(window.contentView)
         let titleFrame = content.convert(controller.titleBar.bounds, from: controller.titleBar)
         XCTAssertEqual(titleFrame.maxY, content.bounds.maxY, accuracy: 0.5)
         XCTAssertEqual(titleFrame.width, content.bounds.width, accuracy: 0.5)
         XCTAssertEqual(titleFrame.minY, window.contentLayoutRect.maxY, accuracy: 0.5, "ends where the title bar ends")
         XCTAssertEqual(controller.titleBar.projectButton.title, root.lastPathComponent)
-        XCTAssertEqual(controller.titleBar.titleLabel.stringValue, window.title)
-        XCTAssertEqual(controller.titleBar.titleLabel.frame.midX, controller.titleBar.bounds.midX, accuracy: 1,
-                       "file name centered")
-        XCTAssertGreaterThan(controller.titleBar.titleLabel.frame.width, 20, "a long project name must not squeeze the title out")
         XCTAssertLessThanOrEqual(controller.titleBar.projectButton.frame.width, 220)
+        // The folder name appears once in the title bar and once as the
+        // sidebar section, not in the breadcrumb or a centered title.
+        XCTAssertEqual(controller.sectionHeader.label.stringValue, root.lastPathComponent.uppercased())
 
         // Tabs at the top of the editor column; breadcrumb right under them.
         let tabsFrame = content.convert(controller.tabBar.bounds, from: controller.tabBar)
@@ -229,6 +228,69 @@ final class ExplorerTests: XCTestCase {
         controller.open(url: root)                 // opening a folder reveals it
         XCTAssertTrue(controller.isSidebarVisible)
         XCTAssertTrue(controller.emptyState.isHidden)
+        XCTAssertFalse(controller.explorer.scrollView.isHidden)
+    }
+
+    func testExplorerLooksLikeVSCode() throws {
+        let root = try makeTree()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let ws = try CoreBridge().core.openWorkspace(path: root.path)
+        let explorer = ExplorerController()
+        explorer.scrollView.frame = NSRect(x: 0, y: 0, width: 240, height: 400)
+        explorer.setWorkspace(ws)
+        explorer.outlineView.layoutSubtreeIfNeeded()
+        func cell(_ row: Int) throws -> ExplorerCell {
+            try XCTUnwrap(explorer.outlineView.view(atColumn: 0, row: row, makeIfNecessary: true) as? ExplorerCell)
+        }
+
+        // Folders: chevron, no icon. Files: no chevron, a type glyph, and
+        // the name lined up with folder names.
+        let src = try cell(1)
+        XCTAssertNotNil(src.chevron.image)
+        XCTAssertTrue(src.icon.isHidden)
+        let readme = try cell(2)
+        XCTAssertNil(readme.chevron.image)
+        XCTAssertFalse(readme.icon.isHidden)
+        XCTAssertEqual(explorer.outlineView.frameOfOutlineCell(atRow: 1), .zero, "no system disclosure triangle")
+
+        // Children are indented by one step and the chevron turns.
+        let node = try XCTUnwrap(explorer.outlineView.item(atRow: 1))
+        explorer.outlineView.expandItem(node)
+        XCTAssertTrue(try cell(1).isExpanded)
+        let parentX = explorer.outlineView.frameOfCell(atColumn: 0, row: 1).minX
+        let childX = explorer.outlineView.frameOfCell(atColumn: 0, row: 2).minX
+        XCTAssertEqual(childX - parentX, ExplorerOutlineView.indent)
+
+        explorer.collapseAll()
+        XCTAssertEqual(names(explorer), ["docs", "src", "README.md"])
+    }
+
+    func testRefreshKeepsOpenFoldersOpenAndShowsNewFiles() throws {
+        let root = try makeTree()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let ws = try CoreBridge().core.openWorkspace(path: root.path)
+        let explorer = ExplorerController()
+        explorer.setWorkspace(ws)
+        explorer.outlineView.expandItem(explorer.outlineView.item(atRow: 1)) // src
+        try "x".write(to: root.appendingPathComponent("src/new.rs"), atomically: true, encoding: .utf8)
+        explorer.refresh()
+        XCTAssertEqual(names(explorer), ["docs", "src", "deep", "main.rs", "new.rs", "README.md"])
+    }
+
+    func testFolderSectionFoldsTheTree() throws {
+        let root = try makeTree()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let controller = MainWindowController(bridge: CoreBridge())
+        controller.showWindow(nil)
+        defer { controller.window?.orderOut(nil) }
+        XCTAssertTrue(controller.sectionHeader.isHidden, "no section before a folder is open")
+        controller.open(url: root)
+        XCTAssertFalse(controller.sectionHeader.isHidden)
+        XCTAssertTrue(controller.sectionHeader.refreshButton.isHidden, "tools show on hover only")
+        XCTAssertTrue(controller.sectionHeader.collapseButton.isHidden)
+        controller.sectionHeader.toggle()
+        XCTAssertTrue(controller.explorer.scrollView.isHidden)
+        controller.sectionHeader.toggle()
         XCTAssertFalse(controller.explorer.scrollView.isHidden)
     }
 

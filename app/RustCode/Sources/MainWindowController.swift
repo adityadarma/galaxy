@@ -50,10 +50,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// Shown for files over 20 MB (M1-14).
     var largeFileBanner: NSTextField { statusBar.largeFileBadge }
     private var findBarHeight: NSLayoutConstraint!
-    /// Sidebar: "EXPLORER" header, folder name, then the explorer or an
-    /// empty state.
+    /// Sidebar, VSCode style: "EXPLORER" view title, a collapsible
+    /// section named after the folder, then the tree or an empty state.
     let sidebar = SidebarView()
-    private let folderTitle = NSTextField(labelWithString: "")
+    let sectionHeader = SidebarSectionHeader()
     let emptyState = NSStackView()
     let explorer = ExplorerController()
     private(set) var workspace: Workspace?
@@ -177,7 +177,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         tabBar.onClose = { [weak self] i in self?.closeTab(at: i) }
         tabBar.onMove = { [weak self] from, to in self?.moveTab(from: from, to: to) }
         pathBar.translatesAutoresizingMaskIntoConstraints = false
-        pathBar.show(["RustCode"])
+        pathBar.show([])
         findBarSlot.translatesAutoresizingMaskIntoConstraints = false
         findBarSlot.isHidden = true
         findBarHeight = findBarSlot.heightAnchor.constraint(equalToConstant: 0)
@@ -239,25 +239,24 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         sidebar.translatesAutoresizingMaskIntoConstraints = false
         sidebar.widthAnchor.constraint(greaterThanOrEqualToConstant: 160).isActive = true
 
-        // VSCode's view title, JetBrains' tool window name.
+        // View title, as in VSCode.
         let viewTitle = NSTextField(labelWithString: "")
         viewTitle.attributedStringValue = NSAttributedString(string: "EXPLORER", attributes: [
-            .font: NSFont.systemFont(ofSize: 10.5, weight: .semibold),
+            .font: NSFont.systemFont(ofSize: 11, weight: .regular),
             .foregroundColor: NSColor.secondaryLabelColor,
-            .kern: 0.6,
+            .kern: 0.4,
         ])
         viewTitle.setAccessibilityIdentifier("sidebar-title")
+        viewTitle.translatesAutoresizingMaskIntoConstraints = false
 
-        folderTitle.font = .systemFont(ofSize: 12, weight: .semibold)
-        folderTitle.textColor = .labelColor
-        folderTitle.lineBreakMode = .byTruncatingMiddle
-        folderTitle.isHidden = true
-        folderTitle.setAccessibilityIdentifier("folder-title")
-        let header = NSStackView(views: [viewTitle, folderTitle])
-        header.orientation = .vertical
-        header.alignment = .leading
-        header.spacing = 8
-        header.translatesAutoresizingMaskIntoConstraints = false
+        // Folder section: click to fold, buttons on the right.
+        sectionHeader.isHidden = true
+        sectionHeader.translatesAutoresizingMaskIntoConstraints = false
+        sectionHeader.onToggle = { [weak self] expanded in
+            self?.explorer.scrollView.isHidden = !expanded
+        }
+        sectionHeader.onRefresh = { [weak self] in self?.explorer.refresh() }
+        sectionHeader.onCollapseAll = { [weak self] in self?.explorer.collapseAll() }
 
         // Shown until a folder is opened.
         let message = NSTextField(wrappingLabelWithString: "No folder open")
@@ -282,14 +281,17 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             self?.openWorkspaceFile(workspace, entry, preview: false)
         }
 
-        sidebar.addSubview(header)
+        sidebar.addSubview(viewTitle)
+        sidebar.addSubview(sectionHeader)
         sidebar.addSubview(explorer.scrollView)
         sidebar.addSubview(emptyState)
         NSLayoutConstraint.activate([
-            header.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: 11),
-            header.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 14),
-            header.trailingAnchor.constraint(lessThanOrEqualTo: sidebar.trailingAnchor, constant: -8),
-            explorer.scrollView.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 6),
+            viewTitle.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 20),
+            viewTitle.centerYAnchor.constraint(equalTo: sidebar.topAnchor, constant: Theme.tabHeight / 2),
+            sectionHeader.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: Theme.tabHeight),
+            sectionHeader.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor),
+            sectionHeader.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor),
+            explorer.scrollView.topAnchor.constraint(equalTo: sectionHeader.bottomAnchor),
             explorer.scrollView.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor),
             explorer.scrollView.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor),
             explorer.scrollView.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor),
@@ -454,7 +456,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         activeIndex = nil
         if isFindVisible { closeFind(nil) }
         editorView.document = nil
-        pathBar.show([workspace?.name() ?? "RustCode"])
+        pathBar.show([])
         statusBar.show(document: nil)
         statusLabel.stringValue = "No open files. ⌘N for a new one, ⌘O to open a file or folder."
         refreshTabBar()
@@ -650,7 +652,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     func updateEditedState() {
         let title = activeTab?.windowTitle ?? workspace?.name() ?? "RustCode"
         if window?.title != title { window?.title = title }
-        titleBar.setTitle(title)
         if let i = activeIndex {
             let tab = tabs[i]
             let edited = tab.doc.isModified()
@@ -791,11 +792,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         explorer.setWorkspace(ws)
         explorer.scrollView.isHidden = false
         emptyState.isHidden = true
-        folderTitle.stringValue = ws.name()
-        folderTitle.isHidden = false
+        sectionHeader.title = ws.name()
+        sectionHeader.isHidden = false
+        sectionHeader.isExpanded = true
         titleBar.setProject(ws.name())
         setSidebarVisible(true)
-        if tabs.isEmpty { pathBar.show([ws.name()]) }
+        if tabs.isEmpty { pathBar.show([]) }
         updateEditedState()
         statusLabel.stringValue = "\(ws.name()): choose a file in the sidebar."
     }
@@ -828,7 +830,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             let doc = try workspace.openFile(relPath: entry.relPath)
             let tab = EditorTab(
                 doc: doc, title: entry.name,
-                pathComponents: [workspace.name()] + entry.relPath.split(separator: "/").map(String.init),
+                pathComponents: entry.relPath.split(separator: "/").map(String.init),
                 windowTitle: "\(entry.name) — \(workspace.name())", isPreview: preview,
                 status: describe(doc, name: entry.relPath, since: start))
             tab.fileKey = Self.fileKey(doc.path())
@@ -857,4 +859,119 @@ final class SidebarView: NSView {
         Theme.sidebar.setFill()
         dirtyRect.intersection(bounds).fill()
     }
+}
+
+/// Collapsible section header in the sidebar, as in VSCode: chevron and
+/// folder name in caps; refresh and collapse-all buttons show on hover.
+@MainActor
+final class SidebarSectionHeader: NSView {
+    static let height: CGFloat = 22
+
+    let chevron = NSImageView()
+    let label = NSTextField(labelWithString: "")
+    let refreshButton = SidebarSectionHeader.tool("arrow.clockwise", "Refresh Explorer")
+    let collapseButton = SidebarSectionHeader.tool("rectangle.compress.vertical", "Collapse Folders in Explorer")
+    var onToggle: ((Bool) -> Void)?
+    var onRefresh: (() -> Void)?
+    var onCollapseAll: (() -> Void)?
+
+    var title = "" {
+        didSet {
+            label.stringValue = title.uppercased()
+            setAccessibilityLabel(title)
+        }
+    }
+    var isExpanded = true {
+        didSet {
+            chevron.image = NSImage(systemSymbolName: isExpanded ? "chevron.down" : "chevron.right",
+                                    accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: 9, weight: .bold))
+            setAccessibilityExpanded(isExpanded)
+        }
+    }
+    private var isHovered = false {
+        didSet { [refreshButton, collapseButton].forEach { $0.isHidden = !isHovered } }
+    }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        setAccessibilityElement(true)
+        setAccessibilityRole(.disclosureTriangle)
+        setAccessibilityIdentifier("folder-title")
+
+        chevron.imageScaling = .scaleNone
+        chevron.contentTintColor = .labelColor
+        label.font = .systemFont(ofSize: 11, weight: .bold)
+        label.textColor = .labelColor
+        label.lineBreakMode = .byTruncatingTail
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        refreshButton.target = self
+        refreshButton.action = #selector(refresh(_:))
+        collapseButton.target = self
+        collapseButton.action = #selector(collapseAll(_:))
+        // Observers do not run for assignments in a class's own init, so
+        // set the initial state directly.
+        isExpanded = true
+        chevron.image = NSImage(systemSymbolName: "chevron.down", accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 9, weight: .bold))
+        refreshButton.isHidden = true
+        collapseButton.isHidden = true
+
+        let row = NSStackView(views: [chevron, label, NSView(), refreshButton, collapseButton])
+        row.spacing = 4
+        row.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(row)
+        NSLayoutConstraint.activate([
+            heightAnchor.constraint(equalToConstant: Self.height),
+            chevron.widthAnchor.constraint(equalToConstant: 16),
+            row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
+            row.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            row.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    private static func tool(_ symbol: String, _ title: String) -> NSButton {
+        let b = NSButton()
+        b.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)?
+            .withSymbolConfiguration(.init(pointSize: 11, weight: .regular))
+        b.isBordered = false
+        b.imagePosition = .imageOnly
+        b.contentTintColor = .secondaryLabelColor
+        b.toolTip = title
+        b.widthAnchor.constraint(equalToConstant: 20).isActive = true
+        return b
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard bounds.contains(convert(event.locationInWindow, from: nil)) else { return }
+        toggle()
+    }
+
+    override func accessibilityPerformPress() -> Bool {
+        toggle()
+        return true
+    }
+
+    func toggle() {
+        isExpanded.toggle()
+        onToggle?(isExpanded)
+    }
+
+    override func mouseDown(with event: NSEvent) {}
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
+                                       owner: self, userInfo: nil))
+    }
+
+    override func mouseEntered(with event: NSEvent) { isHovered = true }
+    override func mouseExited(with event: NSEvent) { isHovered = false }
+
+    @objc private func refresh(_ sender: Any?) { onRefresh?() }
+    @objc private func collapseAll(_ sender: Any?) { onCollapseAll?() }
 }
