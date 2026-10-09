@@ -61,6 +61,11 @@ enum MainMenu {
         findMenu.addItem(withTitle: "Use Selection for Find", action: #selector(MainWindowController.useSelectionForFind(_:)), keyEquivalent: "e")
         findItem.submenu = findMenu
 
+        let goItem = NSMenuItem()
+        let goMenu = NSMenu(title: "Go")
+        goMenu.addItem(withTitle: "Go to File…", action: #selector(MainWindowController.showGoToFile(_:)), keyEquivalent: "p")
+        goItem.submenu = goMenu
+
         let viewItem = NSMenuItem()
         let viewMenu = NSMenu(title: "View")
         viewMenu.addItem(withTitle: "Toggle Sidebar", action: #selector(MainWindowController.toggleSidebar(_:)), keyEquivalent: "b")
@@ -90,6 +95,7 @@ enum MainMenu {
         main.addItem(selectionItem)
         main.addItem(findItem)
         main.addItem(viewItem)
+        main.addItem(goItem)
 
         return main
     }

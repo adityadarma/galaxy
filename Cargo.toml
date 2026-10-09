@@ -30,6 +30,8 @@ unicode-segmentation = "=1.13.3"
 ignore = "=0.4.33"
 # In-file find/replace. Linear-time matching, no backtracking blowups.
 regex = "=1.13.1"
+# Go to File (M2-07). The matcher half of helix's nucleo; MPL-2.0.
+nucleo-matcher = "=0.3.1"
 proptest = { version = "=1.11.0", default-features = false, features = ["std"] }
 
 [workspace.lints.rust]

@@ -20,6 +20,8 @@ unicode-segmentation.workspace = true
 ignore.workspace = true
 # Find/replace in the current file.
 regex.workspace = true
+# Fuzzy file search for Go to File.
+nucleo-matcher.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

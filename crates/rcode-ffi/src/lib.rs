@@ -11,6 +11,7 @@ use std::time::Instant;
 use rcode_core::clipboard;
 use rcode_core::document::{Document, Encoding, LineEnding};
 use rcode_core::edit::{self, IndentConfig};
+use rcode_core::file_finder::FileFinder as CoreFileFinder;
 use rcode_core::find::{FindError, FindOptions, Finder};
 use rcode_core::history::{EditKind, Editor};
 use rcode_core::movement::{self, Motion};
@@ -181,6 +182,21 @@ impl Workspace {
             .collect())
     }
 
+    /// Walks the whole workspace and returns a Go to File searcher. Takes
+    /// about 0.6 s on 100k files: call it off the main thread.
+    pub fn build_file_finder(&self) -> Arc<FileFinder> {
+        let start = Instant::now();
+        let finder = CoreFileFinder::from_index(&self.inner.build_file_index());
+        tracing::info!(
+            files = finder.len(),
+            ms = start.elapsed().as_millis() as u64,
+            "built file finder"
+        );
+        Arc::new(FileFinder {
+            inner: Mutex::new(finder),
+        })
+    }
+
     /// Opens a file inside the workspace. Paths that would leave the
     /// workspace are refused.
     pub fn open_file(&self, rel_path: String) -> Result<Arc<DocumentHandle>, CoreError> {
@@ -188,6 +204,59 @@ impl Workspace {
         let doc = Document::load(&path)?;
         tracing::info!(path = %path.display(), lines = doc.line_count(), "opened workspace file");
         Ok(Arc::new(DocumentHandle::new(doc, path)))
+    }
+}
+
+/// One Go to File result.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct FileMatch {
+    /// Relative, `/`-separated path.
+    pub rel_path: String,
+    /// UTF-16 offset of the file name within `rel_path`.
+    pub name_start: u64,
+    /// Matched characters, UTF-16 ranges within `rel_path`.
+    pub highlights: Vec<Utf16Range>,
+    pub is_recent: bool,
+}
+
+/// Go to File searcher for one workspace (M2-07). A snapshot: files
+/// created later appear after it is rebuilt.
+#[derive(uniffi::Object)]
+pub struct FileFinder {
+    inner: Mutex<CoreFileFinder>,
+}
+
+#[uniffi::export]
+impl FileFinder {
+    pub fn file_count(&self) -> u64 {
+        self.lock().len() as u64
+    }
+
+    /// `current`: the open file's relative path, if any. `recent`: recently
+    /// opened relative paths, most recent first.
+    pub fn set_context(&self, current: Option<String>, recent: Vec<String>) {
+        self.lock().set_context(current.as_deref(), &recent);
+    }
+
+    /// Best `limit` files for `query`; recent files for an empty query.
+    pub fn search(&self, query: String, limit: u32) -> Vec<FileMatch> {
+        self.lock()
+            .search(&query, limit as usize)
+            .into_iter()
+            .map(|m| FileMatch {
+                rel_path: m.path,
+                name_start: m.name_start_utf16 as u64,
+                highlights: m.highlights.into_iter().map(Utf16Range::from).collect(),
+                is_recent: m.is_recent,
+            })
+            .collect()
+    }
+}
+
+impl FileFinder {
+    fn lock(&self) -> std::sync::MutexGuard<'_, CoreFileFinder> {
+        // A panic mid-search leaves nothing half-written worth refusing.
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 
@@ -1158,6 +1227,34 @@ mod tests {
         fn on_event(&self, event: CoreEvent) {
             let _ = self.0.lock().unwrap().send(event);
         }
+    }
+
+    #[test]
+    fn file_finder_searches_the_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/main.rs"), "").unwrap();
+        std::fs::write(dir.path().join("README.md"), "").unwrap();
+        let ws = Core::new()
+            .open_workspace(dir.path().to_string_lossy().into_owned())
+            .unwrap();
+        let finder = ws.build_file_finder();
+        assert_eq!(finder.file_count(), 2);
+        let found = finder.search("main".into(), 10);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].rel_path, "src/main.rs");
+        assert_eq!(found[0].name_start, 4);
+        assert_eq!(
+            found[0].highlights,
+            [Utf16Range {
+                location: 4,
+                length: 4
+            }]
+        );
+        finder.set_context(None, vec!["README.md".into()]);
+        let recent = finder.search(String::new(), 10);
+        assert_eq!(recent[0].rel_path, "README.md");
+        assert!(recent[0].is_recent);
     }
 
     #[test]

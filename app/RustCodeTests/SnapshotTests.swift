@@ -36,11 +36,27 @@ final class SnapshotTests: XCTestCase {
             RunLoop.current.run(until: Date().addingTimeInterval(0.3))
             let view = try XCTUnwrap(c.window?.contentView)
             view.layoutSubtreeIfNeeded()
-            let rep = try XCTUnwrap(view.bitmapImageRepForCachingDisplay(in: view.bounds))
-            view.cacheDisplay(in: view.bounds, to: rep)
-            let png = try XCTUnwrap(rep.representation(using: .png, properties: [:]))
-            try png.write(to: URL(fileURLWithPath: dir).appendingPathComponent("window-\(name).png"))
+            try render(view, to: dir, name: "window-\(name)")
+
+            // Go to File over the same window.
+            let ready = expectation(description: "index \(name)")
+            c.onFileFinderReady = { ready.fulfill() }
+            c.showGoToFile(nil)
+            wait(for: [ready], timeout: 5)
+            c.onFileFinderReady = nil
+            c.quickOpen.setQuery("mars")
+            RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+            view.layoutSubtreeIfNeeded()
+            try render(view, to: dir, name: "quickopen-\(name)")
+            c.closeGoToFile()
             c.window?.orderOut(nil)
         }
+    }
+
+    private func render(_ view: NSView, to dir: String, name: String) throws {
+        let rep = try XCTUnwrap(view.bitmapImageRepForCachingDisplay(in: view.bounds))
+        view.cacheDisplay(in: view.bounds, to: rep)
+        let png = try XCTUnwrap(rep.representation(using: .png, properties: [:]))
+        try png.write(to: URL(fileURLWithPath: dir).appendingPathComponent("\(name).png"))
     }
 }

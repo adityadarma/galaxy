@@ -27,6 +27,11 @@ name = "workspace-index"
 path = "src/bin/workspace_index.rs"
 bench = false
 
+[[bin]]
+name = "file-finder"
+path = "src/bin/file_finder.rs"
+bench = false
+
 [[bench]]
 name = "document"
 harness = false

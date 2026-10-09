@@ -57,6 +57,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     let emptyState = NSStackView()
     let explorer = ExplorerController()
     private(set) var workspace: Workspace?
+    /// Go to File index of `workspace`, built in the background.
+    private(set) var fileFinder: FileFinder?
+    private var finderGeneration = 0
+    /// Called when a (re)built index is installed (tests wait on it).
+    var onFileFinderReady: (() -> Void)?
+    /// Files opened in this workspace, most recent first, relative paths.
+    private(set) var recentFiles: [String] = []
+    private var loadedQuickOpen: QuickOpen?
     let editorView = EditorView(frame: .zero)
 
     enum SaveChoice { case save, discard, cancel }
@@ -349,6 +357,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
         statusLabel.stringValue = tab.status
         statusBar.show(document: tab.doc)
+        if let rel = relativePath(tab.doc.path()) { noteRecent(rel) }
         refreshTabBar()
         updateEditedState()
         if fromTabBar { explorer.outlineView.deselectAll(nil) }
@@ -458,6 +467,98 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         refreshTabBar()
         updateEditedState()
         window?.makeFirstResponder(workspace != nil ? explorer.outlineView : nil)
+    }
+
+    // MARK: Go to File (M2-07)
+
+    var isQuickOpenVisible: Bool { loadedQuickOpen.map { !$0.isHidden } ?? false }
+
+    /// Built on first ⌘P, like the find bar, to keep it out of startup.
+    var quickOpen: QuickOpen {
+        if let panel = loadedQuickOpen { return panel }
+        let panel = QuickOpen()
+        panel.isHidden = true
+        panel.translatesAutoresizingMaskIntoConstraints = false
+        panel.onOpen = { [weak self] match in self?.openQuickOpenMatch(match) }
+        panel.onClose = { [weak self] in self?.closeGoToFile() }
+        window?.contentView?.addSubview(panel)
+        let preferred = panel.widthAnchor.constraint(equalToConstant: QuickOpen.width)
+        preferred.priority = .defaultHigh
+        NSLayoutConstraint.activate([
+            panel.topAnchor.constraint(equalTo: tabBar.topAnchor, constant: 6),
+            panel.centerXAnchor.constraint(equalTo: detailView.centerXAnchor),
+            panel.widthAnchor.constraint(lessThanOrEqualTo: detailView.widthAnchor, constant: -24),
+            preferred,
+        ])
+        loadedQuickOpen = panel
+        return panel
+    }
+
+    /// ⌘P. Pressed again while open, it moves down the list, as in VSCode.
+    @objc func showGoToFile(_ sender: Any?) {
+        guard workspace != nil else {
+            statusLabel.stringValue = "Open a folder to use Go to File (⇧⌘O)."
+            NSSound.beep()
+            return
+        }
+        if isQuickOpenVisible { return quickOpen.move(by: 1) }
+        let panel = quickOpen
+        fileFinder?.setContext(current: activeTab.flatMap { relativePath($0.doc.path()) }, recent: recentFiles)
+        panel.finder = fileFinder
+        panel.isHidden = false
+        panel.reset()
+        panel.focus()
+        // Files may have been added since the last index; there is no file
+        // watcher yet (M2-02), so refresh it each time the panel opens.
+        rebuildFileFinder()
+    }
+
+    func closeGoToFile() {
+        guard isQuickOpenVisible else { return }
+        quickOpen.isHidden = true
+        window?.makeFirstResponder(activeTab != nil ? editorView : explorer.outlineView)
+    }
+
+    private func openQuickOpenMatch(_ match: FileMatch) {
+        closeGoToFile()
+        guard let workspace else { return }
+        let name = (match.relPath as NSString).lastPathComponent
+        openWorkspaceFile(workspace, FileEntry(name: name, relPath: match.relPath, isDir: false), preview: false)
+    }
+
+    /// Walks the workspace off the main thread and installs the result if
+    /// the workspace is still the same.
+    private func rebuildFileFinder() {
+        guard let workspace else { return }
+        finderGeneration += 1
+        let token = finderGeneration
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let finder = workspace.buildFileFinder()
+            await MainActor.run {
+                guard let self, self.finderGeneration == token else { return }
+                finder.setContext(current: self.activeTab.flatMap { self.relativePath($0.doc.path()) },
+                                  recent: self.recentFiles)
+                self.fileFinder = finder
+                self.loadedQuickOpen?.placeholderMessage = "Indexing files…"
+                self.loadedQuickOpen?.finder = finder
+                self.onFileFinderReady?()
+            }
+        }
+    }
+
+    private func noteRecent(_ rel: String) {
+        recentFiles.removeAll { $0 == rel }
+        recentFiles.insert(rel, at: 0)
+        if recentFiles.count > 50 { recentFiles.removeLast(recentFiles.count - 50) }
+    }
+
+    /// `path` relative to the workspace root, if it is inside it.
+    private func relativePath(_ path: String) -> String? {
+        guard let workspace, let file = Self.fileKey(path), let root = Self.fileKey(workspace.root()) else {
+            return nil
+        }
+        let prefix = root.hasSuffix("/") ? root : root + "/"
+        return file.hasPrefix(prefix) ? String(file.dropFirst(prefix.count)) : nil
     }
 
     /// Top of the document, inset included.
@@ -785,6 +886,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     func openWorkspace(at url: URL) throws {
         let ws = try bridge.core.openWorkspace(path: url.path)
         workspace = ws
+        fileFinder = nil
+        recentFiles = []
+        if isQuickOpenVisible { closeGoToFile() }
+        loadedQuickOpen?.finder = nil
+        // Ready by the time ⌘P is pressed in all but huge folders.
+        rebuildFileFinder()
         explorer.setWorkspace(ws)
         explorer.scrollView.isHidden = false
         emptyState.isHidden = true

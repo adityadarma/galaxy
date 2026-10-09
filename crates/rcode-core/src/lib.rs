@@ -9,6 +9,7 @@ pub mod clipboard;
 pub mod composition;
 pub mod document;
 pub mod edit;
+pub mod file_finder;
 pub mod find;
 pub mod grapheme;
 pub mod history;

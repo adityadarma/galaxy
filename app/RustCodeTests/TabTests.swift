@@ -4,7 +4,8 @@ import XCTest
 /// M2-06: tabs, preview tabs, dirty markers, reorder and save prompts.
 @MainActor
 final class TabTests: XCTestCase {
-    private var root: URL!
+    // Set in setUp, which XCTest calls outside the main actor.
+    nonisolated(unsafe) private var root: URL!
 
     override func setUpWithError() throws {
         root = FileManager.default.temporaryDirectory.appendingPathComponent("rcode-tabs-\(UUID().uuidString)")
