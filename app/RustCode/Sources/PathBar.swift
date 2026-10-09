@@ -1,22 +1,18 @@
 import AppKit
 
-/// Path of the open document, at the top of the editor column inside the
-/// title bar area: "workspace › src › main.rs". The window title itself is
-/// hidden, but still set, for the Window menu and accessibility.
+/// Path of the open document, under the tabs: "workspace › src › main.rs".
+/// The window title itself is hidden, but still set, for the Window menu
+/// and accessibility.
 @MainActor
 final class PathBar: NSView {
-    /// Room for the traffic lights when the sidebar is hidden.
-    static let trafficLightInset: CGFloat = 78
-    static let normalInset: CGFloat = 16
-    /// Used when the window has no title bar layout guide (never in practice).
-    static let fallbackHeight: CGFloat = 28
+    static let height: CGFloat = 26
+    static let inset: CGFloat = 16
 
     let label = NSTextField(labelWithString: "")
     /// Copper dot after the file name while there are unsaved changes.
     let editedDot = NSTextField(labelWithString: "●")
     private(set) var components: [String] = []
     var isEdited: Bool { !editedDot.isHidden }
-    private var leading: NSLayoutConstraint!
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -44,9 +40,9 @@ final class PathBar: NSView {
         separator.translatesAutoresizingMaskIntoConstraints = false
         addSubview(separator)
 
-        leading = row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: Self.normalInset)
         NSLayoutConstraint.activate([
-            leading,
+            heightAnchor.constraint(equalToConstant: Self.height),
+            row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: Self.inset),
             row.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -12),
             row.centerYAnchor.constraint(equalTo: centerYAnchor),
             separator.bottomAnchor.constraint(equalTo: bottomAnchor),
@@ -62,12 +58,6 @@ final class PathBar: NSView {
     override func draw(_ dirtyRect: NSRect) {
         NSColor.textBackgroundColor.setFill()
         dirtyRect.intersection(bounds).fill()
-    }
-
-    /// Leaves room for the traffic lights while the sidebar is hidden.
-    var clearsTrafficLights: Bool {
-        get { leading.constant == Self.trafficLightInset }
-        set { leading.constant = newValue ? Self.trafficLightInset : Self.normalInset }
     }
 
     /// Leading parts are dimmed, the last one (the file) is not.

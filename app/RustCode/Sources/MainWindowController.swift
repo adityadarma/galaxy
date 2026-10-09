@@ -3,13 +3,18 @@ import os
 
 /// Main window: sidebar (with a navigator switcher on top) | editor, and a
 /// status bar along the bottom. The title bar is transparent: the sidebar
-/// runs up under the traffic lights and a path bar takes the title's place
-/// above the editor.
+/// runs up under the traffic lights, the tabs take the title's place above
+/// the editor, and a path bar sits under the tabs.
 @MainActor
 final class MainWindowController: NSWindowController, NSWindowDelegate {
     private let bridge: CoreBridge
     let statusBar = StatusBar()
     let pathBar = PathBar()
+    let tabBar = TabBar()
+    /// Open documents, in tab order (M2-06).
+    private(set) var tabs: [EditorTab] = []
+    private(set) var activeIndex: Int?
+    var activeTab: EditorTab? { activeIndex.map { tabs[$0] } }
     /// Left-hand message in the status bar.
     var statusLabel: NSTextField { statusBar.message }
     private let scrollView = NSScrollView()
@@ -71,9 +76,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         panel.canCreateDirectories = true
         return panel.runModal() == .OK ? panel.url : nil
     }
-
-    /// Title without the workspace suffix or edited marker.
-    private var baseTitle = "RustCode"
 
     /// Default sidebar width.
     static let sidebarWidth: CGFloat = 240
@@ -152,16 +154,24 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         scrollView.documentView = editorView
 
         detailView.translatesAutoresizingMaskIntoConstraints = false
+        tabBar.translatesAutoresizingMaskIntoConstraints = false
+        tabBar.onSelect = { [weak self] i in self?.selectTab(i, fromTabBar: true) }
+        tabBar.onClose = { [weak self] i in self?.closeTab(at: i) }
+        tabBar.onMove = { [weak self] from, to in self?.moveTab(from: from, to: to) }
         pathBar.translatesAutoresizingMaskIntoConstraints = false
         pathBar.show(["RustCode"])
         findBarSlot.translatesAutoresizingMaskIntoConstraints = false
         findBarSlot.isHidden = true
         findBarHeight = findBarSlot.heightAnchor.constraint(equalToConstant: 0)
+        detailView.addSubview(tabBar)
         detailView.addSubview(pathBar)
         detailView.addSubview(findBarSlot)
         detailView.addSubview(scrollView)
         NSLayoutConstraint.activate([
-            pathBar.topAnchor.constraint(equalTo: detailView.topAnchor),
+            tabBar.topAnchor.constraint(equalTo: detailView.topAnchor),
+            tabBar.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
+            tabBar.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
+            pathBar.topAnchor.constraint(equalTo: tabBar.bottomAnchor),
             pathBar.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
             pathBar.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
             findBarSlot.topAnchor.constraint(equalTo: pathBar.bottomAnchor),
@@ -194,7 +204,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             statusBar.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             statusBar.bottomAnchor.constraint(equalTo: content.bottomAnchor),
             // Only valid once both views are in the window.
-            pathBar.bottomAnchor.constraint(equalTo: titleBarBottom),
+            tabBar.bottomAnchor.constraint(equalTo: titleBarBottom),
             navigator.topAnchor.constraint(equalTo: titleBarBottom, constant: 4),
         ])
     }
@@ -242,7 +252,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         explorer.scrollView.isHidden = true
         explorer.scrollView.translatesAutoresizingMaskIntoConstraints = false
         explorer.onOpenFile = { [weak self] workspace, entry in
-            self?.openWorkspaceFile(workspace, entry)
+            self?.openWorkspaceFile(workspace, entry, preview: true)
+        }
+        explorer.onPinFile = { [weak self] workspace, entry in
+            self?.openWorkspaceFile(workspace, entry, preview: false)
         }
 
         sidebar.addSubview(navigator)
@@ -284,33 +297,152 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     func setSidebarVisible(_ visible: Bool) {
         guard visible != isSidebarVisible else { return }
         sidebar.isHidden = !visible
-        pathBar.clearsTrafficLights = !visible
+        tabBar.clearsTrafficLights = !visible
         if visible {
             splitView.layoutSubtreeIfNeeded()
             if sidebar.frame.width < 160 { splitView.setPosition(Self.sidebarWidth, ofDividerAt: 0) }
         }
     }
 
-    /// Starts an empty "Untitled" buffer, ready for typing.
+    /// Starts an empty "Untitled" buffer in a new tab, ready for typing.
     @objc func newDocument(_ sender: Any?) {
-        guard confirmDiscardChanges() else { return }
-        show(bridge.newDocument(), title: "Untitled", path: ["Untitled"],
-             status: "Untitled. Type here, or press ⌘O to open a file or folder.")
+        let tab = EditorTab(doc: bridge.newDocument(), title: "Untitled", pathComponents: ["Untitled"],
+                            windowTitle: "Untitled", isPreview: false,
+                            status: "Untitled. Type here, or press ⌘O to open a file or folder.")
+        add(tab, replacing: nil)
     }
 
-    private func show(_ doc: DocumentHandle, title: String, path: [String], status: String) {
-        pathBar.show(path)
-        editorView.document = doc
-        scrollToTop()
-        statusLabel.stringValue = status
-        statusBar.show(document: doc)
-        baseTitle = title
+    // MARK: Tabs (M2-06)
+
+    /// Shows tab `index` in the editor. Coming from the tab bar, the
+    /// explorer selection is cleared so clicking that file again opens it.
+    func selectTab(_ index: Int, fromTabBar: Bool = false) {
+        guard tabs.indices.contains(index) else { return }
+        if let old = activeTab {
+            old.scrollY = scrollView.contentView.bounds.origin.y
+            old.status = statusLabel.stringValue
+        }
+        activeIndex = index
+        let tab = tabs[index]
+        pathBar.show(tab.pathComponents)
+        editorView.document = tab.doc
+        if let y = tab.scrollY {
+            scrollView.contentView.scroll(to: NSPoint(x: 0, y: y))
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+        } else {
+            scrollToTop()
+        }
+        statusLabel.stringValue = tab.status
+        statusBar.show(document: tab.doc)
+        refreshTabBar()
         updateEditedState()
+        if fromTabBar { explorer.outlineView.deselectAll(nil) }
         if isFindVisible {
             applyFind(select: false)
         } else {
             window?.makeFirstResponder(editorView)
         }
+    }
+
+    @objc func selectNextTab(_ sender: Any?) {
+        guard let i = activeIndex, tabs.count > 1 else { return }
+        selectTab((i + 1) % tabs.count, fromTabBar: true)
+    }
+
+    @objc func selectPreviousTab(_ sender: Any?) {
+        guard let i = activeIndex, tabs.count > 1 else { return }
+        selectTab((i + tabs.count - 1) % tabs.count, fromTabBar: true)
+    }
+
+    /// ⌘W: closes the active tab, or the window when no tab is left.
+    @objc func closeTab(_ sender: Any?) {
+        if let i = activeIndex { closeTab(at: i) } else { window?.performClose(nil) }
+    }
+
+    /// Closes tab `index`, asking first if it has unsaved changes. `false`
+    /// if the user cancelled.
+    @discardableResult
+    func closeTab(at index: Int) -> Bool {
+        guard tabs.indices.contains(index) else { return false }
+        editorView.flushPendingUpdates()
+        if tabs[index].doc.isModified() {
+            if activeIndex != index { selectTab(index) }
+            guard confirmDiscardActive() else { return false }
+        }
+        let wasActive = activeIndex == index
+        tabs.remove(at: index)
+        if let a = activeIndex {
+            activeIndex = a > index ? a - 1 : (a == index ? nil : a)
+        }
+        if tabs.isEmpty {
+            showNoDocument()
+        } else if wasActive {
+            selectTab(min(index, tabs.count - 1), fromTabBar: true)
+        } else {
+            refreshTabBar()
+            updateEditedState()
+        }
+        return true
+    }
+
+    func moveTab(from: Int, to: Int) {
+        guard tabs.indices.contains(from), tabs.indices.contains(to), from != to else { return }
+        let active = activeTab
+        tabs.insert(tabs.remove(at: from), at: to)
+        activeIndex = active.flatMap { a in tabs.firstIndex { $0 === a } }
+        refreshTabBar()
+    }
+
+    private func refreshTabBar() {
+        tabBar.set(items: tabs.map { TabBar.Item(title: $0.title, isPreview: $0.isPreview, isEdited: $0.isEdited) },
+                   selected: activeIndex)
+    }
+
+    /// Adds `tab` after the active one, or puts it in place of tab
+    /// `replacing`, and shows it.
+    private func add(_ tab: EditorTab, replacing: Int?) {
+        if let r = replacing {
+            if activeIndex == r { activeIndex = nil }
+            tabs[r] = tab
+            selectTab(r)
+        } else {
+            let at = activeIndex.map { $0 + 1 } ?? tabs.count
+            tabs.insert(tab, at: at)
+            if let a = activeIndex, a >= at { activeIndex = a + 1 }
+            selectTab(at)
+        }
+    }
+
+    /// Where a newly opened file goes: over the current preview tab, or
+    /// over an untouched empty "Untitled" tab, or (nil) a new tab.
+    private func slotForOpening(preview: Bool) -> Int? {
+        if preview, let i = tabs.firstIndex(where: { $0.isPreview && !$0.isEdited }) { return i }
+        guard let i = activeIndex else { return nil }
+        let doc = tabs[i].doc
+        return doc.path().isEmpty && !doc.isModified() && doc.lenBytes() == 0 ? i : nil
+    }
+
+    /// Same file, however it was reached (symlinks, /private/var).
+    private static func fileKey(_ path: String) -> String? {
+        path.isEmpty ? nil : URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
+    }
+
+    private func tabIndex(forPath path: String) -> Int? {
+        guard let key = Self.fileKey(path) else { return nil }
+        return tabs.firstIndex { $0.fileKey == key }
+    }
+
+    /// Editor with no document: after the last tab is closed.
+    private func showNoDocument() {
+        activeIndex = nil
+        if isFindVisible { closeFind(nil) }
+        editorView.document = nil
+        pathBar.show([workspace?.name() ?? "RustCode"])
+        statusBar.show(document: nil)
+        statusLabel.stringValue = "No open files. ⌘N for a new one, ⌘O to open a file or folder."
+        refreshTabBar()
+        updateEditedState()
+        window?.makeFirstResponder(workspace != nil ? explorer.outlineView : nil)
     }
 
     /// Top of the document, inset included.
@@ -495,12 +627,25 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     // MARK: Saving
 
-    /// Shows the title and the "edited" dot in the close button.
+    /// Window title, and the unsaved dots on the tab, the path bar and the
+    /// window's close button. Runs at most once per frame while typing.
+    /// The first edit keeps a preview tab open.
     func updateEditedState() {
-        window?.title = baseTitle
-        let edited = editorView.document?.isModified() ?? false
-        window?.isDocumentEdited = edited
-        pathBar.setEdited(edited)
+        let title = activeTab?.windowTitle ?? workspace?.name() ?? "RustCode"
+        if window?.title != title { window?.title = title }
+        if let i = activeIndex {
+            let tab = tabs[i]
+            let edited = tab.doc.isModified()
+            if edited != tab.isEdited || (edited && tab.isPreview) {
+                tab.isEdited = edited
+                if edited { tab.isPreview = false }
+                refreshTabBar()
+            }
+            pathBar.setEdited(edited)
+        } else {
+            pathBar.setEdited(false)
+        }
+        window?.isDocumentEdited = tabs.contains { $0.isEdited }
     }
 
     private var documentName: String {
@@ -542,8 +687,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             report(error, while: "save \(url.lastPathComponent)")
             return false
         }
-        baseTitle = url.lastPathComponent
-        pathBar.show([url.lastPathComponent])
+        if let tab = activeTab {
+            tab.title = url.lastPathComponent
+            tab.windowTitle = url.lastPathComponent
+            tab.pathComponents = [url.lastPathComponent]
+            tab.fileKey = Self.fileKey(doc.path())
+            pathBar.show(tab.pathComponents)
+            refreshTabBar()
+        }
         savedStatus(doc)
         return true
     }
@@ -553,9 +704,20 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         updateEditedState()
     }
 
-    /// `true` when it is safe to replace or close the current document:
-    /// nothing unsaved, or the user saved or chose to discard.
+    /// `true` when it is safe to close the window or quit: every tab with
+    /// unsaved changes was saved or discarded. Stops at the first Cancel,
+    /// with that tab shown.
     func confirmDiscardChanges() -> Bool {
+        editorView.flushPendingUpdates()
+        for i in tabs.indices where tabs[i].doc.isModified() {
+            if activeIndex != i { selectTab(i) }
+            guard confirmDiscardActive() else { return false }
+        }
+        return true
+    }
+
+    /// Asks about the active tab only.
+    private func confirmDiscardActive() -> Bool {
         guard let doc = editorView.document, doc.isModified() else { return true }
         switch askSaveChoice(documentName) {
         case .save: return save()
@@ -565,8 +727,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        editorView.flushPendingUpdates()
-        return confirmDiscardChanges()
+        confirmDiscardChanges()
     }
 
     /// ⌘O: pick a file or a folder.
@@ -615,30 +776,44 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         folderTitle.stringValue = ws.name()
         folderTitle.isHidden = false
         setSidebarVisible(true)
-        if editorView.document == nil {
-            baseTitle = ws.name()
-            pathBar.show([ws.name()])
-        }
+        if tabs.isEmpty { pathBar.show([ws.name()]) }
         updateEditedState()
         statusLabel.stringValue = "\(ws.name()): choose a file in the sidebar."
     }
 
+    /// Opens a file in its own tab (or shows its tab if already open).
     func openFile(at url: URL) throws {
-        guard confirmDiscardChanges() else { return }
+        if let i = tabIndex(forPath: url.path) {
+            tabs[i].isPreview = false
+            return selectTab(i)
+        }
         let start = ContinuousClock.now
         let doc = try bridge.openDocument(path: url.path)
-        show(doc, title: url.lastPathComponent, path: [url.lastPathComponent],
-             status: describe(doc, name: url.lastPathComponent, since: start))
+        let name = url.lastPathComponent
+        let tab = EditorTab(doc: doc, title: name, pathComponents: [name], windowTitle: name,
+                            isPreview: false, status: describe(doc, name: name, since: start))
+        tab.fileKey = Self.fileKey(doc.path())
+        add(tab, replacing: slotForOpening(preview: false))
     }
 
-    private func openWorkspaceFile(_ workspace: Workspace, _ entry: FileEntry) {
-        guard confirmDiscardChanges() else { return }
+    /// Single click in the explorer opens a preview tab, which the next
+    /// single click replaces; a double click or an edit keeps it.
+    func openWorkspaceFile(_ workspace: Workspace, _ entry: FileEntry, preview: Bool) {
+        let path = URL(fileURLWithPath: workspace.root()).appendingPathComponent(entry.relPath).path
+        if let i = tabIndex(forPath: path) {
+            if !preview { tabs[i].isPreview = false }
+            return selectTab(i)
+        }
         do {
             let start = ContinuousClock.now
             let doc = try workspace.openFile(relPath: entry.relPath)
-            show(doc, title: "\(entry.name) — \(workspace.name())",
-                 path: [workspace.name()] + entry.relPath.split(separator: "/").map(String.init),
-                 status: describe(doc, name: entry.relPath, since: start))
+            let tab = EditorTab(
+                doc: doc, title: entry.name,
+                pathComponents: [workspace.name()] + entry.relPath.split(separator: "/").map(String.init),
+                windowTitle: "\(entry.name) — \(workspace.name())", isPreview: preview,
+                status: describe(doc, name: entry.relPath, since: start))
+            tab.fileKey = Self.fileKey(doc.path())
+            add(tab, replacing: slotForOpening(preview: preview))
         } catch {
             report(error, while: "open \(entry.relPath)")
         }

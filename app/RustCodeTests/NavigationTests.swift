@@ -249,22 +249,24 @@ final class NavigationTests: XCTestCase {
         XCTAssertTrue(c.confirmDiscardChanges(), "clean documents never prompt")
         XCTAssertTrue(asked.isEmpty)
 
+        // Opening another file adds a tab: nothing to ask yet.
         c.editorView.insertText("x", replacementRange: NSRange(location: NSNotFound, length: 0))
         c.open(url: b)
-        XCTAssertEqual(asked, ["a.txt"])
-        XCTAssertEqual(c.editorView.document?.lines(first: 0, count: 1), ["xA"], "Cancel keeps the document")
+        XCTAssertTrue(asked.isEmpty)
+        XCTAssertEqual(c.editorView.document?.lines(first: 0, count: 1), ["B"])
         XCTAssertFalse(c.windowShouldClose(c.window!))
+        XCTAssertEqual(asked, ["a.txt"], "closing asks about the unsaved tab")
+        XCTAssertEqual(c.editorView.document?.lines(first: 0, count: 1), ["xA"], "Cancel shows the tab it asked about")
 
         answer = .discard
-        c.open(url: b)
-        XCTAssertEqual(c.editorView.document?.lines(first: 0, count: 1), ["B"])
+        XCTAssertTrue(c.closeTab(at: 0))
         XCTAssertEqual(try String(contentsOf: a, encoding: .utf8), "A", "discard leaves the file alone")
+        XCTAssertEqual(c.editorView.document?.lines(first: 0, count: 1), ["B"])
 
         c.editorView.insertText("y", replacementRange: NSRange(location: NSNotFound, length: 0))
         answer = .save
-        c.open(url: a)
-        XCTAssertEqual(try String(contentsOf: b, encoding: .utf8), "yB", "save writes before switching")
-        XCTAssertEqual(c.editorView.document?.lines(first: 0, count: 1), ["A"])
+        XCTAssertTrue(c.windowShouldClose(c.window!))
+        XCTAssertEqual(try String(contentsOf: b, encoding: .utf8), "yB", "save writes before closing")
     }
 
     // MARK: Multi-cursor

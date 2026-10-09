@@ -27,8 +27,10 @@ final class ExplorerController: NSObject {
     private(set) var workspace: Workspace?
     /// Number of `listDir` calls so far. Tests use it to prove laziness.
     private(set) var listCalls = 0
-    /// Called when the user selects a file row.
+    /// Called when the user selects a file row (opens a preview tab).
     var onOpenFile: ((Workspace, FileEntry) -> Void)?
+    /// Called when the user double-clicks a file row (keeps it open).
+    var onPinFile: ((Workspace, FileEntry) -> Void)?
 
     private var roots: [ExplorerNode]?
     private var iconCache: [String: NSImage] = [:]
@@ -50,6 +52,8 @@ final class ExplorerController: NSObject {
         outlineView.allowsEmptySelection = true
         outlineView.dataSource = self
         outlineView.delegate = self
+        outlineView.target = self
+        outlineView.doubleAction = #selector(doubleClicked(_:))
         outlineView.setAccessibilityLabel("File explorer")
         outlineView.setAccessibilityIdentifier("explorer")
 
@@ -66,6 +70,13 @@ final class ExplorerController: NSObject {
         roots = nil
         listCalls = 0
         outlineView.reloadData()
+    }
+
+    @objc private func doubleClicked(_ sender: Any?) {
+        let row = outlineView.clickedRow
+        guard row >= 0, let node = outlineView.item(atRow: row) as? ExplorerNode,
+              !node.entry.isDir, let workspace else { return }
+        onPinFile?(workspace, node.entry)
     }
 
     private func children(of node: ExplorerNode?) -> [ExplorerNode] {

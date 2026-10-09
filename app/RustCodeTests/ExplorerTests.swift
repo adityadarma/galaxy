@@ -180,22 +180,25 @@ final class ExplorerTests: XCTestCase {
         XCTAssertEqual(bar.components, [root.lastPathComponent, "src", "main.rs"])
         XCTAssertTrue(window.title.hasPrefix("main.rs"), "the hidden title is still kept for the Window menu")
 
-        // The sidebar reaches the top edge; the path bar fills the title bar.
+        // The sidebar reaches the top edge; the tabs fill the title bar and
+        // the path bar sits right under them.
         let content = try XCTUnwrap(window.contentView)
         let sidebarTop = content.convert(controller.sidebar.bounds, from: controller.sidebar).maxY
         XCTAssertEqual(sidebarTop, content.bounds.maxY, accuracy: 0.5)
+        let tabsFrame = content.convert(controller.tabBar.bounds, from: controller.tabBar)
+        XCTAssertEqual(tabsFrame.maxY, content.bounds.maxY, accuracy: 0.5)
+        XCTAssertEqual(tabsFrame.minY, window.contentLayoutRect.maxY, accuracy: 0.5, "ends where the title bar ends")
         let barFrame = content.convert(bar.bounds, from: bar)
-        XCTAssertEqual(barFrame.maxY, content.bounds.maxY, accuracy: 0.5)
-        XCTAssertEqual(barFrame.minY, window.contentLayoutRect.maxY, accuracy: 0.5, "ends where the title bar ends")
+        XCTAssertEqual(barFrame.maxY, tabsFrame.minY, accuracy: 0.5)
 
         XCTAssertFalse(bar.isEdited)
         controller.editorView.insertText("x", replacementRange: NSRange(location: NSNotFound, length: 0))
         controller.editorView.flushPendingUpdates()
         XCTAssertTrue(bar.isEdited)
 
-        XCTAssertFalse(bar.clearsTrafficLights)
+        XCTAssertFalse(controller.tabBar.clearsTrafficLights)
         controller.toggleSidebar(nil)
-        XCTAssertTrue(bar.clearsTrafficLights, "makes room for the window buttons")
+        XCTAssertTrue(controller.tabBar.clearsTrafficLights, "makes room for the window buttons")
     }
 
     func testOpeningAFolderReplacesTheEmptyState() throws {

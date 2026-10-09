@@ -32,7 +32,9 @@ enum MainMenu {
         let saveAs = fileMenu.addItem(withTitle: "Save As…", action: #selector(MainWindowController.saveDocumentAs(_:)), keyEquivalent: "s")
         saveAs.keyEquivalentModifierMask = [.command, .shift]
         fileMenu.addItem(.separator())
-        fileMenu.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        fileMenu.addItem(withTitle: "Close Tab", action: #selector(MainWindowController.closeTab(_:)), keyEquivalent: "w")
+        let closeWindow = fileMenu.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        closeWindow.keyEquivalentModifierMask = [.command, .shift]
         fileItem.submenu = fileMenu
         main.addItem(fileItem)
 
@@ -64,6 +66,11 @@ enum MainMenu {
         viewMenu.addItem(withTitle: "Toggle Sidebar", action: #selector(MainWindowController.toggleSidebar(_:)), keyEquivalent: "b")
         let explorer = viewMenu.addItem(withTitle: "Show Explorer", action: #selector(MainWindowController.showExplorer(_:)), keyEquivalent: "e")
         explorer.keyEquivalentModifierMask = [.command, .shift]
+        viewMenu.addItem(.separator())
+        let nextTab = viewMenu.addItem(withTitle: "Show Next Tab", action: #selector(MainWindowController.selectNextTab(_:)), keyEquivalent: "]")
+        nextTab.keyEquivalentModifierMask = [.command, .shift]
+        let previousTab = viewMenu.addItem(withTitle: "Show Previous Tab", action: #selector(MainWindowController.selectPreviousTab(_:)), keyEquivalent: "[")
+        previousTab.keyEquivalentModifierMask = [.command, .shift]
         viewMenu.addItem(.separator())
         viewMenu.addItem(withTitle: "Show Typing Latency", action: #selector(MainWindowController.showTypingLatency(_:)), keyEquivalent: "")
         viewItem.submenu = viewMenu

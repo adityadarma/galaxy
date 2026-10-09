@@ -70,7 +70,8 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
 - [ ] M2-04 — Explorer `NSOutlineView` lazy-load per direktori, ikon tipe file, status dirty.
   - Status: lazy-load, ikon, dan klik untuk membuka file sudah ada. Indikator dirty belum. Belum dicoba manual.
 - [ ] M2-05 — Operasi file: new, rename, delete ke Trash, reveal in Finder, copy path.
-- [ ] M2-06 — Tab bar: buka, tutup, reorder, preview tab (single click), indikator dirty, prompt simpan.
+- [x] M2-06 — Tab bar: buka, tutup, reorder, preview tab (single click), indikator dirty, prompt simpan.
+  - Status: tab di baris title bar (`TabBar.swift`), path bar di bawahnya. Klik tunggal di explorer membuka preview tab (judul miring) yang diganti klik berikutnya; edit atau double-click membuatnya tetap. File yang sudah terbuka tidak diduplikasi. Titik copper menggantikan tombol tutup pada tab yang belum disimpan. ⌘W menutup tab, ⇧⌘W menutup window, ⇧⌘[ / ⇧⌘] pindah tab, drag untuk reorder, klik tengah untuk menutup. Menutup window menanyakan setiap tab yang belum disimpan secara berurutan. Posisi scroll disimpan per tab. Tercakup `TabTests`; drag dan hover belum dicoba dengan mouse sungguhan.
 - [ ] M2-07 — Go to File `Cmd+P` dengan `nucleo`, ranking recency + kedekatan path, highlight karakter match.
   - < 30 ms per ketikan pada 100k file.
 - [ ] M2-08 — Go to line `Ctrl+G`, riwayat navigasi back/forward.
