@@ -350,6 +350,13 @@ pub struct ViewportLine {
     pub truncated: bool,
 }
 
+/// Indentation used by Tab, Enter and Outdent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct IndentSettings {
+    pub use_tabs: bool,
+    pub tab_size: u32,
+}
+
 /// Options of the find bar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
 pub struct FindConfig {
@@ -639,6 +646,15 @@ impl DocumentHandle {
 
     pub fn set_line_ending(&self, line_ending: LineEndingKind) {
         self.lock().editor.doc.set_line_ending(line_ending.into());
+    }
+
+    /// Current indentation settings, for the status bar.
+    pub fn indent_settings(&self) -> IndentSettings {
+        let cfg = self.lock().indent;
+        IndentSettings {
+            use_tabs: cfg.use_tabs,
+            tab_size: cfg.tab_size as u32,
+        }
     }
 
     pub fn set_indent(&self, use_tabs: bool, tab_size: u32) {
@@ -1648,6 +1664,26 @@ mod tests {
         let job = doc.start_find_count().unwrap();
         job.cancel();
         assert!(job.run().is_none());
+    }
+
+    #[test]
+    fn indent_settings_round_trip() {
+        let doc = doc_with("x");
+        assert_eq!(
+            doc.indent_settings(),
+            IndentSettings {
+                use_tabs: false,
+                tab_size: 4
+            }
+        );
+        doc.set_indent(true, 8);
+        assert_eq!(
+            doc.indent_settings(),
+            IndentSettings {
+                use_tabs: true,
+                tab_size: 8
+            }
+        );
     }
 
     #[test]

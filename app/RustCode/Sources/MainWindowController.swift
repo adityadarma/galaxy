@@ -1,11 +1,14 @@
 import AppKit
 import os
 
-/// Main window, laid out like VSCode: activity bar | sidebar | editor.
+/// Main window: sidebar (with a navigator switcher on top) | editor, and a
+/// status bar along the bottom.
 @MainActor
 final class MainWindowController: NSWindowController, NSWindowDelegate {
     private let bridge: CoreBridge
-    private(set) var statusLabel = NSTextField(labelWithString: "")
+    let statusBar = StatusBar()
+    /// Left-hand message in the status bar.
+    var statusLabel: NSTextField { statusBar.message }
     private let scrollView = NSScrollView()
     private let splitView = NSSplitView()
     private let detailView = NSView()
@@ -29,12 +32,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         return bar
     }
     /// Shown for files over 20 MB (M1-14).
-    let largeFileBanner = NSTextField(labelWithString: "Large file mode: lines over 10,000 characters are shown cut off.")
+    var largeFileBanner: NSTextField { statusBar.largeFileBadge }
     private var findBarHeight: NSLayoutConstraint!
-    let activityBar = ActivityBar()
-    /// Sidebar: a small header above either the explorer or an empty state.
+    /// Sidebar: navigator switcher, folder name, then the explorer or an
+    /// empty state.
     let sidebar = NSVisualEffectView()
-    private let sidebarTitle = NSTextField(labelWithString: "EXPLORER")
+    let navigator = NavigatorBar()
     private let folderTitle = NSTextField(labelWithString: "")
     let emptyState = NSStackView()
     let explorer = ExplorerController()
@@ -92,6 +95,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             self?.updateEditedState()
             self?.refreshFindStatus()
         }
+        editorView.onCursorChange = { [weak self] primary, count in
+            self?.statusBar.showCursor(primary: primary, count: count)
+        }
         window.contentView?.layoutSubtreeIfNeeded()
         splitView.setPosition(Self.sidebarWidth, ofDividerAt: 0)
         if window.frameAutosaveName.isEmpty || !window.setFrameUsingName("MainWindow") {
@@ -115,9 +121,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         guard let content = window?.contentView else { return }
 
         statusLabel.stringValue = "Core \(bridge.version) starting…"
-        statusLabel.font = .systemFont(ofSize: 13, weight: .semibold)
-        statusLabel.setAccessibilityIdentifier("core-status")
-        statusLabel.translatesAutoresizingMaskIntoConstraints = false
+        statusBar.translatesAutoresizingMaskIntoConstraints = false
+        statusBar.onToggleSidebar = { [weak self] in self?.toggleSidebar(nil) }
 
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = false
@@ -132,24 +137,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         findBarSlot.translatesAutoresizingMaskIntoConstraints = false
         findBarSlot.isHidden = true
         findBarHeight = findBarSlot.heightAnchor.constraint(equalToConstant: 0)
-        largeFileBanner.font = .systemFont(ofSize: 11)
-        largeFileBanner.textColor = .systemOrange
-        largeFileBanner.lineBreakMode = .byTruncatingTail
-        largeFileBanner.isHidden = true
-        largeFileBanner.setAccessibilityIdentifier("large-file-banner")
-        largeFileBanner.translatesAutoresizingMaskIntoConstraints = false
-        largeFileBanner.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        detailView.addSubview(statusLabel)
-        detailView.addSubview(largeFileBanner)
         detailView.addSubview(findBarSlot)
         detailView.addSubview(scrollView)
         NSLayoutConstraint.activate([
-            statusLabel.leadingAnchor.constraint(equalTo: detailView.leadingAnchor, constant: 12),
-            largeFileBanner.leadingAnchor.constraint(equalTo: statusLabel.trailingAnchor, constant: 12),
-            largeFileBanner.firstBaselineAnchor.constraint(equalTo: statusLabel.firstBaselineAnchor),
-            largeFileBanner.trailingAnchor.constraint(lessThanOrEqualTo: detailView.trailingAnchor, constant: -12),
-            statusLabel.topAnchor.constraint(equalTo: detailView.topAnchor, constant: 8),
-            findBarSlot.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 8),
+            findBarSlot.topAnchor.constraint(equalTo: detailView.topAnchor),
             findBarSlot.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
             findBarSlot.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
             findBarHeight,
@@ -168,23 +159,16 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         splitView.addArrangedSubview(detailView)
         splitView.setHoldingPriority(.defaultHigh, forSubviewAt: 0)
 
-        activityBar.translatesAutoresizingMaskIntoConstraints = false
-        activityBar.onSelect = { [weak self] item in
-            if item == .explorer { self?.toggleSidebar(nil) }
-        }
-        activityBar.setActive(.explorer)
-
-        content.addSubview(activityBar)
         content.addSubview(splitView)
+        content.addSubview(statusBar)
         NSLayoutConstraint.activate([
-            activityBar.topAnchor.constraint(equalTo: content.topAnchor),
-            activityBar.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-            activityBar.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            activityBar.widthAnchor.constraint(equalToConstant: ActivityBar.width),
             splitView.topAnchor.constraint(equalTo: content.topAnchor),
-            splitView.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-            splitView.leadingAnchor.constraint(equalTo: activityBar.trailingAnchor),
+            splitView.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             splitView.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            splitView.bottomAnchor.constraint(equalTo: statusBar.topAnchor),
+            statusBar.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            statusBar.trailingAnchor.constraint(equalTo: content.trailingAnchor),
+            statusBar.bottomAnchor.constraint(equalTo: content.bottomAnchor),
         ])
     }
 
@@ -196,24 +180,30 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         sidebar.translatesAutoresizingMaskIntoConstraints = false
         sidebar.widthAnchor.constraint(greaterThanOrEqualToConstant: 160).isActive = true
 
-        sidebarTitle.font = .systemFont(ofSize: 11, weight: .regular)
-        sidebarTitle.textColor = .secondaryLabelColor
-        folderTitle.font = .systemFont(ofSize: 11, weight: .bold)
+        navigator.translatesAutoresizingMaskIntoConstraints = false
+        navigator.onSelect = { [weak self] item in
+            if item == .explorer { self?.setSidebarVisible(true) }
+        }
+        let navigatorRule = NSBox()
+        navigatorRule.boxType = .separator
+        navigatorRule.translatesAutoresizingMaskIntoConstraints = false
+
+        folderTitle.font = .systemFont(ofSize: 12, weight: .semibold)
         folderTitle.textColor = .labelColor
-        folderTitle.lineBreakMode = .byTruncatingTail
+        folderTitle.lineBreakMode = .byTruncatingMiddle
         folderTitle.isHidden = true
-        let header = NSStackView(views: [sidebarTitle, folderTitle])
+        folderTitle.setAccessibilityIdentifier("folder-title")
+        let header = NSStackView(views: [folderTitle])
         header.orientation = .vertical
         header.alignment = .leading
-        header.spacing = 6
         header.translatesAutoresizingMaskIntoConstraints = false
 
-        // Shown until a folder is opened, like VSCode's "Open Folder" prompt.
-        let message = NSTextField(wrappingLabelWithString: "You have not yet opened a folder.")
+        // Shown until a folder is opened.
+        let message = NSTextField(wrappingLabelWithString: "No folder open")
         message.font = .systemFont(ofSize: 12)
         message.textColor = .secondaryLabelColor
         message.alignment = .center
-        let button = NSButton(title: "Open Folder", target: self, action: #selector(openFolder(_:)))
+        let button = NSButton(title: "Open Folder…", target: self, action: #selector(openFolder(_:)))
         button.bezelStyle = .rounded
         button.controlSize = .large
         emptyState.setViews([message, button], in: .leading)
@@ -228,11 +218,19 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             self?.openWorkspaceFile(workspace, entry)
         }
 
+        sidebar.addSubview(navigator)
+        sidebar.addSubview(navigatorRule)
         sidebar.addSubview(header)
         sidebar.addSubview(explorer.scrollView)
         sidebar.addSubview(emptyState)
         NSLayoutConstraint.activate([
-            header.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: 10),
+            navigator.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: 4),
+            navigator.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor),
+            navigator.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor),
+            navigatorRule.topAnchor.constraint(equalTo: navigator.bottomAnchor, constant: 4),
+            navigatorRule.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor),
+            navigatorRule.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor),
+            header.topAnchor.constraint(equalTo: navigatorRule.bottomAnchor, constant: 8),
             header.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 14),
             header.trailingAnchor.constraint(lessThanOrEqualTo: sidebar.trailingAnchor, constant: -8),
             explorer.scrollView.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 6),
@@ -264,7 +262,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             splitView.layoutSubtreeIfNeeded()
             if sidebar.frame.width < 160 { splitView.setPosition(Self.sidebarWidth, ofDividerAt: 0) }
         }
-        activityBar.setActive(visible ? .explorer : nil)
     }
 
     /// Starts an empty "Untitled" buffer, ready for typing.
@@ -278,7 +275,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         scrollView.contentView.scroll(to: .zero)
         scrollView.reflectScrolledClipView(scrollView.contentView)
         statusLabel.stringValue = status
-        largeFileBanner.isHidden = !doc.isLarge()
+        statusBar.show(document: doc)
         baseTitle = title
         updateEditedState()
         if isFindVisible {
@@ -578,7 +575,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         explorer.setWorkspace(ws)
         explorer.scrollView.isHidden = false
         emptyState.isHidden = true
-        folderTitle.stringValue = ws.name().uppercased()
+        folderTitle.stringValue = ws.name()
         folderTitle.isHidden = false
         setSidebarVisible(true)
         if editorView.document == nil { baseTitle = ws.name() }

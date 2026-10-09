@@ -55,7 +55,7 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
   - Status: `EditorView` mengekspos role text area, nilai teks (dibatasi 1 juta UTF-16 unit; jumlah karakter dibatasi sama), selected range/text, dan nomor baris caret, serta mengirim notifikasi `valueChanged` (maks 1x per frame) dan `selectedTextChanged` agar VoiceOver tahu ada perubahan. Tercakup test otomatis. Belum dicoba dengan VoiceOver sungguhan (X-03).
 
 ### Uji UI otomatis (di luar daftar task)
-- Target `RustCodeUITests` (XCUITest) dengan 12 skenario end-to-end: ketik, panah, undo, seleksi, copy/cut per baris, ⌘D, buka file + ⌘S, buka folder + klik file, toggle sidebar, prompt simpan saat tutup, find (navigasi, Esc), Replace All + undo, regex salah.
+- Target `RustCodeUITests` (XCUITest) dengan 12 skenario end-to-end: ketik, panah, undo, seleksi, copy/cut per baris, ⌘D, buka file + ⌘S, buka folder + klik file, toggle sidebar dari status bar, prompt simpan saat tutup, find (navigasi, Esc), Replace All + undo, regex salah.
 - Jalankan: `scripts/ui-test.sh`, atau semua test sekaligus dengan `scripts/test-all.sh --ui`.
 - Test memakai keyboard dan mouse sungguhan. Saat mesin diam, suite lulus penuh; kegagalan acak sebelumnya disebabkan input dari luar yang masuk ke app. `launch()` sekarang gagal dengan pesan jelas bila buffer baru sudah berisi teks.
 - Belum dimasukkan ke CI karena butuh sesi GUI dan izin Accessibility.

@@ -97,31 +97,68 @@ final class ExplorerTests: XCTestCase {
         XCTAssertThrowsError(try controller.openWorkspace(at: root.appendingPathComponent("missing")))
     }
 
-    // MARK: VSCode-style layout
+    // MARK: Layout
 
-    func testActivityBarTogglesSidebarAndShowsEmptyStateFirst() throws {
+    func testSidebarHasANavigatorAndTheStatusBarTogglesIt() throws {
         let controller = MainWindowController(bridge: CoreBridge())
         controller.showWindow(nil)
         defer { controller.window?.orderOut(nil) }
         RunLoop.current.run(until: Date().addingTimeInterval(0.2))
 
-        XCTAssertTrue(controller.isSidebarVisible, "sidebar is open by default, like VSCode")
+        XCTAssertTrue(controller.isSidebarVisible, "sidebar is open by default")
         XCTAssertFalse(controller.emptyState.isHidden, "prompt to open a folder before one is open")
         XCTAssertTrue(controller.explorer.scrollView.isHidden)
-        XCTAssertEqual(controller.activityBar.frame.width, ActivityBar.width)
         XCTAssertGreaterThan(controller.sidebar.frame.width, 150)
 
-        let explorerButton = try XCTUnwrap(controller.activityBar.buttons[.explorer])
-        XCTAssertTrue(explorerButton.isEnabled)
-        XCTAssertFalse(try XCTUnwrap(controller.activityBar.buttons[.search]).isEnabled, "not built yet")
+        // Navigator: Explorer selected, the others not built yet.
+        XCTAssertEqual(controller.navigator.selected, .explorer)
+        XCTAssertTrue(controller.navigator.isEnabled(.explorer))
+        XCTAssertFalse(controller.navigator.isEnabled(.search), "not built yet")
+        XCTAssertFalse(controller.navigator.isEnabled(.sourceControl), "not built yet")
+        XCTAssertTrue(controller.navigator.isDescendant(of: controller.sidebar), "lives inside the sidebar")
 
-        explorerButton.performClick(nil)
+        // Status bar along the bottom, full width.
+        let window = try XCTUnwrap(controller.window)
+        let bar = controller.statusBar
+        XCTAssertEqual(bar.frame.height, Theme.statusHeight)
+        XCTAssertEqual(bar.frame.minY, 0, "at the bottom of the window")
+        XCTAssertEqual(bar.frame.width, window.contentView?.bounds.width ?? 0, accuracy: 0.5)
+
+        bar.sidebarButton.performClick(nil)
         XCTAssertFalse(controller.isSidebarVisible)
         let editorWide = controller.editorView.frame.width
-        explorerButton.performClick(nil)
+        bar.sidebarButton.performClick(nil)
         XCTAssertTrue(controller.isSidebarVisible)
         RunLoop.current.run(until: Date().addingTimeInterval(0.2))
         XCTAssertGreaterThan(editorWide, controller.editorView.frame.width - 1, "editor regains space when hidden")
+    }
+
+    func testStatusBarShowsDocumentFactsAndFollowsTheCursor() throws {
+        let controller = MainWindowController(bridge: CoreBridge())
+        controller.showWindow(nil)
+        defer { controller.window?.orderOut(nil) }
+        controller.newDocument(nil)
+        let bar = controller.statusBar
+        XCTAssertEqual(bar.encoding.stringValue, "UTF-8")
+        XCTAssertEqual(bar.lineEnding.stringValue, "LF")
+        XCTAssertEqual(bar.indent.stringValue, "Spaces: 4")
+        XCTAssertEqual(bar.cursor.stringValue, "Ln 1, Col 1")
+        controller.window?.contentView?.layoutSubtreeIfNeeded()
+        let encodingFrame = bar.convert(bar.encoding.bounds, from: bar.encoding)
+        XCTAssertGreaterThan(encodingFrame.maxX, bar.bounds.width - 40, "facts sit at the right edge")
+
+        let v = controller.editorView
+        v.insertText("ab\ncd", replacementRange: NSRange(location: NSNotFound, length: 0))
+        v.flushPendingUpdates()
+        v.display()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        XCTAssertEqual(bar.cursor.stringValue, "Ln 2, Col 3", "updated from the drawn frame")
+
+        v.document?.addCursorVertical(above: true)
+        v.didChangeSelection()
+        v.display()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        XCTAssertTrue(bar.cursor.stringValue.hasSuffix("(2 cursors)"), bar.cursor.stringValue)
     }
 
     func testOpeningAFolderReplacesTheEmptyState() throws {

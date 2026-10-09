@@ -39,7 +39,7 @@ final class EditorView: NSView {
     static let textInset: CGFloat = 8
     static let caretWidth: CGFloat = 2
     static let blinkInterval: TimeInterval = 0.53
-    static let matchColor = NSColor.systemYellow.withAlphaComponent(0.4)
+    static let matchColor = Theme.findMatch
     static let defaultFont = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
 
     private(set) var font: NSFont
@@ -69,6 +69,9 @@ final class EditorView: NSView {
     /// work (modified flag, find counts), so a burst of keystrokes or key
     /// repeat must not run it per event.
     var onChange: (() -> Void)?
+    /// Primary cursor and cursor count after a frame that moved them. Comes
+    /// from the snapshot that frame already fetched, so it costs no FFI.
+    var onCursorChange: ((CursorInfo, UInt64) -> Void)?
     /// A change is waiting for the next frame.
     private(set) var hasPendingChange = false
     /// How many times pending work was flushed (tests check coalescing).
@@ -329,6 +332,9 @@ final class EditorView: NSView {
         if metadataNeedsRefresh {
             applyDocumentMetadata(snapshot)
             metadataNeedsRefresh = false
+            // After this draw: changing a label mid-draw can trigger layout.
+            let primary = snapshot.primary, count = snapshot.selectionCount
+            DispatchQueue.main.async { [weak self] in self?.onCursorChange?(primary, count) }
             if pendingCaretScroll {
                 pendingCaretScroll = false
                 let caretText = snapshot.lines.first(where: { Int($0.line) == Int(snapshot.primary.line) })?.text
@@ -404,7 +410,7 @@ final class EditorView: NSView {
                 let rect = CGRect(x: x, y: top, width: Self.caretWidth, height: lineHeight)
                 caretRects[Int(line.line)] = rect
                 if drawCarets {
-                    context.setFillColor(NSColor.textColor.cgColor)
+                    context.setFillColor(Theme.caret.cgColor)
                     context.fill(rect)
                 }
             }
