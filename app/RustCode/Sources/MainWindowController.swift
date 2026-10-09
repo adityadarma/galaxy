@@ -66,6 +66,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private(set) var recentFiles: [String] = []
     private var loadedQuickOpen: QuickOpen?
     private var loadedGoToLine: GoToLine?
+    private var loadedPalette: CommandPaletteView?
+    /// Command registry (M2-09); kept for the window so recency survives
+    /// closing the palette.
+    let commands = CommandPalette()
+    /// What had focus before the palette opened; commands run from there.
+    private weak var paletteReturnResponder: NSResponder?
     /// Back/forward history (M2-08).
     let navHistory = NavigationHistory()
     /// Set while back/forward shows a location, so that move is not
@@ -325,7 +331,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     // MARK: Sidebar
 
-    @objc func toggleSidebar(_ sender: Any?) {
+    @objc func toggleSidebarVisibility(_ sender: Any?) {
         setSidebarVisible(!isSidebarVisible)
     }
 
@@ -403,12 +409,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         selectTab(i, fromTabBar: true)
     }
 
-    @objc func selectNextTab(_ sender: Any?) {
+    @objc func showNextTab(_ sender: Any?) {
         guard let i = activeIndex, tabs.count > 1 else { return }
         selectTab((i + 1) % tabs.count, fromTabBar: true)
     }
 
-    @objc func selectPreviousTab(_ sender: Any?) {
+    @objc func showPreviousTab(_ sender: Any?) {
         guard let i = activeIndex, tabs.count > 1 else { return }
         selectTab((i + tabs.count - 1) % tabs.count, fromTabBar: true)
     }
@@ -513,6 +519,127 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         window?.makeFirstResponder(workspace != nil ? explorer.outlineView : nil)
     }
 
+    // MARK: Command palette (M2-09)
+
+    var isCommandPaletteVisible: Bool { loadedPalette.map { !$0.isHidden } ?? false }
+
+    var commandPalette: CommandPaletteView {
+        if let panel = loadedPalette { return panel }
+        let panel = CommandPaletteView()
+        panel.palette = commands
+        panel.isHidden = true
+        panel.translatesAutoresizingMaskIntoConstraints = false
+        panel.onRun = { [weak self] match in self?.runCommand(match.id) }
+        panel.onClose = { [weak self] in self?.closeCommandPalette() }
+        window?.contentView?.addSubview(panel)
+        let preferred = panel.widthAnchor.constraint(equalToConstant: CommandPaletteView.width)
+        preferred.priority = .defaultHigh
+        NSLayoutConstraint.activate([
+            panel.topAnchor.constraint(equalTo: tabBar.topAnchor, constant: 6),
+            panel.centerXAnchor.constraint(equalTo: detailView.centerXAnchor),
+            panel.widthAnchor.constraint(lessThanOrEqualTo: detailView.widthAnchor, constant: -24),
+            preferred,
+        ])
+        loadedPalette = panel
+        return panel
+    }
+
+    /// ⇧⌘P.
+    @objc func showCommandPalette(_ sender: Any?) {
+        if isCommandPaletteVisible { return commandPalette.move(by: 1) }
+        closeOverlays()
+        paletteReturnResponder = window?.firstResponder
+        // Decided before the field takes focus, from what had it.
+        let available = availableCommandIDs()
+        let byAction = CommandPaletteView.shortcuts(in: NSApp.mainMenu ?? MainMenu.build())
+        var shortcuts: [String: String] = [:]
+        for (id, action) in CommandPaletteView.actions {
+            if let text = byAction[action] { shortcuts[id] = text }
+        }
+        // Not menu key equivalents: the window's key monitor handles them.
+        shortcuts["workbench.action.navigateBack"] = "⌃-"
+        shortcuts["workbench.action.navigateForward"] = "⌃⇧-"
+        shortcuts["workbench.action.openPreviousRecentlyUsedEditor"] = "⌃⇥"
+        let panel = commandPalette
+        panel.isHidden = false
+        panel.reset(available: available, shortcuts: shortcuts)
+        panel.focus()
+    }
+
+    func closeCommandPalette() {
+        guard isCommandPaletteVisible else { return }
+        commandPalette.isHidden = true
+        restoreFocusAfterPalette()
+    }
+
+    private func restoreFocusAfterPalette() {
+        let target = paletteReturnResponder ?? (activeTab != nil ? editorView : nil)
+        window?.makeFirstResponder(target)
+    }
+
+    /// Ids whose action has a target that accepts it right now, asked the
+    /// way AppKit asks before enabling a menu item. Go to File and Go to
+    /// Line stay enabled in the menu (they explain what they need) but are
+    /// not offered here when they could only explain.
+    func availableCommandIDs() -> [String] {
+        commands.commands().map(\.id).filter { id in
+            guard let action = CommandPaletteView.actions[id], let target = target(for: action) else { return false }
+            switch action {
+            case #selector(showGoToFile(_:)) where workspace == nil: return false
+            case #selector(showGoToLine(_:)) where editorView.document == nil: return false
+            default: break
+            }
+            let item = NSMenuItem(title: "", action: action, keyEquivalent: "")
+            return (target as? NSMenuItemValidation)?.validateMenuItem(item) ?? true
+        }
+    }
+
+    /// First object that handles `action`, searched like AppKit does for a
+    /// menu item: from the window's first responder up through the window
+    /// and this controller, then the app and its delegate. Walked by hand
+    /// so it also works while the window is not key (tests).
+    private func target(for action: Selector) -> NSObject? {
+        var responder: NSResponder? = window?.firstResponder ?? window
+        while let r = responder {
+            if r.responds(to: action) { return r }
+            responder = r.nextResponder
+        }
+        for candidate in [window as NSObject?, self, NSApp, NSApp.delegate as? NSObject] {
+            if let c = candidate, c.responds(to: action) { return c }
+        }
+        return nil
+    }
+
+    /// Runs command `id` from where focus was, as its menu item would.
+    func runCommand(_ id: String) {
+        commandPalette.isHidden = true
+        restoreFocusAfterPalette()
+        guard let action = CommandPaletteView.actions[id], let target = target(for: action) else {
+            return NSSound.beep()
+        }
+        commands.noteUsed(id: id)
+        _ = target.perform(action, with: self)
+    }
+
+    /// Closes Go to File, Go to Line and the palette, whichever is open.
+    private func closeOverlays() {
+        if isQuickOpenVisible { closeGoToFile() }
+        if isGoToLineVisible { closeGoToLine() }
+        if isCommandPaletteVisible {
+            commandPalette.isHidden = true
+        }
+    }
+
+    @objc func refreshExplorer(_ sender: Any?) {
+        guard workspace != nil else { return NSSound.beep() }
+        explorer.refresh()
+    }
+
+    @objc func collapseExplorerFolders(_ sender: Any?) {
+        guard workspace != nil else { return NSSound.beep() }
+        explorer.collapseAll()
+    }
+
     // MARK: Go to Line and back/forward (M2-08)
 
     var isGoToLineVisible: Bool { loadedGoToLine.map { !$0.isHidden } ?? false }
@@ -544,7 +671,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             statusLabel.stringValue = "Open a file to use Go to Line."
             return NSSound.beep()
         }
-        if isQuickOpenVisible { closeGoToFile() }
+        closeOverlays()
         editorView.flushPendingUpdates()
         let panel = goToLine
         panel.reset(lineCount: doc.lineCount(), current: doc.viewport(firstLine: 0, count: 0).primary.line)
@@ -575,8 +702,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// Steps through the history, skipping places that can no longer be
     /// shown (a closed Untitled buffer, a deleted file).
     private func navigate(forward: Bool) {
-        if isQuickOpenVisible { closeGoToFile() }
-        if isGoToLineVisible { closeGoToLine() }
+        closeOverlays()
         let current = activeTab.map(location(of:))
         while let loc = forward ? navHistory.forward(current: current) : navHistory.back(current: current) {
             if show(loc) { return }
@@ -698,7 +824,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             return
         }
         if isQuickOpenVisible { return quickOpen.move(by: 1) }
-        if isGoToLineVisible { closeGoToLine() }
+        closeOverlays()
         let panel = quickOpen
         fileFinder?.setContext(current: activeTab.flatMap { relativePath($0.doc.path()) }, recent: recentFiles)
         panel.finder = fileFinder
@@ -1291,4 +1417,27 @@ final class SidebarSectionHeader: NSView {
 
     @objc private func refresh(_ sender: Any?) { onRefresh?() }
     @objc private func collapseAll(_ sender: Any?) { onCollapseAll?() }
+}
+
+extension MainWindowController: NSMenuItemValidation {
+    /// Disables menu items (and palette commands) that cannot do anything
+    /// right now.
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        let hasDocument = editorView.document != nil
+        switch item.action {
+        case #selector(saveDocument(_:)), #selector(saveDocumentAs(_:)),
+             #selector(showFind(_:)), #selector(showFindAndReplace(_:)),
+             #selector(findNext(_:)), #selector(findPrevious(_:)), #selector(useSelectionForFind(_:)):
+            return hasDocument
+        case #selector(refreshExplorer(_:)), #selector(collapseExplorerFolders(_:)):
+            return workspace != nil
+        case #selector(closeTab(_:)):
+            return true
+        case #selector(showNextTab(_:)), #selector(showPreviousTab(_:)), #selector(selectLastUsedTab(_:)):
+            return tabs.count > 1
+        case #selector(navigateBack(_:)): return navHistory.canGoBack()
+        case #selector(navigateForward(_:)): return navHistory.canGoForward()
+        default: return true
+        }
+    }
 }

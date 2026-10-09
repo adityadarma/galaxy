@@ -309,7 +309,11 @@ fn utf16_len(s: &str) -> usize {
 }
 
 /// Matched characters of `path` as merged UTF-16 ranges.
-fn highlights(path: &str, pattern: &Pattern, matcher: &mut Matcher) -> Vec<(usize, usize)> {
+pub(crate) fn highlights(
+    path: &str,
+    pattern: &Pattern,
+    matcher: &mut Matcher,
+) -> Vec<(usize, usize)> {
     let mut buf = Vec::new();
     let mut indices = Vec::new();
     let haystack = Utf32Str::new(path, &mut buf);

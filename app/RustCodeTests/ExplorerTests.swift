@@ -221,7 +221,7 @@ final class ExplorerTests: XCTestCase {
         controller.showWindow(nil)
         defer { controller.window?.orderOut(nil) }
 
-        controller.toggleSidebar(nil)              // hidden
+        controller.toggleSidebarVisibility(nil)              // hidden
         controller.open(url: root)                 // opening a folder reveals it
         XCTAssertTrue(controller.isSidebarVisible)
         XCTAssertTrue(controller.emptyState.isHidden)

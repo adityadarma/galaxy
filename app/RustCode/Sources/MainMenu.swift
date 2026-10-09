@@ -76,13 +76,16 @@ enum MainMenu {
 
         let viewItem = NSMenuItem()
         let viewMenu = NSMenu(title: "View")
-        viewMenu.addItem(withTitle: "Toggle Sidebar", action: #selector(MainWindowController.toggleSidebar(_:)), keyEquivalent: "b")
+        let palette = viewMenu.addItem(withTitle: "Command Palette…", action: #selector(MainWindowController.showCommandPalette(_:)), keyEquivalent: "p")
+        palette.keyEquivalentModifierMask = [.command, .shift]
+        viewMenu.addItem(.separator())
+        viewMenu.addItem(withTitle: "Toggle Sidebar", action: #selector(MainWindowController.toggleSidebarVisibility(_:)), keyEquivalent: "b")
         let explorer = viewMenu.addItem(withTitle: "Show Explorer", action: #selector(MainWindowController.showExplorer(_:)), keyEquivalent: "e")
         explorer.keyEquivalentModifierMask = [.command, .shift]
         viewMenu.addItem(.separator())
-        let nextTab = viewMenu.addItem(withTitle: "Show Next Tab", action: #selector(MainWindowController.selectNextTab(_:)), keyEquivalent: "]")
+        let nextTab = viewMenu.addItem(withTitle: "Show Next Tab", action: #selector(MainWindowController.showNextTab(_:)), keyEquivalent: "]")
         nextTab.keyEquivalentModifierMask = [.command, .shift]
-        let previousTab = viewMenu.addItem(withTitle: "Show Previous Tab", action: #selector(MainWindowController.selectPreviousTab(_:)), keyEquivalent: "[")
+        let previousTab = viewMenu.addItem(withTitle: "Show Previous Tab", action: #selector(MainWindowController.showPreviousTab(_:)), keyEquivalent: "[")
         previousTab.keyEquivalentModifierMask = [.command, .shift]
         // The window's key monitor handles ⌃Tab; the item shows it.
         let lastTab = viewMenu.addItem(withTitle: "Switch to Last Tab", action: #selector(MainWindowController.selectLastUsedTab(_:)), keyEquivalent: "\t")

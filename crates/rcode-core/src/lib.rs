@@ -6,6 +6,7 @@
 
 pub mod change;
 pub mod clipboard;
+pub mod commands;
 pub mod composition;
 pub mod document;
 pub mod edit;

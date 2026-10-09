@@ -105,9 +105,9 @@ final class TabTests: XCTestCase {
         XCTAssertEqual(c.editorView.document?.lines(first: 0, count: 1), ["a.txt"])
         XCTAssertFalse(c.pathBar.isEdited)
         XCTAssertEqual(c.window?.isDocumentEdited, true)
-        c.selectNextTab(nil)
+        c.showNextTab(nil)
         XCTAssertEqual(c.editorView.document?.lines(first: 0, count: 1), ["Bb.txt"])
-        c.selectNextTab(nil)
+        c.showNextTab(nil)
         XCTAssertEqual(c.activeIndex, 0, "wraps around")
 
         let tab = try XCTUnwrap(c.tabBar.tabViews[1])

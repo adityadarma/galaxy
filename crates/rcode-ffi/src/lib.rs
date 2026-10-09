@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use rcode_core::clipboard;
+use rcode_core::commands::{self, CommandRegistry};
 use rcode_core::document::{Document, Encoding, LineEnding};
 use rcode_core::edit::{self, IndentConfig};
 use rcode_core::file_finder::FileFinder as CoreFileFinder;
@@ -71,6 +72,84 @@ pub fn core_version() -> String {
 #[uniffi::export]
 pub fn init_logging(dir: String, level: String) -> Result<bool, CoreError> {
     Ok(rcode_core::logging::init(&PathBuf::from(dir), &level)?)
+}
+
+/// A registered command (M2-09).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct CommandInfo {
+    pub id: String,
+    pub category: String,
+    pub title: String,
+}
+
+/// One command palette row.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct CommandMatch {
+    pub id: String,
+    /// `Category: Title`.
+    pub label: String,
+    /// Matched characters, UTF-16 ranges within `label`.
+    pub highlights: Vec<Utf16Range>,
+    pub is_recent: bool,
+}
+
+/// The command registry with the built-in commands, and the palette's
+/// search over it.
+#[derive(uniffi::Object)]
+pub struct CommandPalette {
+    inner: Mutex<CommandRegistry>,
+}
+
+#[uniffi::export]
+impl CommandPalette {
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(commands::builtin()),
+        })
+    }
+
+    pub fn commands(&self) -> Vec<CommandInfo> {
+        self.lock()
+            .commands()
+            .iter()
+            .map(|c| CommandInfo {
+                id: c.id.clone(),
+                category: c.category.clone(),
+                title: c.title.clone(),
+            })
+            .collect()
+    }
+
+    /// Matches for `query`, limited to `available` ids if given.
+    pub fn search(&self, query: String, available: Option<Vec<String>>) -> Vec<CommandMatch> {
+        let available: Option<std::collections::HashSet<String>> =
+            available.map(|ids| ids.into_iter().collect());
+        self.lock()
+            .search(&query, available.as_ref())
+            .into_iter()
+            .map(|m| CommandMatch {
+                id: m.id,
+                label: m.label,
+                highlights: m.highlights.into_iter().map(Utf16Range::from).collect(),
+                is_recent: m.is_recent,
+            })
+            .collect()
+    }
+
+    pub fn note_used(&self, id: String) {
+        self.lock().note_used(&id);
+    }
+
+    pub fn recent(&self) -> Vec<String> {
+        self.lock().recent().to_vec()
+    }
+}
+
+impl CommandPalette {
+    fn lock(&self) -> std::sync::MutexGuard<'_, CommandRegistry> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 /// Where Go to Line goes: zero-based line, optional zero-based char column.
@@ -1349,6 +1428,24 @@ mod tests {
         fn on_event(&self, event: CoreEvent) {
             let _ = self.0.lock().unwrap().send(event);
         }
+    }
+
+    #[test]
+    fn command_palette_searches_builtin_commands() {
+        let p = CommandPalette::new();
+        assert!(p.commands().len() > 30);
+        let found = p.search("save as".into(), None);
+        assert_eq!(found[0].id, "workbench.action.files.saveAs");
+        assert_eq!(found[0].label, "File: Save As…");
+        assert!(!found[0].highlights.is_empty());
+        p.note_used("workbench.action.gotoLine".into());
+        let only = p.search(
+            String::new(),
+            Some(vec!["workbench.action.gotoLine".into()]),
+        );
+        assert_eq!(only.len(), 1);
+        assert!(only[0].is_recent);
+        assert_eq!(p.recent(), ["workbench.action.gotoLine"]);
     }
 
     #[test]
