@@ -22,6 +22,8 @@ final class EditorTab {
     var isEdited = false
     /// Resolved path, to find the tab of a file that is already open.
     var fileKey: String?
+    /// Path relative to the workspace root, for files inside it.
+    var relPath: String?
     /// Identifies an Untitled buffer in the back/forward history.
     private let untitledKey = "untitled:" + UUID().uuidString
     /// Document key for the back/forward history (M2-08).

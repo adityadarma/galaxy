@@ -171,3 +171,122 @@ final class GoToLineTests: XCTestCase {
         XCTAssertEqual(forward.keyEquivalentModifierMask, [.control, .shift])
     }
 }
+
+/// Follow-ups on earlier tasks: far clicks and Find Next in the history,
+/// ⌃Tab, and unsaved markers in the explorer (M2-04).
+@MainActor
+final class NavigationFollowUpTests: XCTestCase {
+    nonisolated(unsafe) private var root: URL!
+
+    override func setUpWithError() throws {
+        root = FileManager.default.temporaryDirectory.appendingPathComponent("rcode-nav-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("src"), withIntermediateDirectories: true)
+        let long = (1...300).map { $0 == 250 ? "needle" : "line \($0)" }.joined(separator: "\n")
+        try long.write(to: root.appendingPathComponent("src/long.txt"), atomically: true, encoding: .utf8)
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            try name.write(to: root.appendingPathComponent(name), atomically: true, encoding: .utf8)
+        }
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    private func makeController() -> MainWindowController {
+        let c = MainWindowController(bridge: CoreBridge())
+        c.showWindow(nil)
+        c.askSaveChoice = { _ in .discard }
+        return c
+    }
+
+    private func line(_ c: MainWindowController) -> UInt64 {
+        c.editorView.document!.viewport(firstLine: 0, count: 0).primary.line
+    }
+
+    func testFindIsAJump() throws {
+        let c = makeController()
+        defer { c.window?.orderOut(nil) }
+        try c.openFile(at: root.appendingPathComponent("src/long.txt"))
+        // Typing in the field jumps to the match; Back returns to line 1.
+        c.showFind(nil)
+        c.findBar.setPattern("needle")
+        XCTAssertEqual(line(c), 249)
+        c.closeFind(nil)
+        c.navigateBack(nil)
+        XCTAssertEqual(line(c), 0)
+        XCTAssertFalse(c.navHistory.canGoBack(), "recorded once")
+
+        // Find Next from far away also records where it started.
+        c.navigateForward(nil)
+        c.editorView.document!.goToLine(line: 100, col: 0)
+        c.findNext(nil)  // the bar is closed: this opens it
+        c.findNext(nil)
+        XCTAssertEqual(line(c), 249)
+        c.navigateBack(nil)
+        XCTAssertEqual(line(c), 100)
+    }
+
+    func testAFarClickIsAJumpAndANearOneIsNot() throws {
+        let c = makeController()
+        defer { c.window?.orderOut(nil) }
+        try c.openFile(at: root.appendingPathComponent("src/long.txt"))
+        let h = c.editorView.metrics.lineHeight
+        func click(line: Int) {
+            let point = NSPoint(x: c.editorView.textOriginX + 2, y: (CGFloat(line) + 0.5) * h)
+            let event = NSEvent.mouseEvent(
+                with: .leftMouseDown, location: c.editorView.convert(point, to: nil),
+                modifierFlags: [], timestamp: 0, windowNumber: c.window!.windowNumber,
+                context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!
+            c.editorView.mouseDown(with: event)
+        }
+        click(line: 3)
+        XCTAssertFalse(c.navHistory.canGoBack(), "3 lines away")
+        click(line: 40)
+        XCTAssertEqual(line(c), 40)
+        XCTAssertTrue(c.navHistory.canGoBack())
+        c.navigateBack(nil)
+        XCTAssertEqual(line(c), 3)
+    }
+
+    func testCtrlTabSwitchesBetweenTheLastTwoTabs() throws {
+        let c = makeController()
+        defer { c.window?.orderOut(nil) }
+        for name in ["a.txt", "b.txt", "c.txt"] { try c.openFile(at: root.appendingPathComponent(name)) }
+        c.selectTab(0)
+        XCTAssertEqual(c.activeTab?.title, "a.txt")
+        c.selectLastUsedTab(nil)
+        XCTAssertEqual(c.activeTab?.title, "c.txt")
+        c.selectLastUsedTab(nil)
+        XCTAssertEqual(c.activeTab?.title, "a.txt")
+        c.closeTab(at: 2)
+        c.selectLastUsedTab(nil)
+        XCTAssertEqual(c.activeTab?.title, "b.txt", "closed tabs drop out")
+
+        let menu = try XCTUnwrap(MainMenu.build().items.compactMap(\.submenu).first { $0.title == "View" })
+        let item = try XCTUnwrap(menu.item(withTitle: "Switch to Last Tab"))
+        XCTAssertEqual(item.keyEquivalentModifierMask, .control)
+    }
+
+    func testExplorerMarksUnsavedFilesAndTheirFolders() throws {
+        let c = makeController()
+        defer { c.window?.orderOut(nil) }
+        try c.openWorkspace(at: root)
+        try c.openFile(at: root.appendingPathComponent("src/long.txt"))
+        XCTAssertTrue(c.explorer.dirtyPaths.isEmpty)
+        c.editorView.insertText("x", replacementRange: NSRange(location: NSNotFound, length: 0))
+        c.editorView.flushPendingUpdates()
+        XCTAssertEqual(c.explorer.dirtyPaths, ["src/long.txt"])
+        XCTAssertTrue(c.explorer.isDirty(FileEntry(name: "src", relPath: "src", isDir: true)))
+        XCTAssertFalse(c.explorer.isDirty(FileEntry(name: "a.txt", relPath: "a.txt", isDir: false)))
+
+        c.window?.contentView?.layoutSubtreeIfNeeded()
+        let row = (0..<c.explorer.outlineView.numberOfRows).first {
+            (c.explorer.outlineView.item(atRow: $0) as? ExplorerNode)?.entry.name == "src"
+        }
+        let cell = try XCTUnwrap(c.explorer.outlineView.view(atColumn: 0, row: XCTUnwrap(row), makeIfNecessary: true) as? ExplorerCell)
+        XCTAssertFalse(cell.dirtyDot.isHidden, "folder row shows the dot")
+
+        XCTAssertTrue(c.save())
+        XCTAssertTrue(c.explorer.dirtyPaths.isEmpty)
+    }
+}

@@ -34,6 +34,11 @@ final class ExplorerController: NSObject {
     var onPinFile: ((Workspace, FileEntry) -> Void)?
 
     private var roots: [ExplorerNode]?
+    /// Relative paths of files with unsaved changes (M2-04). Folders that
+    /// contain one are marked too.
+    var dirtyPaths: Set<String> = [] {
+        didSet { if dirtyPaths != oldValue { refreshDirtyMarks() } }
+    }
     /// A folder already toggled by the mouse-down selection of this click,
     /// so the click action does not toggle it back.
     private var toggledOnMouseDown = false
@@ -95,6 +100,25 @@ final class ExplorerController: NSObject {
                 outlineView.expandItem(node)
             }
             row += 1
+        }
+    }
+
+    func isDirty(_ entry: FileEntry) -> Bool {
+        guard !dirtyPaths.isEmpty else { return false }
+        if !entry.isDir { return dirtyPaths.contains(entry.relPath) }
+        let prefix = entry.relPath + "/"
+        return dirtyPaths.contains { $0.hasPrefix(prefix) }
+    }
+
+    /// Updates the rows on screen; others pick it up when they are made.
+    private func refreshDirtyMarks() {
+        let rows = outlineView.rows(in: outlineView.visibleRect)
+        guard rows.length > 0 else { return }
+        for row in rows.location..<(rows.location + rows.length) {
+            guard let node = outlineView.item(atRow: row) as? ExplorerNode,
+                  let cell = outlineView.view(atColumn: 0, row: row, makeIfNecessary: false) as? ExplorerCell
+            else { continue }
+            cell.isDirty = isDirty(node.entry)
         }
     }
 
@@ -174,6 +198,7 @@ extension ExplorerController: NSOutlineViewDelegate {
         let cell = outlineView.makeView(withIdentifier: ExplorerCell.reuseID, owner: self) as? ExplorerCell
             ?? ExplorerCell()
         cell.show(node.entry, expanded: outlineView.isItemExpanded(node))
+        cell.isDirty = isDirty(node.entry)
         return cell
     }
 
@@ -233,7 +258,16 @@ final class ExplorerCell: NSTableCellView {
     let chevron = NSImageView()
     let icon = NSImageView()
     let label = NSTextField(labelWithString: "")
+    /// Copper dot on the right for unsaved changes, as on the tab.
+    let dirtyDot = NSTextField(labelWithString: "●")
     private(set) var isFolder = false
+
+    var isDirty = false {
+        didSet {
+            dirtyDot.isHidden = !isDirty
+            label.setAccessibilityLabel(isDirty ? "\(label.stringValue), unsaved changes" : nil)
+        }
+    }
 
     var isExpanded = false {
         didSet { if isFolder, isExpanded != oldValue { updateChevron() } }
@@ -252,8 +286,15 @@ final class ExplorerCell: NSTableCellView {
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         imageView = icon
         textField = label
+        dirtyDot.font = .systemFont(ofSize: 9)
+        dirtyDot.textColor = Theme.accent
+        dirtyDot.isHidden = true
+        dirtyDot.setAccessibilityElement(false)
+        dirtyDot.setContentCompressionResistancePriority(.required, for: .horizontal)
 
-        let row = NSStackView(views: [chevron, icon, label])
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.init(1), for: .horizontal)
+        let row = NSStackView(views: [chevron, icon, label, spacer, dirtyDot])
         row.orientation = .horizontal
         row.spacing = 4
         row.translatesAutoresizingMaskIntoConstraints = false
@@ -262,7 +303,7 @@ final class ExplorerCell: NSTableCellView {
             chevron.widthAnchor.constraint(equalToConstant: Self.chevronSize),
             icon.widthAnchor.constraint(equalToConstant: 16),
             row.leadingAnchor.constraint(equalTo: leadingAnchor),
-            row.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -6),
+            row.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             row.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
     }

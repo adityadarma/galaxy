@@ -84,6 +84,9 @@ enum MainMenu {
         nextTab.keyEquivalentModifierMask = [.command, .shift]
         let previousTab = viewMenu.addItem(withTitle: "Show Previous Tab", action: #selector(MainWindowController.selectPreviousTab(_:)), keyEquivalent: "[")
         previousTab.keyEquivalentModifierMask = [.command, .shift]
+        // The window's key monitor handles ⌃Tab; the item shows it.
+        let lastTab = viewMenu.addItem(withTitle: "Switch to Last Tab", action: #selector(MainWindowController.selectLastUsedTab(_:)), keyEquivalent: "\t")
+        lastTab.keyEquivalentModifierMask = [.control]
         viewMenu.addItem(.separator())
         viewMenu.addItem(withTitle: "Show Typing Latency", action: #selector(MainWindowController.showTypingLatency(_:)), keyEquivalent: "")
         viewItem.submenu = viewMenu

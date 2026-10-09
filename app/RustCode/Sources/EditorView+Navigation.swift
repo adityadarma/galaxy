@@ -117,7 +117,11 @@ extension EditorView {
             } else if flags.contains(.option) {
                 document.addCaret(pos: pos)
             } else {
+                let before = document.viewport(firstLine: 0, count: 0).primary
                 document.setCaret(pos: pos)
+                if let onClickMove {
+                    onClickMove(before, document.viewport(firstLine: 0, count: 0).primary)
+                }
             }
         }
         reloadDocument()

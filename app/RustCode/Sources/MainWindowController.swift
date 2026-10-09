@@ -72,6 +72,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// itself recorded as a jump.
     private var isNavigating = false
     private var keyMonitor: Any?
+    /// Tabs in the order they were last shown, most recent first (⌃Tab).
+    private var tabOrderByUse: [ObjectIdentifier] = []
     let editorView = EditorView(frame: .zero)
 
     enum SaveChoice { case save, discard, cancel }
@@ -125,6 +127,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         editorView.onChange = { [weak self] in
             self?.updateEditedState()
             self?.refreshFindStatus()
+        }
+        editorView.onClickMove = { [weak self] before, after in
+            guard let self, let tab = self.activeTab else { return }
+            _ = self.navHistory.recordJump(
+                from: NavLocation(key: tab.navKey, line: before.line, col: before.col),
+                to: NavLocation(key: tab.navKey, line: after.line, col: after.col))
         }
         editorView.onCursorChange = { [weak self] primary, count in
             self?.statusBar.showCursor(primary: primary, count: count)
@@ -350,13 +358,19 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// explorer selection is cleared so clicking that file again opens it.
     func selectTab(_ index: Int, fromTabBar: Bool = false) {
         guard tabs.indices.contains(index) else { return }
-        if let old = activeTab, old !== tabs[index] { noteLeaving(old) }
+        if let old = activeTab, old !== tabs[index] {
+            recordFindOrigin()
+            noteLeaving(old)
+        }
         if let old = activeTab {
             old.scrollY = scrollView.contentView.bounds.origin.y
             old.status = statusLabel.stringValue
         }
         activeIndex = index
         let tab = tabs[index]
+        let id = ObjectIdentifier(tab)
+        tabOrderByUse.removeAll { $0 == id }
+        tabOrderByUse.insert(id, at: 0)
         pathBar.show(tab.pathComponents)
         editorView.document = tab.doc
         if let y = tab.scrollY {
@@ -367,7 +381,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
         statusLabel.stringValue = tab.status
         statusBar.show(document: tab.doc)
-        if let rel = relativePath(tab.doc.path()) { noteRecent(rel) }
+        if let rel = tab.relPath { noteRecent(rel) }
         refreshTabBar()
         updateEditedState()
         if fromTabBar { explorer.outlineView.deselectAll(nil) }
@@ -376,6 +390,17 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         } else {
             window?.makeFirstResponder(editorView)
         }
+    }
+
+    /// ⌃Tab: the tab shown before this one. Pressed again, it goes back.
+    @objc func selectLastUsedTab(_ sender: Any?) {
+        let live = Set(tabs.map(ObjectIdentifier.init))
+        tabOrderByUse.removeAll { !live.contains($0) }
+        guard tabOrderByUse.count > 1,
+              let i = tabs.firstIndex(where: { ObjectIdentifier($0) == tabOrderByUse[1] }) else {
+            return NSSound.beep()
+        }
+        selectTab(i, fromTabBar: true)
     }
 
     @objc func selectNextTab(_ sender: Any?) {
@@ -587,6 +612,23 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         window?.makeFirstResponder(editorView)
     }
 
+    /// Records where the caret was before this find session, once, if find
+    /// has since moved it far away.
+    private func recordFindOrigin() {
+        guard let origin = findOrigin, let tab = activeTab else { return }
+        findOrigin = nil
+        guard origin.key == tab.navKey else { return }
+        _ = navHistory.recordJump(from: origin, to: location(of: tab))
+    }
+
+    /// Runs `move` and records where the caret was if it went far.
+    private func recordingJump(_ move: () -> Void) {
+        guard let tab = activeTab else { return move() }
+        let from = location(of: tab)
+        move()
+        _ = navHistory.recordJump(from: from, to: location(of: tab))
+    }
+
     func location(of tab: EditorTab) -> NavLocation {
         tab.doc.caretLocation(key: tab.navKey)
     }
@@ -603,15 +645,18 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private func installKeyMonitor() {
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             // Only plain values cross into the main-actor closure.
-            guard event.keyCode == 27 else { return event }  // kVK_ANSI_Minus
+            // kVK_ANSI_Minus, kVK_Tab
+            guard event.keyCode == 27 || event.keyCode == 48 else { return event }
+            let isTab = event.keyCode == 48
             let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
                 .subtracting([.capsLock, .numericPad, .function])
             let windowNumber = event.windowNumber
             let handled = MainActor.assumeIsolated { () -> Bool in
                 guard let self, windowNumber == self.window?.windowNumber else { return false }
-                switch mods {
-                case [.control]: self.navigateBack(nil)
-                case [.control, .shift]: self.navigateForward(nil)
+                switch (isTab, mods) {
+                case (false, [.control]): self.navigateBack(nil)
+                case (false, [.control, .shift]): self.navigateForward(nil)
+                case (true, [.control]): self.selectLastUsedTab(nil)
                 default: return false
                 }
                 return true
@@ -743,6 +788,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// Background match count in flight, if any. Only the newest one may
     /// update the bar; older ones are cancelled.
     private var countJob: FindCountJob?
+    /// Caret when the find bar opened. Typing in the field moves the caret
+    /// to the nearest match, so this is the place Back should return to.
+    private var findOrigin: NavLocation?
     var isCountingFind: Bool { countJob != nil }
     /// Called after a background count updated the bar (tests wait on it).
     var onFindCountFinished: (() -> Void)?
@@ -769,6 +817,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     private func presentFind(replace: Bool) {
         guard editorView.document != nil else { return }
+        if !isFindVisible { findOrigin = activeTab.map(location(of:)) }
         if let seed = selectionSeed() {
             findBar.findField.stringValue = findBar.config.regex ? Self.escapeRegex(seed) : seed
         }
@@ -785,6 +834,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     @objc func closeFind(_ sender: Any?) {
         guard isFindVisible else { return }
+        recordFindOrigin()
         setFindVisible(false)
         countJob?.cancel()
         countJob = nil
@@ -796,14 +846,16 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     @objc func findNext(_ sender: Any?) {
         guard let doc = editorView.document else { return }
         if !isFindVisible || findBar.pattern.isEmpty { return presentFind(replace: false) }
-        _ = doc.findNext()
+        recordFindOrigin()
+        recordingJump { _ = doc.findNext() }
         finishFindMove()
     }
 
     @objc func findPrevious(_ sender: Any?) {
         guard let doc = editorView.document else { return }
         if !isFindVisible || findBar.pattern.isEmpty { return presentFind(replace: false) }
-        _ = doc.findPrevious()
+        recordFindOrigin()
+        recordingJump { _ = doc.findPrevious() }
         finishFindMove()
     }
 
@@ -914,6 +966,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             pathBar.setEdited(false)
         }
         window?.isDocumentEdited = tabs.contains { $0.isEdited }
+        explorer.dirtyPaths = Set(tabs.compactMap { $0.isEdited ? $0.relPath : nil })
     }
 
     private var documentName: String {
@@ -960,6 +1013,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             tab.windowTitle = url.lastPathComponent
             tab.pathComponents = [url.lastPathComponent]
             tab.fileKey = Self.fileKey(doc.path())
+            tab.relPath = relativePath(doc.path())
             pathBar.show(tab.pathComponents)
             refreshTabBar()
         }
@@ -1045,6 +1099,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         workspace = ws
         fileFinder = nil
         recentFiles = []
+        // Paths are relative to the new root (or outside it).
+        for tab in tabs { tab.relPath = relativePath(tab.doc.path()) }
         if isQuickOpenVisible { closeGoToFile() }
         loadedQuickOpen?.finder = nil
         // Ready by the time ⌘P is pressed in all but huge folders.
@@ -1073,6 +1129,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         let tab = EditorTab(doc: doc, title: name, pathComponents: [name], windowTitle: name,
                             isPreview: false, status: describe(doc, name: name, since: start))
         tab.fileKey = Self.fileKey(doc.path())
+        tab.relPath = relativePath(doc.path())
         add(tab, replacing: slotForOpening(preview: false))
     }
 
@@ -1093,6 +1150,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 windowTitle: "\(entry.name) — \(workspace.name())", isPreview: preview,
                 status: describe(doc, name: entry.relPath, since: start))
             tab.fileKey = Self.fileKey(doc.path())
+            tab.relPath = entry.relPath
             add(tab, replacing: slotForOpening(preview: preview))
         } catch {
             report(error, while: "open \(entry.relPath)")

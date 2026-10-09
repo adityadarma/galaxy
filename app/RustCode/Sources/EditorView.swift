@@ -72,6 +72,9 @@ final class EditorView: NSView {
     /// Primary cursor and cursor count after a frame that moved them. Comes
     /// from the snapshot that frame already fetched, so it costs no FFI.
     var onCursorChange: ((CursorInfo, UInt64) -> Void)?
+    /// Primary caret before and after a plain click, so the window can
+    /// record a far click in the back/forward history (M2-08).
+    var onClickMove: ((CursorInfo, CursorInfo) -> Void)?
     /// A change is waiting for the next frame.
     private(set) var hasPendingChange = false
     /// How many times pending work was flushed (tests check coalescing).
