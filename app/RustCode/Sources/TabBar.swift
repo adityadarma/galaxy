@@ -24,6 +24,12 @@ final class EditorTab {
     var fileKey: String?
     /// Path relative to the workspace root, for files inside it.
     var relPath: String?
+    /// The file is gone from disk; the tab keeps the text (M2-03).
+    var isDeletedOnDisk = false
+    /// Changed on disk while it had unsaved edits; asked about once shown.
+    var hasDiskConflict = false
+    /// Title with the file's state on disk.
+    var displayTitle: String { isDeletedOnDisk ? "\(title) (deleted)" : title }
     /// Identifies an Untitled buffer in the back/forward history.
     private let untitledKey = "untitled:" + UUID().uuidString
     /// Document key for the back/forward history (M2-08).

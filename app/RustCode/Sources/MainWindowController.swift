@@ -106,6 +106,27 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
+    enum DiskConflictChoice { case reload, keepMine }
+
+    /// Asks what to do when a file with unsaved edits changed on disk
+    /// (M2-03). `saving`: asked by Save, where keeping overwrites the file.
+    /// Tests replace it.
+    var askDiskConflict: (_ documentName: String, _ saving: Bool) -> DiskConflictChoice = { name, saving in
+        let alert = NSAlert()
+        alert.messageText = "\(name) changed on disk."
+        alert.informativeText = saving
+            ? "Another program changed the file since it was opened. Saving replaces its changes with yours."
+            : "Another program changed the file, and you have unsaved changes. Reload discards your changes; you can undo it."
+        alert.addButton(withTitle: saving ? "Save Anyway" : "Keep My Changes")
+        alert.addButton(withTitle: "Reload from Disk")
+        return alert.runModal() == .alertSecondButtonReturn ? .reload : .keepMine
+    }
+
+    /// Conflict prompts wait until the window is key, so a background
+    /// change does not pop an alert over another app. Tests turn it off.
+    var promptsOnlyWhenKey = true
+    private var isResolvingDiskConflict = false
+
     /// Asks where to save an untitled document. Tests replace it.
     var askSaveLocation: (_ suggestedName: String) -> URL? = { name in
         let panel = NSSavePanel()
@@ -397,6 +418,90 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         } else {
             window?.makeFirstResponder(editorView)
         }
+        resolveDiskConflictIfNeeded()
+    }
+
+    // MARK: Changes on disk (M2-03)
+
+    /// Compares open files with the disk: those under `changed` (paths
+    /// relative to the workspace, from the watcher), or all of them when
+    /// `nil`. Unedited tabs reload; edited ones are asked about when shown;
+    /// deleted ones keep their text and are marked "(deleted)".
+    func checkOpenFiles(changed: [String]? = nil) {
+        let touched: (EditorTab) -> Bool = { tab in
+            guard let changed else { return true }
+            guard let rel = tab.relPath else { return false }
+            return changed.contains { rel == $0 || rel.hasPrefix($0 + "/") }
+        }
+        var tabBarChanged = false
+        for tab in tabs where tab.fileKey != nil && touched(tab) {
+            let wasDeleted = tab.isDeletedOnDisk
+            switch tab.doc.checkDisk() {
+            case .unchanged:
+                tab.isDeletedOnDisk = false
+            case .deleted:
+                tab.isDeletedOnDisk = true
+                tab.hasDiskConflict = false
+            case .changed:
+                tab.isDeletedOnDisk = false
+                if tab === activeTab { editorView.flushPendingUpdates() }
+                if tab.doc.isModified() {
+                    tab.hasDiskConflict = true
+                } else {
+                    reloadFromDisk(tab)
+                }
+            }
+            let edited = tab.doc.isModified()
+            if wasDeleted != tab.isDeletedOnDisk || edited != tab.isEdited {
+                tab.isEdited = edited
+                tabBarChanged = true
+            }
+        }
+        if tabBarChanged { refreshTabBar() }
+        updateEditedState()
+        resolveDiskConflictIfNeeded()
+    }
+
+    /// Asks about the active tab's conflict, once the window is key.
+    private func resolveDiskConflictIfNeeded() {
+        guard let tab = activeTab, tab.hasDiskConflict, !isResolvingDiskConflict,
+              !promptsOnlyWhenKey || window?.isKeyWindow == true else { return }
+        isResolvingDiskConflict = true
+        defer { isResolvingDiskConflict = false }
+        tab.hasDiskConflict = false
+        switch askDiskConflict(tab.title, false) {
+        case .reload: reloadFromDisk(tab)
+        case .keepMine: tab.doc.keepBufferOverDisk()
+        }
+        updateEditedState()
+    }
+
+    /// Reloads `tab` from disk as one undoable step.
+    private func reloadFromDisk(_ tab: EditorTab) {
+        do {
+            _ = try tab.doc.reloadFromDisk()
+        } catch {
+            return report(error, while: "reload \(tab.title)")
+        }
+        tab.hasDiskConflict = false
+        tab.isDeletedOnDisk = false
+        tab.isEdited = tab.doc.isModified()
+        let message = "\(tab.title): reloaded from disk. ⌘Z restores the previous text."
+        if tab === activeTab {
+            editorView.requestDocumentRefresh(scrollCaret: false)
+            editorView.scheduleChangeNotification()
+            statusBar.show(document: tab.doc)
+            statusLabel.stringValue = message
+        } else {
+            tab.status = message
+        }
+        refreshTabBar()
+    }
+
+    func windowDidBecomeKey(_ notification: Notification) {
+        // Files outside the workspace are not watched; this catches them,
+        // and a conflict that waited for the window.
+        checkOpenFiles()
     }
 
     /// ⌃Tab: the tab shown before this one. Pressed again, it goes back.
@@ -466,7 +571,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func refreshTabBar() {
-        tabBar.set(items: tabs.map { TabBar.Item(title: $0.title, isPreview: $0.isPreview, isEdited: $0.isEdited) },
+        tabBar.set(items: tabs.map { TabBar.Item(title: $0.displayTitle, isPreview: $0.isPreview, isEdited: $0.isEdited) },
                    selected: activeIndex)
     }
 
@@ -984,11 +1089,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         guard generation == watchGeneration, workspace != nil else { return }
         if batch.rescan {
             explorer.refresh()
+            checkOpenFiles()
             rebuildFileFinder()
             onWorkspaceChangesApplied?(batch)
             return
         }
         explorer.refresh(changed: batch.paths)
+        checkOpenFiles(changed: batch.paths)
         updateFileFinder(changed: batch.paths) { [weak self] in
             self?.onWorkspaceChangesApplied?(batch)
         }
@@ -1240,11 +1347,23 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     func save() -> Bool {
         guard let doc = editorView.document else { return true }
         if doc.path().isEmpty { return saveAs() }
+        if doc.checkDisk() == .changed, let tab = activeTab {
+            tab.hasDiskConflict = false
+            if askDiskConflict(documentName, true) == .reload {
+                reloadFromDisk(tab)
+                updateEditedState()
+                return false
+            }
+        }
         do {
             try doc.save()
         } catch {
             report(error, while: "save \(documentName)")
             return false
+        }
+        if let tab = activeTab, tab.isDeletedOnDisk {
+            tab.isDeletedOnDisk = false
+            refreshTabBar()
         }
         savedStatus(doc)
         return true

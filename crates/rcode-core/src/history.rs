@@ -343,6 +343,22 @@ impl Editor {
         self.sel = sel;
     }
 
+    /// Replaces the text with `new` (a file reloaded from disk, M2-03) as
+    /// one undo step, changing only the part that differs, and takes its
+    /// encoding, BOM and line ending. Returns whether the text changed.
+    pub fn reload(&mut self, new: &Document, now: Instant) -> bool {
+        self.unmark_text();
+        self.history.break_group();
+        let tx = crate::edit::replace_by_diff(&self.doc, &self.sel, &new.text());
+        let changed = !tx.is_noop();
+        self.apply(tx, EditKind::Other, now);
+        self.history.break_group();
+        self.doc.set_encoding(new.encoding());
+        self.doc.set_has_bom(new.has_bom());
+        self.doc.set_line_ending(new.line_ending());
+        changed
+    }
+
     /// Returns `false` when there is nothing to undo.
     pub fn undo(&mut self) -> bool {
         self.unmark_text();
@@ -405,6 +421,49 @@ mod tests {
     fn backspace(ed: &mut Editor, clock: &mut Clock) {
         let tx = edit::backspace(&ed.doc, &ed.sel, &CFG);
         ed.apply(tx, EditKind::Delete, clock.tick(100));
+    }
+
+    #[test]
+    fn reload_changes_only_the_differing_part_as_one_undo_step() {
+        let (mut ed, mut clock) = editor("one\ntwo\nthree\n");
+        // Caret in "three", after the changed line.
+        ed.sel = SelectionSet::single(Selection::caret(10));
+        let before = ed.history.state_id();
+        let mut disk = Document::from_text("one\r\nTWO!\r\nthree\r\n");
+        disk.set_has_bom(true);
+        assert!(ed.reload(&disk, clock.tick(10)));
+        assert_eq!(ed.doc.text(), "one\nTWO!\nthree\n");
+        assert_eq!(
+            ed.sel.primary().head,
+            11,
+            "caret moved with the text after the change"
+        );
+        assert_eq!(ed.doc.line_ending(), crate::document::LineEnding::CrLf);
+        assert!(ed.doc.has_bom());
+
+        // Typing right after is a separate step.
+        type_str(&mut ed, &mut clock, "x");
+        assert!(ed.undo());
+        assert!(ed.undo(), "the reload is undoable");
+        assert_eq!(ed.doc.text(), "one\ntwo\nthree\n");
+        assert_eq!(ed.history.state_id(), before);
+
+        let same = Document::from_text("one\ntwo\nthree\n");
+        assert!(
+            !ed.reload(&same, clock.tick(10)),
+            "same text: nothing recorded"
+        );
+    }
+
+    #[test]
+    fn reload_by_diff_respects_multibyte_boundaries() {
+        let (mut ed, mut clock) = editor("aé😀b");
+        assert!(ed.reload(&Document::from_text("aè😀b"), clock.tick(10)));
+        assert_eq!(ed.doc.text(), "aè😀b");
+        assert!(ed.reload(&Document::from_text(""), clock.tick(10)));
+        assert_eq!(ed.doc.text(), "");
+        assert!(ed.reload(&Document::from_text("😀😀"), clock.tick(10)));
+        assert_eq!(ed.doc.text(), "😀😀");
     }
 
     #[test]

@@ -10,6 +10,7 @@ use std::time::Instant;
 
 use rcode_core::clipboard;
 use rcode_core::commands::{self, CommandRegistry};
+use rcode_core::disk::{DiskCheck, DiskStamp};
 use rcode_core::document::{Document, Encoding, LineEnding};
 use rcode_core::edit::{self, IndentConfig};
 use rcode_core::file_finder::FileFinder as CoreFileFinder;
@@ -302,15 +303,18 @@ impl Core {
 
     pub fn open_document(&self, path: String) -> Result<Arc<DocumentHandle>, CoreError> {
         let path = PathBuf::from(path);
-        let doc = Document::load(&path)?;
-        tracing::info!(
-            path = %path.display(),
-            lines = doc.line_count(),
-            encoding = ?doc.encoding(),
-            line_ending = ?doc.line_ending(),
-            "opened document"
-        );
-        Ok(Arc::new(DocumentHandle::new(doc, path)))
+        let handle = DocumentHandle::load(path)?;
+        {
+            let st = handle.lock();
+            tracing::info!(
+                path = %st.path.display(),
+                lines = st.editor.doc.line_count(),
+                encoding = ?st.editor.doc.encoding(),
+                line_ending = ?st.editor.doc.line_ending(),
+                "opened document"
+            );
+        }
+        Ok(Arc::new(handle))
     }
 }
 
@@ -411,10 +415,23 @@ impl Workspace {
     /// workspace are refused.
     pub fn open_file(&self, rel_path: String) -> Result<Arc<DocumentHandle>, CoreError> {
         let path = self.inner.resolve(&rel_path)?;
-        let doc = Document::load(&path)?;
-        tracing::info!(path = %path.display(), lines = doc.line_count(), "opened workspace file");
-        Ok(Arc::new(DocumentHandle::new(doc, path)))
+        let handle = DocumentHandle::load(path)?;
+        {
+            let st = handle.lock();
+            tracing::info!(path = %st.path.display(), lines = st.editor.doc.line_count(), "opened workspace file");
+        }
+        Ok(Arc::new(handle))
     }
+}
+
+/// A document's file compared with what it last loaded or saved (M2-03).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum DiskStatus {
+    Unchanged,
+    /// Another program changed the content.
+    Changed,
+    /// The file is gone (deleted, or renamed away).
+    Deleted,
 }
 
 /// Paths that changed on disk since the previous batch (M2-02).
@@ -836,6 +853,11 @@ struct State {
     indent: IndentConfig,
     /// `History::state_id` at the last load or save, for `is_modified`.
     saved_state: u64,
+    /// What the file was when last loaded or saved (M2-03). `None` for
+    /// an Untitled buffer.
+    disk: Option<DiskStamp>,
+    /// The file is gone from disk; the buffer counts as unsaved.
+    deleted_on_disk: bool,
     /// Active search, if the find bar has a usable pattern.
     finder: Option<Finder>,
     /// Why the current pattern is unusable.
@@ -843,6 +865,12 @@ struct State {
 }
 
 impl State {
+    /// Edits since the last load or save, ignoring the file's state.
+    fn has_unsaved_edits(&self) -> bool {
+        // Marked IME text is in the buffer but not yet in the history.
+        self.editor.has_marked_text() || self.editor.history.state_id() != self.saved_state
+    }
+
     fn find_status(&self) -> FindStatus {
         let ed = &self.editor;
         match &self.finder {
@@ -949,8 +977,67 @@ impl DocumentHandle {
     /// Undoing (or redoing) back to the saved text clears it again.
     pub fn is_modified(&self) -> bool {
         let st = self.lock();
-        // Marked IME text is in the buffer but not yet in the history.
-        st.editor.has_marked_text() || st.editor.history.state_id() != st.saved_state
+        st.deleted_on_disk || st.has_unsaved_edits()
+    }
+
+    /// Compares the file on disk with what was last loaded or saved
+    /// (M2-03). One `stat` when nothing changed. Errors other than "not
+    /// found" (permissions) report `Unchanged`.
+    pub fn check_disk(&self) -> DiskStatus {
+        let mut st = self.lock();
+        if st.path.as_os_str().is_empty() {
+            return DiskStatus::Unchanged;
+        }
+        let path = st.path.clone();
+        let Some(stamp) = st.disk.as_mut() else {
+            // Saved never and loaded never: nothing to compare with.
+            return DiskStatus::Unchanged;
+        };
+        match stamp.check(&path) {
+            Ok(DiskCheck::Unchanged) => {
+                st.deleted_on_disk = false;
+                DiskStatus::Unchanged
+            }
+            Ok(DiskCheck::Changed(_)) => {
+                st.deleted_on_disk = false;
+                DiskStatus::Changed
+            }
+            Ok(DiskCheck::Deleted) => {
+                st.deleted_on_disk = true;
+                DiskStatus::Deleted
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "could not check file on disk");
+                DiskStatus::Unchanged
+            }
+        }
+    }
+
+    /// Replaces the buffer with the file on disk as one undoable step,
+    /// changing only the part that differs so carets elsewhere stay put.
+    /// The result counts as saved. Returns `true` if the text changed.
+    pub fn reload_from_disk(&self) -> Result<bool, CoreError> {
+        let mut st = self.lock();
+        let (stamp, bytes) = DiskStamp::read(&st.path)?;
+        let disk = Document::from_bytes(&bytes)?;
+        let changed = st.editor.reload(&disk, Instant::now());
+        st.saved_state = st.editor.history.state_id();
+        st.disk = Some(stamp);
+        st.deleted_on_disk = false;
+        tracing::info!(path = %st.path.display(), changed, "reloaded document from disk");
+        Ok(changed)
+    }
+
+    /// Keeps the buffer after the file changed on disk: the change is not
+    /// reported again, and the buffer stays unsaved until it is saved over
+    /// the file.
+    pub fn keep_buffer_over_disk(&self) {
+        let mut st = self.lock();
+        if let Ok((stamp, _)) = DiskStamp::read(&st.path) {
+            st.disk = Some(stamp);
+        }
+        // No history state matches the file any more.
+        st.saved_state = u64::MAX;
     }
 
     pub fn encoding(&self) -> TextEncoding {
@@ -1423,7 +1510,9 @@ impl DocumentHandle {
                 message: "document has no path yet; use save as".into(),
             });
         }
-        st.editor.doc.save(&st.path)?;
+        let stamp = st.editor.doc.save_stamped(&st.path)?;
+        st.disk = Some(stamp);
+        st.deleted_on_disk = false;
         st.editor.history.break_group();
         st.saved_state = st.editor.history.state_id();
         tracing::info!(path = %st.path.display(), "saved document");
@@ -1434,7 +1523,9 @@ impl DocumentHandle {
     pub fn save_as(&self, path: String) -> Result<(), CoreError> {
         let path = PathBuf::from(path);
         let mut st = self.lock();
-        st.editor.doc.save(&path)?;
+        let stamp = st.editor.doc.save_stamped(&path)?;
+        st.disk = Some(stamp);
+        st.deleted_on_disk = false;
         st.editor.history.break_group();
         tracing::info!(path = %path.display(), "saved document as");
         st.saved_state = st.editor.history.state_id();
@@ -1444,9 +1535,19 @@ impl DocumentHandle {
 }
 
 impl DocumentHandle {
+    /// Loads `path` and remembers what was on disk.
+    fn load(path: PathBuf) -> Result<Self, CoreError> {
+        let (stamp, bytes) = DiskStamp::read(&path)?;
+        let handle = Self::new(Document::from_bytes(&bytes)?, path);
+        handle.lock().disk = Some(stamp);
+        Ok(handle)
+    }
+
     fn new(doc: Document, path: PathBuf) -> Self {
         Self {
             state: Mutex::new(State {
+                disk: None,
+                deleted_on_disk: false,
                 saved_state: 0,
                 editor: Editor::new(doc),
                 path,
@@ -1803,6 +1904,95 @@ mod tests {
                 .open_workspace("/nonexistent/dir".into())
                 .is_err()
         );
+    }
+
+    /// Opens a real file; the second write uses a later mtime so the size
+    /// and time check sees it even within one clock tick.
+    fn file_doc(text: &str) -> (tempfile::TempDir, PathBuf, Arc<DocumentHandle>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, text).unwrap();
+        let doc = Core::new()
+            .open_document(path.to_string_lossy().into_owned())
+            .unwrap();
+        (dir, path, doc)
+    }
+
+    fn write_later(path: &std::path::Path, text: &str) {
+        std::fs::write(path, text).unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+    }
+
+    fn all_text(doc: &DocumentHandle) -> String {
+        doc.lines(0, doc.line_count()).join("\n")
+    }
+
+    #[test]
+    fn external_changes_reload_as_one_undo_step() {
+        let (_dir, path, doc) = file_doc("one\ntwo\n");
+        assert_eq!(doc.check_disk(), DiskStatus::Unchanged);
+        write_later(&path, "one\nTWO\n");
+        assert_eq!(doc.check_disk(), DiskStatus::Changed);
+        assert!(doc.reload_from_disk().unwrap());
+        assert_eq!(all_text(&doc), "one\nTWO\n");
+        assert!(!doc.is_modified(), "reloaded text counts as saved");
+        assert_eq!(doc.check_disk(), DiskStatus::Unchanged);
+        assert!(doc.undo());
+        assert_eq!(all_text(&doc), "one\ntwo\n");
+        assert!(doc.is_modified(), "undoing the reload differs from disk");
+    }
+
+    #[test]
+    fn our_own_save_is_not_an_external_change() {
+        let (_dir, _path, doc) = file_doc("a");
+        doc.edit(EditCommand::InsertText { text: "b".into() });
+        doc.save().unwrap();
+        assert_eq!(doc.check_disk(), DiskStatus::Unchanged);
+    }
+
+    #[test]
+    fn keeping_the_buffer_stops_reporting_and_stays_unsaved() {
+        let (_dir, path, doc) = file_doc("a");
+        doc.edit(EditCommand::InsertText {
+            text: "mine ".into(),
+        });
+        write_later(&path, "theirs");
+        assert_eq!(doc.check_disk(), DiskStatus::Changed);
+        doc.keep_buffer_over_disk();
+        assert_eq!(doc.check_disk(), DiskStatus::Unchanged);
+        assert!(doc.undo());
+        assert!(
+            doc.is_modified(),
+            "even undone to the old text, the file differs"
+        );
+        doc.save().unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a");
+        assert!(!doc.is_modified());
+    }
+
+    #[test]
+    fn a_deleted_file_keeps_its_text_and_counts_as_unsaved() {
+        let (_dir, path, doc) = file_doc("keep me");
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(doc.check_disk(), DiskStatus::Deleted);
+        assert!(doc.is_modified());
+        assert_eq!(all_text(&doc), "keep me");
+        // Restored with the same content (git checkout): clean again.
+        std::fs::write(&path, "keep me").unwrap();
+        assert_eq!(doc.check_disk(), DiskStatus::Unchanged);
+        assert!(!doc.is_modified());
+        // Deleted, then saved: recreated.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(doc.check_disk(), DiskStatus::Deleted);
+        doc.save().unwrap();
+        assert!(!doc.is_modified());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep me");
     }
 
     fn doc_with(text: &str) -> Arc<DocumentHandle> {

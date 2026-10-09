@@ -8,6 +8,7 @@ pub mod change;
 pub mod clipboard;
 pub mod commands;
 pub mod composition;
+pub mod disk;
 pub mod document;
 pub mod edit;
 pub mod file_finder;

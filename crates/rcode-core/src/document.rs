@@ -137,6 +137,12 @@ impl Document {
     /// truncated file. Symlinks are followed (the link itself is kept) and
     /// the existing file's permissions are preserved.
     pub fn save(&self, path: &Path) -> io::Result<()> {
+        self.save_stamped(path).map(|_| ())
+    }
+
+    /// [`save`](Self::save), returning a stamp of what was written so a
+    /// later change by another program can be told apart (M2-03).
+    pub fn save_stamped(&self, path: &Path) -> io::Result<crate::disk::DiskStamp> {
         let target = resolve_symlink(path)?;
         let dir = match target.parent() {
             Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
@@ -154,11 +160,13 @@ impl Document {
             .prefix(".rcode-")
             .suffix(".tmp")
             .tempfile_in(&dir)?;
-        {
-            let mut writer = io::BufWriter::new(tmp.as_file_mut());
+        let (len, hash) = {
+            let mut writer = crate::disk::HashingWriter::new(io::BufWriter::new(tmp.as_file_mut()));
             self.write_to(&mut writer)?;
             writer.flush()?;
-        }
+            let (_, len, hash) = writer.finish();
+            (len, hash)
+        };
         match fs::metadata(&target) {
             Ok(meta) => tmp.as_file().set_permissions(meta.permissions())?,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
@@ -176,7 +184,7 @@ impl Document {
         tmp.persist(&target).map_err(|e| e.error)?;
         // Make the rename itself durable.
         fs::File::open(&dir)?.sync_all()?;
-        Ok(())
+        crate::disk::DiskStamp::from_written(&target, len, hash)
     }
 
     pub fn len_chars(&self) -> usize {

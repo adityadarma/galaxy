@@ -384,6 +384,34 @@ pub(crate) fn finish_with_map(
     }
 }
 
+/// Turns the document into `new` with one change covering only the part
+/// that differs (common prefix and suffix kept), so carets and the scroll
+/// position outside it stay put. Used to reload a file changed on disk
+/// (M2-03); the result is one undo step.
+pub fn replace_by_diff(doc: &Document, sel: &SelectionSet, new: &str) -> Transaction {
+    let old = doc.text();
+    let (a, b) = (old.as_bytes(), new.as_bytes());
+    let mut prefix = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    while !old.is_char_boundary(prefix) || !new.is_char_boundary(prefix) {
+        prefix -= 1;
+    }
+    let max_suffix = a.len().min(b.len()) - prefix;
+    let mut suffix = a
+        .iter()
+        .rev()
+        .zip(b.iter().rev())
+        .take(max_suffix)
+        .take_while(|(x, y)| x == y)
+        .count();
+    while !old.is_char_boundary(a.len() - suffix) || !new.is_char_boundary(b.len() - suffix) {
+        suffix -= 1;
+    }
+    let start = old[..prefix].chars().count();
+    let end = start + old[prefix..a.len() - suffix].chars().count();
+    let change = Change::new(start, end, &new[prefix..b.len() - suffix]);
+    finish_with_map(doc, sel, vec![change], |_| false)
+}
+
 /// Lines a selection indents as whole lines, or `None` when Tab should
 /// insert text instead. A selection ending at column 0 does not include
 /// that last line.
