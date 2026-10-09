@@ -183,16 +183,14 @@ final class EditorUITests: XCTestCase {
         attachScreenshot("explorer")
     }
 
-    func testTitleBarButtonTogglesTheSidebar() throws {
+    func testActivityBarTogglesTheSidebar() throws {
         try write("a.txt", "a")
         launch(open: workDir)
         let explorer = app.outlines["explorer"]
         XCTAssertTrue(explorer.waitForExistence(timeout: 5))
 
-        let activity = app.descendants(matching: .any).matching(identifier: "activity-explorer").firstMatch
-        XCTAssertTrue(activity.exists, "activity bar on the left")
-        let button = app.descendants(matching: .any).matching(identifier: "toggle-sidebar").firstMatch
-        XCTAssertTrue(button.exists)
+        let button = app.descendants(matching: .any).matching(identifier: "activity-explorer").firstMatch
+        XCTAssertTrue(button.exists, "activity bar on the left")
         button.click()
         // A hidden view leaves the accessibility tree, so it must stop existing.
         let gone = XCTNSPredicateExpectation(

@@ -137,7 +137,7 @@ final class ExplorerTests: XCTestCase {
         XCTAssertFalse(controller.isSidebarVisible)
         XCTAssertNil(activity.active)
         let editorWide = controller.editorView.frame.width
-        controller.titleBar.sidebarButton.performClick(nil)
+        explorerButton.performClick(nil)
         XCTAssertTrue(controller.isSidebarVisible)
         XCTAssertEqual(activity.active, .explorer)
         RunLoop.current.run(until: Date().addingTimeInterval(0.2))
@@ -191,17 +191,14 @@ final class ExplorerTests: XCTestCase {
         XCTAssertEqual(bar.components, ["src", "main.rs"], "path inside the folder; the folder is named elsewhere")
         XCTAssertTrue(window.title.hasPrefix("main.rs"), "the hidden title is still kept for the Window menu")
 
-        // Title bar: full width, fills the window's title bar area, shows
-        // the project.
+        // Title bar: full width, fills the window's title bar area, empty.
         let content = try XCTUnwrap(window.contentView)
         let titleFrame = content.convert(controller.titleBar.bounds, from: controller.titleBar)
         XCTAssertEqual(titleFrame.maxY, content.bounds.maxY, accuracy: 0.5)
         XCTAssertEqual(titleFrame.width, content.bounds.width, accuracy: 0.5)
         XCTAssertEqual(titleFrame.minY, window.contentLayoutRect.maxY, accuracy: 0.5, "ends where the title bar ends")
-        XCTAssertEqual(controller.titleBar.projectButton.title, root.lastPathComponent)
-        XCTAssertLessThanOrEqual(controller.titleBar.projectButton.frame.width, 220)
-        // The folder name appears once in the title bar and once as the
-        // sidebar section, not in the breadcrumb or a centered title.
+        XCTAssertTrue(controller.titleBar.subviews.allSatisfy { $0 is NSBox }, "no buttons or text in the title bar")
+        // The folder name appears once: the sidebar section.
         XCTAssertEqual(controller.sectionHeader.label.stringValue, root.lastPathComponent.uppercased())
 
         // Tabs at the top of the editor column; breadcrumb right under them.

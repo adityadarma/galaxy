@@ -3,7 +3,7 @@ import os
 
 /// Main window, a mix of VSCode and the JetBrains New UI:
 ///
-///     [ traffic lights | project ·       file — project       · ⌘B ]  title bar
+///     [ traffic lights                                            ]  title bar
 ///     [ activity | sidebar   | tabs                               ]
 ///     [   bar    | explorer  | breadcrumb                         ]
 ///     [          |           | editor                             ]
@@ -144,10 +144,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         statusLabel.stringValue = "Core \(bridge.version) starting…"
         statusBar.translatesAutoresizingMaskIntoConstraints = false
         titleBar.translatesAutoresizingMaskIntoConstraints = false
-        titleBar.sidebarButton.target = self
-        titleBar.sidebarButton.action = #selector(toggleSidebar(_:))
-        titleBar.projectButton.target = self
-        titleBar.projectButton.action = #selector(openFolder(_:))
         activityBar.translatesAutoresizingMaskIntoConstraints = false
         activityBar.setActive(.explorer)
         activityBar.onSelect = { [weak self] item in
@@ -795,7 +791,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         sectionHeader.title = ws.name()
         sectionHeader.isHidden = false
         sectionHeader.isExpanded = true
-        titleBar.setProject(ws.name())
         setSidebarVisible(true)
         if tabs.isEmpty { pathBar.show([]) }
         updateEditedState()
