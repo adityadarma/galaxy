@@ -161,6 +161,43 @@ final class ExplorerTests: XCTestCase {
         XCTAssertTrue(bar.cursor.stringValue.hasSuffix("(2 cursors)"), bar.cursor.stringValue)
     }
 
+    func testTitleBarIsUnifiedAndThePathBarFollowsTheDocument() throws {
+        let root = try makeTree()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let controller = MainWindowController(bridge: CoreBridge())
+        controller.showWindow(nil)
+        defer { controller.window?.orderOut(nil) }
+        let window = try XCTUnwrap(controller.window)
+        XCTAssertTrue(window.styleMask.contains(.fullSizeContentView))
+        XCTAssertEqual(window.titleVisibility, .hidden)
+        XCTAssertTrue(window.titlebarAppearsTransparent)
+
+        controller.open(url: root)
+        controller.explorer.outlineView.selectRowIndexes([1], byExtendingSelection: false) // src
+        controller.explorer.outlineView.selectRowIndexes([3], byExtendingSelection: false) // src/main.rs
+        window.contentView?.layoutSubtreeIfNeeded()
+        let bar = controller.pathBar
+        XCTAssertEqual(bar.components, [root.lastPathComponent, "src", "main.rs"])
+        XCTAssertTrue(window.title.hasPrefix("main.rs"), "the hidden title is still kept for the Window menu")
+
+        // The sidebar reaches the top edge; the path bar fills the title bar.
+        let content = try XCTUnwrap(window.contentView)
+        let sidebarTop = content.convert(controller.sidebar.bounds, from: controller.sidebar).maxY
+        XCTAssertEqual(sidebarTop, content.bounds.maxY, accuracy: 0.5)
+        let barFrame = content.convert(bar.bounds, from: bar)
+        XCTAssertEqual(barFrame.maxY, content.bounds.maxY, accuracy: 0.5)
+        XCTAssertEqual(barFrame.minY, window.contentLayoutRect.maxY, accuracy: 0.5, "ends where the title bar ends")
+
+        XCTAssertFalse(bar.isEdited)
+        controller.editorView.insertText("x", replacementRange: NSRange(location: NSNotFound, length: 0))
+        controller.editorView.flushPendingUpdates()
+        XCTAssertTrue(bar.isEdited)
+
+        XCTAssertFalse(bar.clearsTrafficLights)
+        controller.toggleSidebar(nil)
+        XCTAssertTrue(bar.clearsTrafficLights, "makes room for the window buttons")
+    }
+
     func testOpeningAFolderReplacesTheEmptyState() throws {
         let root = try makeTree()
         defer { try? FileManager.default.removeItem(at: root) }

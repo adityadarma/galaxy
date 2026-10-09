@@ -2,11 +2,14 @@ import AppKit
 import os
 
 /// Main window: sidebar (with a navigator switcher on top) | editor, and a
-/// status bar along the bottom.
+/// status bar along the bottom. The title bar is transparent: the sidebar
+/// runs up under the traffic lights and a path bar takes the title's place
+/// above the editor.
 @MainActor
 final class MainWindowController: NSWindowController, NSWindowDelegate {
     private let bridge: CoreBridge
     let statusBar = StatusBar()
+    let pathBar = PathBar()
     /// Left-hand message in the status bar.
     var statusLabel: NSTextField { statusBar.message }
     private let scrollView = NSScrollView()
@@ -81,11 +84,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         self.bridge = bridge
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 960, height: 640),
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
         window.title = "RustCode"
+        // The title stays set (Window menu, Mission Control, VoiceOver) but
+        // is drawn by the path bar instead.
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
         window.setFrameAutosaveName("MainWindow")
         window.tabbingMode = .disallowed
         super.init(window: window)
@@ -117,6 +124,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
+    /// Bottom edge of the (transparent) title bar, in content coordinates.
+    private var titleBarBottom: NSLayoutYAxisAnchor {
+        (window?.contentLayoutGuide as? NSLayoutGuide)?.topAnchor ?? detailView.topAnchor
+    }
+
     private func buildContent() {
         guard let content = window?.contentView else { return }
 
@@ -134,13 +146,19 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         scrollView.documentView = editorView
 
         detailView.translatesAutoresizingMaskIntoConstraints = false
+        pathBar.translatesAutoresizingMaskIntoConstraints = false
+        pathBar.show(["RustCode"])
         findBarSlot.translatesAutoresizingMaskIntoConstraints = false
         findBarSlot.isHidden = true
         findBarHeight = findBarSlot.heightAnchor.constraint(equalToConstant: 0)
+        detailView.addSubview(pathBar)
         detailView.addSubview(findBarSlot)
         detailView.addSubview(scrollView)
         NSLayoutConstraint.activate([
-            findBarSlot.topAnchor.constraint(equalTo: detailView.topAnchor),
+            pathBar.topAnchor.constraint(equalTo: detailView.topAnchor),
+            pathBar.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
+            pathBar.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
+            findBarSlot.topAnchor.constraint(equalTo: pathBar.bottomAnchor),
             findBarSlot.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
             findBarSlot.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
             findBarHeight,
@@ -169,6 +187,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             statusBar.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             statusBar.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             statusBar.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            // Only valid once both views are in the window.
+            pathBar.bottomAnchor.constraint(equalTo: titleBarBottom),
+            navigator.topAnchor.constraint(equalTo: titleBarBottom, constant: 4),
         ])
     }
 
@@ -224,7 +245,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         sidebar.addSubview(explorer.scrollView)
         sidebar.addSubview(emptyState)
         NSLayoutConstraint.activate([
-            navigator.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: 4),
             navigator.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor),
             navigator.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor),
             navigatorRule.topAnchor.constraint(equalTo: navigator.bottomAnchor, constant: 4),
@@ -258,6 +278,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     func setSidebarVisible(_ visible: Bool) {
         guard visible != isSidebarVisible else { return }
         sidebar.isHidden = !visible
+        pathBar.clearsTrafficLights = !visible
         if visible {
             splitView.layoutSubtreeIfNeeded()
             if sidebar.frame.width < 160 { splitView.setPosition(Self.sidebarWidth, ofDividerAt: 0) }
@@ -267,10 +288,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// Starts an empty "Untitled" buffer, ready for typing.
     @objc func newDocument(_ sender: Any?) {
         guard confirmDiscardChanges() else { return }
-        show(bridge.newDocument(), title: "Untitled", status: "Untitled. Type here, or press ⌘O to open a file or folder.")
+        show(bridge.newDocument(), title: "Untitled", path: ["Untitled"],
+             status: "Untitled. Type here, or press ⌘O to open a file or folder.")
     }
 
-    private func show(_ doc: DocumentHandle, title: String, status: String) {
+    private func show(_ doc: DocumentHandle, title: String, path: [String], status: String) {
+        pathBar.show(path)
         editorView.document = doc
         scrollView.contentView.scroll(to: .zero)
         scrollView.reflectScrolledClipView(scrollView.contentView)
@@ -464,7 +487,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// Shows the title and the "edited" dot in the close button.
     func updateEditedState() {
         window?.title = baseTitle
-        window?.isDocumentEdited = editorView.document?.isModified() ?? false
+        let edited = editorView.document?.isModified() ?? false
+        window?.isDocumentEdited = edited
+        pathBar.setEdited(edited)
     }
 
     private var documentName: String {
@@ -507,6 +532,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             return false
         }
         baseTitle = url.lastPathComponent
+        pathBar.show([url.lastPathComponent])
         savedStatus(doc)
         return true
     }
@@ -578,7 +604,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         folderTitle.stringValue = ws.name()
         folderTitle.isHidden = false
         setSidebarVisible(true)
-        if editorView.document == nil { baseTitle = ws.name() }
+        if editorView.document == nil {
+            baseTitle = ws.name()
+            pathBar.show([ws.name()])
+        }
         updateEditedState()
         statusLabel.stringValue = "\(ws.name()): choose a file in the sidebar."
     }
@@ -587,7 +616,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         guard confirmDiscardChanges() else { return }
         let start = ContinuousClock.now
         let doc = try bridge.openDocument(path: url.path)
-        show(doc, title: url.lastPathComponent, status: describe(doc, name: url.lastPathComponent, since: start))
+        show(doc, title: url.lastPathComponent, path: [url.lastPathComponent],
+             status: describe(doc, name: url.lastPathComponent, since: start))
     }
 
     private func openWorkspaceFile(_ workspace: Workspace, _ entry: FileEntry) {
@@ -596,6 +626,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             let start = ContinuousClock.now
             let doc = try workspace.openFile(relPath: entry.relPath)
             show(doc, title: "\(entry.name) — \(workspace.name())",
+                 path: [workspace.name()] + entry.relPath.split(separator: "/").map(String.init),
                  status: describe(doc, name: entry.relPath, since: start))
         } catch {
             report(error, while: "open \(entry.relPath)")
