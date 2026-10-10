@@ -707,10 +707,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         guard visible != isSidebarVisible else { return }
         sidebar.isHidden = !visible
         activityBar.setActive(visible ? .explorer : nil)
-        if visible {
-            splitView.layoutSubtreeIfNeeded()
-            if sidebar.frame.width < Self.minSidebarWidth { splitView.setPosition(Self.sidebarWidth, ofDividerAt: 0) }
-        }
+        splitView.layoutSubtreeIfNeeded()
+        splitView.setPosition(visible ? max(Self.sidebarWidth, Self.minSidebarWidth) : 0, ofDividerAt: 0)
+        splitView.layoutSubtreeIfNeeded()
+        editorView.needsLayout = true
+        editorView.needsDisplay = true
     }
 
     /// Starts an empty "Untitled" buffer in a new tab, ready for typing.
@@ -2375,7 +2376,7 @@ final class SidebarSectionHeader: NSView {
 extension MainWindowController: NSSplitViewDelegate {
     func splitView(_ splitView: NSSplitView, constrainMinCoordinate proposedMinimumPosition: CGFloat,
                    ofSubviewAt dividerIndex: Int) -> CGFloat {
-        Self.minSidebarWidth
+        isSidebarVisible ? Self.minSidebarWidth : 0
     }
 
     func splitView(_ splitView: NSSplitView, constrainMaxCoordinate proposedMaximumPosition: CGFloat,
