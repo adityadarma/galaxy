@@ -1613,7 +1613,90 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         confirmDiscardChanges()
     }
 
+    // MARK: Session (M2-11)
+
+    /// Where the session is saved. Tests point it elsewhere.
+    var sessionURL = Session.defaultURL
+
+    /// The folder, the file tabs with caret and scroll, and the active tab.
+    func currentSession() -> Session {
+        var session = Session()
+        session.workspace = workspace?.root()
+        session.sidebarVisible = isSidebarVisible
+        for tab in tabs {
+            let path = tab.doc.path()
+            guard !path.isEmpty, !tab.isDeletedOnDisk else { continue }
+            let loc = location(of: tab)
+            let y = tab === activeTab ? scrollView.contentView.bounds.origin.y : tab.scrollY
+            if tab === activeTab { session.active = session.tabs.count }
+            session.tabs.append(Session.Tab(path: path, isPreview: tab.isPreview, line: loc.line, col: loc.col,
+                                            scrollY: y.map(Double.init)))
+        }
+        return session
+    }
+
+    /// Saves the session; failures are logged, never shown.
+    func saveSession() {
+        do {
+            try currentSession().save(to: sessionURL)
+        } catch {
+            Log.app.error("saving session failed: \(String(describing: error), privacy: .public)")
+        }
+    }
+
+    /// Reopens what `session` had: the folder if it still exists, and the
+    /// tabs whose files still exist, with caret and scroll. Returns
+    /// `false` if nothing could be restored.
+    @discardableResult
+    func restore(_ session: Session) -> Bool {
+        isNavigating = true
+        defer { isNavigating = false }
+        var restoredWorkspace = false
+        if let root = session.workspace {
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: root, isDirectory: &isDir), isDir.boolValue {
+                do {
+                    try openWorkspace(at: URL(fileURLWithPath: root))
+                    restoredWorkspace = true
+                } catch {
+                    Log.app.error("restoring workspace failed: \(String(describing: error), privacy: .public)")
+                }
+            }
+        }
+        var restored: [(EditorTab, CGFloat?)] = []
+        var target: EditorTab?
+        for (i, saved) in session.tabs.enumerated() {
+            guard FileManager.default.fileExists(atPath: saved.path) else { continue }
+            if let workspace, let rel = relativePath(saved.path) {
+                let entry = FileEntry(name: (rel as NSString).lastPathComponent, relPath: rel, isDir: false)
+                openWorkspaceFile(workspace, entry, preview: saved.isPreview)
+            } else {
+                try? openFile(at: URL(fileURLWithPath: saved.path))
+            }
+            guard let index = tabIndex(forPath: saved.path) else { continue }
+            let tab = tabs[index]
+            tab.doc.goToLine(line: saved.line, col: saved.col)
+            restored.append((tab, saved.scrollY.map { CGFloat($0) }))
+            if i == session.active { target = tab }
+        }
+        if restoredWorkspace { setSidebarVisible(session.sidebarVisible) }
+        // Opening each tab recorded the scroll of the one before it; put
+        // the saved positions back, then show the active tab.
+        for (tab, y) in restored { tab.scrollY = y }
+        if let current = self.activeTab {
+            scrollView.contentView.scroll(to: NSPoint(x: 0, y: current.scrollY ?? 0))
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+            if let target, target !== current, let i = tabs.firstIndex(where: { $0 === target }) {
+                selectTab(i)
+            }
+            editorView.didChangeSelection()
+        }
+        Log.app.info("restored session: workspace \(restoredWorkspace), \(self.tabs.count) of \(session.tabs.count) tabs")
+        return restoredWorkspace || !tabs.isEmpty
+    }
+
     func windowWillClose(_ notification: Notification) {
+        saveSession()
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
         keyMonitor = nil
         workspaceWatch?.stop()

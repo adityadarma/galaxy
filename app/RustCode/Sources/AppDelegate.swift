@@ -38,7 +38,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let url = pendingURL {
             pendingURL = nil
             controller.open(url: url)
-        } else {
+        } else if !Self.shouldRestoreSession || !restoreSession(in: controller) {
             // Start in an empty buffer so the window is usable immediately.
             controller.newDocument(nil)
         }
@@ -62,6 +62,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Verifies the Rust -> Swift callback path end-to-end.
         bridge.ping("startup")
+    }
+
+    /// Off for benchmarks (startup must not depend on what was open last),
+    /// for the unit-test host, and with `-RestoreSession NO` (UI tests).
+    private static var shouldRestoreSession: Bool {
+        let env = ProcessInfo.processInfo.environment
+        if env["RCODE_BENCH"] != nil || env["XCTestConfigurationFilePath"] != nil
+            || LatencyBench.requestedCount != nil || ScrollBench.requestedFrames != nil {
+            return false
+        }
+        return UserDefaults.standard.object(forKey: "RestoreSession") as? Bool ?? true
+    }
+
+    private func restoreSession(in controller: MainWindowController) -> Bool {
+        guard let session = Session.load(from: controller.sessionURL) else { return false }
+        return controller.restore(session)
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        // Quitting with the window open does not close it first.
+        windowController?.saveSession()
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

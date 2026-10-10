@@ -38,7 +38,8 @@ final class EditorUITests: XCTestCase {
     private func launch(open url: URL? = nil) {
         app = XCUIApplication()
         // A fresh window every run: no restored frame, no saved state.
-        app.launchArguments = ["-ApplePersistenceIgnoreState", "YES", "-NSQuitAlwaysKeepsWindows", "NO"]
+        app.launchArguments = ["-ApplePersistenceIgnoreState", "YES", "-NSQuitAlwaysKeepsWindows", "NO",
+                               "-RestoreSession", "NO"]
         if let url { app.launchArguments += ["-OpenPath", url.path] }
         app.launch()
         XCTAssertTrue(editor.waitForExistence(timeout: 10), "editor did not appear")
