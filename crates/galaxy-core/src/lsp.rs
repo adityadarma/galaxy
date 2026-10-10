@@ -279,6 +279,17 @@ fn is_executable(path: &Path) -> bool {
 #[derive(Debug, Clone, PartialEq)]
 pub enum LspEvent {
     Initialized(LspKey),
+    Response {
+        key: LspKey,
+        id: u64,
+        result: Option<Value>,
+        error: Option<Value>,
+    },
+    TimedOut {
+        key: LspKey,
+        id: u64,
+        method: String,
+    },
     Message(LspKey, Value),
     Error(LspKey, String),
     Closed(LspKey),
@@ -289,12 +300,20 @@ struct ManagedServer {
     initialized: bool,
 }
 
+#[derive(Debug, Clone)]
+struct PendingRequest {
+    method: String,
+    deadline: Instant,
+}
+
 /// Owns one server per `(language, workspace root)` and drives the minimal
 /// JSON-RPC lifecycle. General request IDs and cancellation are M4-05.
 #[derive(Default)]
 pub struct LspManager {
     servers: HashMap<LspKey, ManagedServer>,
     documents: HashMap<String, (LspKey, DocumentSync)>,
+    requests: HashMap<(LspKey, u64), PendingRequest>,
+    next_request_id: u64,
 }
 
 impl LspManager {
@@ -343,6 +362,62 @@ impl LspManager {
             })?
             .transport
             .send(message)
+    }
+
+    /// Sends a tracked JSON-RPC request. IDs 0 and 1 are reserved for the
+    /// initialize and shutdown lifecycles; normal requests start at 2.
+    pub fn request(
+        &mut self,
+        key: &LspKey,
+        method: String,
+        params: Value,
+        timeout: Duration,
+        now: Instant,
+    ) -> io::Result<u64> {
+        let id = self.next_request_id.max(2);
+        self.next_request_id = id.checked_add(1).unwrap_or(2);
+        self.send(
+            key,
+            &serde_json::json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}),
+        )?;
+        self.requests.insert(
+            (key.clone(), id),
+            PendingRequest {
+                method,
+                deadline: now + timeout,
+            },
+        );
+        Ok(id)
+    }
+
+    /// Cancels a request that is no longer useful. Late responses are ignored.
+    pub fn cancel_request(&mut self, key: &LspKey, id: u64) -> io::Result<bool> {
+        if self.requests.remove(&(key.clone(), id)).is_none() {
+            return Ok(false);
+        }
+        self.send(
+            key,
+            &serde_json::json!({"jsonrpc":"2.0","method":"$/cancelRequest","params":{"id":id}}),
+        )?;
+        Ok(true)
+    }
+
+    /// Cancels and reports requests whose deadlines passed. Call from the
+    /// app's regular nonblocking LSP poll loop.
+    pub fn expire_requests(&mut self, now: Instant) -> Vec<LspEvent> {
+        let expired: Vec<_> = self
+            .requests
+            .iter()
+            .filter(|(_, pending)| now >= pending.deadline)
+            .map(|((key, id), pending)| (key.clone(), *id, pending.method.clone()))
+            .collect();
+        expired
+            .into_iter()
+            .map(|(key, id, method)| {
+                let _ = self.cancel_request(&key, id);
+                LspEvent::TimedOut { key, id, method }
+            })
+            .collect()
     }
 
     /// Registers a document and immediately sends `didOpen` to its shared server.
@@ -413,6 +488,15 @@ impl LspManager {
                         match server.transport.send(&serde_json::json!({"jsonrpc": "2.0", "method": "initialized", "params": {}})) {
                             Ok(()) => { server.initialized = true; events.push(LspEvent::Initialized(key.clone())); }
                             Err(error) => events.push(LspEvent::Error(key.clone(), error.to_string())),
+                        }
+                    }
+                    Ok(Incoming::Message(message)) if message.get("id").and_then(Value::as_u64).is_some() => {
+                        let id = message["id"].as_u64().expect("checked above");
+                        if self.requests.remove(&(key.clone(), id)).is_some() {
+                            events.push(LspEvent::Response {
+                                key: key.clone(), id,
+                                result: message.get("result").cloned(), error: message.get("error").cloned(),
+                            });
                         }
                     }
                     Ok(Incoming::Message(message)) => events.push(LspEvent::Message(key.clone(), message)),
@@ -832,5 +916,104 @@ mod tests {
         manager.save_document("file:///doc.rs").unwrap();
         manager.close_document("file:///doc.rs").unwrap();
         assert!(manager.save_document("file:///doc.rs").is_err());
+    }
+
+    #[test]
+    fn requests_get_ids_and_stale_work_is_cancelled_or_timed_out() {
+        let args = vec!["-c".to_owned(), "sleep 1".to_owned()];
+        let key = LspKey {
+            language: "rust".into(),
+            root: PathBuf::from("/workspace"),
+        };
+        let config = ServerConfig {
+            program: "/bin/sh".into(),
+            args,
+            log_traffic: false,
+            initialization_options: Value::Null,
+        };
+        let mut manager = LspManager::default();
+        manager.ensure_server(key.clone(), &config).unwrap();
+        let now = Instant::now();
+        let cancelled = manager
+            .request(
+                &key,
+                "textDocument/hover".into(),
+                Value::Null,
+                Duration::from_secs(1),
+                now,
+            )
+            .unwrap();
+        assert_eq!(cancelled, 2);
+        assert!(manager.cancel_request(&key, cancelled).unwrap());
+        assert!(!manager.cancel_request(&key, cancelled).unwrap());
+        let timed = manager
+            .request(
+                &key,
+                "textDocument/completion".into(),
+                Value::Null,
+                Duration::from_millis(1),
+                now,
+            )
+            .unwrap();
+        assert_eq!(timed, 3);
+        assert_eq!(
+            manager.expire_requests(now + Duration::from_millis(1)),
+            [LspEvent::TimedOut {
+                key: key.clone(),
+                id: timed,
+                method: "textDocument/completion".into()
+            }]
+        );
+        assert!(
+            manager
+                .expire_requests(now + Duration::from_secs(2))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn matching_response_completes_a_tracked_request() {
+        let args = vec![
+            "-c".to_owned(),
+            "read _; read _; read _; read _; body='{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"value\":1}}'; printf 'Content-Length: %s\\r\\n\\r\\n%s' \"${#body}\" \"$body\"; sleep 1".to_owned(),
+        ];
+        let key = LspKey {
+            language: "rust".into(),
+            root: PathBuf::from("/workspace"),
+        };
+        let config = ServerConfig {
+            program: "/bin/sh".into(),
+            args,
+            log_traffic: false,
+            initialization_options: Value::Null,
+        };
+        let mut manager = LspManager::default();
+        manager.ensure_server(key.clone(), &config).unwrap();
+        manager
+            .request(
+                &key,
+                "workspace/symbol".into(),
+                Value::Null,
+                Duration::from_secs(1),
+                Instant::now(),
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let events = manager.poll();
+            if let Some(LspEvent::Response {
+                id, result, error, ..
+            }) = events
+                .into_iter()
+                .find(|event| matches!(event, LspEvent::Response { .. }))
+            {
+                assert_eq!(id, 2);
+                assert_eq!(result.unwrap()["value"], 1);
+                assert_eq!(error, None);
+                break;
+            }
+            assert!(Instant::now() < deadline, "response was not observed");
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 }
