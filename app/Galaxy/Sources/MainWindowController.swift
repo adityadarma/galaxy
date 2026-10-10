@@ -104,6 +104,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private var referencesRequest: DocumentHandle?
     private var renameRequest: DocumentHandle?
     private var codeActionRequest: DocumentHandle?
+    private var formattingRequest: DocumentHandle?
     private var keyMonitor: Any?
     /// Tabs in the order they were last shown, most recent first (⌃Tab).
     private var tabOrderByUse: [ObjectIdentifier] = []
@@ -275,6 +276,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 self?.refreshDefinition()
                 self?.refreshReferences()
                 self?.refreshRename()
+                self?.refreshCodeActions()
+                self?.refreshFormatting()
                 let problems = self?.bridge.core.problems() ?? []
                 self?.problemsPanel.update(problems)
                 self?.problemsPanel.isHidden = problems.isEmpty
@@ -552,6 +555,23 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             if !wasOpen { try? bridge.save(document: target) }
             bridge.syncLSP(document: target)
         }
+        updateEditedState()
+        editorView.needsDisplay = true
+    }
+
+    @objc func formatDocument(_ sender: Any?) {
+        guard let document = activeTab?.doc else { NSSound.beep(); return }
+        formattingRequest = document
+        bridge.requestFormatting(document: document, tabSize: 4, insertSpaces: true)
+    }
+
+    private func refreshFormatting() {
+        guard let document = formattingRequest else { return }
+        let edits = bridge.formattingEdits(document: document)
+        guard !edits.isEmpty else { return }
+        formattingRequest = nil
+        _ = bridge.applyFormattingEdits(document: document, edits: edits)
+        bridge.syncLSP(document: document)
         updateEditedState()
         editorView.needsDisplay = true
     }

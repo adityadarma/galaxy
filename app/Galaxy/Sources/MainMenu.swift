@@ -70,6 +70,8 @@ enum MainMenu {
         goMenu.addItem(withTitle: "Rename Symbol…", action: #selector(MainWindowController.renameSymbol(_:)), keyEquivalent: "")
         let codeActions = goMenu.addItem(withTitle: "Code Actions…", action: #selector(MainWindowController.showCodeActions(_:)), keyEquivalent: ".")
         codeActions.keyEquivalentModifierMask = [.command]
+        let format = goMenu.addItem(withTitle: "Format Document", action: #selector(MainWindowController.formatDocument(_:)), keyEquivalent: "f")
+        format.keyEquivalentModifierMask = [.command, .option, .shift]
         goMenu.addItem(withTitle: "Go to File…", action: #selector(MainWindowController.showGoToFile(_:)), keyEquivalent: "p")
         let symbol = goMenu.addItem(withTitle: "Go to Symbol…", action: #selector(MainWindowController.showGoToSymbol(_:)), keyEquivalent: "o")
         symbol.keyEquivalentModifierMask = [.command, .shift]

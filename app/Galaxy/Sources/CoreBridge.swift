@@ -128,6 +128,18 @@ final class CoreBridge {
         core.codeActions(document: document)
     }
 
+    func requestFormatting(document: DocumentHandle, tabSize: UInt64, insertSpaces: Bool) {
+        core.requestFormatting(document: document, tabSize: tabSize, insertSpaces: insertSpaces)
+    }
+
+    func formattingEdits(document: DocumentHandle) -> [RenameEdit] {
+        core.formattingEdits(document: document)
+    }
+
+    func applyFormattingEdits(document: DocumentHandle, edits: [RenameEdit]) -> Bool {
+        document.applyFormattingEdits(edits: edits)
+    }
+
     fileprivate func deliver(_ event: CoreEvent) {
         lastEvent = event
         if case let .pong(message) = event {

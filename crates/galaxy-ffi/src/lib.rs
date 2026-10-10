@@ -753,6 +753,39 @@ impl Core {
             .collect()
     }
 
+    pub fn request_formatting(
+        &self,
+        document: Arc<DocumentHandle>,
+        tab_size: u64,
+        insert_spaces: bool,
+    ) {
+        let path = document.path();
+        if path.is_empty() {
+            return;
+        }
+        let uri = file_uri(Path::new(&path));
+        let _ = self
+            .lsp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .request_formatting(&uri, tab_size, insert_spaces, Instant::now());
+    }
+
+    pub fn formatting_edits(&self, document: Arc<DocumentHandle>) -> Vec<RenameEdit> {
+        let path = document.path();
+        if path.is_empty() {
+            return Vec::new();
+        }
+        let uri = file_uri(Path::new(&path));
+        self.lsp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .formatting_edits(&uri)
+            .iter()
+            .map(rename_edit)
+            .collect()
+    }
+
     pub fn problems(&self) -> Vec<ProblemInfo> {
         let lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
         lsp.problems()
@@ -2315,6 +2348,10 @@ impl DocumentHandle {
             syntax.submit(&st.editor.doc);
         }
         true
+    }
+
+    pub fn apply_formatting_edits(&self, edits: Vec<RenameEdit>) -> bool {
+        self.apply_rename_edits(edits)
     }
 
     /// `setMarkedText`: `selected` is the caret/selection inside `text`.

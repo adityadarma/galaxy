@@ -508,6 +508,8 @@ pub struct LspManager {
     rename_requests: HashMap<(LspKey, u64), String>,
     code_actions: HashMap<String, Vec<CodeActionInfo>>,
     code_action_requests: HashMap<(LspKey, u64), String>,
+    formatting_edits: HashMap<String, Vec<RenameEdit>>,
+    formatting_requests: HashMap<(LspKey, u64), String>,
 }
 
 impl LspManager {
@@ -764,6 +766,38 @@ impl LspManager {
         self.code_actions.get(uri).map(Vec::as_slice).unwrap_or(&[])
     }
 
+    pub fn request_formatting(
+        &mut self,
+        uri: &str,
+        tab_size: u64,
+        insert_spaces: bool,
+        now: Instant,
+    ) -> io::Result<Option<u64>> {
+        let Some(key) = self.documents.get(uri).map(|(key, _)| key.clone()) else {
+            return Ok(None);
+        };
+        self.formatting_edits.remove(uri);
+        let id = self.request(
+            &key,
+            "textDocument/formatting".into(),
+            serde_json::json!({
+                "textDocument": { "uri": uri },
+                "options": { "tabSize": tab_size, "insertSpaces": insert_spaces }
+            }),
+            Duration::from_millis(1500),
+            now,
+        )?;
+        self.formatting_requests.insert((key, id), uri.to_owned());
+        Ok(Some(id))
+    }
+
+    pub fn formatting_edits(&self, uri: &str) -> &[RenameEdit] {
+        self.formatting_edits
+            .get(uri)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
     /// Sends a notification to one initialized or initializing server.
     pub fn send(&self, key: &LspKey, message: &Value) -> io::Result<()> {
         self.servers
@@ -932,6 +966,9 @@ impl LspManager {
                         if let Some(uri) = self.code_action_requests.remove(&(key.clone(), id))
                             && let Some(result) = message.get("result").and_then(parse_code_actions)
                         { self.code_actions.insert(uri, result); }
+                        if let Some(uri) = self.formatting_requests.remove(&(key.clone(), id))
+                            && let Some(result) = message.get("result").and_then(|value| parse_text_edit_array(&uri, value))
+                        { self.formatting_edits.insert(uri, result); }
                         if self.requests.remove(&(key.clone(), id)).is_some() {
                             events.push(LspEvent::Response {
                                 key: key.clone(), id,
@@ -1159,6 +1196,23 @@ fn parse_code_actions(value: &Value) -> Option<Vec<CodeActionInfo>> {
                 })
             })
             .filter(|action| !action.edits.is_empty())
+            .collect(),
+    )
+}
+
+fn parse_text_edit_array(uri: &str, value: &Value) -> Option<Vec<RenameEdit>> {
+    let edits = value.as_array()?;
+    Some(
+        edits
+            .iter()
+            .filter_map(|item| {
+                let range = parse_range(item.get("range")?)?;
+                Some(RenameEdit {
+                    uri: uri.to_owned(),
+                    range,
+                    new_text: item.get("newText")?.as_str()?.to_owned(),
+                })
+            })
             .collect(),
     )
 }
@@ -1800,5 +1854,29 @@ mod tests {
         assert_eq!(edits.len(), 2);
         assert_eq!(edits[0].uri, "file:///a.rs");
         assert_eq!(edits[1].new_text, "y");
+    }
+
+    #[test]
+    fn parses_document_formatting_text_edits() {
+        let edits = parse_text_edit_array(
+            "file:///main.rs",
+            &serde_json::json!([
+                {"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":3}},"newText":"let"}
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            edits,
+            vec![RenameEdit {
+                uri: "file:///main.rs".into(),
+                range: Range {
+                    start_line: 0,
+                    start_character: 0,
+                    end_line: 0,
+                    end_character: 3
+                },
+                new_text: "let".into(),
+            }]
+        );
     }
 }
