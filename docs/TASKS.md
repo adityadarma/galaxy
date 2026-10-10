@@ -98,7 +98,8 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
 - [x] M3-02 — Incremental parse dengan `InputEdit` dari setiap edit; versi dokumen untuk membuang hasil usang.
   - Status: `SyntaxEdit` menghitung byte range dan `Point` Tree-sitter langsung dari Rope lama/baru, termasuk UTF-8 dan multiline. Worker menyimpan tree revision terakhir, menerapkan `Tree::edit(InputEdit)`, lalu memberi tree itu sebagai old tree ke parser hanya bila `base_revision` tepat sama; worker yang tertinggal atau edit tidak berantai fallback full parse. Hasil tetap hanya diterbitkan bila revision terbaru. API mendukung satu perubahan kontigu; saat grammar dihubungkan (M3-03), transaksi multi-cursor perlu mengirim edit berantai atau fallback full parse. Tercakup test UTF-8/multiline incremental dan fallback revision tak berantai; benchmark 10k baris belum ditambahkan.
   - Re-parse setelah edit < 2 ms di file 10k baris.
-- [ ] M3-03 — Bundel grammar: Rust, TS, TSX, JS, JSON, TOML, YAML, Markdown, Python, Go, HTML, CSS, Bash.
+- [x] M3-03 — Bundel grammar: Rust, TS, TSX, JS, JSON, TOML, YAML, Markdown, Python, Go, HTML, CSS, Bash.
+  - Status: 13 grammar Tree-sitter dipin statis di `galaxy-core`; `SyntaxLanguage` menjadi registry type-safe untuk Rust, TypeScript, TSX, JavaScript, JSON, TOML, YAML, Markdown, Python, Go, HTML, CSS, dan Bash, dengan display name dan `Language` masing-masing. TOML memakai `tree-sitter-toml-ng` dan Markdown memakai `tree-sitter-md-025`, karena crate nama standar masih memakai API Tree-sitter lama. Path/shebang mapping sengaja M3-06; query highlight M3-04. Tercakup test setiap grammar dipasang ke parser dan parse source minimal tanpa error.
 - [ ] M3-04 — Query highlight per bahasa, mapping capture ke scope tema.
 - [ ] M3-05 — Hasilkan style run hanya untuk viewport + margin, sertakan dalam `ViewportSnapshot`.
 - [ ] M3-06 — Deteksi bahasa dari ekstensi, nama file, dan shebang.

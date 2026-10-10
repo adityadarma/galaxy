@@ -21,6 +21,79 @@ use tree_sitter::{InputEdit, Language, Parser, Point, Tree};
 
 use crate::document::Document;
 
+/// Grammars statically linked into Galaxy (M3-03). Path and shebang matching
+/// deliberately remains M3-06; callers choose the language explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SyntaxLanguage {
+    Rust,
+    TypeScript,
+    Tsx,
+    JavaScript,
+    Json,
+    Toml,
+    Yaml,
+    Markdown,
+    Python,
+    Go,
+    Html,
+    Css,
+    Bash,
+}
+
+impl SyntaxLanguage {
+    pub const ALL: [Self; 13] = [
+        Self::Rust,
+        Self::TypeScript,
+        Self::Tsx,
+        Self::JavaScript,
+        Self::Json,
+        Self::Toml,
+        Self::Yaml,
+        Self::Markdown,
+        Self::Python,
+        Self::Go,
+        Self::Html,
+        Self::Css,
+        Self::Bash,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Rust => "Rust",
+            Self::TypeScript => "TypeScript",
+            Self::Tsx => "TSX",
+            Self::JavaScript => "JavaScript",
+            Self::Json => "JSON",
+            Self::Toml => "TOML",
+            Self::Yaml => "YAML",
+            Self::Markdown => "Markdown",
+            Self::Python => "Python",
+            Self::Go => "Go",
+            Self::Html => "HTML",
+            Self::Css => "CSS",
+            Self::Bash => "Bash",
+        }
+    }
+
+    pub fn grammar(self) -> Language {
+        match self {
+            Self::Rust => tree_sitter_rust::LANGUAGE.into(),
+            Self::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            Self::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+            Self::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+            Self::Json => tree_sitter_json::LANGUAGE.into(),
+            Self::Toml => tree_sitter_toml_ng::LANGUAGE.into(),
+            Self::Yaml => tree_sitter_yaml::LANGUAGE.into(),
+            Self::Markdown => tree_sitter_md_025::LANGUAGE.into(),
+            Self::Python => tree_sitter_python::LANGUAGE.into(),
+            Self::Go => tree_sitter_go::LANGUAGE.into(),
+            Self::Html => tree_sitter_html::LANGUAGE.into(),
+            Self::Css => tree_sitter_css::LANGUAGE.into(),
+            Self::Bash => tree_sitter_bash::LANGUAGE.into(),
+        }
+    }
+}
+
 struct Request {
     revision: u64,
     text: Rope,
@@ -340,5 +413,36 @@ mod tests {
         assert_eq!(snapshot.revision(), 8);
         assert!(!snapshot.is_incremental());
         assert!(!snapshot.tree().root_node().has_error());
+    }
+
+    #[test]
+    fn every_bundled_grammar_loads_and_parses_its_language() {
+        let samples = [
+            (SyntaxLanguage::Rust, "fn main() { println!(\"hi\"); }"),
+            (SyntaxLanguage::TypeScript, "const n: number = 1;"),
+            (SyntaxLanguage::Tsx, "const node = <main>hi</main>;"),
+            (SyntaxLanguage::JavaScript, "const n = 1;"),
+            (SyntaxLanguage::Json, "{\"n\": 1}"),
+            (SyntaxLanguage::Toml, "title = \"Galaxy\""),
+            (SyntaxLanguage::Yaml, "name: Galaxy"),
+            (SyntaxLanguage::Markdown, "# Galaxy\n\nText."),
+            (SyntaxLanguage::Python, "def f():\n    return 1"),
+            (SyntaxLanguage::Go, "package main\nfunc main() {}"),
+            (SyntaxLanguage::Html, "<main>Galaxy</main>"),
+            (SyntaxLanguage::Css, "main { color: red; }"),
+            (SyntaxLanguage::Bash, "#!/usr/bin/env bash\necho Galaxy"),
+        ];
+        assert_eq!(SyntaxLanguage::ALL.len(), samples.len());
+        for (language, source) in samples {
+            let mut parser = Parser::new();
+            parser.set_language(&language.grammar()).unwrap();
+            let tree = parser.parse(source, None).unwrap();
+            assert!(
+                !tree.root_node().has_error(),
+                "{} did not parse its sample: {}",
+                language.name(),
+                tree.root_node().to_sexp()
+            );
+        }
     }
 }

@@ -36,8 +36,19 @@ nucleo-matcher = "=0.3.1"
 notify = { version = "=8.2.0", default-features = false, features = ["macos_fsevent"] }
 # Incremental concrete syntax trees. Grammars arrive in M3-03.
 tree-sitter = "=0.25.10"
-proptest = { version = "=1.11.0", default-features = false, features = ["std"] }
+tree-sitter-rust = "=0.24.2"
+tree-sitter-typescript = "=0.23.2"
+tree-sitter-javascript = "=0.25.0"
 tree-sitter-json = "=0.24.8"
+tree-sitter-toml-ng = "=0.7.0"
+tree-sitter-yaml = "=0.7.2"
+tree-sitter-md-025 = "=0.5.6"
+tree-sitter-python = "=0.25.0"
+tree-sitter-go = "=0.25.0"
+tree-sitter-html = "=0.23.2"
+tree-sitter-css = "=0.25.0"
+tree-sitter-bash = "=0.25.1"
+proptest = { version = "=1.11.0", default-features = false, features = ["std"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
