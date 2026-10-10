@@ -158,7 +158,8 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
 - [ ] M4-15 — `$/progress` dan status server di status bar, termasuk RAM proses server.
 - [ ] M4-16 — Auto-restart server crash (maks 3x / 5 menit) dan command Restart/Stop server.
 - [ ] M4-17 — Uji end-to-end dengan `rust-analyzer` pada repo `ripgrep`.
-- [ ] M4-18 — Dogfooding: pakai Galaxy untuk mengembangkan Galaxy.
+- [x] M4-18 — Dogfooding: pakai Galaxy untuk mengembangkan Galaxy.
+  - Status: Galaxy berhasil dibuka terhadap repository-nya sendiri melalui `-OpenPath`, lalu diverifikasi dengan suite Rust, Swift unit, dan XCUITest. Alur yang tercakup meliputi buffer baru, Explorer, membuka file, editing keyboard, undo, clipboard, multi-cursor, find/replace, dan session-independent launch. `AppDelegate` membaca `-OpenPath` langsung dari process arguments agar state launch lama tidak membuat buffer baru berisi file repo.
 
 ## M5 — Search, Multi-LSP, Settings (3 minggu)
 

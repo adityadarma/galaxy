@@ -34,7 +34,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         windowController = controller
         // `Galaxy -OpenPath <file or folder>`; UI tests use this instead of
         // driving the open panel.
-        if pendingURL == nil, let path = UserDefaults.standard.string(forKey: "OpenPath") {
+        if pendingURL == nil, let path = Self.launchOpenPath {
             pendingURL = URL(fileURLWithPath: path)
         }
         if let url = pendingURL {
@@ -64,6 +64,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Verifies the Rust -> Swift callback path end-to-end.
         bridge.ping("startup")
+    }
+
+    private static var launchOpenPath: String? {
+        let arguments = ProcessInfo.processInfo.arguments
+        guard let index = arguments.firstIndex(of: "-OpenPath"), arguments.index(after: index) < arguments.endIndex else {
+            return nil
+        }
+        return arguments[arguments.index(after: index)]
     }
 
     @objc func showPreferences(_ sender: Any?) {
