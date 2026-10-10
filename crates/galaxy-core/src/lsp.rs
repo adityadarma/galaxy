@@ -5,8 +5,9 @@
 //! editor can remain synchronous. No UI call waits for server output.
 
 use std::collections::HashMap;
+use std::env;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
@@ -29,6 +30,116 @@ pub struct ServerConfig {
     pub program: String,
     pub args: Vec<String>,
     pub log_traffic: bool,
+    pub initialization_options: Value,
+}
+
+/// Server configuration supplied by global or workspace settings. The JSON
+/// shape is intentionally small and forwards unknown option contents intact:
+/// `{ "rust": { "command": "rust-analyzer", "args": [],
+/// "initializationOptions": { ... } } }`.
+#[derive(Debug, Default, Clone)]
+pub struct LspSettings {
+    pub servers: HashMap<String, ServerConfig>,
+}
+
+impl LspSettings {
+    pub fn from_json(value: &Value) -> Result<Self, String> {
+        let Some(servers) = value.get("servers").and_then(Value::as_object) else {
+            return Ok(Self::default());
+        };
+        let mut out = Self::default();
+        for (language, entry) in servers {
+            let object = entry
+                .as_object()
+                .ok_or_else(|| format!("server config for {language} must be an object"))?;
+            let program = object
+                .get("command")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("server config for {language} needs string command"))?;
+            let args = object
+                .get("args")
+                .map(|args| {
+                    args.as_array()
+                        .ok_or_else(|| format!("server args for {language} must be an array"))?
+                        .iter()
+                        .map(|arg| {
+                            arg.as_str().map(str::to_owned).ok_or_else(|| {
+                                format!("server args for {language} must be strings")
+                            })
+                        })
+                        .collect()
+                })
+                .transpose()?
+                .unwrap_or_default();
+            out.servers.insert(
+                language.to_ascii_lowercase(),
+                ServerConfig {
+                    program: program.to_owned(),
+                    args,
+                    log_traffic: object
+                        .get("logTraffic")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    initialization_options: object
+                        .get("initializationOptions")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                },
+            );
+        }
+        Ok(out)
+    }
+
+    /// Resolves a server override first, otherwise the built-in language
+    /// default. Relative or bare commands are found in `PATH` at launch time.
+    pub fn resolve(&self, language: &str) -> Option<ServerConfig> {
+        self.servers
+            .get(&language.to_ascii_lowercase())
+            .cloned()
+            .or_else(|| default_server(language))
+    }
+}
+
+fn default_server(language: &str) -> Option<ServerConfig> {
+    let (program, args) = match language.to_ascii_lowercase().as_str() {
+        "rust" => ("rust-analyzer", &[][..]),
+        "typescript" | "tsx" | "javascript" => {
+            ("typescript-language-server", &["--stdio"] as &[&str])
+        }
+        "python" => ("pyright-langserver", &["--stdio"] as &[&str]),
+        "go" => ("gopls", &[] as &[&str]),
+        _ => return None,
+    };
+    find_in_path(program).map(|program| ServerConfig {
+        program: program.to_string_lossy().into_owned(),
+        args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+        log_traffic: false,
+        initialization_options: Value::Null,
+    })
+}
+
+/// Finds an executable with no shell expansion. Absolute or relative paths
+/// are accepted only when executable; bare names are searched through PATH.
+pub fn find_in_path(program: &str) -> Option<PathBuf> {
+    let path = Path::new(program);
+    if path.components().count() > 1 {
+        return is_executable(path).then(|| path.to_path_buf());
+    }
+    env::var_os("PATH")?
+        .as_os_str()
+        .to_str()?
+        .split(':')
+        .map(Path::new)
+        .map(|dir| dir.join(program))
+        .find(|candidate| is_executable(candidate))
+}
+
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.is_file()
+        && path
+            .metadata()
+            .is_ok_and(|meta| meta.permissions().mode() & 0o111 != 0)
 }
 
 /// Lifecycle events observed by the synchronous editor core.
@@ -67,7 +178,8 @@ impl LspManager {
             "params": {
                 "processId": std::process::id(),
                 "rootUri": format!("file://{}", key.root.to_string_lossy()),
-                "capabilities": {}
+                "capabilities": {},
+                "initializationOptions": config.initialization_options
             }
         }))?;
         self.servers.insert(
@@ -301,6 +413,7 @@ async fn read_frame<R: AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::thread;
     use std::time::Instant;
     use tokio::io::AsyncWriteExt;
@@ -379,6 +492,7 @@ mod tests {
             program: "/bin/sh".into(),
             args,
             log_traffic: false,
+            initialization_options: Value::Null,
         };
         let mut manager = LspManager::default();
         assert!(manager.ensure_server(key.clone(), &config).unwrap());
@@ -397,5 +511,36 @@ mod tests {
         }
         manager.shutdown_all();
         assert_eq!(manager.len(), 0);
+    }
+
+    #[test]
+    fn settings_parse_override_and_preserve_initialization_options() {
+        let settings = LspSettings::from_json(&serde_json::json!({
+            "servers": { "Rust": {
+                "command": "/bin/sh", "args": ["-c", "server"], "logTraffic": true,
+                "initializationOptions": { "checkOnSave": true }
+            }}
+        }))
+        .unwrap();
+        let config = settings.resolve("rust").unwrap();
+        assert_eq!(config.program, "/bin/sh");
+        assert_eq!(config.args, ["-c", "server"]);
+        assert!(config.log_traffic);
+        assert_eq!(config.initialization_options["checkOnSave"], true);
+    }
+
+    #[test]
+    fn finds_executable_in_an_explicit_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("test-lsp");
+        fs::write(&executable, "#!/bin/sh\n").unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        use std::os::unix::fs::PermissionsExt;
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).unwrap();
+        assert_eq!(
+            find_in_path(&executable.to_string_lossy()),
+            Some(executable)
+        );
     }
 }
