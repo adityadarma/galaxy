@@ -230,6 +230,14 @@ pub struct OutlineSymbol {
     pub column: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct LspOutlineSymbol {
+    pub name: String,
+    pub kind: String,
+    pub line: u64,
+    pub column: u64,
+}
+
 /// Parses Go to Line input (`42`, `42:7`, `-1`). `None` if it is not one.
 #[uniffi::export]
 pub fn parse_line_target(input: String, line_count: u64) -> Option<LineTarget> {
@@ -751,6 +759,47 @@ impl Core {
                 edits: action.edits.iter().map(rename_edit).collect(),
             })
             .collect()
+    }
+
+    pub fn request_document_symbols(&self, document: Arc<DocumentHandle>) -> bool {
+        let path = document.path();
+        if path.is_empty() {
+            return false;
+        }
+        let uri = file_uri(Path::new(&path));
+        self.lsp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .request_document_symbols(&uri, Instant::now())
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    pub fn document_symbols(&self, document: Arc<DocumentHandle>) -> Vec<LspOutlineSymbol> {
+        let path = document.path();
+        if path.is_empty() {
+            return Vec::new();
+        }
+        let uri = file_uri(Path::new(&path));
+        fn flatten(
+            source: &[galaxy_core::lsp::DocumentSymbolInfo],
+            output: &mut Vec<LspOutlineSymbol>,
+        ) {
+            for symbol in source {
+                output.push(LspOutlineSymbol {
+                    name: symbol.name.clone(),
+                    kind: symbol.kind.to_string(),
+                    line: symbol.range.start_line,
+                    column: symbol.range.start_character,
+                });
+                flatten(&symbol.children, output);
+            }
+        }
+        let mut output = Vec::new();
+        let lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
+        flatten(lsp.document_symbols(&uri), &mut output);
+        output
     }
 
     pub fn request_formatting(

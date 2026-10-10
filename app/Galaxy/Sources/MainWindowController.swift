@@ -105,6 +105,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private var renameRequest: DocumentHandle?
     private var codeActionRequest: DocumentHandle?
     private var formattingRequest: DocumentHandle?
+    private var outlineRequest: DocumentHandle?
     private var keyMonitor: Any?
     /// Tabs in the order they were last shown, most recent first (⌃Tab).
     private var tabOrderByUse: [ObjectIdentifier] = []
@@ -278,6 +279,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 self?.refreshRename()
                 self?.refreshCodeActions()
                 self?.refreshFormatting()
+                self?.refreshDocumentSymbols()
                 let problems = self?.bridge.core.problems() ?? []
                 self?.problemsPanel.update(problems)
                 self?.problemsPanel.isHidden = problems.isEmpty
@@ -1442,9 +1444,20 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         if isOutlinePickerVisible { return outlinePicker.move(by: 1) }
         closeOverlays()
         let panel = outlinePicker
-        panel.reset(symbols: doc.outline())
+        let fallback = doc.outline()
+        panel.reset(symbols: fallback)
+        outlineRequest = doc
+        bridge.requestDocumentSymbols(document: doc)
         panel.isHidden = false
         panel.focus()
+    }
+
+    private func refreshDocumentSymbols() {
+        guard let document = outlineRequest else { return }
+        let symbols = bridge.documentSymbols(document: document)
+        guard !symbols.isEmpty else { return }
+        outlineRequest = nil
+        outlinePicker.reset(symbols: symbols.map { OutlineSymbol(name: $0.name, kind: $0.kind, line: $0.line, column: $0.column) })
     }
 
     func closeGoToSymbol() {

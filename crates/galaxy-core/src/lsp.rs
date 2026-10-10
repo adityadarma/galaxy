@@ -84,6 +84,14 @@ pub struct CodeActionInfo {
     pub edits: Vec<RenameEdit>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocumentSymbolInfo {
+    pub name: String,
+    pub kind: u64,
+    pub range: Range,
+    pub children: Vec<DocumentSymbolInfo>,
+}
+
 /// Latest server diagnostics, replaced atomically per URI by
 /// `textDocument/publishDiagnostics` as required by LSP.
 #[derive(Debug, Default)]
@@ -512,6 +520,8 @@ pub struct LspManager {
     formatting_requests: HashMap<(LspKey, u64), String>,
     range_formatting_requests: HashMap<(LspKey, u64), String>,
     on_type_formatting_requests: HashMap<(LspKey, u64), String>,
+    document_symbols: HashMap<String, Vec<DocumentSymbolInfo>>,
+    document_symbol_requests: HashMap<(LspKey, u64), String>,
 }
 
 impl LspManager {
@@ -800,6 +810,32 @@ impl LspManager {
             .unwrap_or(&[])
     }
 
+    pub fn request_document_symbols(&mut self, uri: &str, now: Instant) -> io::Result<Option<u64>> {
+        let Some(key) = self.documents.get(uri).map(|(key, _)| key.clone()) else {
+            return Ok(None);
+        };
+        self.document_symbols.remove(uri);
+        let id = self.request(
+            &key,
+            "textDocument/documentSymbol".into(),
+            serde_json::json!({
+                "textDocument": { "uri": uri }
+            }),
+            Duration::from_millis(1000),
+            now,
+        )?;
+        self.document_symbol_requests
+            .insert((key, id), uri.to_owned());
+        Ok(Some(id))
+    }
+
+    pub fn document_symbols(&self, uri: &str) -> &[DocumentSymbolInfo] {
+        self.document_symbols
+            .get(uri)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
     pub fn request_range_formatting(
         &mut self,
         uri: &str,
@@ -1043,6 +1079,9 @@ impl LspManager {
                         if let Some(uri) = self.on_type_formatting_requests.remove(&(key.clone(), id))
                             && let Some(result) = message.get("result").and_then(|value| parse_text_edit_array(&uri, value))
                         { self.formatting_edits.insert(uri, result); }
+                        if let Some(uri) = self.document_symbol_requests.remove(&(key.clone(), id))
+                            && let Some(result) = message.get("result").and_then(parse_document_symbols)
+                        { self.document_symbols.insert(uri, result); }
                         if self.requests.remove(&(key.clone(), id)).is_some() {
                             events.push(LspEvent::Response {
                                 key: key.clone(), id,
@@ -1289,6 +1328,32 @@ fn parse_text_edit_array(uri: &str, value: &Value) -> Option<Vec<RenameEdit>> {
             })
             .collect(),
     )
+}
+
+fn parse_document_symbols(value: &Value) -> Option<Vec<DocumentSymbolInfo>> {
+    let mut symbols = Vec::new();
+    for value in value.as_array()? {
+        symbols.push(parse_document_symbol(value)?);
+    }
+    Some(symbols)
+}
+
+fn parse_document_symbol(value: &Value) -> Option<DocumentSymbolInfo> {
+    let object = value.as_object()?;
+    let range = object
+        .get("range")
+        .or_else(|| object.get("selectionRange"))
+        .and_then(parse_range)
+        .or_else(|| object.get("location")?.get("range").and_then(parse_range))?;
+    Some(DocumentSymbolInfo {
+        name: object.get("name")?.as_str()?.to_owned(),
+        kind: object.get("kind")?.as_u64()?,
+        range,
+        children: object
+            .get("children")
+            .and_then(parse_document_symbols)
+            .unwrap_or_default(),
+    })
 }
 
 fn range_value(range: &Range) -> Value {

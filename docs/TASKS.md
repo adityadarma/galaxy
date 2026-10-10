@@ -149,6 +149,8 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
   - Status: formatting options, parser `TextEdit[]`, menu `Format Document` (`Cmd+Option+Shift+F`), apply UTF-16 edits, dan sinkronisasi LSP selesai.
 - [x] M4-15 — Range formatting dan on-type formatting.
   - Status: selection memakai `textDocument/rangeFormatting`, trigger `;`, `}`, `)`, dan newline memakai `textDocument/onTypeFormatting`, semuanya apply sebagai satu undo step selesai.
+- [x] M4-16 — Document symbols / outline refresh dari LSP.
+  - Status: request `textDocument/documentSymbol`, parsing nested `DocumentSymbol` dan flat `SymbolInformation`, refresh Go to Symbol saat response tersedia, fallback Tree-sitter dipertahankan selesai.
 - [ ] M4-13 — Code actions / quick fix (`Cmd+.`).
 - [ ] M4-14 — Formatting dokumen dan format on save.
 - [ ] M4-15 — `$/progress` dan status server di status bar, termasuk RAM proses server.
