@@ -462,6 +462,27 @@ impl Core {
         events.len() as u64
     }
 
+    pub fn problems(&self) -> Vec<ProblemInfo> {
+        let lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
+        lsp.problems()
+            .into_iter()
+            .map(|diagnostic| ProblemInfo {
+                uri: diagnostic.uri.clone(),
+                line: diagnostic.range.start_line,
+                column: diagnostic.range.start_character,
+                severity: match diagnostic.severity {
+                    galaxy_core::lsp::DiagnosticSeverity::Error => 1,
+                    galaxy_core::lsp::DiagnosticSeverity::Warning => 2,
+                    galaxy_core::lsp::DiagnosticSeverity::Information => 3,
+                    galaxy_core::lsp::DiagnosticSeverity::Hint => 4,
+                },
+                message: diagnostic.message.clone(),
+                source: diagnostic.source.clone(),
+                code: diagnostic.code.clone(),
+            })
+            .collect()
+    }
+
     pub fn sync_lsp_document(&self, document: Arc<DocumentHandle>) {
         let path = document.path();
         if path.is_empty() {
@@ -490,6 +511,17 @@ impl Core {
 
 fn file_uri(path: &Path) -> String {
     format!("file://{}", path.to_string_lossy())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ProblemInfo {
+    pub uri: String,
+    pub line: u64,
+    pub column: u64,
+    pub severity: u8,
+    pub message: String,
+    pub source: Option<String>,
+    pub code: Option<String>,
 }
 
 /// One row of the file explorer.

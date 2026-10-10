@@ -129,8 +129,8 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
   - Status: `LspManager` menyimpan `DocumentSync` per URI dan mengirim `didOpen`, `didChange`, `didSave`, serta `didClose` ke server shared. Single `ChangeSet` dikirim incremental dengan range/rangeLength UTF-16; multi-cursor atau burst selama debounce 50 ms dikolaps menjadi full text agar offset server selalu benar. `flush_changes(now)` nonblocking dan dipanggil event loop integrator. Tercakup emoji (2 UTF-16 unit) + CJK range test, debounce/full-text fallback, dan lifecycle manager scripted server. Frontend belum memiliki instance `LspManager` karena settings workspace belum dihubungkan; wiring event `DocumentHandle` ke manager adalah integrasi UI berikutnya sebelum fitur LSP terlihat.
 - [x] M4-05 — Request tracking dengan ID, timeout, dan `$/cancelRequest` untuk request usang.
   - Status: `LspManager::request` menghasilkan ID monotonic mulai 2 (0 initialize, 1 shutdown), menyimpan method/deadline, dan `poll` menerbitkan `LspEvent::Response` hanya untuk ID yang masih pending. `cancel_request` mengirim `$/cancelRequest` lalu membuang state lokal, sehingga response terlambat tidak terlihat; `expire_requests(now)` melakukan cancel dan menerbitkan `TimedOut`. Notification tetap `Message`, terpisah dari response. Tercakup scripted server response, ID/cancel sekali, timeout, dan stale request. Retry/restart server tetap M4-16.
-- [ ] M4-06 — Diagnostics: underline di editor, marker di gutter dan scrollbar, panel Problems.
-  - Status: Live default LSP startup, `publishDiagnostics`, UTF-16 clipping, underline, dan gutter marker selesai. Scrollbar marker dan panel Problems masih tersisa.
+- [x] M4-06 — Diagnostics: underline di editor, marker di gutter dan scrollbar, panel Problems.
+  - Status: Live default LSP startup, `publishDiagnostics`, UTF-16 clipping, underline, gutter/scrollbar marker, dan panel Problems dengan navigasi ke lokasi diagnostic selesai.
 - [ ] M4-07 — Hover popover (Markdown sederhana, code block di-highlight).
 - [ ] M4-08 — Completion: popup, filter lokal fuzzy, `completionItem/resolve`, snippet dasar (`$1`, `$0`).
 - [ ] M4-09 — Signature help.

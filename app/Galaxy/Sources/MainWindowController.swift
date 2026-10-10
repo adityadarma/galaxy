@@ -25,7 +25,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     var activeTab: EditorTab? { activeIndex.map { tabs[$0] } }
     /// Left-hand message in the status bar.
     var statusLabel: NSTextField { statusBar.message }
-    private let scrollView = NSScrollView()
+    private let scrollView = DiagnosticScrollView()
+    private let problemsPanel = ProblemsPanel()
     private let splitView = NSSplitView()
     private let detailView = NSView()
     /// Holds the find bar's place in the layout. The bar itself is built on
@@ -246,6 +247,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         lspTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.bridge.pollLSP()
+                let problems = self?.bridge.core.problems() ?? []
+                self?.problemsPanel.update(problems)
+                self?.problemsPanel.isHidden = problems.isEmpty
+                if let document = self?.activeTab?.doc {
+                    let markers = problems.filter { $0.uri == "file://\(document.path())" }
+                        .map { ($0.line, $0.severity) }
+                    self?.scrollView.diagnosticScroller.update(markers: markers, lineCount: document.lineCount())
+                }
                 self?.editorView.needsDisplay = true
             }
         }
@@ -259,6 +268,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         detailView.addSubview(pathBar)
         detailView.addSubview(findBarSlot)
         detailView.addSubview(scrollView)
+        detailView.addSubview(problemsPanel)
         NSLayoutConstraint.activate([
             tabBar.topAnchor.constraint(equalTo: detailView.topAnchor),
             tabBar.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
@@ -273,8 +283,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             scrollView.topAnchor.constraint(equalTo: findBarSlot.bottomAnchor),
             scrollView.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: detailView.bottomAnchor),
+            problemsPanel.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
+            problemsPanel.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
+            problemsPanel.bottomAnchor.constraint(equalTo: detailView.bottomAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: problemsPanel.topAnchor),
         ])
+        problemsPanel.onSelect = { [weak self] problem in self?.showProblem(problem) }
+        problemsPanel.isHidden = true
 
         buildSidebar()
 
@@ -311,6 +326,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             // Only valid once the bar is in the window.
             titleBar.bottomAnchor.constraint(equalTo: titleBarBottom),
         ])
+    }
+
+    private func showProblem(_ problem: ProblemInfo) {
+        guard let path = URL(string: problem.uri)?.path else { return }
+        guard let index = tabs.firstIndex(where: { $0.doc.path() == path }) else { return }
+        if activeIndex != index { selectTab(index) }
+        activeTab?.doc.goToLine(line: problem.line, col: problem.column)
+        editorView.window?.makeFirstResponder(editorView)
     }
 
     private func buildSidebar() {
