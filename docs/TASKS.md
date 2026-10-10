@@ -93,7 +93,8 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
 
 ## M3 — Syntax Highlighting (3 minggu)
 
-- [ ] M3-01 — `SyntaxService`: tree-sitter parser per dokumen di worker thread, input via rope chunk.
+- [x] M3-01 — `SyntaxService`: tree-sitter parser per dokumen di worker thread, input via rope chunk.
+  - Status: `syntax.rs` menyediakan `SyntaxService` per dokumen dengan parser Tree-sitter pada thread `galaxy-syntax`; submit hanya meng-clone handle `Rope` O(1), input parser dibaca melalui `Rope::chunk_at_byte`, dan poll tidak memblok. Hasil membawa revision dan hanya tree untuk request terbaru yang diterbitkan, sehingga parse usang dibuang. Grammar belum dibundel sampai M3-03, query/capture sampai M3-04, dan style viewport/FFI sampai M3-05; karena itu service belum dihubungkan ke renderer. `tree-sitter-json` hanya dev dependency untuk test worker, bukan grammar produksi. Tercakup test parse rope dan stale revision.
 - [ ] M3-02 — Incremental parse dengan `InputEdit` dari setiap edit; versi dokumen untuk membuang hasil usang.
   - Re-parse setelah edit < 2 ms di file 10k baris.
 - [ ] M3-03 — Bundel grammar: Rust, TS, TSX, JS, JSON, TOML, YAML, Markdown, Python, Go, HTML, CSS, Bash.

@@ -24,9 +24,12 @@ regex.workspace = true
 nucleo-matcher.workspace = true
 # Workspace file watcher (FSEvents).
 notify.workspace = true
+# Parser worker behind M3 syntax highlighting.
+tree-sitter.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+tree-sitter-json.workspace = true
 
 [lints]
 workspace = true

@@ -34,7 +34,10 @@ regex = "=1.13.1"
 nucleo-matcher = "=0.3.1"
 # File watcher (M2-02): FSEvents on macOS. 8.x is the latest stable line.
 notify = { version = "=8.2.0", default-features = false, features = ["macos_fsevent"] }
+# Incremental concrete syntax trees. Grammars arrive in M3-03.
+tree-sitter = "=0.25.10"
 proptest = { version = "=1.11.0", default-features = false, features = ["std"] }
+tree-sitter-json = "=0.24.8"
 
 [workspace.lints.rust]
 unsafe_code = "deny"
