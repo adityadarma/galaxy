@@ -342,6 +342,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "galaxy-bench"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "galaxy-core",
+]
+
+[[package]]
+name = "galaxy-core"
+version = "0.1.0"
+dependencies = [
+ "ignore",
+ "notify",
+ "nucleo-matcher",
+ "proptest",
+ "regex",
+ "ropey",
+ "tempfile",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "unicode-segmentation",
+]
+
+[[package]]
+name = "galaxy-ffi"
+version = "0.1.0"
+dependencies = [
+ "galaxy-core",
+ "tempfile",
+ "tracing",
+ "uniffi",
+]
+
+[[package]]
 name = "getrandom"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -717,41 +752,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "513962919efc330f829edb2535844d1b912b0fbe2ca165d613e4e8788bb05a5a"
 dependencies = [
  "rand_core",
-]
-
-[[package]]
-name = "rcode-bench"
-version = "0.1.0"
-dependencies = [
- "criterion",
- "rcode-core",
-]
-
-[[package]]
-name = "rcode-core"
-version = "0.1.0"
-dependencies = [
- "ignore",
- "notify",
- "nucleo-matcher",
- "proptest",
- "regex",
- "ropey",
- "tempfile",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "unicode-segmentation",
-]
-
-[[package]]
-name = "rcode-ffi"
-version = "0.1.0"
-dependencies = [
- "rcode-core",
- "tempfile",
- "tracing",
- "uniffi",
 ]
 
 [[package]]

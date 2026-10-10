@@ -20,7 +20,7 @@ cargo test --workspace --locked
 
 step "Swift unit tests"
 (cd app && xcodegen generate --quiet)
-xcodebuild -project app/RustCode.xcodeproj -scheme RustCode -configuration Debug \
+xcodebuild -project app/Galaxy.xcodeproj -scheme Galaxy -configuration Debug \
   -derivedDataPath app/build test 2>&1 \
   | grep -vE "linkd.autoShortcut" \
   | grep -E "error:|Test Case .*failed|Executed [0-9]+ tests.*\) seconds$|\*\* TEST" \

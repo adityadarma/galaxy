@@ -1,6 +1,6 @@
-name: RustCode
+name: Galaxy
 options:
-  bundleIdPrefix: dev.rustcode
+  bundleIdPrefix: dev.adityadarma
   deploymentTarget:
     macOS: "14.0"
   createIntermediateGroups: true
@@ -19,90 +19,90 @@ settings:
       SWIFT_COMPILATION_MODE: wholemodule
 
 targets:
-  RustCode:
+  Galaxy:
     type: application
     platform: macOS
     sources:
-      - path: RustCode/Sources
-      - path: RustCode/Generated
+      - path: Galaxy/Sources
+      - path: Galaxy/Generated
         optional: true
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: dev.rustcode.RustCode
-        PRODUCT_NAME: RustCode
+        PRODUCT_BUNDLE_IDENTIFIER: dev.adityadarma.galaxy
+        PRODUCT_NAME: Galaxy
         MARKETING_VERSION: "0.1.0"
         CURRENT_PROJECT_VERSION: "1"
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_NSPrincipalClass: NSApplication
-        INFOPLIST_KEY_CFBundleDisplayName: RustCode
+        INFOPLIST_KEY_CFBundleDisplayName: Galaxy
         INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
         INFOPLIST_KEY_NSHumanReadableCopyright: ""
         ENABLE_HARDENED_RUNTIME: YES
         CODE_SIGN_IDENTITY: "-"
         CODE_SIGN_STYLE: Manual
-        SWIFT_INCLUDE_PATHS: $(PROJECT_DIR)/RustCode/FFI/include
-        HEADER_SEARCH_PATHS: $(PROJECT_DIR)/RustCode/FFI/include
-        LIBRARY_SEARCH_PATHS: $(PROJECT_DIR)/RustCode/FFI
-        OTHER_LDFLAGS: -lrcode_ffi
+        SWIFT_INCLUDE_PATHS: $(PROJECT_DIR)/Galaxy/FFI/include
+        HEADER_SEARCH_PATHS: $(PROJECT_DIR)/Galaxy/FFI/include
+        LIBRARY_SEARCH_PATHS: $(PROJECT_DIR)/Galaxy/FFI
+        OTHER_LDFLAGS: -lgalaxy_ffi
     preBuildScripts:
       - name: Build Rust Core
         script: |
           "${PROJECT_DIR}/../scripts/build-core.sh"
         basedOnDependencyAnalysis: false
         outputFiles:
-          - $(PROJECT_DIR)/RustCode/FFI/librcode_ffi.a
-          - $(PROJECT_DIR)/RustCode/Generated/rcode_ffi.swift
+          - $(PROJECT_DIR)/Galaxy/FFI/libgalaxy_ffi.a
+          - $(PROJECT_DIR)/Galaxy/Generated/galaxy_ffi.swift
 
-  RustCodeTests:
+  GalaxyTests:
     type: bundle.unit-test
     platform: macOS
     sources:
-      - path: RustCodeTests
+      - path: GalaxyTests
     dependencies:
-      - target: RustCode
+      - target: Galaxy
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES
-        PRODUCT_BUNDLE_IDENTIFIER: dev.rustcode.RustCodeTests
-        TEST_HOST: $(BUILT_PRODUCTS_DIR)/RustCode.app/Contents/MacOS/RustCode
+        PRODUCT_BUNDLE_IDENTIFIER: dev.adityadarma.galaxy.tests
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/Galaxy.app/Contents/MacOS/Galaxy
         BUNDLE_LOADER: $(TEST_HOST)
-        SWIFT_INCLUDE_PATHS: $(PROJECT_DIR)/RustCode/FFI/include
+        SWIFT_INCLUDE_PATHS: $(PROJECT_DIR)/Galaxy/FFI/include
         CODE_SIGN_IDENTITY: "-"
         CODE_SIGN_STYLE: Manual
 
-  RustCodeUITests:
+  GalaxyUITests:
     type: bundle.ui-testing
     platform: macOS
     sources:
-      - path: RustCodeUITests
+      - path: GalaxyUITests
     dependencies:
-      - target: RustCode
+      - target: Galaxy
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES
-        PRODUCT_BUNDLE_IDENTIFIER: dev.rustcode.RustCodeUITests
-        TEST_TARGET_NAME: RustCode
+        PRODUCT_BUNDLE_IDENTIFIER: dev.adityadarma.galaxy.uitests
+        TEST_TARGET_NAME: Galaxy
         CODE_SIGN_IDENTITY: "-"
         CODE_SIGN_STYLE: Manual
 
 schemes:
-  RustCode:
+  Galaxy:
     build:
       targets:
-        RustCode: all
-        RustCodeTests: [test]
+        Galaxy: all
+        GalaxyTests: [test]
     test:
       targets:
-        - RustCodeTests
+        - GalaxyTests
 
   # Drives the real app through the accessibility API. Kept out of the
   # default scheme because it needs a GUI session and Accessibility
   # permission; run it with scripts/ui-test.sh.
-  RustCodeUI:
+  GalaxyUI:
     build:
       targets:
-        RustCode: all
-        RustCodeUITests: [test]
+        Galaxy: all
+        GalaxyUITests: [test]
     test:
       targets:
-        - RustCodeUITests
+        - GalaxyUITests

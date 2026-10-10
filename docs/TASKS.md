@@ -1,4 +1,4 @@
-# Tasks: RustCode
+# Tasks: Galaxy
 
 Referensi: `docs/PRD.md`. Setiap task selesai bila acceptance criteria terpenuhi dan benchmark terkait tidak regresi.
 
@@ -6,14 +6,14 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
 
 ## M0 — Fondasi (2 minggu)
 
-- [x] M0-01 — Buat Cargo workspace: `crates/rcode-core`, `crates/rcode-ffi`, `crates/rcode-bench`.
+- [x] M0-01 — Buat Cargo workspace: `crates/galaxy-core`, `crates/galaxy-ffi`, `crates/galaxy-bench`.
   - `cargo build` dan `cargo test` lulus.
-- [x] M0-02 — Buat proyek Xcode (`app/RustCode`) via xcodegen/Tuist, target macOS 14, Swift 6.
+- [x] M0-02 — Buat proyek Xcode (`app/Galaxy`) via xcodegen/Tuist, target macOS 14, Swift 6.
   - App kosong terbuka dan menampilkan window.
 - [x] M0-03 — Integrasi UniFFI: build universal static lib (`arm64` + `x86_64`) dan generate binding Swift.
   - Swift memanggil fungsi Rust `core_version()` dan menerima callback event.
 - [x] M0-04 — Script build `scripts/build-core.sh` dipanggil dari build phase Xcode.
-- [x] M0-05 — Setup `tracing` di Rust dan `os_log` di Swift, dengan log file di `~/Library/Logs/RustCode`.
+- [x] M0-05 — Setup `tracing` di Rust dan `os_log` di Swift, dengan log file di `~/Library/Logs/Galaxy`.
 - [x] M0-06 — CI GitHub Actions (macOS runner): `cargo fmt --check`, `clippy -D warnings`, `cargo test`, `xcodebuild test`.
 - [x] M0-07 — Harness benchmark: `criterion` untuk core, script pengukuran startup dan RAM (`footprint`) untuk app.
   - Hasil benchmark disimpan sebagai artifact CI; regresi > 10% gagal.
@@ -55,7 +55,7 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
   - Status: `EditorView` mengekspos role text area, nilai teks (dibatasi 1 juta UTF-16 unit; jumlah karakter dibatasi sama), selected range/text, dan nomor baris caret, serta mengirim notifikasi `valueChanged` (maks 1x per frame) dan `selectedTextChanged` agar VoiceOver tahu ada perubahan. Tercakup test otomatis. Belum dicoba dengan VoiceOver sungguhan (X-03).
 
 ### Uji UI otomatis (di luar daftar task)
-- Target `RustCodeUITests` (XCUITest) dengan 12 skenario end-to-end: ketik, panah, undo, seleksi, copy/cut per baris, ⌘D, buka file + ⌘S, buka folder + klik file, toggle sidebar dari status bar, prompt simpan saat tutup, find (navigasi, Esc), Replace All + undo, regex salah.
+- Target `GalaxyUITests` (XCUITest) dengan 12 skenario end-to-end: ketik, panah, undo, seleksi, copy/cut per baris, ⌘D, buka file + ⌘S, buka folder + klik file, toggle sidebar dari status bar, prompt simpan saat tutup, find (navigasi, Esc), Replace All + undo, regex salah.
 - Jalankan: `scripts/ui-test.sh`, atau semua test sekaligus dengan `scripts/test-all.sh --ui`.
 - Test memakai keyboard dan mouse sungguhan. Saat mesin diam, suite lulus penuh; kegagalan acak sebelumnya disebabkan input dari luar yang masuk ke app. `launch()` sekarang gagal dengan pesan jelas bila buffer baru sudah berisi teks.
 - Belum dimasukkan ke CI karena butuh sesi GUI dan izin Accessibility.
@@ -66,7 +66,7 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
   - Index 100k file < 1 s, RAM index < 20 MB.
   - Status: `build_file_index` memindai file (bukan direktori) dengan aturan ignore yang sama seperti explorer dan menyimpan path sebagai ID komponen terintern di `PathArena`; pembukaan workspace tetap lazy. Symlink ke folder tidak masuk indeks (tidak diikuti). `workspace-index` pada repo sintetis 100.001 file (Release, tiga run): 622–823 ms, estimasi 12,3 MB. Estimasi lama 10,82 MB terlalu rendah karena nama komponen tersimpan dua kali (vektor dan kunci map); sekarang keduanya dihitung. Dipakai Go to File (M2-07) lewat `Workspace.build_file_finder`.
 - [x] M2-02 — File watcher `notify` (FSEvents) dengan debounce, update index dan buffer terbuka.
-  - Status: `watcher.rs` memakai `notify` 8.2.0 (CC0-1.0, backend FSEvents saja). Satu watcher rekursif per window, mulai saat folder dibuka dan berhenti saat window ditutup atau folder diganti. Event dikumpulkan jadi batch: dikirim setelah 60 ms tanpa event baru, paling lambat 300 ms setelah event pertama; 200 file sekaligus tiba dalam ≤ 5 batch. Path di `.git`, folder exclude bawaan, dan file temp atomic save (`.rcode-*.tmp`) dibuang di sini; aturan `.gitignore` diterapkan oleh `Workspace::index_delta`, yang memeriksa disk. Event hilang, perubahan pada root, atau batch > 1.000 path menjadi rescan (bangun ulang indeks dan explorer). Indeks Go to File diperbarui di tempat (`FileFinder::apply_delta`, ~19 ms untuk 100k file, di background); recency dan konteks tetap; ⌘P tidak lagi membangun ulang indeks. Explorer hanya di-list ulang bila perubahan menyentuh folder yang sudah pernah dibuka; folder terbuka, pilihan, dan posisi scroll dipertahankan. Buffer terbuka ditangani di M2-03. Tercakup test Rust (`watcher`, `index_delta`, `apply_delta`, FFI) dan `QuickOpenTests`/`ExplorerTests`; belum dicoba dengan `git checkout` besar.
+  - Status: `watcher.rs` memakai `notify` 8.2.0 (CC0-1.0, backend FSEvents saja). Satu watcher rekursif per window, mulai saat folder dibuka dan berhenti saat window ditutup atau folder diganti. Event dikumpulkan jadi batch: dikirim setelah 60 ms tanpa event baru, paling lambat 300 ms setelah event pertama; 200 file sekaligus tiba dalam ≤ 5 batch. Path di `.git`, folder exclude bawaan, dan file temp atomic save (`.galaxy-*.tmp`) dibuang di sini; aturan `.gitignore` diterapkan oleh `Workspace::index_delta`, yang memeriksa disk. Event hilang, perubahan pada root, atau batch > 1.000 path menjadi rescan (bangun ulang indeks dan explorer). Indeks Go to File diperbarui di tempat (`FileFinder::apply_delta`, ~19 ms untuk 100k file, di background); recency dan konteks tetap; ⌘P tidak lagi membangun ulang indeks. Explorer hanya di-list ulang bila perubahan menyentuh folder yang sudah pernah dibuka; folder terbuka, pilihan, dan posisi scroll dipertahankan. Buffer terbuka ditangani di M2-03. Tercakup test Rust (`watcher`, `index_delta`, `apply_delta`, FFI) dan `QuickOpenTests`/`ExplorerTests`; belum dicoba dengan `git checkout` besar.
 - [x] M2-03 — Handling perubahan eksternal: reload otomatis bila buffer bersih, prompt konflik bila dirty.
   - Status: tiap dokumen menyimpan `DiskStamp` (ukuran, mtime, hash isi) saat dibuka dan disimpan; save sendiri tidak terdeteksi sebagai perubahan. Cek berjalan pada batch watcher (file di workspace) dan saat window menjadi key (juga file di luar workspace); file yang tak berubah cukup satu `stat`, dan `touch` atau checkout dengan isi sama tidak dianggap perubahan. Buffer bersih di-reload otomatis, termasuk tab di background: hanya bagian yang berbeda yang diganti (prefix/suffix sama dipertahankan), satu langkah undo, encoding/BOM/line ending ikut file. Buffer dirty: prompt "Keep My Changes" / "Reload from Disk", ditanyakan sekali saat tab ditampilkan dan window aktif; Keep membuat buffer tetap unsaved terhadap file baru. Save mengecek disk dulu dan meminta konfirmasi sebelum menimpa. File terhapus: tab berjudul "(deleted)", teks tetap, dihitung unsaved; Save membuatnya kembali, dan file yang dipulihkan dengan isi sama kembali bersih. Tercakup test Rust (`disk`, `reload`, FFI) dan `DiskChangeTests`. Rename di luar editor tampil sebagai "(deleted)"; tab tidak mengikuti nama baru.
 - [x] M2-04 — Explorer `NSOutlineView` lazy-load per direktori, ikon tipe file, status dirty.
@@ -83,10 +83,10 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
 - [x] M2-09 — Command registry di Rust + command palette `Cmd+Shift+P`.
   - Status: `commands.rs` berisi registry (id unik ala VSCode, kategori, judul, kata kunci tersembunyi), 36 command bawaan, dan pencarian fuzzy `nucleo-matcher` pada label `Kategori: Judul` (kata kunci hanya menemukan, peringkatnya di bawah match label), dengan bonus untuk 20 command terakhir; query kosong: terakhir dipakai dulu, lalu alfabet. Panel ⇧⌘P (`CommandPalette.swift`) dibangun saat pertama dipakai, menampilkan shortcut dari menu dan hanya command yang bisa jalan saat itu (validasi sama seperti menu). Command dijalankan dari responder yang fokus sebelum palette dibuka. Test memastikan setiap command punya action, setiap item menu punya command, dan tidak ada action yang tertutup oleh method AppKit. Temuan: `toggleSidebar:`, `selectNextTab:`, `selectPreviousTab:` sudah dimiliki `NSWindow`, yang lebih dulu di responder chain, jadi ⌘B dan ⇧⌘[ / ⇧⌘] dari menu kemungkinan tidak pernah sampai ke controller; ketiganya diganti nama. Tercakup test Rust dan `CommandPaletteTests`; belum dicoba dengan keyboard sungguhan.
 - [x] M2-10 — Keymap default (mirip VSCode) dan override `keybindings.json`.
-  - Status: default di `keymap.rs` (shortcut macOS VSCode untuk semua command yang ada). File `~/Library/Application Support/RustCode/User/keybindings.json` memakai format VSCode: `{ "key", "command" }` menambah binding dan mengambil key itu dari command lain, `"-command"` menghapus default (satu key, atau semua bila `key` kosong). Komentar dan trailing comma diterima (parser JSONC sendiri, `jsonc.rs`, tanpa dependency baru). Entri salah dilewati dengan pesan per entri (baris/kolom untuk file rusak, yang memakai default); `when`, `args`, dan chord belum didukung dan dilaporkan. Semua shortcut lewat satu key monitor per window, dijalankan hanya bila item menunya aktif; menu dan command palette menampilkan key utama tiap command. "Keyboard Shortcuts…" (menu View dan palette) membuka file, dibuat dengan semua default sebagai komentar; menyimpannya langsung menerapkan, dan file juga dibaca ulang saat window aktif. Tercakup test Rust (`jsonc`, `keymap`) dan `KeybindingsTests`; belum dicoba dengan keyboard sungguhan atau layout non-US.
+  - Status: default di `keymap.rs` (shortcut macOS VSCode untuk semua command yang ada). File `~/Library/Application Support/Galaxy/User/keybindings.json` memakai format VSCode: `{ "key", "command" }` menambah binding dan mengambil key itu dari command lain, `"-command"` menghapus default (satu key, atau semua bila `key` kosong). Komentar dan trailing comma diterima (parser JSONC sendiri, `jsonc.rs`, tanpa dependency baru). Entri salah dilewati dengan pesan per entri (baris/kolom untuk file rusak, yang memakai default); `when`, `args`, dan chord belum didukung dan dilaporkan. Semua shortcut lewat satu key monitor per window, dijalankan hanya bila item menunya aktif; menu dan command palette menampilkan key utama tiap command. "Keyboard Shortcuts…" (menu View dan palette) membuka file, dibuat dengan semua default sebagai komentar; menyimpannya langsung menerapkan, dan file juga dibaca ulang saat window aktif. Tercakup test Rust (`jsonc`, `keymap`) dan `KeybindingsTests`; belum dicoba dengan keyboard sungguhan atau layout non-US.
 - [x] M2-11 — Session restore: workspace terakhir, tab, posisi cursor, scroll.
-  - Status: `~/Library/Application Support/RustCode/session.json` (JSON berversi) disimpan saat window ditutup atau app quit: folder, tab file berurutan (preview atau tidak), caret, scroll per tab, tab aktif, sidebar. Saat launch tanpa path, session dipulihkan; folder atau file yang sudah hilang dilewati, caret di-clamp. Kalau tidak ada yang pulih, buffer Untitled seperti biasa. Untitled dan edit belum disimpan tidak ikut (penutupan sudah menanyakannya). File session rusak atau versi lain diabaikan dengan log. Mati untuk benchmark, host unit test, dan `-RestoreSession NO` (UI test). Tercakup `SessionTests`; belum dicoba restart app sungguhan dengan tangan, dan efeknya pada startup budget belum diukur dengan session besar.
-- [ ] M2-12 — CLI `rcode <path>` (symlink ke binary helper yang membuka app via `NSWorkspace`).
+  - Status: `~/Library/Application Support/Galaxy/session.json` (JSON berversi) disimpan saat window ditutup atau app quit: folder, tab file berurutan (preview atau tidak), caret, scroll per tab, tab aktif, sidebar. Saat launch tanpa path, session dipulihkan; folder atau file yang sudah hilang dilewati, caret di-clamp. Kalau tidak ada yang pulih, buffer Untitled seperti biasa. Untitled dan edit belum disimpan tidak ikut (penutupan sudah menanyakannya). File session rusak atau versi lain diabaikan dengan log. Mati untuk benchmark, host unit test, dan `-RestoreSession NO` (UI test). Tercakup `SessionTests`; belum dicoba restart app sungguhan dengan tangan, dan efeknya pada startup budget belum diukur dengan session besar.
+- [ ] M2-12 — CLI `galaxy <path>` (symlink ke binary helper yang membuka app via `NSWorkspace`).
 - [ ] M2-13 — Status bar: line/col, encoding, line ending, bahasa, indent.
   - Status: line/col (plus jumlah cursor), encoding (dengan BOM), line ending, dan indent sudah tampil. Bahasa belum, karena deteksi bahasa baru ada di M3-06.
 
@@ -125,7 +125,7 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
 - [ ] M4-15 — `$/progress` dan status server di status bar, termasuk RAM proses server.
 - [ ] M4-16 — Auto-restart server crash (maks 3x / 5 menit) dan command Restart/Stop server.
 - [ ] M4-17 — Uji end-to-end dengan `rust-analyzer` pada repo `ripgrep`.
-- [ ] M4-18 — Dogfooding: pakai RustCode untuk mengembangkan RustCode.
+- [ ] M4-18 — Dogfooding: pakai Galaxy untuk mengembangkan Galaxy.
 
 ## M5 — Search, Multi-LSP, Settings (3 minggu)
 
@@ -137,7 +137,7 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
 - [ ] M5-05 — Integrasi dan uji `pyright-langserver`.
 - [ ] M5-06 — Integrasi dan uji `gopls`.
 - [ ] M5-07 — `workspace/symbol` untuk `Cmd+T`.
-- [ ] M5-08 — Settings global dan per workspace (`.rcode/settings.json`), reload saat file berubah.
+- [ ] M5-08 — Settings global dan per workspace (`.galaxy/settings.json`), reload saat file berubah.
 - [ ] M5-09 — UI settings minimal: buka file JSON dengan validasi schema dan completion.
 
 ## M6 — Git, Terminal, Produktivitas (4 minggu)

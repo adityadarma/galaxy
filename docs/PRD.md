@@ -1,4 +1,4 @@
-# PRD: RustCode — Code Editor Native macOS
+# PRD: Galaxy — Code Editor Native macOS
 
 Versi: 0.1 (draft)
 Tanggal: 2026-10-05
@@ -6,7 +6,7 @@ Platform: macOS 14+ (Apple Silicon prioritas, Intel didukung)
 
 ## 1. Ringkasan
 
-RustCode adalah code editor native macOS dengan fokus utama pada performa dan efisiensi RAM. UI dibangun dengan Swift + AppKit, sedangkan core (text buffer, parsing, indexing, LSP, search) ditulis dalam Rust. Fitur difokuskan pada navigasi kode cepat: LSP, Go to File, syntax highlighting, dan workflow keyboard-first.
+Galaxy adalah code editor native macOS dengan fokus utama pada performa dan efisiensi RAM. UI dibangun dengan Swift + AppKit, sedangkan core (text buffer, parsing, indexing, LSP, search) ditulis dalam Rust. Fitur difokuskan pada navigasi kode cepat: LSP, Go to File, syntax highlighting, dan workflow keyboard-first.
 
 ## 2. Masalah
 
@@ -66,7 +66,7 @@ Prinsip:
 Prioritas: P0 = wajib v1, P1 = target v1, P2 = setelah v1.
 
 ### 7.1 Workspace dan File Explorer (P0)
-- Buka folder via menu, drag-and-drop, dan CLI `rcode <path>`.
+- Buka folder via menu, drag-and-drop, dan CLI `galaxy <path>`.
 - Tree explorer lazy: hanya membaca direktori yang dibuka.
 - Menghormati `.gitignore`, `.ignore`, dan exclude bawaan (`.git`, `node_modules`, `target`, `dist`, `build`).
 - File watcher (FSEvents) memperbarui tree dan buffer.
@@ -116,7 +116,7 @@ Acceptance: hasil Go to File muncul < 30 ms per ketikan pada 100k file.
 - `Cmd+Shift+P`: semua command terdaftar dan dapat dicari fuzzy.
 - Keybinding default mirip VSCode agar migrasi mudah.
 - Override keybinding via file `keybindings.json`.
-- Settings via `settings.json` (global dan per workspace `.rcode/settings.json`).
+- Settings via `settings.json` (global dan per workspace `.galaxy/settings.json`).
 
 ### 7.6 LSP (P0)
 - Satu proses server per (bahasa, root workspace), dijalankan saat file bahasa itu pertama dibuka.
@@ -175,7 +175,7 @@ Acceptance: semua fitur P0 berjalan dengan `rust-analyzer` pada repo Rust nyata 
 └───────────────▲──────────────────────────────┬───────────────────┘
                 │ snapshot viewport, events    │ commands, input
 ┌───────────────┴──────────── UniFFI ──────────▼───────────────────┐
-│                         Rust core (rcode-core)                   │
+│                         Rust core (galaxy-core)                   │
 │ Document store (ropey) · Undo · Selections · Edit ops            │
 │ Syntax service (tree-sitter, worker thread)                      │
 │ Workspace: file index, FSEvents watcher (notify), ignore         │
@@ -238,7 +238,7 @@ Keputusan desain:
 ## 12. Metrik keberhasilan
 
 - Seluruh anggaran di bagian 6 terpenuhi pada build v1.
-- Dapat dipakai harian (dogfooding) untuk mengembangkan RustCode sendiri sejak M4.
+- Dapat dipakai harian (dogfooding) untuk mengembangkan Galaxy sendiri sejak M4.
 - Crash-free session > 99.5%.
 - Tidak ada kebocoran memori setelah sesi 8 jam (RAM stabil ±10%).
 

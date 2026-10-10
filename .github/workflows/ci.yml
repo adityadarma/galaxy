@@ -41,7 +41,7 @@ jobs:
         run: xcodegen generate
       - name: Build and test
         run: |
-          xcodebuild -project app/RustCode.xcodeproj -scheme RustCode \
+          xcodebuild -project app/Galaxy.xcodeproj -scheme Galaxy \
             -configuration Debug -derivedDataPath app/build test
 
   bench:
@@ -56,7 +56,7 @@ jobs:
       - name: Install xcodegen
         run: brew install xcodegen
       - name: Core benchmarks
-        run: cargo bench -p rcode-bench --locked
+        run: cargo bench -p galaxy-bench --locked
       - name: App startup and RAM
         run: scripts/measure-app.sh 5 --json target/app-metrics.json
       - name: Collect results

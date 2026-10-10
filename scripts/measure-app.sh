@@ -3,7 +3,7 @@
 #
 # Usage: scripts/measure-app.sh [runs] [--json out.json]
 #
-# Builds Release, launches the app N times with RCODE_BENCH=1, and reports:
+# Builds Release, launches the app N times with GALAXY_BENCH=1, and reports:
 #   startup_ms      process start -> first window frame (median)
 #   footprint_mb    physical footprint after 2 s idle (median)
 #
@@ -21,10 +21,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 DERIVED="$ROOT/app/build"
-APP_BIN="$DERIVED/Build/Products/Release/RustCode.app/Contents/MacOS/RustCode"
+APP_BIN="$DERIVED/Build/Products/Release/Galaxy.app/Contents/MacOS/Galaxy"
 
 (cd "$ROOT/app" && xcodegen generate --quiet)
-xcodebuild -project "$ROOT/app/RustCode.xcodeproj" -scheme RustCode \
+xcodebuild -project "$ROOT/app/Galaxy.xcodeproj" -scheme Galaxy \
   -configuration Release -derivedDataPath "$DERIVED" build -quiet
 
 median() { sort -n | awk '{a[NR]=$1} END {print (NR%2 ? a[(NR+1)/2] : (a[NR/2]+a[NR/2+1])/2)}'; }
@@ -43,7 +43,7 @@ STARTUPS=()
 FOOTPRINTS=()
 for i in $(seq 1 "$RUNS"); do
   OUT="$(mktemp)"
-  RCODE_BENCH=1 "$APP_BIN" >"$OUT" 2>/dev/null &
+  GALAXY_BENCH=1 "$APP_BIN" >"$OUT" 2>/dev/null &
   PID=$!
   for _ in $(seq 1 100); do
     grep -q startup_ms "$OUT" && break

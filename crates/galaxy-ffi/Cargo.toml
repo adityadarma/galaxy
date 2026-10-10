@@ -1,0 +1,28 @@
+[package]
+name = "galaxy-ffi"
+description = "UniFFI bridge between galaxy-core and the Swift/AppKit app."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+name = "galaxy_ffi"
+# staticlib: linked into the macOS app.
+# cdylib: read by uniffi-bindgen (library mode) to generate Swift bindings.
+# lib: used by Rust unit tests.
+crate-type = ["staticlib", "cdylib", "lib"]
+
+[dependencies]
+galaxy-core.workspace = true
+uniffi.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+# UniFFI scaffolding emits `extern "C"` symbols, which requires unsafe code.
+# This is the only crate allowed to contain it.
+[lints.clippy]
+all = { level = "warn", priority = -1 }

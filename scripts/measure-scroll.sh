@@ -14,13 +14,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FRAMES="${1:-240}"
 LINES="${2:-50000}"
 DERIVED="$ROOT/app/build"
-APP_BIN="$DERIVED/Build/Products/Release/RustCode.app/Contents/MacOS/RustCode"
+APP_BIN="$DERIVED/Build/Products/Release/Galaxy.app/Contents/MacOS/Galaxy"
 
 (cd "$ROOT/app" && xcodegen generate --quiet)
-xcodebuild -project "$ROOT/app/RustCode.xcodeproj" -scheme RustCode \
+xcodebuild -project "$ROOT/app/Galaxy.xcodeproj" -scheme Galaxy \
   -configuration Release -derivedDataPath "$DERIVED" build -quiet
 
-BASE="$(mktemp -t rcode-scroll)"
+BASE="$(mktemp -t galaxy-scroll)"
 FIXTURE="$BASE.rs"
 trap 'rm -f "$BASE" "$FIXTURE"' EXIT
 python3 - "$FIXTURE" "$LINES" <<'PY'
@@ -37,7 +37,7 @@ if [[ "$GOT" != "$LINES" ]]; then
   exit 1
 fi
 
-OUT="$(RCODE_SCROLL_BENCH="$FRAMES" "$APP_BIN" -OpenPath "$FIXTURE" \
+OUT="$(GALAXY_SCROLL_BENCH="$FRAMES" "$APP_BIN" -OpenPath "$FIXTURE" \
   -ApplePersistenceIgnoreState YES 2>/dev/null | grep '^scroll_frames=' || true)"
 if [[ -z "$OUT" ]]; then
   echo "no scroll benchmark report (did the app start?)" >&2

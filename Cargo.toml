@@ -1,9 +1,9 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/rcode-core",
-    "crates/rcode-ffi",
-    "crates/rcode-bench",
+    "crates/galaxy-core",
+    "crates/galaxy-ffi",
+    "crates/galaxy-bench",
     "tools/uniffi-bindgen",
 ]
 
@@ -15,7 +15,7 @@ license = "UNLICENSED"
 publish = false
 
 [workspace.dependencies]
-rcode-core = { path = "crates/rcode-core" }
+galaxy-core = { path = "crates/galaxy-core" }
 # `unicode_lines` is off so only `\n` breaks lines (CR is normalized on load).
 # This matches LSP, which does not treat U+2028/U+0085/VT/FF as line breaks.
 ropey = { version = "=1.6.1", default-features = false, features = ["simd"] }

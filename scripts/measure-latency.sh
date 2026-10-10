@@ -5,23 +5,23 @@
 #
 # Builds Release, opens a generated source file of <lines> lines (default
 # 50000), and lets the app type <keys> keys (default 300) into the middle
-# of it by itself (RCODE_LATENCY_BENCH). Prints median, p95 and worst time
+# of it by itself (GALAXY_LATENCY_BENCH). Prints median, p95 and worst time
 # from key event to the end of drawing. Budget (PRD 6): < 8 ms, max 16 ms.
 #
-# A RustCode window appears for a few seconds. The keys are sent straight
+# A Galaxy window appears for a few seconds. The keys are sent straight
 # to that window, not through the keyboard, so you can keep working.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 KEYS="${1:-300}"
 LINES="${2:-50000}"
 DERIVED="$ROOT/app/build"
-APP_BIN="$DERIVED/Build/Products/Release/RustCode.app/Contents/MacOS/RustCode"
+APP_BIN="$DERIVED/Build/Products/Release/Galaxy.app/Contents/MacOS/Galaxy"
 
 (cd "$ROOT/app" && xcodegen generate --quiet)
-xcodebuild -project "$ROOT/app/RustCode.xcodeproj" -scheme RustCode \
+xcodebuild -project "$ROOT/app/Galaxy.xcodeproj" -scheme Galaxy \
   -configuration Release -derivedDataPath "$DERIVED" build -quiet
 
-BASE="$(mktemp -t rcode-latency)"
+BASE="$(mktemp -t galaxy-latency)"
 FIXTURE="$BASE.rs"
 trap 'rm -f "$BASE" "$FIXTURE"' EXIT
 python3 - "$FIXTURE" "$LINES" <<'PY'
@@ -32,7 +32,7 @@ with open(path, "w") as f:
         f.write(f"    let value_{i} = compute(input, {i}) + offset; // line {i}\n")
 PY
 
-OUT="$(RCODE_LATENCY_BENCH="$KEYS" "$APP_BIN" -OpenPath "$FIXTURE" \
+OUT="$(GALAXY_LATENCY_BENCH="$KEYS" "$APP_BIN" -OpenPath "$FIXTURE" \
   -ApplePersistenceIgnoreState YES 2>/dev/null | grep '^latency_samples=' || true)"
 if [[ -z "$OUT" ]]; then
   echo "no latency report (did the app start?)" >&2
