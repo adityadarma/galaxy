@@ -510,6 +510,8 @@ pub struct LspManager {
     code_action_requests: HashMap<(LspKey, u64), String>,
     formatting_edits: HashMap<String, Vec<RenameEdit>>,
     formatting_requests: HashMap<(LspKey, u64), String>,
+    range_formatting_requests: HashMap<(LspKey, u64), String>,
+    on_type_formatting_requests: HashMap<(LspKey, u64), String>,
 }
 
 impl LspManager {
@@ -798,6 +800,72 @@ impl LspManager {
             .unwrap_or(&[])
     }
 
+    pub fn request_range_formatting(
+        &mut self,
+        uri: &str,
+        range: Range,
+        tab_size: u64,
+        insert_spaces: bool,
+        now: Instant,
+    ) -> io::Result<Option<u64>> {
+        self.request_formatting_variant(
+            uri,
+            "textDocument/rangeFormatting",
+            serde_json::json!({
+                "textDocument": { "uri": uri }, "range": range_value(&range),
+                "options": { "tabSize": tab_size, "insertSpaces": insert_spaces }
+            }),
+            now,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn request_on_type_formatting(
+        &mut self,
+        uri: &str,
+        line: u64,
+        character: u64,
+        trigger: &str,
+        tab_size: u64,
+        insert_spaces: bool,
+        now: Instant,
+    ) -> io::Result<Option<u64>> {
+        self.request_formatting_variant(uri, "textDocument/onTypeFormatting", serde_json::json!({
+            "textDocument": { "uri": uri }, "position": { "line": line, "character": character },
+            "ch": trigger, "options": { "tabSize": tab_size, "insertSpaces": insert_spaces }
+        }), now, false)
+    }
+
+    fn request_formatting_variant(
+        &mut self,
+        uri: &str,
+        method: &str,
+        params: Value,
+        now: Instant,
+        range: bool,
+    ) -> io::Result<Option<u64>> {
+        let Some(key) = self.documents.get(uri).map(|(key, _)| key.clone()) else {
+            return Ok(None);
+        };
+        self.formatting_edits.remove(uri);
+        let id = self.request(
+            &key,
+            method.into(),
+            params,
+            Duration::from_millis(1500),
+            now,
+        )?;
+        if range {
+            self.range_formatting_requests
+                .insert((key, id), uri.to_owned());
+        } else {
+            self.on_type_formatting_requests
+                .insert((key, id), uri.to_owned());
+        }
+        Ok(Some(id))
+    }
+
     /// Sends a notification to one initialized or initializing server.
     pub fn send(&self, key: &LspKey, message: &Value) -> io::Result<()> {
         self.servers
@@ -967,6 +1035,12 @@ impl LspManager {
                             && let Some(result) = message.get("result").and_then(parse_code_actions)
                         { self.code_actions.insert(uri, result); }
                         if let Some(uri) = self.formatting_requests.remove(&(key.clone(), id))
+                            && let Some(result) = message.get("result").and_then(|value| parse_text_edit_array(&uri, value))
+                        { self.formatting_edits.insert(uri, result); }
+                        if let Some(uri) = self.range_formatting_requests.remove(&(key.clone(), id))
+                            && let Some(result) = message.get("result").and_then(|value| parse_text_edit_array(&uri, value))
+                        { self.formatting_edits.insert(uri, result); }
+                        if let Some(uri) = self.on_type_formatting_requests.remove(&(key.clone(), id))
                             && let Some(result) = message.get("result").and_then(|value| parse_text_edit_array(&uri, value))
                         { self.formatting_edits.insert(uri, result); }
                         if self.requests.remove(&(key.clone(), id)).is_some() {
@@ -1215,6 +1289,13 @@ fn parse_text_edit_array(uri: &str, value: &Value) -> Option<Vec<RenameEdit>> {
             })
             .collect(),
     )
+}
+
+fn range_value(range: &Range) -> Value {
+    serde_json::json!({
+        "start": { "line": range.start_line, "character": range.start_character },
+        "end": { "line": range.end_line, "character": range.end_character }
+    })
 }
 
 fn parse_text_edits(uri: &str, value: &Value, output: &mut Vec<RenameEdit>) {

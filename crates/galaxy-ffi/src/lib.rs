@@ -786,6 +786,62 @@ impl Core {
             .collect()
     }
 
+    pub fn request_range_formatting(
+        &self,
+        document: Arc<DocumentHandle>,
+        range: Utf16Range,
+        tab_size: u64,
+        insert_spaces: bool,
+    ) {
+        let path = document.path();
+        if path.is_empty() {
+            return;
+        }
+        let uri = file_uri(Path::new(&path));
+        let start = document.position_at(range.location);
+        let end = document.position_at(range.location.saturating_add(range.length));
+        let lsp_range = galaxy_core::lsp::Range {
+            start_line: start.line,
+            start_character: start.col_utf16,
+            end_line: end.line,
+            end_character: end.col_utf16,
+        };
+        let _ = self
+            .lsp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .request_range_formatting(&uri, lsp_range, tab_size, insert_spaces, Instant::now());
+    }
+
+    pub fn request_on_type_formatting(
+        &self,
+        document: Arc<DocumentHandle>,
+        line: u64,
+        character: u64,
+        trigger: String,
+        tab_size: u64,
+        insert_spaces: bool,
+    ) {
+        let path = document.path();
+        if path.is_empty() {
+            return;
+        }
+        let uri = file_uri(Path::new(&path));
+        let _ = self
+            .lsp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .request_on_type_formatting(
+                &uri,
+                line,
+                character,
+                &trigger,
+                tab_size,
+                insert_spaces,
+                Instant::now(),
+            );
+    }
+
     pub fn problems(&self) -> Vec<ProblemInfo> {
         let lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
         lsp.problems()

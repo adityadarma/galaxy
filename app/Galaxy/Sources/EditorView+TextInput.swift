@@ -100,6 +100,7 @@ extension EditorView: @preconcurrency NSTextInputClient {
             document.edit(command: .insertText(text: text))
         }
         didChangeDocument()
+        onTextInput?(text)
     }
 
     func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {

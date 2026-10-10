@@ -147,6 +147,8 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
   - Status: request `textDocument/codeAction` membawa diagnostics aktif, popup action, apply edit satu transaksi per file, dan file tertutup disimpan selesai.
 - [x] M4-14 — Formatting provider: request `textDocument/formatting` dan terapkan `TextEdit` sebagai satu undo step.
   - Status: formatting options, parser `TextEdit[]`, menu `Format Document` (`Cmd+Option+Shift+F`), apply UTF-16 edits, dan sinkronisasi LSP selesai.
+- [x] M4-15 — Range formatting dan on-type formatting.
+  - Status: selection memakai `textDocument/rangeFormatting`, trigger `;`, `}`, `)`, dan newline memakai `textDocument/onTypeFormatting`, semuanya apply sebagai satu undo step selesai.
 - [ ] M4-13 — Code actions / quick fix (`Cmd+.`).
 - [ ] M4-14 — Formatting dokumen dan format on save.
 - [ ] M4-15 — `$/progress` dan status server di status bar, termasuk RAM proses server.

@@ -140,6 +140,14 @@ final class CoreBridge {
         document.applyFormattingEdits(edits: edits)
     }
 
+    func requestRangeFormatting(document: DocumentHandle, range: Utf16Range, tabSize: UInt64, insertSpaces: Bool) {
+        core.requestRangeFormatting(document: document, range: range, tabSize: tabSize, insertSpaces: insertSpaces)
+    }
+
+    func requestOnTypeFormatting(document: DocumentHandle, line: UInt64, character: UInt64, trigger: String, tabSize: UInt64, insertSpaces: Bool) {
+        core.requestOnTypeFormatting(document: document, line: line, character: character, trigger: trigger, tabSize: tabSize, insertSpaces: insertSpaces)
+    }
+
     fileprivate func deliver(_ event: CoreEvent) {
         lastEvent = event
         if case let .pong(message) = event {

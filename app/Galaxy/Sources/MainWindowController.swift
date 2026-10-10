@@ -334,6 +334,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         completionPopup.onClose = { [weak self] in self?.closeCompletion() }
         completionPopup.onSelect = { [weak self] item in self?.acceptCompletion(item) }
         editorView.onCompletionKey = { [weak self] event in self?.handleCompletionKey(event) ?? false }
+        editorView.onTextInput = { [weak self] text in self?.requestOnTypeFormatting(trigger: text) }
 
         buildSidebar()
 
@@ -561,8 +562,22 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     @objc func formatDocument(_ sender: Any?) {
         guard let document = activeTab?.doc else { NSSound.beep(); return }
+        let selected = document.selectedRange()
         formattingRequest = document
-        bridge.requestFormatting(document: document, tabSize: 4, insertSpaces: true)
+        if selected.length > 0 {
+            bridge.requestRangeFormatting(document: document, range: selected, tabSize: 4, insertSpaces: true)
+        } else {
+            bridge.requestFormatting(document: document, tabSize: 4, insertSpaces: true)
+        }
+    }
+
+    private func requestOnTypeFormatting(trigger: String) {
+        guard trigger == ";" || trigger == "}" || trigger == ")" || trigger == "\n",
+              let document = activeTab?.doc else { return }
+        let position = document.selectedRange().location
+        let cursor = document.positionAt(offset: position)
+        formattingRequest = document
+        bridge.requestOnTypeFormatting(document: document, line: cursor.line, character: cursor.colUtf16, trigger: trigger, tabSize: 4, insertSpaces: true)
     }
 
     private func refreshFormatting() {
