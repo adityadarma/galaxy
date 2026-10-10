@@ -4,7 +4,9 @@
 //! messages and forwards them through a standard channel so the rest of the
 //! editor can remain synchronous. No UI call waits for server output.
 
+use std::collections::HashMap;
 use std::io;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
@@ -13,6 +15,120 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::runtime::Runtime;
+
+/// A language server is shared by all documents with this language and root.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LspKey {
+    pub language: String,
+    pub root: PathBuf,
+}
+
+/// Process launch details. Detection and user overrides arrive in M4-03.
+#[derive(Debug, Clone)]
+pub struct ServerConfig {
+    pub program: String,
+    pub args: Vec<String>,
+    pub log_traffic: bool,
+}
+
+/// Lifecycle events observed by the synchronous editor core.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LspEvent {
+    Initialized(LspKey),
+    Message(LspKey, Value),
+    Error(LspKey, String),
+    Closed(LspKey),
+}
+
+struct ManagedServer {
+    transport: LspTransport,
+    initialized: bool,
+}
+
+/// Owns one server per `(language, workspace root)` and drives the minimal
+/// JSON-RPC lifecycle. General request IDs and cancellation are M4-05.
+#[derive(Default)]
+pub struct LspManager {
+    servers: HashMap<LspKey, ManagedServer>,
+}
+
+impl LspManager {
+    /// Starts and initializes a server unless an equivalent key already runs.
+    /// `true` means a child was spawned; `false` means the shared instance won.
+    pub fn ensure_server(&mut self, key: LspKey, config: &ServerConfig) -> io::Result<bool> {
+        if self.servers.contains_key(&key) {
+            return Ok(false);
+        }
+        let transport = LspTransport::spawn(&config.program, &config.args, config.log_traffic)?;
+        transport.send(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "processId": std::process::id(),
+                "rootUri": format!("file://{}", key.root.to_string_lossy()),
+                "capabilities": {}
+            }
+        }))?;
+        self.servers.insert(
+            key,
+            ManagedServer {
+                transport,
+                initialized: false,
+            },
+        );
+        Ok(true)
+    }
+
+    pub fn len(&self) -> usize {
+        self.servers.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.servers.is_empty()
+    }
+
+    /// Drains server output without blocking. An initialize response with ID 0
+    /// transitions the server and emits the mandatory `initialized` notification.
+    pub fn poll(&mut self) -> Vec<LspEvent> {
+        let mut events = Vec::new();
+        for (key, server) in &mut self.servers {
+            loop {
+                match server.transport.try_recv() {
+                    Ok(Incoming::Message(message)) if !server.initialized && message.get("id") == Some(&Value::from(0)) => {
+                        match server.transport.send(&serde_json::json!({"jsonrpc": "2.0", "method": "initialized", "params": {}})) {
+                            Ok(()) => { server.initialized = true; events.push(LspEvent::Initialized(key.clone())); }
+                            Err(error) => events.push(LspEvent::Error(key.clone(), error.to_string())),
+                        }
+                    }
+                    Ok(Incoming::Message(message)) => events.push(LspEvent::Message(key.clone(), message)),
+                    Ok(Incoming::Error(error)) => events.push(LspEvent::Error(key.clone(), error)),
+                    Ok(Incoming::Closed) => { events.push(LspEvent::Closed(key.clone())); break; }
+                    Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
+                }
+            }
+        }
+        events
+    }
+
+    /// Sends the graceful shutdown sequence to all children. Dropping their
+    /// transports then guarantees process cleanup even if a server ignores it.
+    pub fn shutdown_all(&mut self) {
+        for server in self.servers.values() {
+            let _ = server.transport.send(&serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "shutdown", "params": null}));
+            let _ = server
+                .transport
+                .send(&serde_json::json!({"jsonrpc": "2.0", "method": "exit", "params": {}}));
+        }
+        self.servers.clear();
+    }
+}
+
+impl Drop for LspManager {
+    fn drop(&mut self) {
+        self.shutdown_all();
+    }
+}
 
 /// A received JSON-RPC payload. Invalid JSON and broken streams are surfaced
 /// as errors rather than silently discarded, so a manager can restart a server.
@@ -185,6 +301,8 @@ async fn read_frame<R: AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
+    use std::time::Instant;
     use tokio::io::AsyncWriteExt;
 
     #[test]
@@ -245,5 +363,39 @@ mod tests {
             Incoming::Message(message) => assert_eq!(message["method"], "ready"),
             other => panic!("expected JSON-RPC message, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn manager_shares_a_server_and_completes_initialize_lifecycle() {
+        let args = vec![
+            "-c".to_owned(),
+            "read _; read _; body='{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"capabilities\":{}}}'; printf 'Content-Length: %s\\r\\n\\r\\n%s' \"${#body}\" \"$body\"; sleep 1".to_owned(),
+        ];
+        let key = LspKey {
+            language: "rust".into(),
+            root: PathBuf::from("/workspace"),
+        };
+        let config = ServerConfig {
+            program: "/bin/sh".into(),
+            args,
+            log_traffic: false,
+        };
+        let mut manager = LspManager::default();
+        assert!(manager.ensure_server(key.clone(), &config).unwrap());
+        assert!(!manager.ensure_server(key.clone(), &config).unwrap());
+        assert_eq!(manager.len(), 1);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if manager.poll().contains(&LspEvent::Initialized(key.clone())) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "initialize response was not observed"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        manager.shutdown_all();
+        assert_eq!(manager.len(), 0);
     }
 }
