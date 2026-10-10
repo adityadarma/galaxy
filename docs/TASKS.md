@@ -100,7 +100,8 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
   - Re-parse setelah edit < 2 ms di file 10k baris.
 - [x] M3-03 — Bundel grammar: Rust, TS, TSX, JS, JSON, TOML, YAML, Markdown, Python, Go, HTML, CSS, Bash.
   - Status: 13 grammar Tree-sitter dipin statis di `galaxy-core`; `SyntaxLanguage` menjadi registry type-safe untuk Rust, TypeScript, TSX, JavaScript, JSON, TOML, YAML, Markdown, Python, Go, HTML, CSS, dan Bash, dengan display name dan `Language` masing-masing. TOML memakai `tree-sitter-toml-ng` dan Markdown memakai `tree-sitter-md-025`, karena crate nama standar masih memakai API Tree-sitter lama. Path/shebang mapping sengaja M3-06; query highlight M3-04. Tercakup test setiap grammar dipasang ke parser dan parse source minimal tanpa error.
-- [ ] M3-04 — Query highlight per bahasa, mapping capture ke scope tema.
+- [x] M3-04 — Query highlight per bahasa, mapping capture ke scope tema.
+  - Status: `SyntaxLanguage::highlight_query` memakai `highlights.scm` dari grammar yang mengekspornya; JavaScript dan Bash memakai query lokal minimal karena crate upstream tidak mengekspos query Rust. Semua query dikompilasi terhadap grammar yang sama. Capture upstream (`keyword.control`, `function.builtin`, `string.special`, `punctuation.bracket`, dan lain-lain) dipetakan ke `HighlightScope` stabil: attribute, comment, constant, constructor, function, keyword, label, number, operator, property, punctuation, string, tag, type, dan variable. Scope belum diberi warna sampai M3-07 dan belum dikirim ke viewport sampai M3-05. Markdown baru block query; inline injection ditunda. Tercakup compile seluruh query, mapping capture, dan capture Rust nyata.
 - [ ] M3-05 — Hasilkan style run hanya untuk viewport + margin, sertakan dalam `ViewportSnapshot`.
 - [ ] M3-06 — Deteksi bahasa dari ekstensi, nama file, dan shebang.
 - [ ] M3-07 — Sistem tema JSON, tema bawaan terang + gelap, ikut appearance macOS.

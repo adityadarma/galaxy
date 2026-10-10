@@ -17,7 +17,7 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 
 use ropey::Rope;
-use tree_sitter::{InputEdit, Language, Parser, Point, Tree};
+use tree_sitter::{InputEdit, Language, Parser, Point, Query, Tree};
 
 use crate::document::Document;
 
@@ -90,6 +90,104 @@ impl SyntaxLanguage {
             Self::Html => tree_sitter_html::LANGUAGE.into(),
             Self::Css => tree_sitter_css::LANGUAGE.into(),
             Self::Bash => tree_sitter_bash::LANGUAGE.into(),
+        }
+    }
+
+    /// Upstream highlights.scm bundled with the matching grammar version.
+    pub fn highlight_query(self) -> &'static str {
+        match self {
+            Self::Rust => tree_sitter_rust::HIGHLIGHTS_QUERY,
+            Self::TypeScript | Self::Tsx => tree_sitter_typescript::HIGHLIGHTS_QUERY,
+            Self::JavaScript => JAVASCRIPT_HIGHLIGHTS,
+            Self::Json => tree_sitter_json::HIGHLIGHTS_QUERY,
+            Self::Toml => tree_sitter_toml_ng::HIGHLIGHTS_QUERY,
+            Self::Yaml => tree_sitter_yaml::HIGHLIGHTS_QUERY,
+            // The inline grammar is injected by M3-05; this captures Markdown
+            // block nodes now and leaves inline styling as plain text.
+            Self::Markdown => tree_sitter_md_025::HIGHLIGHT_QUERY_BLOCK,
+            Self::Python => tree_sitter_python::HIGHLIGHTS_QUERY,
+            Self::Go => tree_sitter_go::HIGHLIGHTS_QUERY,
+            Self::Html => tree_sitter_html::HIGHLIGHTS_QUERY,
+            Self::Css => tree_sitter_css::HIGHLIGHTS_QUERY,
+            Self::Bash => BASH_HIGHLIGHTS,
+        }
+    }
+
+    /// Compiles the grammar's query against exactly its matching grammar.
+    pub fn compile_highlights(self) -> Result<Query, tree_sitter::QueryError> {
+        Query::new(&self.grammar(), self.highlight_query())
+    }
+}
+
+// These two grammar crates do not export their upstream query. Keep a small,
+// self-contained equivalent here rather than depending on Cargo registry paths.
+const JAVASCRIPT_HIGHLIGHTS: &str = r#"
+[(comment)] @comment
+[(string) (template_string) (regex)] @string
+(number) @number
+[(true) (false) (null) (undefined)] @constant
+(identifier) @variable
+(property_identifier) @property
+(function_declaration name: (identifier) @function)
+(call_expression function: (identifier) @function)
+[("const") ("let") ("var") ("function") ("class") ("return") ("if") ("else") ("for") ("while") ("import") ("export") ("async") ("await") ("new")] @keyword
+[("+") ("-") ("*") ("/") ("=") ("==") ("===") ("=>") ("!") ("&&") ("||")] @operator
+[("(") (")") ("[") ("]") ("{") ("}") (",") (";") (".")] @punctuation
+"#;
+
+const BASH_HIGHLIGHTS: &str = r#"
+(comment) @comment
+[(string) (raw_string) (heredoc_body)] @string
+(number) @number
+(variable_name) @variable
+(command_name) @function
+[("if") ("then") ("else") ("elif") ("fi") ("for") ("while") ("do") ("done") ("case") ("esac") ("function") ("in")] @keyword
+[("|") ("||") ("&&") (";") ("&")] @operator
+[("(") (")") ("{") ("}") (";")] @punctuation
+"#;
+
+/// Semantic color categories. Themes map these scopes to concrete colors in
+/// M3-07. The string spelling follows upstream Tree-sitter/Helix captures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HighlightScope {
+    Attribute,
+    Comment,
+    Constant,
+    Constructor,
+    Function,
+    Keyword,
+    Label,
+    Number,
+    Operator,
+    Property,
+    Punctuation,
+    String,
+    Tag,
+    Type,
+    Variable,
+}
+
+impl HighlightScope {
+    /// Maps a capture name, including modifiers like `function.builtin`, to
+    /// the stable base scope consumed by themes and viewport style runs.
+    pub fn from_capture(capture: &str) -> Option<Self> {
+        match capture.split('.').next()? {
+            "attribute" => Some(Self::Attribute),
+            "comment" => Some(Self::Comment),
+            "constant" | "boolean" => Some(Self::Constant),
+            "constructor" => Some(Self::Constructor),
+            "function" | "method" => Some(Self::Function),
+            "keyword" => Some(Self::Keyword),
+            "label" => Some(Self::Label),
+            "number" | "float" => Some(Self::Number),
+            "operator" => Some(Self::Operator),
+            "property" | "field" => Some(Self::Property),
+            "punctuation" | "delimiter" => Some(Self::Punctuation),
+            "string" | "character" => Some(Self::String),
+            "tag" => Some(Self::Tag),
+            "type" | "namespace" => Some(Self::Type),
+            "variable" | "parameter" => Some(Self::Variable),
+            _ => None,
         }
     }
 }
@@ -335,6 +433,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+    use tree_sitter::{QueryCursor, StreamingIterator};
 
     fn wait_for(service: &SyntaxService) -> SyntaxSnapshot {
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -444,5 +543,67 @@ mod tests {
                 tree.root_node().to_sexp()
             );
         }
+    }
+
+    #[test]
+    fn every_bundled_highlight_query_compiles() {
+        for language in SyntaxLanguage::ALL {
+            let query = language.compile_highlights().unwrap_or_else(|error| {
+                panic!(
+                    "{} highlight query did not compile: {error}",
+                    language.name()
+                )
+            });
+            assert!(
+                !query.capture_names().is_empty(),
+                "{} has no highlight captures",
+                language.name()
+            );
+        }
+    }
+
+    #[test]
+    fn capture_names_map_to_stable_theme_scopes() {
+        assert_eq!(
+            HighlightScope::from_capture("keyword.control"),
+            Some(HighlightScope::Keyword)
+        );
+        assert_eq!(
+            HighlightScope::from_capture("function.builtin"),
+            Some(HighlightScope::Function)
+        );
+        assert_eq!(
+            HighlightScope::from_capture("punctuation.bracket"),
+            Some(HighlightScope::Punctuation)
+        );
+        assert_eq!(
+            HighlightScope::from_capture("string.special.path"),
+            Some(HighlightScope::String)
+        );
+        assert_eq!(HighlightScope::from_capture("embedded"), None);
+    }
+
+    #[test]
+    fn rust_query_emits_keyword_string_and_comment_scopes() {
+        let language = SyntaxLanguage::Rust;
+        let source = "// note\nfn main() { let name = \"Galaxy\"; }";
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let query = language.compile_highlights().unwrap();
+        let names = query.capture_names();
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+        let mut scopes = Vec::new();
+        while let Some(m) = matches.next() {
+            scopes.extend(
+                m.captures.iter().filter_map(|capture| {
+                    HighlightScope::from_capture(names[capture.index as usize])
+                }),
+            );
+        }
+        assert!(scopes.contains(&HighlightScope::Comment));
+        assert!(scopes.contains(&HighlightScope::Keyword));
+        assert!(scopes.contains(&HighlightScope::String));
     }
 }
