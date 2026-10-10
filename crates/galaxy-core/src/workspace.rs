@@ -164,6 +164,14 @@ pub struct Workspace {
     root: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchMatch {
+    pub rel_path: String,
+    pub line: usize,
+    pub column: usize,
+    pub text: String,
+}
+
 impl Workspace {
     pub fn open(root: impl Into<PathBuf>) -> io::Result<Self> {
         let root = root.into();
@@ -357,6 +365,71 @@ impl Workspace {
                 .then_with(|| a.name.cmp(&b.name))
         });
         Ok(entries)
+    }
+
+    /// Searches readable UTF-8 files while walking with the same ignore rules
+    /// as the explorer. Results are bounded so a broad query cannot flood the
+    /// UI or retain an unbounded snapshot.
+    pub fn search(&self, query: &str, limit: usize) -> io::Result<Vec<SearchMatch>> {
+        if query.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let walker = WalkBuilder::new(&self.root)
+            .hidden(false)
+            .ignore(true)
+            .git_ignore(true)
+            .git_global(false)
+            .git_exclude(false)
+            .require_git(false)
+            .follow_links(false)
+            .filter_entry(|e| e.depth() == 0 || !is_default_excluded(e))
+            .build();
+        let mut results = Vec::new();
+        for entry in walker
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
+        {
+            if results.len() >= limit {
+                break;
+            }
+            let path = entry.path();
+            let Ok(bytes) = fs::read(path) else { continue };
+            let Ok(text) = String::from_utf8(bytes) else {
+                continue;
+            };
+            let Some(relative) = path.strip_prefix(&self.root).ok() else {
+                continue;
+            };
+            let rel_path = relative
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            for (line, content) in text.lines().enumerate() {
+                let mut start = 0;
+                while let Some(offset) = content[start..].find(query) {
+                    if results.len() >= limit {
+                        break;
+                    }
+                    let byte_column = start + offset;
+                    let column = content[..byte_column].encode_utf16().count();
+                    results.push(SearchMatch {
+                        rel_path: rel_path.clone(),
+                        line,
+                        column,
+                        text: content.to_string(),
+                    });
+                    start = byte_column + query.len().max(1);
+                    if start >= content.len() {
+                        break;
+                    }
+                }
+                if results.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(results)
     }
 
     /// Works out how the file index changes after `changed` (relative
@@ -605,6 +678,31 @@ mod tests {
 
         assert!(!names(&ws.list_dir("src").unwrap()).contains(&"generated.rs"));
         assert!(!names(&ws.list_dir("").unwrap()).contains(&"Cargo.toml"));
+    }
+
+    #[test]
+    fn search_returns_line_columns_and_skips_ignored_or_binary_files() {
+        let (dir, ws) = tree();
+        fs::write(
+            dir.path().join("src/main.rs"),
+            "first needle\n😀 second needle",
+        )
+        .unwrap();
+        fs::write(dir.path().join("node_modules/pkg/ignored.js"), "needle").unwrap();
+        fs::write(dir.path().join("binary.bin"), [0, 159, 146, 150]).unwrap();
+
+        let matches = ws.search("needle", 20).unwrap();
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].rel_path, "src/main.rs");
+        assert_eq!((matches[0].line, matches[0].column), (0, 6));
+        assert_eq!((matches[1].line, matches[1].column), (1, 10));
+    }
+
+    #[test]
+    fn search_respects_result_limit_and_empty_query() {
+        let (_dir, ws) = tree();
+        assert!(ws.search("x", 1).unwrap().len() <= 1);
+        assert!(ws.search("", 20).unwrap().is_empty());
     }
 
     #[test]

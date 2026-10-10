@@ -84,6 +84,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// Files opened in this workspace, most recent first, relative paths.
     private(set) var recentFiles: [String] = []
     private var loadedQuickOpen: QuickOpen?
+    private var loadedWorkspaceSearch: WorkspaceSearch?
+    private var searchGeneration = 0
     private var loadedGoToLine: GoToLine?
     private var loadedOutlinePicker: OutlinePicker?
     private var loadedPalette: CommandPaletteView?
@@ -1084,6 +1086,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     /// Closes Go to File, Go to Line, Go to Symbol and the palette, whichever is open.
     private func closeOverlays() {
+        if isWorkspaceSearchVisible { closeWorkspaceSearch() }
         if isQuickOpenVisible { closeGoToFile() }
         if isOutlinePickerVisible { closeGoToSymbol() }
         if isGoToLineVisible { closeGoToLine() }
@@ -1613,6 +1616,65 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
 
     // MARK: Go to File (M2-07)
+
+    var isWorkspaceSearchVisible: Bool { loadedWorkspaceSearch.map { !$0.isHidden } ?? false }
+
+    private var workspaceSearch: WorkspaceSearch {
+        if let panel = loadedWorkspaceSearch { return panel }
+        let panel = WorkspaceSearch()
+        panel.isHidden = true
+        panel.translatesAutoresizingMaskIntoConstraints = false
+        panel.onClose = { [weak self] in self?.closeWorkspaceSearch() }
+        panel.onSearch = { [weak self] query in self?.searchWorkspace(query) }
+        panel.onOpen = { [weak self] match in self?.openWorkspaceSearchMatch(match) }
+        window?.contentView?.addSubview(panel)
+        NSLayoutConstraint.activate([
+            panel.topAnchor.constraint(equalTo: tabBar.topAnchor, constant: 6),
+            panel.centerXAnchor.constraint(equalTo: detailView.centerXAnchor),
+            panel.widthAnchor.constraint(equalToConstant: WorkspaceSearch.width),
+            panel.widthAnchor.constraint(lessThanOrEqualTo: detailView.widthAnchor, constant: -24),
+        ])
+        loadedWorkspaceSearch = panel
+        return panel
+    }
+
+    @objc func showWorkspaceSearch(_ sender: Any?) {
+        guard workspace != nil else { NSSound.beep(); statusLabel.stringValue = "Open a folder to search the workspace."; return }
+        closeOverlays()
+        let panel = workspaceSearch
+        panel.isHidden = false
+        panel.reset()
+        panel.focus()
+    }
+
+    private func searchWorkspace(_ query: String) {
+        guard let workspace else { return }
+        searchGeneration += 1
+        let generation = searchGeneration
+        guard !query.isEmpty else { workspaceSearch.show([], message: "Type to search the workspace"); return }
+        workspaceSearch.show([], message: "Searching…")
+        Task.detached(priority: .userInitiated) { [weak self, workspace] in
+            let results = (try? workspace.search(query: query, limit: 10_000)) ?? []
+            await MainActor.run {
+                guard let self, self.searchGeneration == generation, self.isWorkspaceSearchVisible else { return }
+                self.workspaceSearch.show(results, message: results.isEmpty ? "No results" : nil)
+            }
+        }
+    }
+
+    private func openWorkspaceSearchMatch(_ match: WorkspaceSearchMatch) {
+        closeWorkspaceSearch()
+        guard let workspace else { return }
+        openWorkspaceFile(workspace, FileEntry(name: (match.relPath as NSString).lastPathComponent,
+                                               relPath: match.relPath, isDir: false), preview: false)
+        activeTab?.doc.goToLine(line: match.line, col: match.column)
+    }
+
+    private func closeWorkspaceSearch() {
+        guard isWorkspaceSearchVisible else { return }
+        workspaceSearch.isHidden = true
+        window?.makeFirstResponder(activeTab != nil ? editorView : explorer.outlineView)
+    }
 
     var isQuickOpenVisible: Bool { loadedQuickOpen.map { !$0.isHidden } ?? false }
 

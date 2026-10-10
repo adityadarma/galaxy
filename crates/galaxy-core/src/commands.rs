@@ -337,6 +337,12 @@ const BUILTIN: &[(&str, &str, &str, &[&str])] = &[
         "Go to File…",
         &["quick open", "fuzzy"],
     ),
+    (
+        "workbench.action.findInFiles",
+        "Search",
+        "Search in Workspace…",
+        &["workspace", "files", "text"],
+    ),
     ("workbench.action.gotoLine", "Go", "Go to Line…", &["jump"]),
     (
         "workbench.action.navigateBack",

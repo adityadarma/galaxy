@@ -28,7 +28,7 @@ use galaxy_core::selection::{Selection, SelectionSet};
 use galaxy_core::syntax::{self, SyntaxLanguage, SyntaxService, SyntaxSnapshot};
 use galaxy_core::viewport;
 use galaxy_core::watcher::WorkspaceWatcher;
-use galaxy_core::workspace::Workspace as CoreWorkspace;
+use galaxy_core::workspace::{SearchMatch as CoreSearchMatch, Workspace as CoreWorkspace};
 
 uniffi::setup_scaffolding!();
 
@@ -1086,6 +1086,14 @@ pub struct FileEntry {
     pub is_dir: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct WorkspaceSearchMatch {
+    pub rel_path: String,
+    pub line: u64,
+    pub column: u64,
+    pub text: String,
+}
+
 /// A folder opened in the explorer.
 #[derive(uniffi::Object)]
 pub struct Workspace {
@@ -1188,6 +1196,24 @@ impl Workspace {
             tracing::info!(path = %st.path.display(), lines = st.editor.doc.line_count(), "opened workspace file");
         }
         Ok(Arc::new(handle))
+    }
+
+    pub fn search(
+        &self,
+        query: String,
+        limit: u64,
+    ) -> Result<Vec<WorkspaceSearchMatch>, CoreError> {
+        Ok(self
+            .inner
+            .search(&query, limit as usize)?
+            .into_iter()
+            .map(|m: CoreSearchMatch| WorkspaceSearchMatch {
+                rel_path: m.rel_path,
+                line: m.line as u64,
+                column: m.column as u64,
+                text: m.text,
+            })
+            .collect())
     }
 }
 

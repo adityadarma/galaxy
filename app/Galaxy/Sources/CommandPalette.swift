@@ -40,6 +40,7 @@ final class CommandPaletteView: NSView, NSTextFieldDelegate, NSTableViewDataSour
         "editor.action.previousMatchFindAction": #selector(MainWindowController.findPrevious(_:)),
         "actions.findWithSelection": #selector(MainWindowController.useSelectionForFind(_:)),
         "workbench.action.quickOpen": #selector(MainWindowController.showGoToFile(_:)),
+        "workbench.action.findInFiles": #selector(MainWindowController.showWorkspaceSearch(_:)),
         "workbench.action.gotoSymbol": #selector(MainWindowController.showGoToSymbol(_:)),
         "workbench.action.gotoLine": #selector(MainWindowController.showGoToLine(_:)),
         "workbench.action.navigateBack": #selector(MainWindowController.navigateBack(_:)),

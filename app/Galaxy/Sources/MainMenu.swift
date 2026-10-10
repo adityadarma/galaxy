@@ -93,6 +93,8 @@ enum MainMenu {
         palette.keyEquivalentModifierMask = [.command, .shift]
         viewMenu.addItem(.separator())
         viewMenu.addItem(withTitle: "Toggle Sidebar", action: #selector(MainWindowController.toggleSidebarVisibility(_:)), keyEquivalent: "b")
+        let search = viewMenu.addItem(withTitle: "Search in Workspace…", action: #selector(MainWindowController.showWorkspaceSearch(_:)), keyEquivalent: "f")
+        search.keyEquivalentModifierMask = [.command, .shift]
         let explorer = viewMenu.addItem(withTitle: "Show Explorer", action: #selector(MainWindowController.showExplorer(_:)), keyEquivalent: "e")
         explorer.keyEquivalentModifierMask = [.command, .shift]
         viewMenu.addItem(.separator())

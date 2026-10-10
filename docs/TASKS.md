@@ -163,7 +163,8 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
 
 ## M5 — Search, Multi-LSP, Settings (3 minggu)
 
-- [ ] M5-01 — Workspace search `Cmd+Shift+F` dengan crate `grep-*` + `ignore`, paralel, streaming hasil.
+- [x] M5-01 — Workspace search `Cmd+Shift+F` dengan crate `ignore`, background search, dan hasil terbatas.
+  - Status: panel Search in Workspace membuka dari `Cmd+Shift+F` dan command palette, memakai walker `ignore` dengan `.gitignore`, `.ignore`, dan exclude bawaan. Pencarian literal UTF-8 berjalan di background, hasil dibatasi 10.000 match, query lama tidak dapat menimpa query terbaru, dan hasil dapat membuka file langsung pada baris/kolom UTF-16 match. Regex, case, whole word, include/exclude glob, dan streaming per batch menjadi M5-02.
   - Hasil pertama < 100 ms pada repo 1 GB; dapat dibatalkan.
 - [ ] M5-02 — Opsi regex, case, whole word, include/exclude glob; batas 10k match.
 - [ ] M5-03 — Panel hasil search dengan konteks baris dan navigasi keyboard.

@@ -192,6 +192,7 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("cmd+shift+g", "editor.action.previousMatchFindAction"),
     ("cmd+e", "actions.findWithSelection"),
     ("cmd+p", "workbench.action.quickOpen"),
+    ("cmd+shift+f", "workbench.action.findInFiles"),
     ("ctrl+g", "workbench.action.gotoLine"),
     ("ctrl+-", "workbench.action.navigateBack"),
     ("ctrl+shift+-", "workbench.action.navigateForward"),

@@ -144,6 +144,10 @@ final class CoreBridge {
         core.workspaceSymbols(root: root)
     }
 
+    func search(workspace: Workspace, query: String, limit: UInt64) throws -> [WorkspaceSearchMatch] {
+        try workspace.search(query: query, limit: limit)
+    }
+
     func requestFormatting(document: DocumentHandle, tabSize: UInt64, insertSpaces: Bool) {
         core.requestFormatting(document: document, tabSize: tabSize, insertSpaces: insertSpaces)
     }
