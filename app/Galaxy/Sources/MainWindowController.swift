@@ -412,7 +412,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             scrollToTop()
         }
         statusLabel.stringValue = tab.status
-        statusBar.show(document: tab.doc)
+        statusBar.show(document: tab.doc, path: tab.doc.path())
         if let rel = tab.relPath { noteRecent(rel) }
         refreshTabBar()
         updateEditedState()
@@ -494,7 +494,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         if tab === activeTab {
             editorView.requestDocumentRefresh(scrollCaret: false)
             editorView.scheduleChangeNotification()
-            statusBar.show(document: tab.doc)
+            statusBar.show(document: tab.doc, path: tab.doc.path())
             statusLabel.stringValue = message
         } else {
             tab.status = message

@@ -7,6 +7,7 @@ final class StatusBar: NSView {
     let message = NSTextField(labelWithString: "")
     let largeFileBadge = NSTextField(labelWithString: "Large file")
     let cursor = StatusBar.label("status-cursor")
+    let language = StatusBar.label("status-language")
     let indent = StatusBar.label("status-indent")
     let lineEnding = StatusBar.label("status-eol")
     let encoding = StatusBar.label("status-encoding")
@@ -32,7 +33,7 @@ final class StatusBar: NSView {
 
         let left = NSStackView(views: [message, largeFileBadge])
         left.spacing = 8
-        let right = NSStackView(views: [cursor, indent, lineEnding, encoding])
+        let right = NSStackView(views: [cursor, language, indent, lineEnding, encoding])
         right.spacing = 14
         // The spacer takes the slack, so the facts sit on the right edge.
         let spacer = NSView()
@@ -74,13 +75,14 @@ final class StatusBar: NSView {
     }
 
     /// Shows the facts of `doc`, or clears them without a document.
-    func show(document doc: DocumentHandle?) {
+    func show(document doc: DocumentHandle?, path: String? = nil) {
         guard let doc else {
-            for label in [cursor, indent, lineEnding, encoding] { label.stringValue = "" }
+            for label in [cursor, language, indent, lineEnding, encoding] { label.stringValue = "" }
             largeFileBadge.isHidden = true
             return
         }
         let settings = doc.indentSettings()
+        language.stringValue = Self.language(for: path)
         indent.stringValue = settings.useTabs ? "Tab Size: \(settings.tabSize)" : "Spaces: \(settings.tabSize)"
         lineEnding.stringValue = switch doc.lineEnding() {
         case .lf: "LF"
@@ -95,6 +97,34 @@ final class StatusBar: NSView {
         encoding.stringValue = doc.hasBom() ? "\(name) with BOM" : name
         largeFileBadge.isHidden = !doc.isLarge()
         showCursor(of: doc)
+    }
+
+    /// Lightweight path detection for the status bar. Syntax parsers replace
+    /// this in M3, but the label is useful before highlighting exists.
+    static func language(for path: String?) -> String {
+        guard let path, !path.isEmpty else { return "Plain Text" }
+        let name = URL(fileURLWithPath: path).lastPathComponent.lowercased()
+        let extensionMap = [
+            "rs": "Rust", "swift": "Swift", "c": "C", "h": "C/C++ Header", "cc": "C++", "cpp": "C++", "cxx": "C++",
+            "m": "Objective-C", "mm": "Objective-C++", "go": "Go", "py": "Python", "rb": "Ruby", "java": "Java",
+            "kt": "Kotlin", "kts": "Kotlin", "cs": "C#", "php": "PHP", "sh": "Shell Script", "bash": "Shell Script",
+            "zsh": "Shell Script", "fish": "Fish", "js": "JavaScript", "mjs": "JavaScript", "cjs": "JavaScript",
+            "ts": "TypeScript", "tsx": "TypeScript React", "jsx": "JavaScript React", "html": "HTML", "htm": "HTML",
+            "css": "CSS", "scss": "SCSS", "sass": "Sass", "less": "Less", "json": "JSON", "jsonc": "JSON with Comments",
+            "toml": "TOML", "yaml": "YAML", "yml": "YAML", "xml": "XML", "md": "Markdown", "markdown": "Markdown",
+            "txt": "Plain Text", "csv": "CSV", "sql": "SQL", "graphql": "GraphQL", "gql": "GraphQL", "lua": "Lua",
+            "r": "R", "dart": "Dart", "ex": "Elixir", "exs": "Elixir", "erl": "Erlang", "hrl": "Erlang",
+            "dockerfile": "Dockerfile", "makefile": "Makefile",
+        ]
+        if let language = extensionMap[(name as NSString).pathExtension] { return language }
+        switch name {
+        case "dockerfile": return "Dockerfile"
+        case "makefile", "gnumakefile": return "Makefile"
+        case "cargo.toml": return "TOML"
+        case "package.json": return "JSON"
+        case ".gitignore", ".gitattributes": return "Git Config"
+        default: return "Plain Text"
+        }
     }
 
     func showCursor(of doc: DocumentHandle) {
