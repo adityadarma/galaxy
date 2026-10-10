@@ -422,11 +422,9 @@ impl LspSettings {
 }
 
 fn default_server(language: &str) -> Option<ServerConfig> {
-    let (program, args) = match language.to_ascii_lowercase().as_str() {
+    let (program, args) = match default_server_kind(language)? {
         "rust" => ("rust-analyzer", &[][..]),
-        "typescript" | "tsx" | "javascript" => {
-            ("typescript-language-server", &["--stdio"] as &[&str])
-        }
+        "typescript" => ("typescript-language-server", &["--stdio"] as &[&str]),
         "python" => ("pyright-langserver", &["--stdio"] as &[&str]),
         "go" => ("gopls", &[] as &[&str]),
         _ => return None,
@@ -437,6 +435,19 @@ fn default_server(language: &str) -> Option<ServerConfig> {
         log_traffic: false,
         initialization_options: Value::Null,
     })
+}
+
+fn default_server_kind(language: &str) -> Option<&'static str> {
+    let normalized = language.to_ascii_lowercase().replace([' ', '-'], "");
+    match normalized.as_str() {
+        "rust" => Some("rust"),
+        "typescript" | "typescriptreact" | "tsx" | "javascript" | "javascriptreact" | "js" => {
+            Some("typescript")
+        }
+        "python" => Some("python"),
+        "go" => Some("go"),
+        _ => None,
+    }
 }
 
 /// Finds an executable with no shell expansion. Absolute or relative paths
@@ -1735,6 +1746,23 @@ mod tests {
         assert_eq!(config.args, ["-c", "server"]);
         assert!(config.log_traffic);
         assert_eq!(config.initialization_options["checkOnSave"], true);
+    }
+
+    #[test]
+    fn display_language_names_resolve_to_typescript_server_kind() {
+        for language in [
+            "TypeScript",
+            "TypeScript React",
+            "JavaScript",
+            "JavaScript React",
+        ] {
+            assert_eq!(
+                default_server_kind(language),
+                Some("typescript"),
+                "{language}"
+            );
+        }
+        assert_eq!(default_server_kind("TypeScript Server"), None);
     }
 
     #[test]

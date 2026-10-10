@@ -171,6 +171,7 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
 - [x] M5-03 — Panel hasil search dengan konteks baris dan navigasi keyboard.
   - Status: Setiap hasil menampilkan path, lokasi UTF-16, baris match, serta satu baris konteks sebelum dan sesudahnya. Panel mempertahankan selection saat hasil diperbarui, mendukung Up/Down, Page Up/Page Down, Enter, klik, dan Escape. Hasil dibuka langsung pada lokasi match. Rust dan Swift unit tests lulus.
 - [ ] M5-04 — Integrasi dan uji `typescript-language-server`.
+  - Status: Integrasi built-in sudah diperbaiki: label UI `TypeScript`, `TypeScript React`, `JavaScript`, dan `JavaScript React` kini dinormalisasi ke server `typescript-language-server --stdio`, sehingga startup LSP tidak lagi gagal karena label display. Resolver alias dan lifecycle JSON-RPC tercakup test Rust, serta full Rust/Swift verification lulus. Smoke test dengan executable `typescript-language-server` nyata masih pending karena executable belum terpasang di environment ini.
 - [ ] M5-05 — Integrasi dan uji `pyright-langserver`.
 - [ ] M5-06 — Integrasi dan uji `gopls`.
 - [ ] M5-07 — `workspace/symbol` untuk `Cmd+T`.
