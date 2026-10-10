@@ -705,10 +705,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     func setSidebarVisible(_ visible: Bool) {
         guard visible != isSidebarVisible else { return }
-        sidebar.isHidden = !visible
         activityBar.setActive(visible ? .explorer : nil)
-        splitView.layoutSubtreeIfNeeded()
-        splitView.setPosition(visible ? max(Self.sidebarWidth, Self.minSidebarWidth) : 0, ofDividerAt: 0)
+        if visible {
+            sidebar.isHidden = false
+            splitView.setPosition(Self.sidebarWidth, ofDividerAt: 0)
+        } else {
+            sidebar.isHidden = true
+            splitView.setPosition(0, ofDividerAt: 0)
+        }
         splitView.layoutSubtreeIfNeeded()
         editorView.needsLayout = true
         editorView.needsDisplay = true
@@ -2376,7 +2380,7 @@ final class SidebarSectionHeader: NSView {
 extension MainWindowController: NSSplitViewDelegate {
     func splitView(_ splitView: NSSplitView, constrainMinCoordinate proposedMinimumPosition: CGFloat,
                    ofSubviewAt dividerIndex: Int) -> CGFloat {
-        isSidebarVisible ? Self.minSidebarWidth : 0
+        Self.minSidebarWidth
     }
 
     func splitView(_ splitView: NSSplitView, constrainMaxCoordinate proposedMaximumPosition: CGFloat,
@@ -2389,7 +2393,7 @@ extension MainWindowController: NSSplitViewDelegate {
         view !== sidebar
     }
 
-    func splitView(_ splitView: NSSplitView, canCollapseSubview subview: NSView) -> Bool { false }
+    func splitView(_ splitView: NSSplitView, canCollapseSubview subview: NSView) -> Bool { subview === sidebar }
 }
 
 extension MainWindowController: NSMenuItemValidation {

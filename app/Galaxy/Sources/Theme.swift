@@ -35,6 +35,7 @@ enum Theme {
     }
 
     static let caret = accent
+    static let activityActive = NSColor.systemBlue
     static let findMatch = NSColor(name: "GalaxyFindMatch") { appearance in
         accent.resolved(for: appearance).withAlphaComponent(0.32)
     }

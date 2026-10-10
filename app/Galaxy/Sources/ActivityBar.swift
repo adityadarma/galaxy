@@ -128,7 +128,7 @@ final class ActivityBarButton: NSButton {
         if !item.isAvailable {
             contentTintColor = .tertiaryLabelColor
         } else {
-            contentTintColor = isActive ? .labelColor : .secondaryLabelColor
+            contentTintColor = isActive ? Theme.activityActive : .secondaryLabelColor
         }
         setAccessibilityValue(isActive ? 1 : 0)
         needsDisplay = true
@@ -136,8 +136,7 @@ final class ActivityBarButton: NSButton {
 
     override func draw(_ dirtyRect: NSRect) {
         if isActive {
-            // Copper bar on the left edge, as VSCode marks the active view.
-            Theme.accent.setFill()
+            Theme.activityActive.setFill()
             NSRect(x: 0, y: 8, width: 2, height: max(0, bounds.height - 16)).fill()
         }
         super.draw(dirtyRect)
