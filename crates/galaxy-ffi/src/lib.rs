@@ -574,6 +574,58 @@ impl Core {
             })
     }
 
+    pub fn request_definition(
+        &self,
+        document: Arc<DocumentHandle>,
+        line: u64,
+        character: u64,
+    ) -> bool {
+        request_definition_kind(self, document, line, character, DefinitionKind::Definition)
+    }
+
+    pub fn request_type_definition(
+        &self,
+        document: Arc<DocumentHandle>,
+        line: u64,
+        character: u64,
+    ) -> bool {
+        request_definition_kind(self, document, line, character, DefinitionKind::Type)
+    }
+
+    pub fn request_implementation(
+        &self,
+        document: Arc<DocumentHandle>,
+        line: u64,
+        character: u64,
+    ) -> bool {
+        request_definition_kind(
+            self,
+            document,
+            line,
+            character,
+            DefinitionKind::Implementation,
+        )
+    }
+
+    pub fn definition_locations(&self, document: Arc<DocumentHandle>) -> Vec<DefinitionLocation> {
+        let path = document.path();
+        if path.is_empty() {
+            return Vec::new();
+        }
+        let uri = file_uri(Path::new(&path));
+        self.lsp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .definition_locations(&uri)
+            .iter()
+            .map(|location| DefinitionLocation {
+                uri: location.uri.clone(),
+                line: location.range.start_line,
+                column: location.range.start_character,
+            })
+            .collect()
+    }
+
     pub fn problems(&self) -> Vec<ProblemInfo> {
         let lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
         lsp.problems()
@@ -659,6 +711,42 @@ pub struct SignatureInfo {
     pub documentation: Option<String>,
     pub parameters: Vec<String>,
     pub active_parameter: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct DefinitionLocation {
+    pub uri: String,
+    pub line: u64,
+    pub column: u64,
+}
+
+enum DefinitionKind {
+    Definition,
+    Type,
+    Implementation,
+}
+
+fn request_definition_kind(
+    core: &Core,
+    document: Arc<DocumentHandle>,
+    line: u64,
+    character: u64,
+    kind: DefinitionKind,
+) -> bool {
+    let path = document.path();
+    if path.is_empty() {
+        return false;
+    }
+    let uri = file_uri(Path::new(&path));
+    let mut lsp = core.lsp.lock().unwrap_or_else(|e| e.into_inner());
+    let result = match kind {
+        DefinitionKind::Definition => lsp.request_definition(&uri, line, character, Instant::now()),
+        DefinitionKind::Type => lsp.request_type_definition(&uri, line, character, Instant::now()),
+        DefinitionKind::Implementation => {
+            lsp.request_implementation(&uri, line, character, Instant::now())
+        }
+    };
+    result.ok().flatten().is_some()
 }
 
 /// One row of the file explorer.

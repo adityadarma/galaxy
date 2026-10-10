@@ -77,6 +77,7 @@ final class EditorView: NSView {
     var onClickMove: ((CursorInfo, CursorInfo) -> Void)?
     var onHover: ((TextPos, NSPoint) -> Void)?
     var onCompletionKey: ((NSEvent) -> Bool)?
+    var onDefinitionClick: ((TextPos) -> Bool)?
     /// A change is waiting for the next frame.
     private(set) var hasPendingChange = false
     /// How many times pending work was flushed (tests check coalescing).

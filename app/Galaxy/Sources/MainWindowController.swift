@@ -98,6 +98,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// Set while back/forward shows a location, so that move is not
     /// itself recorded as a jump.
     private var isNavigating = false
+    private var definitionRequest: (document: DocumentHandle, position: TextPos)?
     private var keyMonitor: Any?
     /// Tabs in the order they were last shown, most recent first (⌃Tab).
     private var tabOrderByUse: [ObjectIdentifier] = []
@@ -191,6 +192,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         editorView.onHover = { [weak self] position, point in
             self?.beginHover(at: position, point: point)
         }
+        editorView.onDefinitionClick = { [weak self] position in
+            self?.requestDefinition(at: position) ?? false
+        }
         editorView.onCursorChange = { [weak self] primary, count in
             self?.statusBar.showCursor(primary: primary, count: count)
         }
@@ -262,7 +266,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 self?.bridge.pollLSP()
                 self?.refreshHover()
             self?.refreshCompletion()
-            self?.refreshSignatureHelp()
+                self?.refreshSignatureHelp()
+                self?.refreshDefinition()
                 let problems = self?.bridge.core.problems() ?? []
                 self?.problemsPanel.update(problems)
                 self?.problemsPanel.isHidden = problems.isEmpty
@@ -417,6 +422,44 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         signaturePopup.show(signature)
         signaturePopup.isHidden = false
         signaturePopup.frame = NSRect(x: editorView.textOriginX + 8, y: CGFloat(completionPosition.line + 1) * editorView.metrics.lineHeight + 8, width: 520, height: signature.documentation == nil ? 48 : 78)
+    }
+
+    private func requestDefinition(at position: TextPos) -> Bool {
+        guard let document = activeTab?.doc else { return false }
+        definitionRequest = (document, position)
+        bridge.requestDefinition(document: document, line: position.line, character: position.colUtf16)
+        return true
+    }
+
+    private func refreshDefinition() {
+        guard let request = definitionRequest,
+              let location = bridge.definitionLocations(document: request.document).first else { return }
+        definitionRequest = nil
+        guard let path = URL(string: location.uri)?.path else { return }
+        let current = activeTab.map(location(of:))
+        let target = NavLocation(key: path, line: location.line, col: location.column)
+        if let current { _ = navHistory.recordJump(from: current, to: target) }
+        _ = show(target)
+    }
+
+    @objc func goToDefinition(_ sender: Any?) {
+        guard let document = activeTab?.doc else { NSSound.beep(); return }
+        let position = document.viewport(firstLine: 0, count: 0).primary
+        _ = requestDefinition(at: TextPos(line: position.line, colUtf16: position.colUtf16))
+    }
+
+    @objc func goToTypeDefinition(_ sender: Any?) {
+        guard let document = activeTab?.doc else { NSSound.beep(); return }
+        let position = document.viewport(firstLine: 0, count: 0).primary
+        definitionRequest = (document, TextPos(line: position.line, colUtf16: position.colUtf16))
+        bridge.requestTypeDefinition(document: document, line: position.line, character: position.colUtf16)
+    }
+
+    @objc func goToImplementation(_ sender: Any?) {
+        guard let document = activeTab?.doc else { NSSound.beep(); return }
+        let position = document.viewport(firstLine: 0, count: 0).primary
+        definitionRequest = (document, TextPos(line: position.line, colUtf16: position.colUtf16))
+        bridge.requestImplementation(document: document, line: position.line, character: position.colUtf16)
     }
 
     private func handleCompletionKey(_ event: NSEvent) -> Bool {
@@ -1309,6 +1352,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             let windowNumber = event.windowNumber
             let handled = MainActor.assumeIsolated { () -> Bool in
                 guard let self, windowNumber == self.window?.windowNumber else { return false }
+                if event.keyCode == 0x6F, event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty {
+                    self.goToDefinition(self)
+                    return true
+                }
                 return self.performKeyBinding(id)
             }
             return handled ? nil : event

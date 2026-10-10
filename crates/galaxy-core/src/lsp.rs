@@ -64,6 +64,12 @@ pub struct SignatureInfo {
     pub active_parameter: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DefinitionLocation {
+    pub uri: String,
+    pub range: Range,
+}
+
 /// Latest server diagnostics, replaced atomically per URI by
 /// `textDocument/publishDiagnostics` as required by LSP.
 #[derive(Debug, Default)]
@@ -480,6 +486,8 @@ pub struct LspManager {
     completion_requests: HashMap<(LspKey, u64), String>,
     signatures: HashMap<String, SignatureInfo>,
     signature_requests: HashMap<(LspKey, u64), String>,
+    definition_locations: HashMap<String, Vec<DefinitionLocation>>,
+    definition_requests: HashMap<(LspKey, u64), String>,
 }
 
 impl LspManager {
@@ -601,6 +609,68 @@ impl LspManager {
 
     pub fn signature_help(&self, uri: &str) -> Option<&SignatureInfo> {
         self.signatures.get(uri)
+    }
+
+    pub fn request_definition(
+        &mut self,
+        uri: &str,
+        line: u64,
+        character: u64,
+        now: Instant,
+    ) -> io::Result<Option<u64>> {
+        self.request_definition_kind(uri, line, character, "textDocument/definition", now)
+    }
+
+    pub fn request_type_definition(
+        &mut self,
+        uri: &str,
+        line: u64,
+        character: u64,
+        now: Instant,
+    ) -> io::Result<Option<u64>> {
+        self.request_definition_kind(uri, line, character, "textDocument/typeDefinition", now)
+    }
+
+    pub fn request_implementation(
+        &mut self,
+        uri: &str,
+        line: u64,
+        character: u64,
+        now: Instant,
+    ) -> io::Result<Option<u64>> {
+        self.request_definition_kind(uri, line, character, "textDocument/implementation", now)
+    }
+
+    fn request_definition_kind(
+        &mut self,
+        uri: &str,
+        line: u64,
+        character: u64,
+        method: &str,
+        now: Instant,
+    ) -> io::Result<Option<u64>> {
+        let Some(key) = self.documents.get(uri).map(|(key, _)| key.clone()) else {
+            return Ok(None);
+        };
+        self.definition_locations.remove(uri);
+        let id = self.request(
+            &key,
+            method.into(),
+            serde_json::json!({
+                "textDocument": { "uri": uri }, "position": { "line": line, "character": character }
+            }),
+            Duration::from_millis(1000),
+            now,
+        )?;
+        self.definition_requests.insert((key, id), uri.to_owned());
+        Ok(Some(id))
+    }
+
+    pub fn definition_locations(&self, uri: &str) -> &[DefinitionLocation] {
+        self.definition_locations
+            .get(uri)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// Sends a notification to one initialized or initializing server.
@@ -759,6 +829,9 @@ impl LspManager {
                         if let Some(uri) = self.signature_requests.remove(&(key.clone(), id))
                             && let Some(result) = message.get("result").and_then(parse_signature)
                         { self.signatures.insert(uri, result); }
+                        if let Some(uri) = self.definition_requests.remove(&(key.clone(), id))
+                            && let Some(result) = message.get("result").and_then(parse_definition_locations)
+                        { self.definition_locations.insert(uri, result); }
                         if self.requests.remove(&(key.clone(), id)).is_some() {
                             events.push(LspEvent::Response {
                                 key: key.clone(), id,
@@ -915,6 +988,50 @@ fn parse_signature(value: &Value) -> Option<SignatureInfo> {
             .get("activeParameter")
             .and_then(Value::as_u64)
             .unwrap_or(0),
+    })
+}
+
+fn parse_definition_locations(value: &Value) -> Option<Vec<DefinitionLocation>> {
+    let values = match value {
+        Value::Array(items) => items,
+        Value::Object(object) if object.get("uri").is_some() => std::slice::from_ref(value),
+        _ => return None,
+    };
+    Some(
+        values
+            .iter()
+            .filter_map(|item| {
+                let object = item.as_object()?;
+                let uri = object
+                    .get("uri")
+                    .or_else(|| object.get("targetUri"))?
+                    .as_str()?
+                    .to_owned();
+                let range = object
+                    .get("range")
+                    .or_else(|| object.get("targetSelectionRange"))
+                    .and_then(parse_range)?;
+                Some(DefinitionLocation { uri, range })
+            })
+            .collect(),
+    )
+}
+
+fn parse_range(value: &Value) -> Option<Range> {
+    let position = |name: &str| {
+        let position = value.get(name)?.as_object()?;
+        Some((
+            position.get("line")?.as_u64()?,
+            position.get("character")?.as_u64()?,
+        ))
+    };
+    let (start_line, start_character) = position("start")?;
+    let (end_line, end_character) = position("end")?;
+    Some(Range {
+        start_line,
+        start_character,
+        end_line,
+        end_character,
     })
 }
 
@@ -1480,5 +1597,18 @@ mod tests {
         assert_eq!(signature.parameters, ["path", "options"]);
         assert_eq!(signature.active_parameter, 1);
         assert_eq!(signature.documentation.as_deref(), Some("Reads a file."));
+    }
+
+    #[test]
+    fn parses_definition_locations_and_links() {
+        let locations = parse_definition_locations(&serde_json::json!([
+            {"uri":"file:///tmp/lib.rs","range":{"start":{"line":4,"character":2},"end":{"line":4,"character":8}}},
+            {"targetUri":"file:///tmp/main.rs","targetSelectionRange":{"start":{"line":9,"character":1},"end":{"line":9,"character":5}}}
+        ])).unwrap();
+        assert_eq!(locations.len(), 2);
+        assert_eq!(locations[0].uri, "file:///tmp/lib.rs");
+        assert_eq!(locations[0].range.start_line, 4);
+        assert_eq!(locations[1].uri, "file:///tmp/main.rs");
+        assert_eq!(locations[1].range.start_character, 1);
     }
 }

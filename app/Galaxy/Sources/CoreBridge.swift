@@ -80,6 +80,22 @@ final class CoreBridge {
         core.signatureHelp(document: document)
     }
 
+    func requestDefinition(document: DocumentHandle, line: UInt64, character: UInt64) {
+        _ = core.requestDefinition(document: document, line: line, character: character)
+    }
+
+    func requestTypeDefinition(document: DocumentHandle, line: UInt64, character: UInt64) {
+        _ = core.requestTypeDefinition(document: document, line: line, character: character)
+    }
+
+    func requestImplementation(document: DocumentHandle, line: UInt64, character: UInt64) {
+        _ = core.requestImplementation(document: document, line: line, character: character)
+    }
+
+    func definitionLocations(document: DocumentHandle) -> [DefinitionLocation] {
+        core.definitionLocations(document: document)
+    }
+
     fileprivate func deliver(_ event: CoreEvent) {
         lastEvent = event
         if case let .pong(message) = event {

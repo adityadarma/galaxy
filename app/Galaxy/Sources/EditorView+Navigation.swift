@@ -99,6 +99,7 @@ extension EditorView {
         let local = convert(event.locationInWindow, from: nil)
         let pos = textPosition(at: local)
         let flags = event.modifierFlags
+        if flags.contains(.command), event.clickCount == 1, onDefinitionClick?(pos) == true { return }
         columnAnchor = nil
         if flags.contains(.option), flags.contains(.shift) {
             // Opt+Shift+drag: column (box) selection.

@@ -137,7 +137,8 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
   - Status: Request completion, parsing item/textEdit, fuzzy subsequence filter, keyboard popup, dan snippet placeholder removal selesai. `completionItem/resolve` belum diperlukan untuk server yang mengembalikan detail langsung.
 - [x] M4-09 — Signature help.
   - Status: `textDocument/signatureHelp`, signature/parameter parsing, active parameter highlighting, and editor popup selesai.
-- [ ] M4-10 — Go to definition / type definition / implementation (`F12`, `Cmd+Click`).
+- [x] M4-10 — Go to definition / type definition / implementation (`F12`, `Cmd+Click`).
+  - Status: request LSP definition/typeDefinition/implementation, parsing Location/LocationLink, pembukaan file target, navigation history, menu, `F12`, dan `Cmd+Click` selesai.
 - [ ] M4-11 — Find references dengan panel hasil.
 - [ ] M4-12 — Rename symbol: input inline, terapkan `WorkspaceEdit` ke file terbuka dan tertutup, satu langkah undo per file.
 - [ ] M4-13 — Code actions / quick fix (`Cmd+.`).
