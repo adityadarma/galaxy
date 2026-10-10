@@ -536,6 +536,44 @@ impl Core {
             .collect()
     }
 
+    pub fn request_signature_help(
+        &self,
+        document: Arc<DocumentHandle>,
+        line: u64,
+        character: u64,
+    ) -> bool {
+        let path = document.path();
+        if path.is_empty() {
+            return false;
+        }
+        let uri = file_uri(Path::new(&path));
+        self.lsp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .request_signature_help(&uri, line, character, Instant::now())
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    pub fn signature_help(&self, document: Arc<DocumentHandle>) -> Option<SignatureInfo> {
+        let path = document.path();
+        if path.is_empty() {
+            return None;
+        }
+        let uri = file_uri(Path::new(&path));
+        self.lsp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .signature_help(&uri)
+            .map(|signature| SignatureInfo {
+                label: signature.label.clone(),
+                documentation: signature.documentation.clone(),
+                parameters: signature.parameters.clone(),
+                active_parameter: signature.active_parameter,
+            })
+    }
+
     pub fn problems(&self) -> Vec<ProblemInfo> {
         let lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
         lsp.problems()
@@ -613,6 +651,14 @@ pub struct CompletionInfo {
     pub detail: Option<String>,
     pub insert_text: String,
     pub is_snippet: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SignatureInfo {
+    pub label: String,
+    pub documentation: Option<String>,
+    pub parameters: Vec<String>,
+    pub active_parameter: u64,
 }
 
 /// One row of the file explorer.

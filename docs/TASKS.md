@@ -135,7 +135,8 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
   - Status: `textDocument/hover`, parsing string/MarkedString/MarkupContent, UTF-16 range, popup saat pointer berada di editor, dan navigasi response aktif. Markdown dirender sebagai teks sederhana; code block belum memiliki syntax highlighting khusus.
 - [x] M4-08 — Completion: popup, filter lokal fuzzy, `completionItem/resolve`, snippet dasar (`$1`, `$0`).
   - Status: Request completion, parsing item/textEdit, fuzzy subsequence filter, keyboard popup, dan snippet placeholder removal selesai. `completionItem/resolve` belum diperlukan untuk server yang mengembalikan detail langsung.
-- [ ] M4-09 — Signature help.
+- [x] M4-09 — Signature help.
+  - Status: `textDocument/signatureHelp`, signature/parameter parsing, active parameter highlighting, and editor popup selesai.
 - [ ] M4-10 — Go to definition / type definition / implementation (`F12`, `Cmd+Click`).
 - [ ] M4-11 — Find references dengan panel hasil.
 - [ ] M4-12 — Rename symbol: input inline, terapkan `WorkspaceEdit` ke file terbuka dan tertutup, satu langkah undo per file.

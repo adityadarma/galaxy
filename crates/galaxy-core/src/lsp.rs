@@ -56,6 +56,14 @@ pub struct CompletionItem {
     pub sort_text: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignatureInfo {
+    pub label: String,
+    pub documentation: Option<String>,
+    pub parameters: Vec<String>,
+    pub active_parameter: u64,
+}
+
 /// Latest server diagnostics, replaced atomically per URI by
 /// `textDocument/publishDiagnostics` as required by LSP.
 #[derive(Debug, Default)]
@@ -470,6 +478,8 @@ pub struct LspManager {
     hover_requests: HashMap<(LspKey, u64), String>,
     completion: HashMap<String, Vec<CompletionItem>>,
     completion_requests: HashMap<(LspKey, u64), String>,
+    signatures: HashMap<String, SignatureInfo>,
+    signature_requests: HashMap<(LspKey, u64), String>,
 }
 
 impl LspManager {
@@ -570,6 +580,27 @@ impl LspManager {
 
     pub fn completions(&self, uri: &str) -> &[CompletionItem] {
         self.completion.get(uri).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    pub fn request_signature_help(
+        &mut self,
+        uri: &str,
+        line: u64,
+        character: u64,
+        now: Instant,
+    ) -> io::Result<Option<u64>> {
+        let Some(key) = self.documents.get(uri).map(|(key, _)| key.clone()) else {
+            return Ok(None);
+        };
+        let id = self.request(&key, "textDocument/signatureHelp".into(), serde_json::json!({
+            "textDocument": { "uri": uri }, "position": { "line": line, "character": character }, "context": { "triggerKind": 1 }
+        }), Duration::from_millis(750), now)?;
+        self.signature_requests.insert((key, id), uri.to_owned());
+        Ok(Some(id))
+    }
+
+    pub fn signature_help(&self, uri: &str) -> Option<&SignatureInfo> {
+        self.signatures.get(uri)
     }
 
     /// Sends a notification to one initialized or initializing server.
@@ -725,6 +756,9 @@ impl LspManager {
                         if let Some(uri) = self.completion_requests.remove(&(key.clone(), id))
                             && let Some(result) = message.get("result").and_then(parse_completion)
                         { self.completion.insert(uri, result); }
+                        if let Some(uri) = self.signature_requests.remove(&(key.clone(), id))
+                            && let Some(result) = message.get("result").and_then(parse_signature)
+                        { self.signatures.insert(uri, result); }
                         if self.requests.remove(&(key.clone(), id)).is_some() {
                             events.push(LspEvent::Response {
                                 key: key.clone(), id,
@@ -843,6 +877,45 @@ fn parse_completion(value: &Value) -> Option<Vec<CompletionItem>> {
             })
             .collect(),
     )
+}
+
+fn parse_signature(value: &Value) -> Option<SignatureInfo> {
+    let signature = value.get("signatures")?.as_array()?.first()?.as_object()?;
+    let label = signature.get("label")?.as_str()?.to_owned();
+    let parameters = signature
+        .get("parameters")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| match item {
+                    Value::Object(object) => object
+                        .get("label")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    Value::String(text) => Some(text.clone()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let documentation = signature.get("documentation").and_then(|value| {
+        value.as_str().map(str::to_owned).or_else(|| {
+            value
+                .get("value")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+    });
+    Some(SignatureInfo {
+        label,
+        documentation,
+        parameters,
+        active_parameter: value
+            .get("activeParameter")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+    })
 }
 
 impl Drop for LspManager {
@@ -1395,5 +1468,17 @@ mod tests {
         assert_eq!(items[0].label, "println!");
         assert!(items[0].is_snippet);
         assert_eq!(items[1].insert_text, "print");
+    }
+
+    #[test]
+    fn parses_signature_parameters_and_active_parameter() {
+        let signature = parse_signature(&serde_json::json!({
+            "signatures": [{"label":"read(path, options)","documentation":{"kind":"markdown","value":"Reads a file."},"parameters":[{"label":"path"},{"label":"options"}]}],
+            "activeSignature": 0, "activeParameter": 1
+        })).unwrap();
+        assert_eq!(signature.label, "read(path, options)");
+        assert_eq!(signature.parameters, ["path", "options"]);
+        assert_eq!(signature.active_parameter, 1);
+        assert_eq!(signature.documentation.as_deref(), Some("Reads a file."));
     }
 }

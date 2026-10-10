@@ -72,6 +72,14 @@ final class CoreBridge {
         core.completions(document: document)
     }
 
+    func requestSignatureHelp(document: DocumentHandle, line: UInt64, character: UInt64) {
+        _ = core.requestSignatureHelp(document: document, line: line, character: character)
+    }
+
+    func signatureHelp(document: DocumentHandle) -> SignatureInfo? {
+        core.signatureHelp(document: document)
+    }
+
     fileprivate func deliver(_ event: CoreEvent) {
         lastEvent = event
         if case let .pong(message) = event {

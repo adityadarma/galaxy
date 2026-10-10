@@ -29,6 +29,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private let problemsPanel = ProblemsPanel()
     private let hoverPopover = HoverPopover()
     private let completionPopup = CompletionPopup()
+    private let signaturePopup = SignaturePopup()
     private var completionQuery = ""
     private var completionPosition = TextPos(line: 0, colUtf16: 0)
     private var hoverPosition: TextPos?
@@ -260,7 +261,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             Task { @MainActor [weak self] in
                 self?.bridge.pollLSP()
                 self?.refreshHover()
-                self?.refreshCompletion()
+            self?.refreshCompletion()
+            self?.refreshSignatureHelp()
                 let problems = self?.bridge.core.problems() ?? []
                 self?.problemsPanel.update(problems)
                 self?.problemsPanel.isHidden = problems.isEmpty
@@ -285,6 +287,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         detailView.addSubview(problemsPanel)
         detailView.addSubview(hoverPopover)
         detailView.addSubview(completionPopup)
+        detailView.addSubview(signaturePopup)
         NSLayoutConstraint.activate([
             tabBar.topAnchor.constraint(equalTo: detailView.topAnchor),
             tabBar.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
@@ -308,6 +311,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         problemsPanel.isHidden = true
         hoverPopover.isHidden = true
         completionPopup.isHidden = true
+        signaturePopup.isHidden = true
         completionPopup.onClose = { [weak self] in self?.closeCompletion() }
         completionPopup.onSelect = { [weak self] item in self?.acceptCompletion(item) }
         editorView.onCompletionKey = { [weak self] event in self?.handleCompletionKey(event) ?? false }
@@ -405,6 +409,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func closeCompletion() { completionPopup.isHidden = true }
+
+    private func refreshSignatureHelp() {
+        guard let document = activeTab?.doc else { signaturePopup.isHidden = true; return }
+        bridge.requestSignatureHelp(document: document, line: completionPosition.line, character: completionPosition.colUtf16)
+        guard let signature = bridge.signatureHelp(document: document) else { signaturePopup.isHidden = true; return }
+        signaturePopup.show(signature)
+        signaturePopup.isHidden = false
+        signaturePopup.frame = NSRect(x: editorView.textOriginX + 8, y: CGFloat(completionPosition.line + 1) * editorView.metrics.lineHeight + 8, width: 520, height: signature.documentation == nil ? 48 : 78)
+    }
 
     private func handleCompletionKey(_ event: NSEvent) -> Bool {
         guard !completionPopup.isHidden else { return false }
