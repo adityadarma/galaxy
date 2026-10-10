@@ -861,6 +861,16 @@ pub struct CursorInfo {
     pub col_utf16: u64,
 }
 
+/// One semantic syntax style range on a document line. Columns are UTF-16,
+/// matching `ViewportLine.text`; `scope` is a stable theme key (M3-04).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct StyleRun {
+    pub line: u64,
+    pub start: u64,
+    pub end: u64,
+    pub scope: String,
+}
+
 /// Everything the editor view needs to draw one frame. Columns are UTF-16.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct ViewportSnapshot {
@@ -869,6 +879,9 @@ pub struct ViewportSnapshot {
     pub lines: Vec<ViewportLine>,
     pub primary: CursorInfo,
     pub selection_count: u64,
+    /// Visible syntax plus a small scroll margin. Empty until M3-06 attaches
+    /// a language parser to each document.
+    pub styles: Vec<StyleRun>,
 }
 
 impl From<viewport::ViewportSnapshot> for ViewportSnapshot {
@@ -907,6 +920,16 @@ impl From<viewport::ViewportSnapshot> for ViewportSnapshot {
                 col_utf16: s.primary.col_utf16 as u64,
             },
             selection_count: s.selection_count as u64,
+            styles: s
+                .styles
+                .into_iter()
+                .map(|run| StyleRun {
+                    line: run.line as u64,
+                    start: run.start as u64,
+                    end: run.end as u64,
+                    scope: run.scope.name().to_owned(),
+                })
+                .collect(),
         }
     }
 }

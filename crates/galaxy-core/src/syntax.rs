@@ -17,7 +17,9 @@ use std::sync::{
 use std::thread::{self, JoinHandle};
 
 use ropey::Rope;
-use tree_sitter::{InputEdit, Language, Parser, Point, Query, Tree};
+use tree_sitter::{
+    InputEdit, Language, Parser, Point, Query, QueryCursor, StreamingIterator, Tree,
+};
 
 use crate::document::Document;
 
@@ -190,6 +192,114 @@ impl HighlightScope {
             _ => None,
         }
     }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Attribute => "attribute",
+            Self::Comment => "comment",
+            Self::Constant => "constant",
+            Self::Constructor => "constructor",
+            Self::Function => "function",
+            Self::Keyword => "keyword",
+            Self::Label => "label",
+            Self::Number => "number",
+            Self::Operator => "operator",
+            Self::Property => "property",
+            Self::Punctuation => "punctuation",
+            Self::String => "string",
+            Self::Tag => "tag",
+            Self::Type => "type",
+            Self::Variable => "variable",
+        }
+    }
+}
+
+/// A semantic style range on one document line, in UTF-16 columns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StyleRun {
+    pub line: usize,
+    pub start: usize,
+    pub end: usize,
+    pub scope: HighlightScope,
+}
+
+/// Extra lines queried either side of the visible viewport. They make a
+/// future style cache useful immediately after a short scroll without ever
+/// querying a whole document on a frame.
+pub const VIEWPORT_STYLE_MARGIN_LINES: usize = 10;
+
+/// Returns semantic style runs for `first_line..first_line + count`, expanded
+/// by [`VIEWPORT_STYLE_MARGIN_LINES`]. Ranges are clipped to displayed text so
+/// renderer columns stay valid even for minified lines cut by the viewport.
+pub fn style_runs_for_viewport(
+    doc: &Document,
+    tree: &Tree,
+    language: SyntaxLanguage,
+    first_line: usize,
+    count: usize,
+) -> Vec<StyleRun> {
+    let line_count = doc.line_count();
+    let first = first_line.saturating_sub(VIEWPORT_STYLE_MARGIN_LINES);
+    let last = first_line
+        .saturating_add(count)
+        .saturating_add(VIEWPORT_STYLE_MARGIN_LINES)
+        .min(line_count);
+    if first >= last {
+        return Vec::new();
+    }
+    let rope = doc.rope();
+    let start_byte = rope.line_to_byte(first);
+    let end_byte = if last == line_count {
+        rope.len_bytes()
+    } else {
+        rope.line_to_byte(last)
+    };
+    let query = match language.compile_highlights() {
+        Ok(query) => query,
+        Err(_) => return Vec::new(), // grammar queries are validated in tests
+    };
+    let names = query.capture_names();
+    let mut cursor = QueryCursor::new();
+    cursor.set_byte_range(start_byte..end_byte);
+    let text = rope.to_string();
+    let mut runs = Vec::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), text.as_bytes());
+    while let Some(m) = matches.next() {
+        for capture in m.captures {
+            let Some(scope) = HighlightScope::from_capture(names[capture.index as usize]) else {
+                continue;
+            };
+            let node = capture.node;
+            let start = node.start_byte().max(start_byte);
+            let end = node.end_byte().min(end_byte);
+            if start >= end {
+                continue;
+            }
+            let start_char = rope.byte_to_char(start);
+            let end_char = rope.byte_to_char(end);
+            let start_line = rope.char_to_line(start_char);
+            let end_line = rope.char_to_line(end_char);
+            for line in start_line..=end_line.min(last - 1) {
+                let line_start = rope.line_to_char(line);
+                let line_end = doc
+                    .line_end_char(line)
+                    .min(line_start + crate::viewport::MAX_LINE_DISPLAY_CHARS);
+                let from = start_char.max(line_start);
+                let to = end_char.min(line_end);
+                if from < to {
+                    let base = rope.char_to_utf16_cu(line_start);
+                    runs.push(StyleRun {
+                        line,
+                        start: rope.char_to_utf16_cu(from) - base,
+                        end: rope.char_to_utf16_cu(to) - base,
+                        scope,
+                    });
+                }
+            }
+        }
+    }
+    runs.sort_by_key(|run| (run.line, run.start, run.end));
+    runs
 }
 
 struct Request {
@@ -605,5 +715,29 @@ mod tests {
         assert!(scopes.contains(&HighlightScope::Comment));
         assert!(scopes.contains(&HighlightScope::Keyword));
         assert!(scopes.contains(&HighlightScope::String));
+    }
+
+    #[test]
+    fn styles_are_utf16_bounded_and_include_the_scroll_margin() {
+        let doc = Document::from_text("// ���\nfn main() {\n  let name = \"Galaxy\";\n}\nend");
+        let language = SyntaxLanguage::Rust;
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(doc.text(), None).unwrap();
+        // View line 2; line 0 is included because the 10-line margin reaches it.
+        let runs = style_runs_for_viewport(&doc, &tree, language, 2, 1);
+        assert!(
+            runs.iter()
+                .any(|run| run.line == 0 && run.scope == HighlightScope::Comment)
+        );
+        assert!(
+            runs.iter()
+                .any(|run| run.line == 2 && run.scope == HighlightScope::String)
+        );
+        for run in runs {
+            let text = crate::viewport::display_text(&doc, run.line);
+            assert!(run.start < run.end);
+            assert!(run.end <= text.encode_utf16().count());
+        }
     }
 }

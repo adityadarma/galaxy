@@ -16,6 +16,8 @@
 use crate::document::Document;
 use crate::history::Editor;
 use crate::selection::SelectionSet;
+use crate::syntax::{StyleRun, SyntaxLanguage, style_runs_for_viewport};
+use tree_sitter::Tree;
 
 /// Lines longer than this many chars are cut off for display.
 pub const MAX_LINE_DISPLAY_CHARS: usize = 10_000;
@@ -74,6 +76,9 @@ pub struct ViewportSnapshot {
     pub lines: Vec<ViewportLine>,
     pub primary: CursorInfo,
     pub selection_count: usize,
+    /// Syntax style runs for the visible range plus a small scroll margin.
+    /// Empty until a parsed tree is attached by the syntax service.
+    pub styles: Vec<StyleRun>,
 }
 
 impl Editor {
@@ -97,6 +102,20 @@ impl Editor {
                 }
             }
         }
+        snap
+    }
+
+    /// Like [`Self::viewport`], with styles from a completed background parse.
+    /// Passing a tree never parses or blocks the caller.
+    pub fn viewport_with_syntax(
+        &self,
+        first_line: usize,
+        count: usize,
+        tree: &Tree,
+        language: SyntaxLanguage,
+    ) -> ViewportSnapshot {
+        let mut snap = self.viewport(first_line, count);
+        snap.styles = style_runs_for_viewport(&self.doc, tree, language, first_line, count);
         snap
     }
 }
@@ -184,6 +203,7 @@ pub fn snapshot(
             col_utf16: doc.char_to_utf16(head).col,
         },
         selection_count: sel.len(),
+        styles: Vec::new(),
     }
 }
 
