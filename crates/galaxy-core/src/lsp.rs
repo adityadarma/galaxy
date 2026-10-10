@@ -41,6 +41,12 @@ pub struct Diagnostic {
     pub code: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HoverInfo {
+    pub contents: String,
+    pub range: Option<Range>,
+}
+
 /// Latest server diagnostics, replaced atomically per URI by
 /// `textDocument/publishDiagnostics` as required by LSP.
 #[derive(Debug, Default)]
@@ -451,6 +457,8 @@ pub struct LspManager {
     requests: HashMap<(LspKey, u64), PendingRequest>,
     next_request_id: u64,
     diagnostics: DiagnosticStore,
+    hover: HashMap<String, HoverInfo>,
+    hover_requests: HashMap<(LspKey, u64), String>,
 }
 
 impl LspManager {
@@ -502,6 +510,34 @@ impl LspManager {
 
     pub fn problems(&self) -> Vec<&Diagnostic> {
         self.diagnostics.problems()
+    }
+
+    pub fn request_hover(
+        &mut self,
+        uri: &str,
+        line: u64,
+        character: u64,
+        now: Instant,
+    ) -> io::Result<Option<u64>> {
+        let Some(key) = self.documents.get(uri).map(|(key, _)| key.clone()) else {
+            return Ok(None);
+        };
+        self.hover.remove(uri);
+        let id = self.request(
+            &key,
+            "textDocument/hover".into(),
+            serde_json::json!({
+                "textDocument": { "uri": uri }, "position": { "line": line, "character": character }
+            }),
+            Duration::from_millis(750),
+            now,
+        )?;
+        self.hover_requests.insert((key, id), uri.to_owned());
+        Ok(Some(id))
+    }
+
+    pub fn hover(&self, uri: &str) -> Option<&HoverInfo> {
+        self.hover.get(uri)
     }
 
     /// Sends a notification to one initialized or initializing server.
@@ -649,6 +685,11 @@ impl LspManager {
                     }
                     Ok(Incoming::Message(message)) if message.get("id").and_then(Value::as_u64).is_some() => {
                         let id = message["id"].as_u64().expect("checked above");
+                        if let Some(uri) = self.hover_requests.remove(&(key.clone(), id))
+                            && let Some(value) = message.get("result").and_then(parse_hover)
+                        {
+                            self.hover.insert(uri, value);
+                        }
                         if self.requests.remove(&(key.clone(), id)).is_some() {
                             events.push(LspEvent::Response {
                                 key: key.clone(), id,
@@ -685,6 +726,51 @@ impl LspManager {
         self.servers.clear();
         self.documents.clear();
     }
+}
+
+fn parse_hover(value: &Value) -> Option<HoverInfo> {
+    if value.is_null() {
+        return None;
+    }
+    let contents = value.get("contents")?;
+    let text = match contents {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| match item {
+                Value::String(text) => Some(text.clone()),
+                Value::Object(object) => object
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(object) => object.get("value").and_then(Value::as_str)?.to_owned(),
+        _ => return None,
+    };
+    let range = value.get("range").and_then(|range| {
+        let position = |name: &str| {
+            let position = range.get(name)?.as_object()?;
+            Some((
+                position.get("line")?.as_u64()?,
+                position.get("character")?.as_u64()?,
+            ))
+        };
+        let (start_line, start_character) = position("start")?;
+        let (end_line, end_character) = position("end")?;
+        Some(Range {
+            start_line,
+            start_character,
+            end_line,
+            end_character,
+        })
+    });
+    Some(HoverInfo {
+        contents: text,
+        range,
+    })
 }
 
 impl Drop for LspManager {
@@ -1205,6 +1291,25 @@ mod tests {
             !manager
                 .publish_diagnostics(&serde_json::json!({"method":"window/logMessage"}))
                 .unwrap()
+        );
+    }
+
+    #[test]
+    fn parses_marked_hover_contents_and_range() {
+        let hover = parse_hover(&serde_json::json!({
+            "contents": [{"language":"rust","value":"fn main()"}, "A description"],
+            "range": {"start":{"line":2,"character":1},"end":{"line":2,"character":5}}
+        }))
+        .unwrap();
+        assert_eq!(hover.contents, "fn main()\nA description");
+        assert_eq!(
+            hover.range,
+            Some(Range {
+                start_line: 2,
+                start_character: 1,
+                end_line: 2,
+                end_character: 5
+            })
         );
     }
 }

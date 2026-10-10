@@ -56,6 +56,14 @@ final class CoreBridge {
         core.saveLspDocument(document: document)
     }
 
+    func requestHover(document: DocumentHandle, line: UInt64, character: UInt64) {
+        _ = core.requestHover(document: document, line: line, character: character)
+    }
+
+    func hover(document: DocumentHandle) -> HoverInfo? {
+        core.hover(document: document)
+    }
+
     fileprivate func deliver(_ event: CoreEvent) {
         lastEvent = event
         if case let .pong(message) = event {

@@ -462,6 +462,40 @@ impl Core {
         events.len() as u64
     }
 
+    pub fn request_hover(&self, document: Arc<DocumentHandle>, line: u64, character: u64) -> bool {
+        let path = document.path();
+        if path.is_empty() {
+            return false;
+        }
+        let uri = file_uri(Path::new(&path));
+        self.lsp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .request_hover(&uri, line, character, Instant::now())
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    pub fn hover(&self, document: Arc<DocumentHandle>) -> Option<HoverInfo> {
+        let path = document.path();
+        if path.is_empty() {
+            return None;
+        }
+        let uri = file_uri(Path::new(&path));
+        self.lsp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .hover(&uri)
+            .map(|hover| HoverInfo {
+                contents: hover.contents.clone(),
+                start_line: hover.range.map(|range| range.start_line),
+                start_character: hover.range.map(|range| range.start_character),
+                end_line: hover.range.map(|range| range.end_line),
+                end_character: hover.range.map(|range| range.end_character),
+            })
+    }
+
     pub fn problems(&self) -> Vec<ProblemInfo> {
         let lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
         lsp.problems()
@@ -522,6 +556,15 @@ pub struct ProblemInfo {
     pub message: String,
     pub source: Option<String>,
     pub code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct HoverInfo {
+    pub contents: String,
+    pub start_line: Option<u64>,
+    pub start_character: Option<u64>,
+    pub end_line: Option<u64>,
+    pub end_character: Option<u64>,
 }
 
 /// One row of the file explorer.

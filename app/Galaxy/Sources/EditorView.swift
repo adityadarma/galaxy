@@ -75,6 +75,7 @@ final class EditorView: NSView {
     /// Primary caret before and after a plain click, so the window can
     /// record a far click in the back/forward history (M2-08).
     var onClickMove: ((CursorInfo, CursorInfo) -> Void)?
+    var onHover: ((TextPos, NSPoint) -> Void)?
     /// A change is waiting for the next frame.
     private(set) var hasPendingChange = false
     /// How many times pending work was flushed (tests check coalescing).
@@ -118,6 +119,20 @@ final class EditorView: NSView {
 
     override var isFlipped: Bool { true }
     override var isOpaque: Bool { true }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        let area = NSTrackingArea(rect: bounds, options: [.activeInKeyWindow, .mouseMoved, .mouseExited, .inVisibleRect], owner: self)
+        addTrackingArea(area)
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        onHover?(textPosition(at: point), point)
+    }
+
+    override func mouseExited(with event: NSEvent) { onHover?(TextPos(line: UInt64.max, colUtf16: 0), .zero) }
     override var acceptsFirstResponder: Bool { true }
 
     override func viewDidChangeEffectiveAppearance() {

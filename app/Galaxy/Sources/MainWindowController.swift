@@ -27,6 +27,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     var statusLabel: NSTextField { statusBar.message }
     private let scrollView = DiagnosticScrollView()
     private let problemsPanel = ProblemsPanel()
+    private let hoverPopover = HoverPopover()
+    private var hoverPosition: TextPos?
+    private var hoverPoint = NSPoint.zero
+    private var hoverDocument: DocumentHandle?
+    private var hoverRequestPosition: TextPos?
     private let splitView = NSSplitView()
     private let detailView = NSView()
     /// Holds the find bar's place in the layout. The bar itself is built on
@@ -178,6 +183,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 from: NavLocation(key: tab.navKey, line: before.line, col: before.col),
                 to: NavLocation(key: tab.navKey, line: after.line, col: after.col))
         }
+        editorView.onHover = { [weak self] position, point in
+            self?.beginHover(at: position, point: point)
+        }
         editorView.onCursorChange = { [weak self] primary, count in
             self?.statusBar.showCursor(primary: primary, count: count)
         }
@@ -247,6 +255,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         lspTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.bridge.pollLSP()
+                self?.refreshHover()
                 let problems = self?.bridge.core.problems() ?? []
                 self?.problemsPanel.update(problems)
                 self?.problemsPanel.isHidden = problems.isEmpty
@@ -269,6 +278,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         detailView.addSubview(findBarSlot)
         detailView.addSubview(scrollView)
         detailView.addSubview(problemsPanel)
+        detailView.addSubview(hoverPopover)
         NSLayoutConstraint.activate([
             tabBar.topAnchor.constraint(equalTo: detailView.topAnchor),
             tabBar.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
@@ -290,6 +300,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         ])
         problemsPanel.onSelect = { [weak self] problem in self?.showProblem(problem) }
         problemsPanel.isHidden = true
+        hoverPopover.isHidden = true
 
         buildSidebar()
 
@@ -334,6 +345,29 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         if activeIndex != index { selectTab(index) }
         activeTab?.doc.goToLine(line: problem.line, col: problem.column)
         editorView.window?.makeFirstResponder(editorView)
+    }
+
+    private func beginHover(at position: TextPos, point: NSPoint) {
+        guard position.line != UInt64.max, let document = activeTab?.doc else {
+            hoverPopover.isHidden = true
+            return
+        }
+        if hoverDocument === document, hoverRequestPosition?.line == position.line, hoverRequestPosition?.colUtf16 == position.colUtf16 { return }
+        hoverDocument = document
+        hoverPosition = position
+        hoverPoint = point
+        hoverRequestPosition = position
+        bridge.requestHover(document: document, line: position.line, character: position.colUtf16)
+    }
+
+    private func refreshHover() {
+        guard let document = hoverDocument, let position = hoverRequestPosition,
+              let hover = bridge.hover(document: document),
+              hover.startLine == nil || (position.line >= (hover.startLine ?? 0) && position.line <= (hover.endLine ?? position.line)) else { return }
+        hoverPopover.show(hover.contents)
+        hoverPopover.isHidden = false
+        hoverPopover.frame = NSRect(x: hoverPoint.x + 14, y: hoverPoint.y + 18, width: 360, height: 72)
+        hoverPopover.needsDisplay = true
     }
 
     private func buildSidebar() {
