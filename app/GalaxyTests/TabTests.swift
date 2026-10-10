@@ -64,6 +64,22 @@ final class TabTests: XCTestCase {
         XCTAssertEqual(titles(c), ["a.txt", "Untitled", "b.txt"])
     }
 
+    func testInactiveSyntaxIsEvictedAndResumedWhenSelected() throws {
+        try "fn first() {}".write(to: file("first.rs"), atomically: true, encoding: .utf8)
+        try "fn second() {}".write(to: file("second.rs"), atomically: true, encoding: .utf8)
+        let c = makeController()
+        defer { c.window?.orderOut(nil) }
+        try c.openFile(at: file("first.rs"))
+        try c.openFile(at: file("second.rs"))
+        let first = c.tabs[0]
+        XCTAssertTrue(first.doc.syntaxActive())
+        first.lastActiveAt = Date.now.addingTimeInterval(-MainWindowController.syntaxEvictionInterval)
+        c.evictInactiveSyntax(now: .now)
+        XCTAssertFalse(first.doc.syntaxActive())
+        c.selectTab(0)
+        XCTAssertTrue(first.doc.syntaxActive())
+    }
+
     func testPreviewTabIsReplacedUntilEditedOrPinned() throws {
         let c = makeController()
         defer { c.window?.orderOut(nil) }

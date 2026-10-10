@@ -28,6 +28,8 @@ final class EditorTab {
     var isDeletedOnDisk = false
     /// Changed on disk while it had unsaved edits; asked about once shown.
     var hasDiskConflict = false
+    /// Last time this tab was active, used to release background syntax state.
+    var lastActiveAt = Date.now
     /// Title with the file's state on disk.
     var displayTitle: String { isDeletedOnDisk ? "\(title) (deleted)" : title }
     /// Identifies an Untitled buffer in the back/forward history.

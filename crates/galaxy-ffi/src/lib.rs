@@ -1085,6 +1085,27 @@ impl DocumentHandle {
             .is_some()
     }
 
+    /// Stops the parser worker and releases its completed tree. Document text,
+    /// selections and history remain resident; `resume_syntax` recreates it.
+    pub fn suspend_syntax(&self) -> bool {
+        self.lock().syntax.take().is_some()
+    }
+
+    /// Recreates syntax parsing for a supported non-large document. Returns
+    /// whether a worker is active after the call.
+    pub fn resume_syntax(&self) -> bool {
+        let mut st = self.lock();
+        if st.syntax.is_none() {
+            st.syntax = syntax_for(&st.path, &st.editor.doc);
+        }
+        st.syntax.is_some()
+    }
+
+    /// Whether this handle currently owns a syntax worker and completed tree.
+    pub fn syntax_active(&self) -> bool {
+        self.lock().syntax.is_some()
+    }
+
     /// Definitions from the current completed syntax tree. Parsing stays on
     /// the syntax worker; callers receive an empty list while it catches up.
     pub fn outline(&self) -> Vec<OutlineSymbol> {
@@ -1925,6 +1946,22 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn syntax_can_be_suspended_and_resumed_without_changing_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("idle.rs");
+        std::fs::write(&path, "fn idle() {}\n").unwrap();
+        let doc = Core::new()
+            .open_document(path.to_string_lossy().into_owned())
+            .unwrap();
+        assert!(doc.syntax_active());
+        assert!(doc.suspend_syntax());
+        assert!(!doc.syntax_active());
+        assert_eq!(doc.lines(0, 1), ["fn idle() {}"]);
+        assert!(doc.resume_syntax());
+        assert!(doc.syntax_active());
     }
 
     #[test]

@@ -75,6 +75,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private var loadedGoToLine: GoToLine?
     private var loadedOutlinePicker: OutlinePicker?
     private var loadedPalette: CommandPaletteView?
+    private var syntaxEvictionTimer: Timer?
+    static let syntaxEvictionInterval: TimeInterval = 5 * 60
     /// Command registry (M2-09); kept for the window so recency survives
     /// closing the palette.
     let commands = CommandPalette()
@@ -235,6 +237,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         tabBar.onSelect = { [weak self] i in self?.selectTab(i, fromTabBar: true) }
         tabBar.onClose = { [weak self] i in self?.closeTab(at: i) }
         tabBar.onMove = { [weak self] from, to in self?.moveTab(from: from, to: to) }
+        syntaxEvictionTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            self?.evictInactiveSyntax(now: .now)
+        }
         tabBar.titleBar = titleBar
         pathBar.translatesAutoresizingMaskIntoConstraints = false
         pathBar.show([])
@@ -401,6 +406,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
         activeIndex = index
         let tab = tabs[index]
+        tab.lastActiveAt = .now
+        _ = tab.doc.resumeSyntax()
         let id = ObjectIdentifier(tab)
         tabOrderByUse.removeAll { $0 == id }
         tabOrderByUse.insert(id, at: 0)
@@ -424,6 +431,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             window?.makeFirstResponder(editorView)
         }
         resolveDiskConflictIfNeeded()
+    }
+
+    /// Releases parser workers/trees for tabs that stayed hidden long enough.
+    /// Called by the timer and directly by tests with a deterministic clock.
+    func evictInactiveSyntax(now: Date) {
+        for tab in tabs where tab !== activeTab && now.timeIntervalSince(tab.lastActiveAt) >= Self.syntaxEvictionInterval {
+            _ = tab.doc.suspendSyntax()
+        }
     }
 
     // MARK: Changes on disk (M2-03)
@@ -1753,6 +1768,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     func windowWillClose(_ notification: Notification) {
         saveSession()
+        syntaxEvictionTimer?.invalidate()
+        syntaxEvictionTimer = nil
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
         keyMonitor = nil
         workspaceWatch?.stop()
