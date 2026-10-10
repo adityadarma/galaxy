@@ -18,6 +18,7 @@ pub mod history;
 pub mod jsonc;
 pub mod keymap;
 pub mod logging;
+pub mod lsp;
 pub mod movement;
 pub mod multicursor;
 pub mod navigation;

@@ -119,7 +119,8 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
 
 ## M4 — LSP (5 minggu)
 
-- [ ] M4-01 — Transport JSON-RPC over stdio (`tokio::process`), framing `Content-Length`, log trafik opsional.
+- [x] M4-01 — Transport JSON-RPC over stdio (`tokio::process`), framing `Content-Length`, log trafik opsional.
+  - Status: `lsp::LspTransport` menjalankan satu child server dengan stdin/stdout piped via `tokio::process`, mengirim JSON `Value` dalam frame `Content-Length`, dan reader task meneruskan JSON-RPC message/error/closed ke channel standar yang dapat dipoll tanpa blocking UI. Header dibatasi 16 KiB; header terpotong, missing/invalid `Content-Length`, dan JSON invalid menjadi error observabel. `log_traffic` menulis payload masuk/keluar pada tracing target `galaxy_lsp_traffic`; stderr child disembunyikan sampai lifecycle manager menambah log server. Drop menghentikan child. Tercakup decoding multiple frame, malformed header, dan child `/bin/sh` end-to-end; request ID, timeout, dan lifecycle protocol adalah M4-02/M4-05.
 - [ ] M4-02 — `LspManager`: lifecycle `initialize`/`initialized`/`shutdown`/`exit`, satu server per (bahasa, root).
 - [ ] M4-03 — Konfigurasi server: deteksi di `PATH`, override di settings, `initializationOptions`.
 - [ ] M4-04 — Document sync: `didOpen`, `didChange` incremental dengan debounce, `didSave`, `didClose`.
