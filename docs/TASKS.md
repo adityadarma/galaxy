@@ -130,6 +130,7 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
 - [x] M4-05 — Request tracking dengan ID, timeout, dan `$/cancelRequest` untuk request usang.
   - Status: `LspManager::request` menghasilkan ID monotonic mulai 2 (0 initialize, 1 shutdown), menyimpan method/deadline, dan `poll` menerbitkan `LspEvent::Response` hanya untuk ID yang masih pending. `cancel_request` mengirim `$/cancelRequest` lalu membuang state lokal, sehingga response terlambat tidak terlihat; `expire_requests(now)` melakukan cancel dan menerbitkan `TimedOut`. Notification tetap `Message`, terpisah dari response. Tercakup scripted server response, ID/cancel sekali, timeout, dan stale request. Retry/restart server tetap M4-16.
 - [ ] M4-06 — Diagnostics: underline di editor, marker di gutter dan scrollbar, panel Problems.
+  - Status: Live default LSP startup, `publishDiagnostics`, UTF-16 clipping, underline, dan gutter marker selesai. Scrollbar marker dan panel Problems masih tersisa.
 - [ ] M4-07 — Hover popover (Markdown sederhana, code block di-highlight).
 - [ ] M4-08 — Completion: popup, filter lokal fuzzy, `completionItem/resolve`, snippet dasar (`$1`, `$0`).
 - [ ] M4-09 — Signature help.

@@ -3,6 +3,7 @@
 //! Design rule: the UI calls in with coarse-grained commands and receives
 //! batched events through `CoreListener`. No per-character FFI chatter.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -17,6 +18,7 @@ use galaxy_core::file_finder::FileFinder as CoreFileFinder;
 use galaxy_core::find::{FindError, FindOptions, Finder};
 use galaxy_core::history::{EditKind, Editor};
 use galaxy_core::keymap::{self, Keymap};
+use galaxy_core::lsp::{LspKey, LspManager, LspSettings};
 use galaxy_core::movement::{self, Motion};
 use galaxy_core::multicursor;
 use galaxy_core::navigation::{self, Location, NavHistory};
@@ -316,12 +318,16 @@ impl NavigationHistory {
 #[derive(uniffi::Object)]
 pub struct Core {
     listener: RwLock<Option<Arc<dyn CoreListener>>>,
+    lsp: Mutex<LspManager>,
+    lsp_documents: Mutex<HashMap<String, Arc<DocumentHandle>>>,
 }
 
 impl Default for Core {
     fn default() -> Self {
         Self {
             listener: RwLock::new(None),
+            lsp: Mutex::new(LspManager::default()),
+            lsp_documents: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -382,6 +388,108 @@ impl Core {
         }
         Ok(Arc::new(handle))
     }
+
+    /// Starts the built-in language server for a document when its executable
+    /// is available on PATH. Unsupported languages and missing servers are
+    /// intentionally non-fatal.
+    pub fn start_lsp(
+        &self,
+        document: Arc<DocumentHandle>,
+        language: String,
+        root: String,
+    ) -> Result<bool, CoreError> {
+        let path = document.path();
+        if path.is_empty() {
+            return Ok(false);
+        }
+        let key = LspKey {
+            language: language.clone(),
+            root: PathBuf::from(root),
+        };
+        let Some(config) = LspSettings::default().resolve(&language) else {
+            return Ok(false);
+        };
+        let uri = file_uri(Path::new(&path));
+        if self
+            .lsp_documents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&uri)
+        {
+            return Ok(true);
+        }
+        let mut lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
+        lsp.ensure_server(key.clone(), &config)?;
+        let text = document.text();
+        let doc = Document::from_text(&text);
+        lsp.open_document(key, uri.clone(), language, &doc)?;
+        self.lsp_documents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(uri, document);
+        Ok(true)
+    }
+
+    /// Polls all running default servers and applies their latest diagnostics
+    /// to registered documents. Returns the number of consumed events.
+    pub fn poll_lsp(&self) -> u64 {
+        let mut lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = lsp.flush_changes(Instant::now());
+        let events = lsp.poll();
+        let documents = self.lsp_documents.lock().unwrap_or_else(|e| e.into_inner());
+        for uri in documents.keys() {
+            let diagnostics = lsp
+                .diagnostics(uri)
+                .iter()
+                .map(|diagnostic| DiagnosticInfo {
+                    start_line: diagnostic.range.start_line,
+                    start_character: diagnostic.range.start_character,
+                    end_line: diagnostic.range.end_line,
+                    end_character: diagnostic.range.end_character,
+                    severity: match diagnostic.severity {
+                        galaxy_core::lsp::DiagnosticSeverity::Error => 1,
+                        galaxy_core::lsp::DiagnosticSeverity::Warning => 2,
+                        galaxy_core::lsp::DiagnosticSeverity::Information => 3,
+                        galaxy_core::lsp::DiagnosticSeverity::Hint => 4,
+                    },
+                    message: diagnostic.message.clone(),
+                })
+                .collect();
+            if let Some(document) = documents.get(uri) {
+                document.set_diagnostics(diagnostics);
+            }
+        }
+        events.len() as u64
+    }
+
+    pub fn sync_lsp_document(&self, document: Arc<DocumentHandle>) {
+        let path = document.path();
+        if path.is_empty() {
+            return;
+        }
+        let uri = file_uri(Path::new(&path));
+        self.lsp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .note_full_text(&uri, document.text(), Instant::now());
+    }
+
+    pub fn save_lsp_document(&self, document: Arc<DocumentHandle>) {
+        let path = document.path();
+        if path.is_empty() {
+            return;
+        }
+        let uri = file_uri(Path::new(&path));
+        let _ = self
+            .lsp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .save_document(&uri);
+    }
+}
+
+fn file_uri(path: &Path) -> String {
+    format!("file://{}", path.to_string_lossy())
 }
 
 /// One row of the file explorer.
@@ -752,6 +860,25 @@ pub struct LineSpan {
     pub includes_eol: bool,
 }
 
+/// A UTF-16 LSP diagnostic range, supplied by the LSP manager to a document.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct DiagnosticInfo {
+    pub start_line: u64,
+    pub start_character: u64,
+    pub end_line: u64,
+    pub end_character: u64,
+    /// LSP severity: 1 error, 2 warning, 3 information, 4 hint.
+    pub severity: u8,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct DiagnosticSpan {
+    pub start: u64,
+    pub end: u64,
+    pub severity: u8,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct ViewportLine {
     pub line: u64,
@@ -768,6 +895,7 @@ pub struct ViewportLine {
     pub indent_guides: Vec<u64>,
     /// Matching bracket cells on this line, when the primary caret is beside one.
     pub brackets: Vec<LineSpan>,
+    pub diagnostics: Vec<DiagnosticSpan>,
 }
 
 /// Indentation used by Tab, Enter and Outdent.
@@ -937,6 +1065,15 @@ impl From<viewport::ViewportSnapshot> for ViewportSnapshot {
                             includes_eol: sp.includes_eol,
                         })
                         .collect(),
+                    diagnostics: l
+                        .diagnostics
+                        .into_iter()
+                        .map(|span| DiagnosticSpan {
+                            start: span.start as u64,
+                            end: span.end as u64,
+                            severity: span.severity,
+                        })
+                        .collect(),
                 })
                 .collect(),
             primary: CursorInfo {
@@ -975,6 +1112,7 @@ struct State {
     /// Why the current pattern is unusable.
     find_error: Option<String>,
     syntax: Option<SyntaxState>,
+    diagnostics: Vec<DiagnosticInfo>,
 }
 
 struct SyntaxState {
@@ -1106,6 +1244,10 @@ impl DocumentHandle {
         self.lock().syntax.is_some()
     }
 
+    pub fn set_diagnostics(&self, diagnostics: Vec<DiagnosticInfo>) {
+        self.lock().diagnostics = diagnostics;
+    }
+
     /// Definitions from the current completed syntax tree. Parsing stays on
     /// the syntax worker; callers receive an empty list while it catches up.
     pub fn outline(&self) -> Vec<OutlineSymbol> {
@@ -1172,6 +1314,30 @@ impl DocumentHandle {
                     .collect();
             }
         }
+        for line in &mut snap.lines {
+            for diagnostic in &st.diagnostics {
+                if line.line < diagnostic.start_line || line.line > diagnostic.end_line {
+                    continue;
+                }
+                let start = if line.line == diagnostic.start_line {
+                    diagnostic.start_character
+                } else {
+                    0
+                };
+                let end = if line.line == diagnostic.end_line {
+                    diagnostic.end_character
+                } else {
+                    line.text.encode_utf16().count() as u64
+                };
+                if start < end {
+                    line.diagnostics.push(DiagnosticSpan {
+                        start,
+                        end,
+                        severity: diagnostic.severity,
+                    });
+                }
+            }
+        }
         snap
     }
 
@@ -1192,6 +1358,10 @@ impl DocumentHandle {
 
     pub fn path(&self) -> String {
         self.lock().path.to_string_lossy().into_owned()
+    }
+
+    pub fn text(&self) -> String {
+        self.lock().editor.doc.text()
     }
 
     /// `true` when the text differs from what was last loaded or saved.
@@ -1815,6 +1985,7 @@ impl DocumentHandle {
                 finder: None,
                 find_error: None,
                 syntax,
+                diagnostics: Vec::new(),
             }),
         }
     }
@@ -1962,6 +2133,27 @@ mod tests {
         assert_eq!(doc.lines(0, 1), ["fn idle() {}"]);
         assert!(doc.resume_syntax());
         assert!(doc.syntax_active());
+    }
+
+    #[test]
+    fn diagnostics_are_clipped_to_visible_utf16_lines() {
+        let doc = Core::new().new_document();
+        doc.edit(EditCommand::InsertText {
+            text: "a😀\nxyz".into(),
+        });
+        doc.set_diagnostics(vec![DiagnosticInfo {
+            start_line: 0,
+            start_character: 1,
+            end_line: 1,
+            end_character: 2,
+            severity: 1,
+            message: "bad".into(),
+        }]);
+        let snap = doc.viewport(0, 2);
+        assert_eq!(snap.lines[0].diagnostics[0].start, 1);
+        assert_eq!(snap.lines[0].diagnostics[0].end, 3);
+        assert_eq!(snap.lines[1].diagnostics[0].start, 0);
+        assert_eq!(snap.lines[1].diagnostics[0].end, 2);
     }
 
     #[test]

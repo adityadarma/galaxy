@@ -447,6 +447,14 @@ final class EditorView: NSView {
                 CTLineDraw(styles.isEmpty ? layout(for: line.text) : syntaxLayout(for: line.text, styles: styles), context)
             }
 
+            // LSP diagnostics sit above text decorations but beneath carets.
+            for span in line.diagnostics {
+                let x0 = originX + xOffset(in: line.text, column: span.start)
+                let x1 = originX + xOffset(in: line.text, column: span.end)
+                context.setFillColor(Theme.diagnostic(span.severity).cgColor)
+                context.fill(CGRect(x: x0, y: top + lineHeight - 2, width: max(1, x1 - x0), height: 1))
+            }
+
             // IME marked text: thin underline under the preedit.
             if let marked = line.marked {
                 let x0 = originX + xOffset(in: line.text, column: marked.start)
@@ -473,6 +481,10 @@ final class EditorView: NSView {
             context.setFillColor((hasCaret ? Theme.accent : Theme.gutterText).cgColor)
             context.textPosition = CGPoint(x: gutterRight - width, y: top + metrics.ascent)
             CTLineDraw(number, context)
+            if let severity = line.diagnostics.map(\.severity).min() {
+                context.setFillColor(Theme.diagnostic(severity).cgColor)
+                context.fill(CGRect(x: gutterRight + 3, y: top + lineHeight / 2 - 2, width: 4, height: 4))
+            }
         }
     }
 

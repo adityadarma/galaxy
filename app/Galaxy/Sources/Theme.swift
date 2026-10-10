@@ -52,6 +52,14 @@ enum Theme {
     static let bracketMatch = NSColor(name: "GalaxyBracketMatch") { appearance in
         accent.resolved(for: appearance).withAlphaComponent(0.28)
     }
+    static func diagnostic(_ severity: UInt8) -> NSColor {
+        switch severity {
+        case 1: .systemRed
+        case 2: .systemOrange
+        case 3: .systemBlue
+        default: .secondaryLabelColor
+        }
+    }
     /// Space above the first line, so text does not touch the path bar.
     static let editorTopInset: CGFloat = 6
 

@@ -23,6 +23,131 @@ use crate::document::Document;
 
 pub const DOCUMENT_SYNC_DEBOUNCE: Duration = Duration::from_millis(50);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DiagnosticSeverity {
+    Error,
+    Warning,
+    Information,
+    Hint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Diagnostic {
+    pub uri: String,
+    pub range: Range,
+    pub severity: DiagnosticSeverity,
+    pub message: String,
+    pub source: Option<String>,
+    pub code: Option<String>,
+}
+
+/// Latest server diagnostics, replaced atomically per URI by
+/// `textDocument/publishDiagnostics` as required by LSP.
+#[derive(Debug, Default)]
+pub struct DiagnosticStore {
+    by_uri: HashMap<String, Vec<Diagnostic>>,
+}
+
+impl DiagnosticStore {
+    pub fn publish(&mut self, message: &Value) -> Result<bool, String> {
+        if message.get("method").and_then(Value::as_str) != Some("textDocument/publishDiagnostics")
+        {
+            return Ok(false);
+        }
+        let params = message
+            .get("params")
+            .and_then(Value::as_object)
+            .ok_or("publishDiagnostics missing params")?;
+        let uri = params
+            .get("uri")
+            .and_then(Value::as_str)
+            .ok_or("publishDiagnostics missing uri")?
+            .to_owned();
+        let diagnostics = params
+            .get("diagnostics")
+            .and_then(Value::as_array)
+            .ok_or("publishDiagnostics missing diagnostics")?
+            .iter()
+            .map(|value| parse_diagnostic(&uri, value))
+            .collect::<Result<Vec<_>, _>>()?;
+        self.by_uri.insert(uri, diagnostics);
+        Ok(true)
+    }
+
+    pub fn for_uri(&self, uri: &str) -> &[Diagnostic] {
+        self.by_uri.get(uri).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    pub fn problems(&self) -> Vec<&Diagnostic> {
+        let mut out: Vec<_> = self.by_uri.values().flatten().collect();
+        out.sort_by_key(|diagnostic| {
+            (
+                &diagnostic.uri,
+                diagnostic.range.start_line,
+                diagnostic.range.start_character,
+                diagnostic.severity,
+            )
+        });
+        out
+    }
+}
+
+fn parse_diagnostic(uri: &str, value: &Value) -> Result<Diagnostic, String> {
+    let range = value
+        .get("range")
+        .and_then(Value::as_object)
+        .ok_or("diagnostic missing range")?;
+    let position = |name: &str| -> Result<(u64, u64), String> {
+        let position = range
+            .get(name)
+            .and_then(Value::as_object)
+            .ok_or_else(|| format!("diagnostic missing range.{name}"))?;
+        Ok((
+            position
+                .get("line")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| format!("diagnostic missing {name}.line"))?,
+            position
+                .get("character")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| format!("diagnostic missing {name}.character"))?,
+        ))
+    };
+    let (start_line, start_character) = position("start")?;
+    let (end_line, end_character) = position("end")?;
+    let severity = match value.get("severity").and_then(Value::as_u64).unwrap_or(1) {
+        1 => DiagnosticSeverity::Error,
+        2 => DiagnosticSeverity::Warning,
+        3 => DiagnosticSeverity::Information,
+        _ => DiagnosticSeverity::Hint,
+    };
+    let code = value.get("code").and_then(|code| {
+        code.as_str()
+            .map(str::to_owned)
+            .or_else(|| code.as_u64().map(|code| code.to_string()))
+    });
+    Ok(Diagnostic {
+        uri: uri.to_owned(),
+        range: Range {
+            start_line,
+            start_character,
+            end_line,
+            end_character,
+        },
+        severity,
+        message: value
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        source: value
+            .get("source")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        code,
+    })
+}
+
 /// One pending `textDocument/didChange` batch. Contiguous edits retain a
 /// UTF-16 range; a burst/multi-cursor batch falls back to full text safely.
 #[derive(Debug, Clone, PartialEq)]
@@ -63,6 +188,17 @@ impl DocumentSync {
 
     pub fn did_open(&self, doc: &Document) -> Value {
         serde_json::json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":self.uri,"languageId":self.language_id,"version":self.version,"text":doc.text()}}})
+    }
+
+    pub fn note_full_text(&mut self, text: String, now: Instant) {
+        self.version += 1;
+        self.pending = Some(PendingChange {
+            version: self.version,
+            text,
+            range: None,
+            range_length: None,
+            due_at: now + DOCUMENT_SYNC_DEBOUNCE,
+        });
     }
 
     /// Records a change made to `before`; `after` must be the resulting doc.
@@ -314,6 +450,7 @@ pub struct LspManager {
     documents: HashMap<String, (LspKey, DocumentSync)>,
     requests: HashMap<(LspKey, u64), PendingRequest>,
     next_request_id: u64,
+    diagnostics: DiagnosticStore,
 }
 
 impl LspManager {
@@ -351,6 +488,20 @@ impl LspManager {
 
     pub fn is_empty(&self) -> bool {
         self.servers.is_empty()
+    }
+
+    /// Consumes `textDocument/publishDiagnostics`; other notifications return
+    /// false so callers can route them to their feature-specific handlers.
+    pub fn publish_diagnostics(&mut self, message: &Value) -> Result<bool, String> {
+        self.diagnostics.publish(message)
+    }
+
+    pub fn diagnostics(&self, uri: &str) -> &[Diagnostic] {
+        self.diagnostics.for_uri(uri)
+    }
+
+    pub fn problems(&self) -> Vec<&Diagnostic> {
+        self.diagnostics.problems()
     }
 
     /// Sends a notification to one initialized or initializing server.
@@ -449,6 +600,12 @@ impl LspManager {
         }
     }
 
+    pub fn note_full_text(&mut self, uri: &str, text: String, now: Instant) {
+        if let Some((_, sync)) = self.documents.get_mut(uri) {
+            sync.note_full_text(text, now);
+        }
+    }
+
     pub fn flush_changes(&mut self, now: Instant) -> Vec<io::Error> {
         let ready: Vec<_> = self
             .documents
@@ -504,6 +661,13 @@ impl LspManager {
                     Ok(Incoming::Closed) => { events.push(LspEvent::Closed(key.clone())); break; }
                     Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
                 }
+            }
+        }
+        for event in &events {
+            if let LspEvent::Message(_, message) = event
+                && let Err(error) = self.publish_diagnostics(message)
+            {
+                tracing::warn!(%error, "discarded invalid LSP diagnostics notification");
             }
         }
         events
@@ -1015,5 +1179,32 @@ mod tests {
             assert!(Instant::now() < deadline, "response was not observed");
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn publish_diagnostics_replaces_a_uri_and_orders_problems() {
+        let mut manager = LspManager::default();
+        let first = serde_json::json!({"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file:///b.rs","diagnostics":[
+            {"range":{"start":{"line":2,"character":1},"end":{"line":2,"character":4}},"severity":2,"message":"warn","source":"rustc","code":"W1"},
+            {"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"severity":1,"message":"error"}
+        ]}});
+        assert!(manager.publish_diagnostics(&first).unwrap());
+        assert_eq!(manager.diagnostics("file:///b.rs").len(), 2);
+        assert_eq!(
+            manager
+                .problems()
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>(),
+            ["error", "warn"]
+        );
+        let replacement = serde_json::json!({"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file:///b.rs","diagnostics":[]}});
+        assert!(manager.publish_diagnostics(&replacement).unwrap());
+        assert!(manager.diagnostics("file:///b.rs").is_empty());
+        assert!(
+            !manager
+                .publish_diagnostics(&serde_json::json!({"method":"window/logMessage"}))
+                .unwrap()
+        );
     }
 }

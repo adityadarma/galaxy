@@ -59,6 +59,15 @@ pub struct ViewportLine {
     pub indent_guides: Vec<usize>,
     /// Brackets paired with a primary empty caret, in UTF-16 columns.
     pub brackets: Vec<LineSpan>,
+    /// Diagnostic spans for this line, in UTF-16 columns.
+    pub diagnostics: Vec<DiagnosticSpan>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiagnosticSpan {
+    pub start: usize,
+    pub end: usize,
+    pub severity: u8,
 }
 
 /// Primary cursor position for the status bar and scroll-into-view.
@@ -272,6 +281,7 @@ pub fn snapshot(
             truncated,
             indent_guides: indent_guides(&slice.to_string(), 4),
             brackets: Vec::new(),
+            diagnostics: Vec::new(),
         });
     }
 

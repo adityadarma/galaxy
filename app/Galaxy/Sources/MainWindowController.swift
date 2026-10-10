@@ -76,6 +76,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private var loadedOutlinePicker: OutlinePicker?
     private var loadedPalette: CommandPaletteView?
     private var syntaxEvictionTimer: Timer?
+    private var lspTimer: Timer?
     static let syntaxEvictionInterval: TimeInterval = 5 * 60
     /// Command registry (M2-09); kept for the window so recency survives
     /// closing the palette.
@@ -167,6 +168,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         editorView.onChange = { [weak self] in
             self?.updateEditedState()
             self?.refreshFindStatus()
+            if let document = self?.activeTab?.doc { self?.bridge.syncLSP(document: document) }
+            self?.bridge.pollLSP()
         }
         editorView.onClickMove = { [weak self] before, after in
             guard let self, let tab = self.activeTab else { return }
@@ -239,6 +242,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         tabBar.onMove = { [weak self] from, to in self?.moveTab(from: from, to: to) }
         syntaxEvictionTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             self?.evictInactiveSyntax(now: .now)
+        }
+        lspTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.bridge.pollLSP()
+                self?.editorView.needsDisplay = true
+            }
         }
         tabBar.titleBar = titleBar
         pathBar.translatesAutoresizingMaskIntoConstraints = false
@@ -413,6 +422,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         tabOrderByUse.insert(id, at: 0)
         pathBar.show(tab.pathComponents)
         editorView.document = tab.doc
+        let root = workspace?.root() ?? (tab.doc.path() as NSString).deletingLastPathComponent
+        _ = bridge.startLSP(document: tab.doc, language: tab.doc.syntaxLanguage() ?? StatusBar.language(for: tab.doc.path()), root: root)
         if let y = tab.scrollY {
             scrollView.contentView.scroll(to: NSPoint(x: 0, y: y))
             scrollView.reflectScrolledClipView(scrollView.contentView)
@@ -1618,6 +1629,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             report(error, while: "save \(documentName)")
             return false
         }
+        bridge.saveLSP(document: doc)
         if let tab = activeTab, tab.isDeletedOnDisk {
             tab.isDeletedOnDisk = false
             refreshTabBar()
@@ -1635,6 +1647,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             report(error, while: "save \(url.lastPathComponent)")
             return false
         }
+        bridge.saveLSP(document: doc)
         if let tab = activeTab {
             tab.title = url.lastPathComponent
             tab.windowTitle = url.lastPathComponent
@@ -1770,6 +1783,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         saveSession()
         syntaxEvictionTimer?.invalidate()
         syntaxEvictionTimer = nil
+        lspTimer?.invalidate()
+        lspTimer = nil
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
         keyMonitor = nil
         workspaceWatch?.stop()

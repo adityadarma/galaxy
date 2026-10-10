@@ -39,6 +39,23 @@ final class CoreBridge {
         try core.openDocument(path: path)
     }
 
+    @discardableResult
+    func startLSP(document: DocumentHandle, language: String, root: String) -> Bool {
+        (try? core.startLsp(document: document, language: language, root: root)) ?? false
+    }
+
+    func pollLSP() {
+        _ = core.pollLsp()
+    }
+
+    func syncLSP(document: DocumentHandle) {
+        core.syncLspDocument(document: document)
+    }
+
+    func saveLSP(document: DocumentHandle) {
+        core.saveLspDocument(document: document)
+    }
+
     fileprivate func deliver(_ event: CoreEvent) {
         lastEvent = event
         if case let .pong(message) = event {
