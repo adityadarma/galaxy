@@ -367,6 +367,14 @@ impl Workspace {
         Ok(rel)
     }
 
+    /// Renames `rel_path` within its folder; returns the new relative
+    /// path. Never overwrites.
+    pub fn rename_entry(&self, rel_path: String, new_name: String) -> Result<String, CoreError> {
+        let rel = self.inner.rename(&rel_path, &new_name)?;
+        tracing::info!(from = %rel_path, to = %rel, "renamed");
+        Ok(rel)
+    }
+
     /// Creates folder `name` in `parent_rel_path`; returns its relative path.
     pub fn create_folder(
         &self,
@@ -1517,6 +1525,14 @@ impl DocumentHandle {
         st.saved_state = st.editor.history.state_id();
         tracing::info!(path = %st.path.display(), "saved document");
         Ok(())
+    }
+
+    /// The file was renamed or moved (by the explorer): follow it. The
+    /// content is unchanged, so the disk stamp still applies.
+    pub fn set_path(&self, path: String) {
+        let mut st = self.lock();
+        st.path = PathBuf::from(path);
+        st.deleted_on_disk = false;
     }
 
     /// Saves atomically to `path` and makes it the document's path.

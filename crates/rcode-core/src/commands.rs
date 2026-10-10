@@ -388,6 +388,19 @@ const BUILTIN: &[(&str, &str, &str, &[&str])] = &[
     ),
     ("copyFilePath", "Explorer", "Copy Path", &["clipboard"]),
     (
+        "copyRelativeFilePath",
+        "Explorer",
+        "Copy Relative Path",
+        &["clipboard"],
+    ),
+    ("renameFile", "Explorer", "Rename…", &["move", "name"]),
+    (
+        "deleteFile",
+        "Explorer",
+        "Delete (Move to Trash)",
+        &["remove", "trash"],
+    ),
+    (
         "workbench.files.action.refreshFilesExplorer",
         "Explorer",
         "Refresh",

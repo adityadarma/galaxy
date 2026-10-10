@@ -332,6 +332,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         explorer.onPinFile = { [weak self] workspace, entry in
             self?.openWorkspaceFile(workspace, entry, preview: false)
         }
+        explorer.onRename = { [weak self] entry, name in self?.renameEntry(entry, to: name) }
+        explorer.contextMenu = { [weak self] in self?.explorerContextMenu() }
+        explorer.outlineView.onKey = { [weak self] event in self?.explorerKey(event) ?? false }
 
         sidebar.addSubview(sectionHeader)
         sidebar.addSubview(explorer.scrollView)
@@ -804,6 +807,149 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         guard let url = explorerSelectionURL else { return NSSound.beep() }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(url.path, forType: .string)
+    }
+
+    @objc func copyExplorerRelativePath(_ sender: Any?) {
+        guard workspace != nil else { return NSSound.beep() }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(explorer.selectedEntry?.relPath ?? ".", forType: .string)
+    }
+
+    // MARK: Rename and delete (M2-05)
+
+    /// Asks before moving `name` to the Trash. Tests replace it.
+    var askConfirmDelete: (_ name: String, _ isFolder: Bool) -> Bool = { name, isFolder in
+        let alert = NSAlert()
+        alert.messageText = "Move \"\(name)\" to the Trash?"
+        alert.informativeText = isFolder
+            ? "The folder and everything in it can be restored from the Trash."
+            : "You can restore it from the Trash."
+        alert.addButton(withTitle: "Move to Trash")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    /// Moves a file to the Trash. Tests replace it so they do not fill the
+    /// user's Trash.
+    var moveToTrash: (URL) throws -> Void = { url in
+        try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+    }
+
+    /// F2 / Return in the explorer: rename the selected row in place.
+    @objc func renameExplorerItem(_ sender: Any?) {
+        guard let entry = explorer.selectedEntry else { return NSSound.beep() }
+        setSidebarVisible(true)
+        explorer.beginRename(relPath: entry.relPath)
+    }
+
+    /// ⌘⌫ in the explorer: move the selected row to the Trash.
+    @objc func deleteExplorerItem(_ sender: Any?) {
+        guard let workspace, let entry = explorer.selectedEntry else { return NSSound.beep() }
+        guard askConfirmDelete(entry.name, entry.isDir) else { return }
+        let url = URL(fileURLWithPath: workspace.root()).appendingPathComponent(entry.relPath)
+        do {
+            try moveToTrash(url)
+        } catch {
+            return report(error, while: "move \(entry.name) to the Trash")
+        }
+        Log.ui.info("moved \(entry.relPath, privacy: .public) to the Trash")
+        // Clean tabs of what was deleted close; edited ones stay, marked
+        // "(deleted)", so nothing typed is lost.
+        let under = { (tab: EditorTab) in
+            tab.relPath.map { $0 == entry.relPath || $0.hasPrefix(entry.relPath + "/") } ?? false
+        }
+        for tab in tabs.reversed() where under(tab) {
+            guard let i = tabs.firstIndex(where: { $0 === tab }) else { continue }
+            if tab.doc.isModified() {
+                tab.isDeletedOnDisk = true
+                _ = tab.doc.checkDisk()
+            } else {
+                closeTab(at: i)
+            }
+        }
+        recentFiles.removeAll { $0 == entry.relPath || $0.hasPrefix(entry.relPath + "/") }
+        explorer.refresh()
+        refreshTabBar()
+        updateEditedState()
+        updateFileFinder(changed: [entry.relPath])
+    }
+
+    /// Renames `entry` to `name` (within its folder) and follows it in the
+    /// open tabs, the recent list and the Go to File index.
+    func renameEntry(_ entry: FileEntry, to name: String) {
+        guard let workspace else { return }
+        let newRel: String
+        do {
+            newRel = try workspace.renameEntry(relPath: entry.relPath, newName: name)
+        } catch {
+            return report(error, while: "rename \(entry.name)")
+        }
+        guard newRel != entry.relPath else { return }
+        let root = URL(fileURLWithPath: workspace.root())
+        let moved = { (rel: String) -> String? in
+            if rel == entry.relPath { return newRel }
+            if rel.hasPrefix(entry.relPath + "/") { return newRel + rel.dropFirst(entry.relPath.count) }
+            return nil
+        }
+        for tab in tabs {
+            guard let old = tab.relPath, let rel = moved(old) else { continue }
+            let path = root.appendingPathComponent(rel).path
+            navHistory.forget(key: tab.navKey)
+            tab.doc.setPath(path: path)
+            tab.relPath = rel
+            tab.fileKey = Self.fileKey(path)
+            tab.title = (rel as NSString).lastPathComponent
+            tab.windowTitle = "\(tab.title) — \(workspace.name())"
+            tab.pathComponents = rel.split(separator: "/").map(String.init)
+            tab.isDeletedOnDisk = false
+            if tab === activeTab { pathBar.show(tab.pathComponents) }
+        }
+        recentFiles = recentFiles.map { moved($0) ?? $0 }
+        explorer.refresh()
+        explorer.reveal(relPath: newRel)
+        refreshTabBar()
+        updateEditedState()
+        updateFileFinder(changed: [entry.relPath, newRel])
+        statusLabel.stringValue = "Renamed \(entry.relPath) to \(newRel)."
+    }
+
+    /// Return renames, ⌘⌫ deletes, as in VSCode on macOS.
+    private func explorerKey(_ event: NSEvent) -> Bool {
+        let mods = event.modifierFlags.intersection([.command, .shift, .control, .option])
+        guard explorer.selectedEntry != nil else { return false }
+        switch (event.keyCode, mods) {
+        case (36, []), (76, []): // Return, keypad Enter
+            renameExplorerItem(nil)
+            return true
+        case (51, [.command]), (117, [.command]): // ⌘⌫, ⌘⌦
+            deleteExplorerItem(nil)
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Right-click menu for the selected row, or the root below the rows.
+    func explorerContextMenu() -> NSMenu {
+        let menu = NSMenu()
+        func add(_ title: String, _ action: Selector, key: String = "", mods: NSEvent.ModifierFlags = []) {
+            let item = menu.addItem(withTitle: title, action: action, keyEquivalent: key)
+            item.keyEquivalentModifierMask = mods
+            item.target = self
+        }
+        add("New File…", #selector(explorerNewFile(_:)))
+        add("New Folder…", #selector(explorerNewFolder(_:)))
+        menu.addItem(.separator())
+        add("Reveal in Finder", #selector(revealInFinder(_:)))
+        menu.addItem(.separator())
+        add("Copy Path", #selector(copyExplorerPath(_:)))
+        add("Copy Relative Path", #selector(copyExplorerRelativePath(_:)))
+        if explorer.selectedEntry != nil {
+            menu.addItem(.separator())
+            add("Rename…", #selector(renameExplorerItem(_:)), key: "\r")
+            add("Move to Trash", #selector(deleteExplorerItem(_:)), key: "\u{8}", mods: .command)
+        }
+        return menu
     }
 
     /// The header's "…" menu.
@@ -1681,8 +1827,11 @@ extension MainWindowController: NSMenuItemValidation {
             return hasDocument
         case #selector(refreshExplorer(_:)), #selector(collapseExplorerFolders(_:)),
              #selector(explorerNewFile(_:)), #selector(explorerNewFolder(_:)),
-             #selector(revealInFinder(_:)), #selector(copyExplorerPath(_:)):
+             #selector(revealInFinder(_:)), #selector(copyExplorerPath(_:)),
+             #selector(copyExplorerRelativePath(_:)):
             return workspace != nil
+        case #selector(renameExplorerItem(_:)), #selector(deleteExplorerItem(_:)):
+            return workspace != nil && explorer.selectedEntry != nil
         case #selector(closeTab(_:)):
             return true
         case #selector(showNextTab(_:)), #selector(showPreviousTab(_:)), #selector(selectLastUsedTab(_:)):

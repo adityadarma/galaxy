@@ -232,6 +232,50 @@ impl Workspace {
         Ok(rel)
     }
 
+    /// Renames `rel` to `new_name` in the same folder (`/` in the name
+    /// moves it into subfolders, created as needed) and returns the new
+    /// relative path. Never overwrites another file; a change of letter
+    /// case only is allowed on case-insensitive volumes.
+    pub fn rename(&self, rel: &str, new_name: &str) -> io::Result<String> {
+        let from = self.resolve(rel)?;
+        if rel.split('/').all(|p| p.is_empty() || p == ".") {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the workspace folder cannot be renamed here",
+            ));
+        }
+        fs::symlink_metadata(&from)?;
+        let parent = rel.rsplit_once('/').map_or("", |(p, _)| p);
+        let (new_rel, to) = self.new_entry_path(parent, new_name)?;
+        if new_rel == rel {
+            return Ok(new_rel);
+        }
+        if new_rel.starts_with(&format!("{rel}/")) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a folder cannot be moved into itself",
+            ));
+        }
+        if let Ok(existing) = fs::symlink_metadata(&to) {
+            let same_file = {
+                use std::os::unix::fs::MetadataExt;
+                let src = fs::symlink_metadata(&from)?;
+                src.dev() == existing.dev() && src.ino() == existing.ino()
+            };
+            if !same_file {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("{new_rel} already exists"),
+                ));
+            }
+        }
+        if let Some(dir) = to.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        fs::rename(&from, &to)?;
+        Ok(new_rel)
+    }
+
     /// Validates a new name and returns `(relative path, absolute path)`.
     fn new_entry_path(&self, parent: &str, name: &str) -> io::Result<(String, PathBuf)> {
         let invalid = |why: &str| io::Error::new(io::ErrorKind::InvalidInput, why.to_string());
@@ -578,6 +622,54 @@ mod tests {
         // Slashes create the folders on the way, as in VSCode.
         assert_eq!(ws.create_file("", "a/b/c.txt").unwrap(), "a/b/c.txt");
         assert!(dir.path().join("a/b/c.txt").is_file());
+    }
+
+    #[test]
+    fn rename_moves_within_the_folder_and_never_overwrites() {
+        let (dir, ws) = tree();
+        let r = dir.path();
+        fs::write(r.join("src/main.rs"), "main").unwrap();
+        fs::write(r.join("src/other.rs"), "other").unwrap();
+        assert_eq!(ws.rename("src/main.rs", "app.rs").unwrap(), "src/app.rs");
+        assert_eq!(fs::read_to_string(r.join("src/app.rs")).unwrap(), "main");
+        assert!(!r.join("src/main.rs").exists());
+
+        let err = ws.rename("src/app.rs", "other.rs").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(r.join("src/other.rs")).unwrap(), "other");
+
+        // Slashes move it into (new) subfolders of the same folder.
+        assert_eq!(
+            ws.rename("src/app.rs", "bin/app.rs").unwrap(),
+            "src/bin/app.rs"
+        );
+        // Folders move with their contents.
+        assert_eq!(ws.rename("src/bin", "cli").unwrap(), "src/cli");
+        assert!(r.join("src/cli/app.rs").is_file());
+        assert_eq!(
+            ws.rename("src", "src/inner").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        for bad in ["", "../x", "/x", "a/../b"] {
+            assert!(ws.rename("src/other.rs", bad).is_err(), "{bad:?}");
+        }
+        assert!(ws.rename("", "x").is_err());
+        assert_eq!(
+            ws.rename("missing.txt", "x").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn rename_can_change_only_the_letter_case() {
+        let (dir, ws) = tree();
+        fs::write(dir.path().join("readme.txt"), "x").unwrap();
+        assert_eq!(ws.rename("readme.txt", "README.txt").unwrap(), "README.txt");
+        let names: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"README.txt".to_string()), "{names:?}");
     }
 
     #[test]

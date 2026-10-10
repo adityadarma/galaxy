@@ -44,6 +44,14 @@ final class ExplorerController: NSObject {
     private var selectingFromClick = false
     /// Set while `reveal` selects a row: no opening, no toggling.
     private var quietSelection = false
+    /// Row being renamed in place (M2-05), and its field.
+    private(set) var renamingEntry: FileEntry?
+    private weak var renameField: NSTextField?
+    private weak var renameCell: ExplorerCell?
+    /// Called with the new name when an in-place rename is confirmed.
+    var onRename: ((FileEntry, String) -> Void)?
+    /// Builds the right-click menu, after the clicked row was selected.
+    var contextMenu: (() -> NSMenu?)?
 
     override init() {
         super.init()
@@ -64,6 +72,7 @@ final class ExplorerController: NSObject {
         outlineView.target = self
         outlineView.doubleAction = #selector(doubleClicked(_:))
         outlineView.onFolderClick = { [weak self] row in self?.folderClicked(row: row) ?? false }
+        outlineView.onContextMenu = { [weak self] row in self?.menu(forRow: row) }
         outlineView.setAccessibilityLabel("File explorer")
         outlineView.setAccessibilityIdentifier("explorer")
 
@@ -194,6 +203,69 @@ final class ExplorerController: NSObject {
         }
     }
 
+    /// Right click: selects the row under the pointer without opening it
+    /// (nothing when below the rows, meaning the root), then the menu.
+    func menu(forRow row: Int) -> NSMenu? {
+        if renamingEntry != nil { finishRename(commit: true) }
+        quietSelection = true
+        if row >= 0 {
+            outlineView.selectRowIndexes([row], byExtendingSelection: false)
+        } else {
+            outlineView.deselectAll(nil)
+        }
+        quietSelection = false
+        return contextMenu?()
+    }
+
+    // MARK: Rename in place (M2-05)
+
+    /// Turns the row's name into a text field with the name selected up to
+    /// the extension, as in VSCode. Return confirms, Escape cancels, and
+    /// moving focus elsewhere confirms.
+    @discardableResult
+    func beginRename(relPath: String) -> Bool {
+        if renamingEntry != nil { finishRename(commit: true) }
+        guard let row = row(forRelPath: relPath), let node = outlineView.item(atRow: row) as? ExplorerNode else {
+            return false
+        }
+        outlineView.scrollRowToVisible(row)
+        guard let cell = outlineView.view(atColumn: 0, row: row, makeIfNecessary: true) as? ExplorerCell else {
+            return false
+        }
+        renamingEntry = node.entry
+        renameCell = cell
+        renameField = cell.label
+        cell.setEditing(true)
+        cell.label.delegate = self
+        outlineView.window?.makeFirstResponder(cell.label)
+        if let editor = cell.label.currentEditor() {
+            let name = node.entry.name as NSString
+            let stem = node.entry.isDir ? name : name.deletingPathExtension as NSString
+            // ".gitignore" has no stem: select it all.
+            let length = stem.length == 0 ? name.length : stem.length
+            editor.selectedRange = NSRange(location: 0, length: length)
+        }
+        return true
+    }
+
+    /// Ends an in-place rename; `commit` passes the new name on.
+    func finishRename(commit: Bool) {
+        guard let entry = renamingEntry else { return }
+        renamingEntry = nil
+        let name = renameField?.stringValue ?? entry.name
+        renameField?.delegate = nil
+        renameField?.stringValue = entry.name
+        renameCell?.setEditing(false)
+        renameField = nil
+        renameCell = nil
+        outlineView.window?.makeFirstResponder(outlineView)
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        if commit, !trimmed.isEmpty, trimmed != entry.name { onRename?(entry, name) }
+    }
+
+    /// The field while a rename is in progress (tests type into it).
+    var renameFieldForTesting: NSTextField? { renameField }
+
     func collapseAll() {
         outlineView.collapseItem(nil, collapseChildren: true)
     }
@@ -251,6 +323,26 @@ final class ExplorerController: NSObject {
         guard row >= 0 else { return }
         (outlineView.view(atColumn: 0, row: row, makeIfNecessary: false) as? ExplorerCell)?
             .isExpanded = outlineView.isItemExpanded(node)
+    }
+}
+
+extension ExplorerController: NSTextFieldDelegate {
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
+        switch selector {
+        case #selector(NSResponder.cancelOperation(_:)):
+            finishRename(commit: false)
+            return true
+        case #selector(NSResponder.insertNewline(_:)):
+            finishRename(commit: true)
+            return true
+        default:
+            return false
+        }
+    }
+
+    func controlTextDidEndEditing(_ notification: Notification) {
+        // Focus moved elsewhere: keep the typed name, as VSCode does.
+        finishRename(commit: true)
     }
 }
 
@@ -314,6 +406,20 @@ final class ExplorerOutlineView: NSOutlineView {
 
     /// Handles a left click on `row`; returns `true` when it did.
     var onFolderClick: ((Int) -> Bool)?
+    /// Right click on `row` (-1 below the rows).
+    var onContextMenu: ((Int) -> NSMenu?)?
+    /// Keys handled before the table's own (Return renames, ⌘⌫ deletes).
+    var onKey: ((NSEvent) -> Bool)?
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let row = row(at: convert(event.locationInWindow, from: nil))
+        return onContextMenu?(row) ?? super.menu(for: event)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        if onKey?(event) == true { return }
+        super.keyDown(with: event)
+    }
 
     override func mouseDown(with event: NSEvent) {
         let row = row(at: convert(event.locationInWindow, from: nil))
@@ -399,7 +505,19 @@ final class ExplorerCell: NSTableCellView {
 
     /// Folders: chevron and name. Files: an empty chevron slot (so names
     /// line up as in VSCode), then the file-type glyph and name.
+    /// The name becomes an editable field for a rename in place.
+    func setEditing(_ editing: Bool) {
+        label.isEditable = editing
+        label.isSelectable = editing
+        label.drawsBackground = editing
+        label.backgroundColor = editing ? .textBackgroundColor : nil
+        label.isBordered = editing
+        label.lineBreakMode = editing ? .byClipping : .byTruncatingMiddle
+        label.cell?.isScrollable = editing
+    }
+
     func show(_ entry: FileEntry, expanded: Bool) {
+        setEditing(false)
         label.stringValue = entry.name
         isFolder = entry.isDir
         isExpanded = expanded
