@@ -15,6 +15,8 @@ pub mod file_finder;
 pub mod find;
 pub mod grapheme;
 pub mod history;
+pub mod jsonc;
+pub mod keymap;
 pub mod logging;
 pub mod movement;
 pub mod multicursor;

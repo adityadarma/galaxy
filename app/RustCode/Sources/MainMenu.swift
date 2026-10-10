@@ -92,6 +92,8 @@ enum MainMenu {
         lastTab.keyEquivalentModifierMask = [.control]
         viewMenu.addItem(.separator())
         viewMenu.addItem(withTitle: "Show Typing Latency", action: #selector(MainWindowController.showTypingLatency(_:)), keyEquivalent: "")
+        viewMenu.addItem(.separator())
+        viewMenu.addItem(withTitle: "Keyboard Shortcuts…", action: #selector(MainWindowController.openKeybindingsFile(_:)), keyEquivalent: "")
         viewItem.submenu = viewMenu
 
         let editItem = NSMenuItem()

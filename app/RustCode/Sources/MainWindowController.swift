@@ -181,6 +181,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
 
         installKeyMonitor()
+        reloadKeybindings(force: true)
 
         bridge.onEvent = { [weak self] event in
             if case let .pong(message) = event {
@@ -505,6 +506,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         // Files outside the workspace are not watched; this catches them,
         // and a conflict that waited for the window.
         checkOpenFiles()
+        reloadKeybindings()
     }
 
     /// ⌃Tab: the tab shown before this one. Pressed again, it goes back.
@@ -660,15 +662,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         paletteReturnResponder = window?.firstResponder
         // Decided before the field takes focus, from what had it.
         let available = availableCommandIDs()
-        let byAction = CommandPaletteView.shortcuts(in: NSApp.mainMenu ?? MainMenu.build())
-        var shortcuts: [String: String] = [:]
-        for (id, action) in CommandPaletteView.actions {
-            if let text = byAction[action] { shortcuts[id] = text }
-        }
-        // Not menu key equivalents: the window's key monitor handles them.
-        shortcuts["workbench.action.navigateBack"] = "⌃-"
-        shortcuts["workbench.action.navigateForward"] = "⌃⇧-"
-        shortcuts["workbench.action.openPreviousRecentlyUsedEditor"] = "⌃⇥"
+        let shortcuts = keybindings.shortcutTexts
         let panel = commandPalette
         panel.isHidden = false
         panel.reset(available: available, shortcuts: shortcuts)
@@ -1095,29 +1089,75 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         navHistory.record(from: location(of: tab))
     }
 
-    /// ⌃- and ⌃⇧- go to the menu items, whatever the Shift key does to
-    /// the character: Shift turns `-` into `_` on US keyboards, which a
-    /// menu key equivalent of `-` would not match.
+    /// Every keyboard shortcut goes through here (M2-10), before menus
+    /// and the focused view see the key. That covers keys a menu key
+    /// equivalent cannot match (⌃⇧- arrives as `_`), and extra keys from
+    /// `keybindings.json`.
     private func installKeyMonitor() {
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             // Only plain values cross into the main-actor closure.
-            // kVK_ANSI_Minus, kVK_Tab
-            guard event.keyCode == 27 || event.keyCode == 48 else { return event }
-            let isTab = event.keyCode == 48
-            let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-                .subtracting([.capsLock, .numericPad, .function])
+            guard let id = Keybindings.keyID(for: event) else { return event }
             let windowNumber = event.windowNumber
             let handled = MainActor.assumeIsolated { () -> Bool in
                 guard let self, windowNumber == self.window?.windowNumber else { return false }
-                switch (isTab, mods) {
-                case (false, [.control]): self.navigateBack(nil)
-                case (false, [.control, .shift]): self.navigateForward(nil)
-                case (true, [.control]): self.selectLastUsedTab(nil)
-                default: return false
-                }
-                return true
+                return self.performKeyBinding(id)
             }
             return handled ? nil : event
+        }
+    }
+
+    // MARK: Keyboard shortcuts (M2-10)
+
+    /// Runs the command bound to key `id`, from the focused view, if its
+    /// menu item would be enabled. `false` lets the key go on as usual
+    /// (typing, a text field's own ⌘A, a disabled command).
+    @discardableResult
+    func performKeyBinding(_ id: String) -> Bool {
+        guard let command = keybindings.commandByKey[id],
+              let action = CommandPaletteView.actions[command],
+              let target = target(for: action) else { return false }
+        let item = NSMenuItem(title: "", action: action, keyEquivalent: "")
+        if let validator = target as? NSMenuItemValidation, !validator.validateMenuItem(item) { return false }
+        _ = target.perform(action, with: self)
+        return true
+    }
+
+    /// Where `keybindings.json` lives. Tests point it elsewhere.
+    var keybindingsURL = Keybindings.defaultURL
+    private(set) var keybindings = Keybindings.defaults
+    private var keybindingsModified: Date?
+
+    /// Reads `keybindings.json` again if it changed, and updates the menu.
+    /// Problems are logged and shown in the status line.
+    func reloadKeybindings(force: Bool = false) {
+        let modified = (try? keybindingsURL.resourceValues(forKeys: [.contentModificationDateKey]))?
+            .contentModificationDate
+        guard force || modified != keybindingsModified else { return }
+        keybindingsModified = modified
+        keybindings = Keybindings.load(from: keybindingsURL)
+        if let menu = NSApp.mainMenu { keybindings.apply(to: menu) }
+        for problem in keybindings.problems {
+            Log.ui.error("keybindings: \(problem, privacy: .public)")
+        }
+        if let first = keybindings.problems.first {
+            let more = keybindings.problems.count > 1 ? " (+\(keybindings.problems.count - 1) more)" : ""
+            statusLabel.stringValue = "Keyboard shortcuts: \(first)\(more)"
+        }
+    }
+
+    /// Opens `keybindings.json`, created with every default listed in
+    /// comments if it does not exist. Saving it applies it.
+    @objc func openKeybindingsFile(_ sender: Any?) {
+        let url = keybindingsURL
+        do {
+            if !FileManager.default.fileExists(atPath: url.path) {
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                        withIntermediateDirectories: true)
+                try keybindingsTemplate().write(to: url, atomically: true, encoding: .utf8)
+            }
+            try openFile(at: url)
+        } catch {
+            report(error, while: "open keybindings.json")
         }
     }
 
@@ -1540,6 +1580,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private func savedStatus(_ doc: DocumentHandle) {
         statusLabel.stringValue = "\(documentName): saved, \(doc.lineCount()) lines, \(doc.lenBytes()) bytes"
         updateEditedState()
+        // Saving keybindings.json applies it right away.
+        if Self.fileKey(doc.path()) == Self.fileKey(keybindingsURL.path) {
+            reloadKeybindings(force: true)
+            if keybindings.problems.isEmpty { statusLabel.stringValue = "Keyboard shortcuts updated." }
+        }
     }
 
     /// `true` when it is safe to close the window or quit: every tab with

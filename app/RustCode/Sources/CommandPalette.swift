@@ -42,6 +42,8 @@ final class CommandPaletteView: NSView, NSTextFieldDelegate, NSTableViewDataSour
         "workbench.action.gotoLine": #selector(MainWindowController.showGoToLine(_:)),
         "workbench.action.navigateBack": #selector(MainWindowController.navigateBack(_:)),
         "workbench.action.navigateForward": #selector(MainWindowController.navigateForward(_:)),
+        "workbench.action.showCommands": #selector(MainWindowController.showCommandPalette(_:)),
+        "workbench.action.openGlobalKeybindingsFile": #selector(MainWindowController.openKeybindingsFile(_:)),
         "workbench.action.toggleSidebarVisibility": #selector(MainWindowController.toggleSidebarVisibility(_:)),
         "workbench.view.explorer": #selector(MainWindowController.showExplorer(_:)),
         "workbench.action.nextEditor": #selector(MainWindowController.showNextTab(_:)),

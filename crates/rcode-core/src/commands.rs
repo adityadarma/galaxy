@@ -339,6 +339,18 @@ const BUILTIN: &[(&str, &str, &str, &[&str])] = &[
         &["history", "next location"],
     ),
     (
+        "workbench.action.showCommands",
+        "View",
+        "Command Palette…",
+        &["show all commands"],
+    ),
+    (
+        "workbench.action.openGlobalKeybindingsFile",
+        "Preferences",
+        "Open Keyboard Shortcuts (JSON)",
+        &["keybindings", "keymap", "shortcuts"],
+    ),
+    (
         "workbench.action.toggleSidebarVisibility",
         "View",
         "Toggle Sidebar",

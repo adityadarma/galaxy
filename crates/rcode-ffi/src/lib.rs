@@ -16,6 +16,7 @@ use rcode_core::edit::{self, IndentConfig};
 use rcode_core::file_finder::FileFinder as CoreFileFinder;
 use rcode_core::find::{FindError, FindOptions, Finder};
 use rcode_core::history::{EditKind, Editor};
+use rcode_core::keymap::{self, Keymap};
 use rcode_core::movement::{self, Motion};
 use rcode_core::multicursor;
 use rcode_core::navigation::{self, Location, NavHistory};
@@ -74,6 +75,61 @@ pub fn core_version() -> String {
 #[uniffi::export]
 pub fn init_logging(dir: String, level: String) -> Result<bool, CoreError> {
     Ok(rcode_core::logging::init(&PathBuf::from(dir), &level)?)
+}
+
+/// One keyboard shortcut (M2-10). `key_id` is canonical text such as
+/// `shift+cmd+p`; the Swift side builds the same text from key events.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KeyBindingInfo {
+    pub command: String,
+    pub key_id: String,
+    /// Lowercase character, or a name such as `up`, `tab`, `f5`.
+    pub name: String,
+    pub ctrl: bool,
+    pub shift: bool,
+    pub alt: bool,
+    pub cmd: bool,
+}
+
+/// Effective shortcuts: a command's first binding is the one menus show.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct KeymapLoad {
+    pub bindings: Vec<KeyBindingInfo>,
+    /// One line per skipped entry, or one for a file that does not parse.
+    pub problems: Vec<String>,
+}
+
+/// Default shortcuts, with the text of the user's `keybindings.json`
+/// applied when given.
+#[uniffi::export]
+pub fn load_keymap(user_file: Option<String>) -> KeymapLoad {
+    let registry = commands::builtin();
+    let (map, problems) = match user_file {
+        Some(text) => Keymap::with_user_file(&text, &registry),
+        None => (Keymap::defaults(), Vec::new()),
+    };
+    KeymapLoad {
+        bindings: map
+            .bindings()
+            .iter()
+            .map(|b| KeyBindingInfo {
+                command: b.command.clone(),
+                key_id: b.key.id(),
+                name: b.key.name.clone(),
+                ctrl: b.key.ctrl,
+                shift: b.key.shift,
+                alt: b.key.alt,
+                cmd: b.key.cmd,
+            })
+            .collect(),
+        problems,
+    }
+}
+
+/// Starting content for a new `keybindings.json`.
+#[uniffi::export]
+pub fn keybindings_template() -> String {
+    keymap::user_file_template(&commands::builtin())
 }
 
 /// A registered command (M2-09).
