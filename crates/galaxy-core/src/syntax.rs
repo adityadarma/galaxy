@@ -109,7 +109,7 @@ impl SyntaxLanguage {
     pub fn highlight_query(self) -> &'static str {
         match self {
             Self::Rust => tree_sitter_rust::HIGHLIGHTS_QUERY,
-            Self::TypeScript | Self::Tsx => tree_sitter_typescript::HIGHLIGHTS_QUERY,
+            Self::TypeScript | Self::Tsx => TYPESCRIPT_HIGHLIGHTS,
             Self::JavaScript => JAVASCRIPT_HIGHLIGHTS,
             Self::Json => tree_sitter_json::HIGHLIGHTS_QUERY,
             Self::Toml => tree_sitter_toml_ng::HIGHLIGHTS_QUERY,
@@ -253,6 +253,40 @@ pub fn outline_symbols(
 
 // These two grammar crates do not export their upstream query. Keep a small,
 // self-contained equivalent here rather than depending on Cargo registry paths.
+const TYPESCRIPT_HIGHLIGHTS: &str = r#"
+(comment) @comment
+(type_identifier) @type
+(predefined_type) @type
+[
+  (string)
+  (template_string)
+] @string
+(number) @number
+(property_identifier) @property
+(call_expression function: (identifier) @function)
+(call_expression function: (member_expression property: (property_identifier) @function))
+(function_declaration name: (identifier) @function)
+(method_definition name: (property_identifier) @function)
+(function_expression name: (identifier) @function)
+(arrow_function) @function
+(identifier) @variable
+[
+  "async" "await" "break" "case" "catch" "class" "const" "continue"
+  "debugger" "default" "delete" "do" "else" "export" "extends" "finally"
+  "for" "from" "function" "if" "import" "in" "instanceof" "let" "new"
+  "of" "return" "static" "switch" "throw" "try" "typeof" "var" "void"
+  "while" "with" "yield" "as" "interface" "implements" "private"
+  "protected" "public" "readonly" "type" "namespace" "declare"
+] @keyword
+[
+  ";" "." "," "(" ")" "[" "]" "{" "}" ":"
+] @punctuation
+[
+  "=" "+" "-" "*" "/" "%" "==" "===" "!=" "!==" "=>" ">" ">=" "<" "<="
+  "&&" "||" "??" "!" "&" "|" "^" "~" "?"
+] @operator
+"#;
+
 const JAVASCRIPT_HIGHLIGHTS: &str = r#"
 [(comment)] @comment
 [(string) (template_string) (regex)] @string
@@ -845,6 +879,40 @@ mod tests {
         assert!(scopes.contains(&HighlightScope::Comment));
         assert!(scopes.contains(&HighlightScope::Keyword));
         assert!(scopes.contains(&HighlightScope::String));
+    }
+
+    #[test]
+    fn typescript_query_emits_editor_token_scopes() {
+        let language = SyntaxLanguage::TypeScript;
+        let source = "import Database from 'better-sqlite3';\nexport async function backup(db: Database.Database, destination: string): Promise<void> {\n  const count: number = 42;\n  return db.backup(destination);\n}\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let query = language.compile_highlights().unwrap();
+        let names = query.capture_names();
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+        let mut scopes = std::collections::HashSet::new();
+        while let Some(m) = matches.next() {
+            scopes.extend(
+                m.captures.iter().filter_map(|capture| {
+                    HighlightScope::from_capture(names[capture.index as usize])
+                }),
+            );
+        }
+        for expected in [
+            HighlightScope::Keyword,
+            HighlightScope::Function,
+            HighlightScope::String,
+            HighlightScope::Type,
+            HighlightScope::Number,
+            HighlightScope::Property,
+        ] {
+            assert!(
+                scopes.contains(&expected),
+                "missing TypeScript scope {expected:?}"
+            );
+        }
     }
 
     #[test]
