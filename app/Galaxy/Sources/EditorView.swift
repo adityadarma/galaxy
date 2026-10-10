@@ -40,7 +40,6 @@ final class EditorView: NSView {
     static let caretWidth: CGFloat = 2
     static let blinkInterval: TimeInterval = 0.53
     static let matchColor = Theme.findMatch
-    static let defaultFont = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
 
     private(set) var font: NSFont
     private(set) var metrics: Metrics
@@ -105,8 +104,8 @@ final class EditorView: NSView {
     }
 
     override init(frame: NSRect) {
-        font = Self.defaultFont
-        metrics = Metrics(font: Self.defaultFont)
+        font = Theme.editorFont
+        metrics = Metrics(font: Theme.editorFont)
         super.init(frame: frame)
         wantsLayer = true
         // Redraw only when told to; the scroll view handles scrolling blits.

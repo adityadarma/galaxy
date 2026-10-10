@@ -718,6 +718,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         editorView.needsDisplay = true
     }
 
+    func applyPreferences() {
+        editorView.setFont(Theme.editorFont)
+    }
+
     /// Starts an empty "Untitled" buffer in a new tab, ready for typing.
     @objc func newDocument(_ sender: Any?) {
         let tab = EditorTab(doc: bridge.newDocument(), title: "Untitled", pathComponents: ["Untitled"],

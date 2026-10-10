@@ -5,6 +5,7 @@ import os
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let bridge = CoreBridge()
     private var windowController: MainWindowController?
+    private var preferencesController: PreferencesWindowController?
     /// A path handed to us before the window existed (`Galaxy <path>`).
     private var pendingURL: URL?
 
@@ -21,6 +22,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         StartupProbe.mark("did_finish_launching")
         Log.app.info("launch started")
         bridge.start()
+        applyAppearancePreference()
         StartupProbe.mark("core_started")
 
         NSApp.mainMenu = MainMenu.build()
@@ -62,6 +64,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Verifies the Rust -> Swift callback path end-to-end.
         bridge.ping("startup")
+    }
+
+    @objc func showPreferences(_ sender: Any?) {
+        let controller = PreferencesWindowController { [weak self] in
+            self?.applyAppearancePreference()
+            self?.windowController?.applyPreferences()
+        }
+        preferencesController = controller
+        controller.showWindow(sender)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func applyAppearancePreference() {
+        switch UserDefaults.standard.string(forKey: "Appearance") {
+        case "Light": NSApp.appearance = NSAppearance(named: .aqua)
+        case "Dark": NSApp.appearance = NSAppearance(named: .darkAqua)
+        default: NSApp.appearance = nil
+        }
     }
 
     /// Off for benchmarks (startup must not depend on what was open last),

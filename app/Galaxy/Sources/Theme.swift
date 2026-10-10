@@ -26,26 +26,26 @@ enum Theme {
         }
         return theme.scopes
     }
-    /// Soft copper: caret, find matches, the active activity item and tab.
+    /// Blue accent: caret, find matches, active tab and editor decorations.
     static let accent = NSColor(name: "GalaxyAccent") { appearance in
         let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         return dark
-            ? NSColor(srgbRed: 0.91, green: 0.60, blue: 0.40, alpha: 1)
-            : NSColor(srgbRed: 0.72, green: 0.42, blue: 0.24, alpha: 1)
+            ? NSColor(srgbRed: 0.18, green: 0.55, blue: 0.95, alpha: 1)
+            : NSColor(srgbRed: 0.00, green: 0.38, blue: 0.78, alpha: 1)
     }
 
     static let caret = accent
-    static let activityActive = NSColor.systemBlue
+    static let activityActive = accent
     static let findMatch = NSColor(name: "GalaxyFindMatch") { appearance in
         accent.resolved(for: appearance).withAlphaComponent(0.32)
     }
 
-    /// Lines with a caret and no selection: a faint warm wash.
+    /// Lines with a caret and no selection: a faint blue wash.
     static let currentLine = NSColor(name: "GalaxyCurrentLine") { appearance in
         let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         return dark
-            ? NSColor(srgbRed: 1, green: 0.92, blue: 0.85, alpha: 0.06)
-            : NSColor(srgbRed: 0.45, green: 0.30, blue: 0.20, alpha: 0.06)
+            ? NSColor(srgbRed: 0.42, green: 0.70, blue: 1, alpha: 0.08)
+            : NSColor(srgbRed: 0.00, green: 0.38, blue: 0.78, alpha: 0.08)
     }
     /// Line numbers: quieter than body text; the caret line uses `accent`.
     static let gutterText = NSColor.secondaryLabelColor
@@ -80,6 +80,15 @@ enum Theme {
             : NSColor(srgbRed: 0.969, green: 0.965, blue: 0.957, alpha: 1)
     }
     static let tabHeight: CGFloat = 34
+
+    static var editorFont: NSFont {
+        let defaults = UserDefaults.standard
+        let size = max(10, min(24, defaults.object(forKey: "EditorFontSize") as? CGFloat ?? 13))
+        guard let name = defaults.string(forKey: "EditorFontName"), name != "System Monospaced" else {
+            return .monospacedSystemFont(ofSize: size, weight: .regular)
+        }
+        return NSFont(name: name, size: size) ?? .monospacedSystemFont(ofSize: size, weight: .regular)
+    }
 
     /// Status bar: compact, secondary text.
     static var statusFont: NSFont { .systemFont(ofSize: 11) }

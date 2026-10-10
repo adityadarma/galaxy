@@ -2,9 +2,9 @@
   "name": "Galaxy Dark",
   "type": "dark",
   "scopes": {
-    "attribute": "#D6A95C", "comment": "#87909D", "constant": "#E5A06B",
+    "attribute": "#7CC7FF", "comment": "#87909D", "constant": "#7CC7FF",
     "constructor": "#D7A2EE", "function": "#7CC7FF", "keyword": "#FF9AA9",
-    "label": "#E8C77B", "number": "#E5A06B", "operator": "#C3CAD5",
+    "label": "#7CC7FF", "number": "#7CC7FF", "operator": "#C3CAD5",
     "property": "#7CC7FF", "punctuation": "#C3CAD5", "string": "#8DD694",
     "tag": "#FF9AA9", "type": "#D7A2EE", "variable": "#E5E9F0"
   }

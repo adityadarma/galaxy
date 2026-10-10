@@ -10,6 +10,8 @@ enum MainMenu {
         appMenu.addItem(withTitle: "About Galaxy",
                         action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
                         keyEquivalent: "")
+        let preferences = appMenu.addItem(withTitle: "Settings…", action: #selector(AppDelegate.showPreferences(_:)), keyEquivalent: ",")
+        preferences.keyEquivalentModifierMask = [.command]
         appMenu.addItem(.separator())
         appMenu.addItem(withTitle: "Hide Galaxy", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         let hideOthers = appMenu.addItem(withTitle: "Hide Others",

@@ -2,9 +2,9 @@
   "name": "Galaxy Light",
   "type": "light",
   "scopes": {
-    "attribute": "#8A4F10", "comment": "#6A737D", "constant": "#8A3B12",
+    "attribute": "#005E9C", "comment": "#6A737D", "constant": "#005E9C",
     "constructor": "#7A3E9D", "function": "#005E9C", "keyword": "#9B1C31",
-    "label": "#795E26", "number": "#8A3B12", "operator": "#5C6370",
+    "label": "#005E9C", "number": "#005E9C", "operator": "#5C6370",
     "property": "#005E9C", "punctuation": "#4B5563", "string": "#24713B",
     "tag": "#9B1C31", "type": "#7A3E9D", "variable": "#1F2937"
   }
