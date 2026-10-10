@@ -19,6 +19,19 @@ settings:
       SWIFT_COMPILATION_MODE: wholemodule
 
 targets:
+  GalaxyCLI:
+    type: tool
+    platform: macOS
+    sources:
+      - path: GalaxyCLI
+    settings:
+      base:
+        PRODUCT_NAME: galaxy
+        PRODUCT_MODULE_NAME: GalaxyCLI
+        PRODUCT_BUNDLE_IDENTIFIER: dev.adityadarma.galaxy.cli
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
+
   Galaxy:
     type: application
     platform: macOS
@@ -52,6 +65,12 @@ targets:
         outputFiles:
           - $(PROJECT_DIR)/Galaxy/FFI/libgalaxy_ffi.a
           - $(PROJECT_DIR)/Galaxy/Generated/galaxy_ffi.swift
+    dependencies:
+      - target: GalaxyCLI
+    copyFiles:
+      - destination: executables
+        files:
+          - target: GalaxyCLI
 
   GalaxyTests:
     type: bundle.unit-test
