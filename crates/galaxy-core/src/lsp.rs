@@ -70,6 +70,13 @@ pub struct DefinitionLocation {
     pub range: Range,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenameEdit {
+    pub uri: String,
+    pub range: Range,
+    pub new_text: String,
+}
+
 /// Latest server diagnostics, replaced atomically per URI by
 /// `textDocument/publishDiagnostics` as required by LSP.
 #[derive(Debug, Default)]
@@ -490,6 +497,8 @@ pub struct LspManager {
     definition_requests: HashMap<(LspKey, u64), String>,
     references: HashMap<String, Vec<DefinitionLocation>>,
     reference_requests: HashMap<(LspKey, u64), String>,
+    rename_edits: HashMap<String, Vec<RenameEdit>>,
+    rename_requests: HashMap<(LspKey, u64), String>,
 }
 
 impl LspManager {
@@ -697,6 +706,29 @@ impl LspManager {
         self.references.get(uri).map(Vec::as_slice).unwrap_or(&[])
     }
 
+    pub fn request_rename(
+        &mut self,
+        uri: &str,
+        line: u64,
+        character: u64,
+        new_name: &str,
+        now: Instant,
+    ) -> io::Result<Option<u64>> {
+        let Some(key) = self.documents.get(uri).map(|(key, _)| key.clone()) else {
+            return Ok(None);
+        };
+        self.rename_edits.remove(uri);
+        let id = self.request(&key, "textDocument/rename".into(), serde_json::json!({
+            "textDocument": { "uri": uri }, "position": { "line": line, "character": character }, "newName": new_name
+        }), Duration::from_millis(1500), now)?;
+        self.rename_requests.insert((key, id), uri.to_owned());
+        Ok(Some(id))
+    }
+
+    pub fn rename_edits(&self, uri: &str) -> &[RenameEdit] {
+        self.rename_edits.get(uri).map(Vec::as_slice).unwrap_or(&[])
+    }
+
     /// Sends a notification to one initialized or initializing server.
     pub fn send(&self, key: &LspKey, message: &Value) -> io::Result<()> {
         self.servers
@@ -859,6 +891,9 @@ impl LspManager {
                         if let Some(uri) = self.reference_requests.remove(&(key.clone(), id))
                             && let Some(result) = message.get("result").and_then(parse_definition_locations)
                         { self.references.insert(uri, result); }
+                        if let Some(uri) = self.rename_requests.remove(&(key.clone(), id))
+                            && let Some(result) = message.get("result").and_then(parse_workspace_edit)
+                        { self.rename_edits.insert(uri, result); }
                         if self.requests.remove(&(key.clone(), id)).is_some() {
                             events.push(LspEvent::Response {
                                 key: key.clone(), id,
@@ -1042,6 +1077,40 @@ fn parse_definition_locations(value: &Value) -> Option<Vec<DefinitionLocation>> 
             })
             .collect(),
     )
+}
+
+fn parse_workspace_edit(value: &Value) -> Option<Vec<RenameEdit>> {
+    let mut edits = Vec::new();
+    if let Some(changes) = value.get("changes").and_then(Value::as_object) {
+        for (uri, items) in changes {
+            parse_text_edits(uri, items, &mut edits);
+        }
+    }
+    if let Some(document_changes) = value.get("documentChanges").and_then(Value::as_array) {
+        for change in document_changes {
+            if let (Some(uri), Some(items)) = (
+                change.pointer("/textDocument/uri").and_then(Value::as_str),
+                change.get("edits"),
+            ) {
+                parse_text_edits(uri, items, &mut edits);
+            }
+        }
+    }
+    Some(edits)
+}
+
+fn parse_text_edits(uri: &str, value: &Value, output: &mut Vec<RenameEdit>) {
+    let Some(items) = value.as_array() else {
+        return;
+    };
+    output.extend(items.iter().filter_map(|item| {
+        let range = parse_range(item.get("range")?)?;
+        Some(RenameEdit {
+            uri: uri.to_owned(),
+            range,
+            new_text: item.get("newText")?.as_str()?.to_owned(),
+        })
+    }));
 }
 
 fn parse_range(value: &Value) -> Option<Range> {
@@ -1656,5 +1725,16 @@ mod tests {
                 }
             }]
         );
+    }
+
+    #[test]
+    fn parses_workspace_edit_changes_and_document_changes() {
+        let edits = parse_workspace_edit(&serde_json::json!({
+            "changes": {"file:///a.rs": [{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"newText":"x"}]},
+            "documentChanges": [{"textDocument":{"uri":"file:///b.rs","version":null},"edits":[{"range":{"start":{"line":2,"character":1},"end":{"line":2,"character":2}},"newText":"y"}]}]
+        })).unwrap();
+        assert_eq!(edits.len(), 2);
+        assert_eq!(edits[0].uri, "file:///a.rs");
+        assert_eq!(edits[1].new_text, "y");
     }
 }

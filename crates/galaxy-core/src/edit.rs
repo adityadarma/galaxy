@@ -89,6 +89,15 @@ impl Transaction {
     }
 }
 
+pub fn from_changes(changes: ChangeSet, doc: &Document) -> Transaction {
+    let end = changes.len_after(doc.len_chars());
+    Transaction {
+        changes,
+        selections: vec![Selection::caret(end)],
+        primary: 0,
+    }
+}
+
 /// Types `text` at every selection (replacing selected text).
 pub fn insert_text(doc: &Document, sel: &SelectionSet, text: &str) -> Transaction {
     let items = sel

@@ -104,6 +104,22 @@ final class CoreBridge {
         core.references(document: document)
     }
 
+    func requestRename(document: DocumentHandle, line: UInt64, character: UInt64, newName: String) {
+        _ = core.requestRename(document: document, line: line, character: character, newName: newName)
+    }
+
+    func renameEdits(document: DocumentHandle) -> [RenameEdit] {
+        core.renameEdits(document: document)
+    }
+
+    func applyRenameEdits(document: DocumentHandle, edits: [RenameEdit]) -> Bool {
+        document.applyRenameEdits(edits: edits)
+    }
+
+    func save(document: DocumentHandle) throws {
+        try document.save()
+    }
+
     fileprivate func deliver(_ event: CoreEvent) {
         lastEvent = event
         if case let .pong(message) = event {

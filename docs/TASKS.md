@@ -141,7 +141,8 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
   - Status: request LSP definition/typeDefinition/implementation, parsing Location/LocationLink, pembukaan file target, navigation history, menu, `F12`, dan `Cmd+Click` selesai.
 - [x] M4-11 — Find references dengan panel hasil.
   - Status: `textDocument/references`, parsing lokasi, panel hasil, navigasi ke file/baris, dan menu Find References selesai.
-- [ ] M4-12 — Rename symbol: input inline, terapkan `WorkspaceEdit` ke file terbuka dan tertutup, satu langkah undo per file.
+- [x] M4-12 — Rename symbol: input inline, terapkan `WorkspaceEdit` ke file terbuka dan tertutup, satu langkah undo per file.
+  - Status: request `textDocument/rename`, parsing `WorkspaceEdit`, input nama simbol, apply UTF-16 edits satu undo step per file, file tertutup disimpan, dan file terbuka tetap dirty selesai.
 - [ ] M4-13 — Code actions / quick fix (`Cmd+.`).
 - [ ] M4-14 — Formatting dokumen dan format on save.
 - [ ] M4-15 — `$/progress` dan status server di status bar, termasuk RAM proses server.

@@ -101,6 +101,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private var isNavigating = false
     private var definitionRequest: (document: DocumentHandle, position: TextPos)?
     private var referencesRequest: DocumentHandle?
+    private var renameRequest: DocumentHandle?
     private var keyMonitor: Any?
     /// Tabs in the order they were last shown, most recent first (⌃Tab).
     private var tabOrderByUse: [ObjectIdentifier] = []
@@ -271,6 +272,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 self?.refreshSignatureHelp()
                 self?.refreshDefinition()
                 self?.refreshReferences()
+                self?.refreshRename()
                 let problems = self?.bridge.core.problems() ?? []
                 self?.problemsPanel.update(problems)
                 self?.problemsPanel.isHidden = problems.isEmpty
@@ -472,6 +474,44 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         let target = NavLocation(key: path, line: location.line, col: location.column)
         if let current { _ = navHistory.recordJump(from: current, to: target) }
         _ = show(target)
+    }
+
+    @objc func renameSymbol(_ sender: Any?) {
+        guard let document = activeTab?.doc else { NSSound.beep(); return }
+        let current = document.viewport(firstLine: 0, count: 0).primary
+        let line = document.displayLine(line: current.line)
+        let column = min(Int(current.colUtf16), line.utf16.count)
+        let prefix = String(line.prefix(column))
+        let suffix = String(line.dropFirst(column))
+        let left = prefix.lastIndex(where: { !$0.isLetter && !$0.isNumber && $0 != "_" }).map { prefix.index(after: $0) } ?? prefix.startIndex
+        let right = suffix.firstIndex(where: { !$0.isLetter && !$0.isNumber && $0 != "_" }) ?? suffix.endIndex
+        let field = NSTextField(string: String(prefix[left...]) + String(suffix[..<right]))
+        field.frame = NSRect(x: 0, y: 0, width: 280, height: 24)
+        let alert = NSAlert(); alert.messageText = "Rename Symbol"; alert.informativeText = "Enter the new symbol name."; alert.accessoryView = field
+        alert.addButton(withTitle: "Rename"); alert.addButton(withTitle: "Cancel"); alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn, !field.stringValue.isEmpty else { return }
+        renameRequest = document
+        bridge.requestRename(document: document, line: current.line, character: current.colUtf16, newName: field.stringValue)
+    }
+
+    private func refreshRename() {
+        guard let document = renameRequest else { return }
+        let edits = bridge.renameEdits(document: document)
+        guard !edits.isEmpty else { return }
+        renameRequest = nil
+        var grouped: [String: [RenameEdit]] = [:]
+        for edit in edits { grouped[edit.uri, default: []].append(edit) }
+        for (uri, fileEdits) in grouped {
+            guard let path = URL(string: uri)?.path else { continue }
+            let target: DocumentHandle
+            let wasOpen = tabs.contains { $0.doc.path() == path }
+            if let tab = tabs.first(where: { $0.doc.path() == path }) { target = tab.doc }
+            else { guard let opened = try? bridge.openDocument(path: path) else { continue }; target = opened }
+            _ = bridge.applyRenameEdits(document: target, edits: fileEdits)
+            if !wasOpen { try? bridge.save(document: target) }
+            bridge.syncLSP(document: target)
+        }
+        updateEditedState()
     }
 
     @objc func goToDefinition(_ sender: Any?) {

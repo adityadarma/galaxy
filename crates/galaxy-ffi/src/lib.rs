@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
+use galaxy_core::change::{Change, ChangeSet};
 use galaxy_core::clipboard;
 use galaxy_core::commands::{self, CommandRegistry};
 use galaxy_core::disk::{DiskCheck, DiskStamp};
@@ -665,6 +666,49 @@ impl Core {
             .collect()
     }
 
+    pub fn request_rename(
+        &self,
+        document: Arc<DocumentHandle>,
+        line: u64,
+        character: u64,
+        new_name: String,
+    ) -> bool {
+        let path = document.path();
+        if path.is_empty() {
+            return false;
+        }
+        let uri = file_uri(Path::new(&path));
+        self.lsp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .request_rename(&uri, line, character, &new_name, Instant::now())
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    pub fn rename_edits(&self, document: Arc<DocumentHandle>) -> Vec<RenameEdit> {
+        let path = document.path();
+        if path.is_empty() {
+            return Vec::new();
+        }
+        let uri = file_uri(Path::new(&path));
+        self.lsp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .rename_edits(&uri)
+            .iter()
+            .map(|edit| RenameEdit {
+                uri: edit.uri.clone(),
+                start_line: edit.range.start_line,
+                start_character: edit.range.start_character,
+                end_line: edit.range.end_line,
+                end_character: edit.range.end_character,
+                new_text: edit.new_text.clone(),
+            })
+            .collect()
+    }
+
     pub fn problems(&self) -> Vec<ProblemInfo> {
         let lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
         lsp.problems()
@@ -757,6 +801,16 @@ pub struct DefinitionLocation {
     pub uri: String,
     pub line: u64,
     pub column: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct RenameEdit {
+    pub uri: String,
+    pub start_line: u64,
+    pub start_character: u64,
+    pub end_line: u64,
+    pub end_character: u64,
+    pub new_text: String,
 }
 
 enum DefinitionKind {
@@ -2170,6 +2224,37 @@ impl DocumentHandle {
         self.lock().editor.text_utf16(location, length)
     }
 
+    pub fn apply_rename_edits(&self, edits: Vec<RenameEdit>) -> bool {
+        let mut st = self.lock();
+        let doc = &st.editor.doc;
+        let doc_len = doc.len_chars();
+        let changes = edits
+            .into_iter()
+            .map(|edit| {
+                let start = doc.utf16_to_char(galaxy_core::position::Utf16Position::new(
+                    edit.start_line as usize,
+                    edit.start_character as usize,
+                ));
+                let end = doc.utf16_to_char(galaxy_core::position::Utf16Position::new(
+                    edit.end_line as usize,
+                    edit.end_character as usize,
+                ));
+                Change::new(start, end, edit.new_text)
+            })
+            .collect::<Vec<_>>();
+        let tx = ChangeSet::new(changes, doc_len);
+        if tx.is_empty() {
+            return false;
+        }
+        let transaction = galaxy_core::edit::from_changes(tx, doc);
+        st.editor
+            .apply(transaction, EditKind::Other, Instant::now());
+        if let Some(syntax) = &st.syntax {
+            syntax.submit(&st.editor.doc);
+        }
+        true
+    }
+
     /// `setMarkedText`: `selected` is the caret/selection inside `text`.
     pub fn set_marked_text(
         &self,
@@ -2842,6 +2927,32 @@ mod tests {
     fn primary(doc: &DocumentHandle) -> (u64, u64) {
         let r = doc.selected_range();
         (r.location, r.length)
+    }
+
+    #[test]
+    fn rename_edits_use_utf16_ranges_and_one_undo_step() {
+        let doc = doc_with("😀 old old");
+        assert!(doc.apply_rename_edits(vec![
+            RenameEdit {
+                uri: String::new(),
+                start_line: 0,
+                start_character: 3,
+                end_line: 0,
+                end_character: 6,
+                new_text: "new".into()
+            },
+            RenameEdit {
+                uri: String::new(),
+                start_line: 0,
+                start_character: 7,
+                end_line: 0,
+                end_character: 10,
+                new_text: "new".into()
+            },
+        ]));
+        assert_eq!(all_text(&doc), "😀 new new");
+        assert!(doc.undo());
+        assert_eq!(all_text(&doc), "😀 old old");
     }
 
     #[test]
