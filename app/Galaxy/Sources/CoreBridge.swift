@@ -136,6 +136,14 @@ final class CoreBridge {
         core.documentSymbols(document: document)
     }
 
+    func requestWorkspaceSymbols(root: String, query: String) {
+        _ = core.requestWorkspaceSymbols(root: root, query: query)
+    }
+
+    func workspaceSymbols(root: String) -> [LspOutlineSymbol] {
+        core.workspaceSymbols(root: root)
+    }
+
     func requestFormatting(document: DocumentHandle, tabSize: UInt64, insertSpaces: Bool) {
         core.requestFormatting(document: document, tabSize: tabSize, insertSpaces: insertSpaces)
     }

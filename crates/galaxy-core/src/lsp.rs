@@ -86,6 +86,7 @@ pub struct CodeActionInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentSymbolInfo {
+    pub uri: Option<String>,
     pub name: String,
     pub kind: u64,
     pub range: Range,
@@ -522,6 +523,8 @@ pub struct LspManager {
     on_type_formatting_requests: HashMap<(LspKey, u64), String>,
     document_symbols: HashMap<String, Vec<DocumentSymbolInfo>>,
     document_symbol_requests: HashMap<(LspKey, u64), String>,
+    workspace_symbols: HashMap<String, Vec<DocumentSymbolInfo>>,
+    workspace_symbol_requests: HashMap<(LspKey, u64), String>,
 }
 
 impl LspManager {
@@ -836,6 +839,40 @@ impl LspManager {
             .unwrap_or(&[])
     }
 
+    pub fn request_workspace_symbols(
+        &mut self,
+        root: &str,
+        query: &str,
+        now: Instant,
+    ) -> io::Result<Option<u64>> {
+        let key = self
+            .documents
+            .values()
+            .find(|(key, _)| key.root.to_string_lossy() == root)
+            .map(|(key, _)| key.clone());
+        let Some(key) = key else {
+            return Ok(None);
+        };
+        self.workspace_symbols.remove(root);
+        let id = self.request(
+            &key,
+            "workspace/symbol".into(),
+            serde_json::json!({ "query": query }),
+            Duration::from_millis(1000),
+            now,
+        )?;
+        self.workspace_symbol_requests
+            .insert((key, id), root.to_owned());
+        Ok(Some(id))
+    }
+
+    pub fn workspace_symbols(&self, root: &str) -> &[DocumentSymbolInfo] {
+        self.workspace_symbols
+            .get(root)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
     pub fn request_range_formatting(
         &mut self,
         uri: &str,
@@ -1082,6 +1119,9 @@ impl LspManager {
                         if let Some(uri) = self.document_symbol_requests.remove(&(key.clone(), id))
                             && let Some(result) = message.get("result").and_then(parse_document_symbols)
                         { self.document_symbols.insert(uri, result); }
+                        if let Some(root) = self.workspace_symbol_requests.remove(&(key.clone(), id))
+                            && let Some(result) = message.get("result").and_then(parse_workspace_symbols)
+                        { self.workspace_symbols.insert(root, result); }
                         if self.requests.remove(&(key.clone(), id)).is_some() {
                             events.push(LspEvent::Response {
                                 key: key.clone(), id,
@@ -1346,6 +1386,11 @@ fn parse_document_symbol(value: &Value) -> Option<DocumentSymbolInfo> {
         .and_then(parse_range)
         .or_else(|| object.get("location")?.get("range").and_then(parse_range))?;
     Some(DocumentSymbolInfo {
+        uri: object
+            .get("location")
+            .and_then(|location| location.get("uri"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         name: object.get("name")?.as_str()?.to_owned(),
         kind: object.get("kind")?.as_u64()?,
         range,
@@ -1354,6 +1399,10 @@ fn parse_document_symbol(value: &Value) -> Option<DocumentSymbolInfo> {
             .and_then(parse_document_symbols)
             .unwrap_or_default(),
     })
+}
+
+fn parse_workspace_symbols(value: &Value) -> Option<Vec<DocumentSymbolInfo>> {
+    parse_document_symbols(value)
 }
 
 fn range_value(range: &Range) -> Value {

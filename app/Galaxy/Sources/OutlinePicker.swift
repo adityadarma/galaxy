@@ -17,6 +17,7 @@ final class OutlinePicker: NSView, NSTextFieldDelegate, NSTableViewDataSource, N
     private(set) var symbols: [OutlineSymbol] = []
     private(set) var results: [OutlineSymbol] = []
     var onGo: ((OutlineSymbol) -> Void)?
+    var onQueryChange: ((String) -> Void)?
     var onClose: (() -> Void)?
 
     override init(frame: NSRect) {
@@ -129,7 +130,7 @@ final class OutlinePicker: NSView, NSTextFieldDelegate, NSTableViewDataSource, N
         setAccessibilityValue(results.isEmpty ? message.stringValue : "\(results.count) symbols")
     }
 
-    func controlTextDidChange(_ obj: Notification) { runSearch() }
+    func controlTextDidChange(_ obj: Notification) { runSearch(); onQueryChange?(field.stringValue) }
 
     func controlTextDidEndEditing(_ obj: Notification) {
         if window?.firstResponder !== field.currentEditor() { onClose?() }

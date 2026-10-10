@@ -224,6 +224,7 @@ pub struct LineTarget {
 /// A definition in the active document's completed Tree-sitter outline.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct OutlineSymbol {
+    pub uri: Option<String>,
     pub name: String,
     pub kind: String,
     pub line: u64,
@@ -232,6 +233,7 @@ pub struct OutlineSymbol {
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct LspOutlineSymbol {
+    pub uri: Option<String>,
     pub name: String,
     pub kind: String,
     pub line: u64,
@@ -788,6 +790,7 @@ impl Core {
         ) {
             for symbol in source {
                 output.push(LspOutlineSymbol {
+                    uri: symbol.uri.clone(),
                     name: symbol.name.clone(),
                     kind: symbol.kind.to_string(),
                     line: symbol.range.start_line,
@@ -799,6 +802,38 @@ impl Core {
         let mut output = Vec::new();
         let lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
         flatten(lsp.document_symbols(&uri), &mut output);
+        output
+    }
+
+    pub fn request_workspace_symbols(&self, root: String, query: String) -> bool {
+        self.lsp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .request_workspace_symbols(&root, &query, Instant::now())
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    pub fn workspace_symbols(&self, root: String) -> Vec<LspOutlineSymbol> {
+        fn flatten(
+            source: &[galaxy_core::lsp::DocumentSymbolInfo],
+            output: &mut Vec<LspOutlineSymbol>,
+        ) {
+            for symbol in source {
+                output.push(LspOutlineSymbol {
+                    uri: symbol.uri.clone(),
+                    name: symbol.name.clone(),
+                    kind: symbol.kind.to_string(),
+                    line: symbol.range.start_line,
+                    column: symbol.range.start_character,
+                });
+                flatten(&symbol.children, output);
+            }
+        }
+        let mut output = Vec::new();
+        let lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
+        flatten(lsp.workspace_symbols(&root), &mut output);
         output
     }
 
@@ -1815,6 +1850,7 @@ impl DocumentHandle {
         syntax::outline_symbols(&st.editor.doc, &tree, language)
             .into_iter()
             .map(|symbol| OutlineSymbol {
+                uri: None,
                 name: symbol.name,
                 kind: symbol.kind,
                 line: symbol.line as u64,

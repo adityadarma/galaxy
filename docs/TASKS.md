@@ -151,6 +151,8 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
   - Status: selection memakai `textDocument/rangeFormatting`, trigger `;`, `}`, `)`, dan newline memakai `textDocument/onTypeFormatting`, semuanya apply sebagai satu undo step selesai.
 - [x] M4-16 — Document symbols / outline refresh dari LSP.
   - Status: request `textDocument/documentSymbol`, parsing nested `DocumentSymbol` dan flat `SymbolInformation`, refresh Go to Symbol saat response tersedia, fallback Tree-sitter dipertahankan selesai.
+- [x] M4-17 — Workspace symbols search dari LSP.
+  - Status: request `workspace/symbol` mengikuti query picker, hasil lintas file ditampilkan di Go to Symbol, URI target dinavigasi, dan fallback outline lokal dipertahankan selesai.
 - [ ] M4-13 — Code actions / quick fix (`Cmd+.`).
 - [ ] M4-14 — Formatting dokumen dan format on save.
 - [ ] M4-15 — `$/progress` dan status server di status bar, termasuk RAM proses server.

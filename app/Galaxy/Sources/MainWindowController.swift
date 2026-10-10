@@ -106,6 +106,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private var codeActionRequest: DocumentHandle?
     private var formattingRequest: DocumentHandle?
     private var outlineRequest: DocumentHandle?
+    private var workspaceSymbolRoot: String?
     private var keyMonitor: Any?
     /// Tabs in the order they were last shown, most recent first (⌃Tab).
     private var tabOrderByUse: [ObjectIdentifier] = []
@@ -1421,6 +1422,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         panel.isHidden = true
         panel.translatesAutoresizingMaskIntoConstraints = false
         panel.onGo = { [weak self] symbol in self?.goTo(symbol) }
+        panel.onQueryChange = { [weak self] query in self?.requestWorkspaceSymbols(query: query) }
         panel.onClose = { [weak self] in self?.closeGoToSymbol() }
         window?.contentView?.addSubview(panel)
         let preferred = panel.widthAnchor.constraint(equalToConstant: OutlinePicker.width)
@@ -1446,18 +1448,36 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         let panel = outlinePicker
         let fallback = doc.outline()
         panel.reset(symbols: fallback)
+        workspaceSymbolRoot = workspace?.root()
         outlineRequest = doc
-        bridge.requestDocumentSymbols(document: doc)
+        if let root = workspaceSymbolRoot {
+            bridge.requestWorkspaceSymbols(root: root, query: "")
+        } else {
+            bridge.requestDocumentSymbols(document: doc)
+        }
         panel.isHidden = false
         panel.focus()
     }
 
     private func refreshDocumentSymbols() {
+        if let root = workspaceSymbolRoot {
+            let symbols = bridge.workspaceSymbols(root: root)
+            if !symbols.isEmpty {
+                let mapped = symbols.map { OutlineSymbol(uri: $0.uri, name: $0.name, kind: $0.kind, line: $0.line, column: $0.column) }
+                outlinePicker.reset(symbols: mapped)
+            }
+            return
+        }
         guard let document = outlineRequest else { return }
         let symbols = bridge.documentSymbols(document: document)
         guard !symbols.isEmpty else { return }
         outlineRequest = nil
-        outlinePicker.reset(symbols: symbols.map { OutlineSymbol(name: $0.name, kind: $0.kind, line: $0.line, column: $0.column) })
+        outlinePicker.reset(symbols: symbols.map { OutlineSymbol(uri: $0.uri, name: $0.name, kind: $0.kind, line: $0.line, column: $0.column) })
+    }
+
+    private func requestWorkspaceSymbols(query: String) {
+        guard let root = workspaceSymbolRoot else { return }
+        bridge.requestWorkspaceSymbols(root: root, query: query)
     }
 
     func closeGoToSymbol() {
@@ -1468,6 +1488,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     private func goTo(_ symbol: OutlineSymbol) {
         closeGoToSymbol()
+        if let uri = symbol.uri, let path = URL(string: uri)?.path,
+           let workspace, let rel = relativePath(path) {
+            openWorkspaceFile(workspace, FileEntry(name: URL(fileURLWithPath: path).lastPathComponent, relPath: rel, isDir: false), preview: false)
+        }
         guard let tab = activeTab else { return }
         let from = location(of: tab)
         _ = navHistory.recordJump(
