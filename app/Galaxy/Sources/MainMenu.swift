@@ -66,6 +66,7 @@ enum MainMenu {
         goMenu.addItem(withTitle: "Go to Definition", action: #selector(MainWindowController.goToDefinition(_:)), keyEquivalent: "")
         goMenu.addItem(withTitle: "Go to Type Definition", action: #selector(MainWindowController.goToTypeDefinition(_:)), keyEquivalent: "")
         goMenu.addItem(withTitle: "Go to Implementation", action: #selector(MainWindowController.goToImplementation(_:)), keyEquivalent: "")
+        goMenu.addItem(withTitle: "Find References", action: #selector(MainWindowController.findReferences(_:)), keyEquivalent: "")
         goMenu.addItem(withTitle: "Go to File…", action: #selector(MainWindowController.showGoToFile(_:)), keyEquivalent: "p")
         let symbol = goMenu.addItem(withTitle: "Go to Symbol…", action: #selector(MainWindowController.showGoToSymbol(_:)), keyEquivalent: "o")
         symbol.keyEquivalentModifierMask = [.command, .shift]

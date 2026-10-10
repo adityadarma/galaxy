@@ -96,6 +96,14 @@ final class CoreBridge {
         core.definitionLocations(document: document)
     }
 
+    func requestReferences(document: DocumentHandle, line: UInt64, character: UInt64) {
+        _ = core.requestReferences(document: document, line: line, character: character)
+    }
+
+    func references(document: DocumentHandle) -> [DefinitionLocation] {
+        core.references(document: document)
+    }
+
     fileprivate func deliver(_ event: CoreEvent) {
         lastEvent = event
         if case let .pong(message) = event {

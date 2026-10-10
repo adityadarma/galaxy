@@ -27,6 +27,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     var statusLabel: NSTextField { statusBar.message }
     private let scrollView = DiagnosticScrollView()
     private let problemsPanel = ProblemsPanel()
+    private let referencesPanel = ReferencesPanel()
     private let hoverPopover = HoverPopover()
     private let completionPopup = CompletionPopup()
     private let signaturePopup = SignaturePopup()
@@ -99,6 +100,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// itself recorded as a jump.
     private var isNavigating = false
     private var definitionRequest: (document: DocumentHandle, position: TextPos)?
+    private var referencesRequest: DocumentHandle?
     private var keyMonitor: Any?
     /// Tabs in the order they were last shown, most recent first (⌃Tab).
     private var tabOrderByUse: [ObjectIdentifier] = []
@@ -268,6 +270,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             self?.refreshCompletion()
                 self?.refreshSignatureHelp()
                 self?.refreshDefinition()
+                self?.refreshReferences()
                 let problems = self?.bridge.core.problems() ?? []
                 self?.problemsPanel.update(problems)
                 self?.problemsPanel.isHidden = problems.isEmpty
@@ -290,6 +293,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         detailView.addSubview(findBarSlot)
         detailView.addSubview(scrollView)
         detailView.addSubview(problemsPanel)
+        detailView.addSubview(referencesPanel)
         detailView.addSubview(hoverPopover)
         detailView.addSubview(completionPopup)
         detailView.addSubview(signaturePopup)
@@ -310,10 +314,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             problemsPanel.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
             problemsPanel.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
             problemsPanel.bottomAnchor.constraint(equalTo: detailView.bottomAnchor),
+            referencesPanel.leadingAnchor.constraint(equalTo: detailView.leadingAnchor), referencesPanel.trailingAnchor.constraint(equalTo: detailView.trailingAnchor), referencesPanel.bottomAnchor.constraint(equalTo: detailView.bottomAnchor),
             scrollView.bottomAnchor.constraint(equalTo: problemsPanel.topAnchor),
         ])
         problemsPanel.onSelect = { [weak self] problem in self?.showProblem(problem) }
+        referencesPanel.onSelect = { [weak self] location in self?.showReference(location) }
         problemsPanel.isHidden = true
+        referencesPanel.isHidden = true
         hoverPopover.isHidden = true
         completionPopup.isHidden = true
         signaturePopup.isHidden = true
@@ -436,6 +443,31 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
               let location = bridge.definitionLocations(document: request.document).first else { return }
         definitionRequest = nil
         guard let path = URL(string: location.uri)?.path else { return }
+        let current = activeTab.map(location(of:))
+        let target = NavLocation(key: path, line: location.line, col: location.column)
+        if let current { _ = navHistory.recordJump(from: current, to: target) }
+        _ = show(target)
+    }
+
+    @objc func findReferences(_ sender: Any?) {
+        guard let document = activeTab?.doc else { NSSound.beep(); return }
+        let position = document.viewport(firstLine: 0, count: 0).primary
+        referencesRequest = document
+        bridge.requestReferences(document: document, line: position.line, character: position.colUtf16)
+    }
+
+    private func refreshReferences() {
+        guard let document = referencesRequest else { return }
+        let locations = bridge.references(document: document)
+        guard !locations.isEmpty else { return }
+        referencesRequest = nil
+        problemsPanel.isHidden = true
+        referencesPanel.update(locations); referencesPanel.isHidden = false
+    }
+
+    private func showReference(_ location: DefinitionLocation) {
+        guard let path = URL(string: location.uri)?.path else { return }
+        referencesPanel.isHidden = true
         let current = activeTab.map(location(of:))
         let target = NavLocation(key: path, line: location.line, col: location.column)
         if let current { _ = navHistory.recordJump(from: current, to: target) }

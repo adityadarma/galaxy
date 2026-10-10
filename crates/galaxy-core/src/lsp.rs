@@ -488,6 +488,8 @@ pub struct LspManager {
     signature_requests: HashMap<(LspKey, u64), String>,
     definition_locations: HashMap<String, Vec<DefinitionLocation>>,
     definition_requests: HashMap<(LspKey, u64), String>,
+    references: HashMap<String, Vec<DefinitionLocation>>,
+    reference_requests: HashMap<(LspKey, u64), String>,
 }
 
 impl LspManager {
@@ -673,6 +675,28 @@ impl LspManager {
             .unwrap_or(&[])
     }
 
+    pub fn request_references(
+        &mut self,
+        uri: &str,
+        line: u64,
+        character: u64,
+        now: Instant,
+    ) -> io::Result<Option<u64>> {
+        let Some(key) = self.documents.get(uri).map(|(key, _)| key.clone()) else {
+            return Ok(None);
+        };
+        self.references.remove(uri);
+        let id = self.request(&key, "textDocument/references".into(), serde_json::json!({
+            "textDocument": { "uri": uri }, "position": { "line": line, "character": character }, "context": { "includeDeclaration": true }
+        }), Duration::from_millis(1000), now)?;
+        self.reference_requests.insert((key, id), uri.to_owned());
+        Ok(Some(id))
+    }
+
+    pub fn references(&self, uri: &str) -> &[DefinitionLocation] {
+        self.references.get(uri).map(Vec::as_slice).unwrap_or(&[])
+    }
+
     /// Sends a notification to one initialized or initializing server.
     pub fn send(&self, key: &LspKey, message: &Value) -> io::Result<()> {
         self.servers
@@ -832,6 +856,9 @@ impl LspManager {
                         if let Some(uri) = self.definition_requests.remove(&(key.clone(), id))
                             && let Some(result) = message.get("result").and_then(parse_definition_locations)
                         { self.definition_locations.insert(uri, result); }
+                        if let Some(uri) = self.reference_requests.remove(&(key.clone(), id))
+                            && let Some(result) = message.get("result").and_then(parse_definition_locations)
+                        { self.references.insert(uri, result); }
                         if self.requests.remove(&(key.clone(), id)).is_some() {
                             events.push(LspEvent::Response {
                                 key: key.clone(), id,
@@ -1610,5 +1637,24 @@ mod tests {
         assert_eq!(locations[0].range.start_line, 4);
         assert_eq!(locations[1].uri, "file:///tmp/main.rs");
         assert_eq!(locations[1].range.start_character, 1);
+    }
+
+    #[test]
+    fn parses_reference_locations() {
+        let locations = parse_definition_locations(&serde_json::json!([
+            {"uri":"file:///tmp/a.rs","range":{"start":{"line":1,"character":3},"end":{"line":1,"character":7}}}
+        ])).unwrap();
+        assert_eq!(
+            locations,
+            vec![DefinitionLocation {
+                uri: "file:///tmp/a.rs".into(),
+                range: Range {
+                    start_line: 1,
+                    start_character: 3,
+                    end_line: 1,
+                    end_character: 7
+                }
+            }]
+        );
     }
 }

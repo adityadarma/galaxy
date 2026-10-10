@@ -139,7 +139,8 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
   - Status: `textDocument/signatureHelp`, signature/parameter parsing, active parameter highlighting, and editor popup selesai.
 - [x] M4-10 — Go to definition / type definition / implementation (`F12`, `Cmd+Click`).
   - Status: request LSP definition/typeDefinition/implementation, parsing Location/LocationLink, pembukaan file target, navigation history, menu, `F12`, dan `Cmd+Click` selesai.
-- [ ] M4-11 — Find references dengan panel hasil.
+- [x] M4-11 — Find references dengan panel hasil.
+  - Status: `textDocument/references`, parsing lokasi, panel hasil, navigasi ke file/baris, dan menu Find References selesai.
 - [ ] M4-12 — Rename symbol: input inline, terapkan `WorkspaceEdit` ke file terbuka dan tertutup, satu langkah undo per file.
 - [ ] M4-13 — Code actions / quick fix (`Cmd+.`).
 - [ ] M4-14 — Formatting dokumen dan format on save.

@@ -626,6 +626,45 @@ impl Core {
             .collect()
     }
 
+    pub fn request_references(
+        &self,
+        document: Arc<DocumentHandle>,
+        line: u64,
+        character: u64,
+    ) -> bool {
+        let path = document.path();
+        if path.is_empty() {
+            return false;
+        }
+        let uri = file_uri(Path::new(&path));
+        self.lsp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .request_references(&uri, line, character, Instant::now())
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    pub fn references(&self, document: Arc<DocumentHandle>) -> Vec<DefinitionLocation> {
+        let path = document.path();
+        if path.is_empty() {
+            return Vec::new();
+        }
+        let uri = file_uri(Path::new(&path));
+        self.lsp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .references(&uri)
+            .iter()
+            .map(|location| DefinitionLocation {
+                uri: location.uri.clone(),
+                line: location.range.start_line,
+                column: location.range.start_character,
+            })
+            .collect()
+    }
+
     pub fn problems(&self) -> Vec<ProblemInfo> {
         let lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
         lsp.problems()
