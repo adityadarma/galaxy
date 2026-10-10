@@ -119,6 +119,56 @@ impl SyntaxLanguage {
     pub fn compile_highlights(self) -> Result<Query, tree_sitter::QueryError> {
         Query::new(&self.grammar(), self.highlight_query())
     }
+
+    /// Detects bundled languages by filename, extension, then an interpreter
+    /// shebang. The first source line is enough; callers need not copy a file.
+    pub fn detect(path: &str, first_line: &str) -> Option<Self> {
+        let name = path
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(path)
+            .to_ascii_lowercase();
+        let by_name = match name.as_str() {
+            "dockerfile" => None,
+            "cargo.toml" => Some(Self::Toml),
+            _ => None,
+        };
+        if by_name.is_some() {
+            return by_name;
+        }
+        let extension = name.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("");
+        let by_extension = match extension {
+            "rs" => Some(Self::Rust),
+            "ts" => Some(Self::TypeScript),
+            "tsx" => Some(Self::Tsx),
+            "js" | "mjs" | "cjs" => Some(Self::JavaScript),
+            "json" | "jsonc" => Some(Self::Json),
+            "toml" => Some(Self::Toml),
+            "yaml" | "yml" => Some(Self::Yaml),
+            "md" | "markdown" => Some(Self::Markdown),
+            "py" | "pyw" => Some(Self::Python),
+            "go" => Some(Self::Go),
+            "html" | "htm" => Some(Self::Html),
+            "css" => Some(Self::Css),
+            "sh" | "bash" | "zsh" => Some(Self::Bash),
+            _ => None,
+        };
+        if by_extension.is_some() {
+            return by_extension;
+        }
+        let interpreter = first_line
+            .strip_prefix("#!")?
+            .split_whitespace()
+            .last()?
+            .rsplit('/')
+            .next()?;
+        match interpreter {
+            "bash" | "sh" | "zsh" => Some(Self::Bash),
+            "python" | "python3" => Some(Self::Python),
+            "node" | "deno" => Some(Self::JavaScript),
+            _ => None,
+        }
+    }
 }
 
 // These two grammar crates do not export their upstream query. Keep a small,
@@ -715,6 +765,27 @@ mod tests {
         assert!(scopes.contains(&HighlightScope::Comment));
         assert!(scopes.contains(&HighlightScope::Keyword));
         assert!(scopes.contains(&HighlightScope::String));
+    }
+
+    #[test]
+    fn detects_extensions_special_names_and_shebangs() {
+        assert_eq!(
+            SyntaxLanguage::detect("/w/main.rs", ""),
+            Some(SyntaxLanguage::Rust)
+        );
+        assert_eq!(
+            SyntaxLanguage::detect("Cargo.toml", ""),
+            Some(SyntaxLanguage::Toml)
+        );
+        assert_eq!(
+            SyntaxLanguage::detect("script", "#!/usr/bin/env python3"),
+            Some(SyntaxLanguage::Python)
+        );
+        assert_eq!(
+            SyntaxLanguage::detect("script", "#!/bin/bash"),
+            Some(SyntaxLanguage::Bash)
+        );
+        assert_eq!(SyntaxLanguage::detect("notes.txt", "hello"), None);
     }
 
     #[test]

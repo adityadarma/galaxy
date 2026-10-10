@@ -88,9 +88,16 @@ final class EditorView: NSView {
     private var lastImmediateInputDraw: TimeInterval = 0
     private var isHandlingKeyEvent = false
     private var keyEventRequestedRefresh = false
+    /// Keeps the display link alive only while a background syntax tree is
+    /// catching up; the completed tree then triggers one redraw.
+    private var syntaxAwaiting = false
 
     var document: DocumentHandle? {
-        didSet { reloadDocument() }
+        didSet {
+            syntaxAwaiting = document?.syntaxLanguage() != nil
+            startSyntaxPollingIfNeeded()
+            reloadDocument()
+        }
     }
 
     override init(frame: NSRect) {
@@ -178,6 +185,8 @@ final class EditorView: NSView {
         caretOn = true
         updateBlinking()
         needsDisplay = true
+        syntaxAwaiting = document?.syntaxLanguage() != nil
+        startSyntaxPollingIfNeeded()
         if window == nil {
             let snapshot = reloadDocument()
             if scrollCaret, let primary = snapshot?.primary {
@@ -263,13 +272,28 @@ final class EditorView: NSView {
         frameLink?.isPaused = false
     }
 
+    private func startSyntaxPollingIfNeeded() {
+        guard syntaxAwaiting, window != nil else { return }
+        if frameLink == nil {
+            let link = displayLink(target: self, selector: #selector(frameTick(_:)))
+            link.add(to: .main, forMode: .common)
+            frameLink = link
+        }
+        frameLink?.isPaused = false
+    }
+
     @objc private func frameTick(_ link: CADisplayLink) {
         flushPendingUpdates()
+        if syntaxAwaiting, document?.pollSyntax() == true {
+            syntaxAwaiting = false
+            needsDisplay = true
+        }
+        if !hasPendingChange && !syntaxAwaiting { link.isPaused = true }
     }
 
     /// Runs pending work now. Tests call this instead of waiting a frame.
     func flushPendingUpdates() {
-        frameLink?.isPaused = true
+        if !syntaxAwaiting { frameLink?.isPaused = true }
         if hasPendingChange {
             hasPendingChange = false
             frameFlushes += 1

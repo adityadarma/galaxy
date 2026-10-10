@@ -3,7 +3,7 @@
 //! Design rule: the UI calls in with coarse-grained commands and receives
 //! batched events through `CoreListener`. No per-character FFI chatter.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
@@ -22,6 +22,7 @@ use galaxy_core::multicursor;
 use galaxy_core::navigation::{self, Location, NavHistory};
 use galaxy_core::position::Utf16Position;
 use galaxy_core::selection::{Selection, SelectionSet};
+use galaxy_core::syntax::{SyntaxLanguage, SyntaxService, SyntaxSnapshot};
 use galaxy_core::viewport;
 use galaxy_core::watcher::WorkspaceWatcher;
 use galaxy_core::workspace::Workspace as CoreWorkspace;
@@ -949,6 +950,38 @@ struct State {
     finder: Option<Finder>,
     /// Why the current pattern is unusable.
     find_error: Option<String>,
+    syntax: Option<SyntaxState>,
+}
+
+struct SyntaxState {
+    language: SyntaxLanguage,
+    service: SyntaxService,
+    snapshot: Option<SyntaxSnapshot>,
+}
+
+impl SyntaxState {
+    fn new(language: SyntaxLanguage, doc: &Document) -> Self {
+        let service = SyntaxService::new(language.grammar());
+        service.submit_document(doc);
+        Self {
+            language,
+            service,
+            snapshot: None,
+        }
+    }
+
+    fn submit(&self, doc: &Document) {
+        self.service.submit_document(doc);
+    }
+
+    fn poll(&mut self, revision: u64) -> Option<&SyntaxSnapshot> {
+        if let Some(snapshot) = self.service.poll() {
+            self.snapshot = Some(snapshot);
+        }
+        self.snapshot
+            .as_ref()
+            .filter(|snapshot| snapshot.revision() == revision)
+    }
 }
 
 impl State {
@@ -1009,6 +1042,25 @@ impl DocumentHandle {
         self.lock().editor.doc.revision()
     }
 
+    /// Detected Tree-sitter language, if this is a supported non-large file.
+    pub fn syntax_language(&self) -> Option<String> {
+        self.lock()
+            .syntax
+            .as_ref()
+            .map(|syntax| syntax.language.name().to_owned())
+    }
+
+    /// Polls the background parser without blocking. `true` means styles for
+    /// the current document revision are ready for the next viewport draw.
+    pub fn poll_syntax(&self) -> bool {
+        let mut st = self.lock();
+        let revision = st.editor.doc.revision();
+        st.syntax
+            .as_mut()
+            .and_then(|syntax| syntax.poll(revision))
+            .is_some()
+    }
+
     /// Plain lines without selection info.
     pub fn lines(&self, first: u64, count: u64) -> Vec<String> {
         self.lock()
@@ -1019,11 +1071,23 @@ impl DocumentHandle {
 
     /// One snapshot per frame: visible lines, selections, carets, cursor.
     pub fn viewport(&self, first_line: u64, count: u64) -> ViewportSnapshot {
-        let st = self.lock();
-        let mut snap: ViewportSnapshot = st
-            .editor
-            .viewport(clamp_usize(first_line), clamp_usize(count))
-            .into();
+        let mut st = self.lock();
+        let first_line = clamp_usize(first_line);
+        let count = clamp_usize(count);
+        let revision = st.editor.doc.revision();
+        let syntax = st.syntax.as_mut().and_then(|syntax| {
+            let language = syntax.language;
+            syntax
+                .poll(revision)
+                .map(|snapshot| (language, snapshot.tree().clone()))
+        });
+        let mut snap: ViewportSnapshot = if let Some((language, tree)) = syntax {
+            st.editor
+                .viewport_with_syntax(first_line, count, &tree, language)
+                .into()
+        } else {
+            st.editor.viewport(first_line, count).into()
+        };
         if let Some(finder) = &st.finder {
             for line in &mut snap.lines {
                 // Only the displayed part, so a minified line stays cheap.
@@ -1111,6 +1175,7 @@ impl DocumentHandle {
         st.saved_state = st.editor.history.state_id();
         st.disk = Some(stamp);
         st.deleted_on_disk = false;
+        st.syntax = syntax_for(&st.path, &st.editor.doc);
         tracing::info!(path = %st.path.display(), changed, "reloaded document from disk");
         Ok(changed)
     }
@@ -1180,20 +1245,25 @@ impl DocumentHandle {
     pub fn edit(&self, command: EditCommand) {
         let mut st = self.lock();
         let cfg = st.indent;
-        let ed = &mut st.editor;
-        let (doc, sel) = (&ed.doc, &ed.sel);
-        let (tx, kind) = match &command {
-            EditCommand::InsertText { text } => {
-                (edit::insert_text(doc, sel, text), insert_kind(text))
-            }
-            EditCommand::Paste { text } => (edit::paste(doc, sel, text), EditKind::Other),
-            EditCommand::Backspace => (edit::backspace(doc, sel, &cfg), EditKind::Delete),
-            EditCommand::DeleteForward => (edit::delete_forward(doc, sel), EditKind::Delete),
-            EditCommand::Newline => (edit::newline(doc, sel, &cfg), EditKind::Other),
-            EditCommand::Indent => (edit::indent(doc, sel, &cfg), EditKind::Other),
-            EditCommand::Outdent => (edit::outdent(doc, sel, &cfg), EditKind::Other),
-        };
-        ed.apply(tx, kind, Instant::now());
+        {
+            let ed = &mut st.editor;
+            let (doc, sel) = (&ed.doc, &ed.sel);
+            let (tx, kind) = match &command {
+                EditCommand::InsertText { text } => {
+                    (edit::insert_text(doc, sel, text), insert_kind(text))
+                }
+                EditCommand::Paste { text } => (edit::paste(doc, sel, text), EditKind::Other),
+                EditCommand::Backspace => (edit::backspace(doc, sel, &cfg), EditKind::Delete),
+                EditCommand::DeleteForward => (edit::delete_forward(doc, sel), EditKind::Delete),
+                EditCommand::Newline => (edit::newline(doc, sel, &cfg), EditKind::Other),
+                EditCommand::Indent => (edit::indent(doc, sel, &cfg), EditKind::Other),
+                EditCommand::Outdent => (edit::outdent(doc, sel, &cfg), EditKind::Other),
+            };
+            ed.apply(tx, kind, Instant::now());
+        }
+        if let Some(syntax) = &st.syntax {
+            syntax.submit(&st.editor.doc);
+        }
     }
 
     // --- Navigation and selection (M1-11) ---
@@ -1612,6 +1682,7 @@ impl DocumentHandle {
         let mut st = self.lock();
         st.path = PathBuf::from(path);
         st.deleted_on_disk = false;
+        st.syntax = syntax_for(&st.path, &st.editor.doc);
     }
 
     /// Saves atomically to `path` and makes it the document's path.
@@ -1625,6 +1696,7 @@ impl DocumentHandle {
         tracing::info!(path = %path.display(), "saved document as");
         st.saved_state = st.editor.history.state_id();
         st.path = path;
+        st.syntax = syntax_for(&st.path, &st.editor.doc);
         Ok(())
     }
 }
@@ -1639,6 +1711,7 @@ impl DocumentHandle {
     }
 
     fn new(doc: Document, path: PathBuf) -> Self {
+        let syntax = syntax_for(&path, &doc);
         Self {
             state: Mutex::new(State {
                 disk: None,
@@ -1649,6 +1722,7 @@ impl DocumentHandle {
                 indent: IndentConfig::default(),
                 finder: None,
                 find_error: None,
+                syntax,
             }),
         }
     }
@@ -1656,6 +1730,15 @@ impl DocumentHandle {
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
+}
+
+fn syntax_for(path: &Path, doc: &Document) -> Option<SyntaxState> {
+    if doc.is_large() {
+        return None;
+    }
+    let first_line = doc.lines(0, 1).into_iter().next().unwrap_or_default();
+    SyntaxLanguage::detect(&path.to_string_lossy(), &first_line)
+        .map(|language| SyntaxState::new(language, doc))
 }
 
 /// Typing a space or punctuation still groups with surrounding typing in
@@ -1701,6 +1784,7 @@ fn clamp_usize(v: u64) -> usize {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+    use std::time::{Duration, Instant};
 
     struct ChannelListener(Mutex<mpsc::Sender<CoreEvent>>);
 
@@ -1708,6 +1792,39 @@ mod tests {
         fn on_event(&self, event: CoreEvent) {
             let _ = self.0.lock().unwrap().send(event);
         }
+    }
+
+    #[test]
+    fn syntax_is_detected_and_arrives_without_blocking_viewport() {
+        let dir = tempfile::tempdir().unwrap();
+        let rust = dir.path().join("main.rs");
+        std::fs::write(&rust, "// note\nfn main() { let name = \"Galaxy\"; }\n").unwrap();
+        let doc = Core::new()
+            .open_document(rust.to_string_lossy().into_owned())
+            .unwrap();
+        assert_eq!(doc.syntax_language(), Some("Rust".into()));
+        // First snapshot is allowed to have no tree: parsing stays off-thread.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let snap = doc.viewport(0, 2);
+            if !snap.styles.is_empty() {
+                assert!(snap.styles.iter().any(|run| run.scope == "comment"));
+                assert!(snap.styles.iter().any(|run| run.scope == "keyword"));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "syntax worker did not return styles"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let plain = dir.path().join("notes.txt");
+        std::fs::write(&plain, "plain text").unwrap();
+        let plain = Core::new()
+            .open_document(plain.to_string_lossy().into_owned())
+            .unwrap();
+        assert_eq!(plain.syntax_language(), None);
+        assert!(plain.viewport(0, 1).styles.is_empty());
     }
 
     #[test]

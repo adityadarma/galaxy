@@ -82,7 +82,7 @@ final class StatusBar: NSView {
             return
         }
         let settings = doc.indentSettings()
-        language.stringValue = Self.language(for: path)
+        language.stringValue = doc.syntaxLanguage() ?? Self.language(for: path)
         indent.stringValue = settings.useTabs ? "Tab Size: \(settings.tabSize)" : "Spaces: \(settings.tabSize)"
         lineEnding.stringValue = switch doc.lineEnding() {
         case .lf: "LF"
