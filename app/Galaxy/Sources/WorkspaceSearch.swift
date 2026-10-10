@@ -6,12 +6,17 @@ final class WorkspaceSearch: NSView, NSTextFieldDelegate, NSTableViewDataSource,
     static let rowHeight: CGFloat = 40
 
     let field = NSTextField()
+    let includeField = NSTextField()
+    let excludeField = NSTextField()
+    let regexButton = NSButton(checkboxWithTitle: "Regex", target: nil, action: nil)
+    let caseButton = NSButton(checkboxWithTitle: "Match case", target: nil, action: nil)
+    let wordButton = NSButton(checkboxWithTitle: "Whole word", target: nil, action: nil)
     let table = NSTableView()
     let message = NSTextField(labelWithString: "")
     private let scroll = NSScrollView()
     private var heightConstraint: NSLayoutConstraint!
     private(set) var results: [WorkspaceSearchMatch] = []
-    var onSearch: ((String) -> Void)?
+    var onSearch: ((String, WorkspaceSearchOptions) -> Void)?
     var onOpen: ((WorkspaceSearchMatch) -> Void)?
     var onClose: (() -> Void)?
 
@@ -34,6 +39,20 @@ final class WorkspaceSearch: NSView, NSTextFieldDelegate, NSTableViewDataSource,
         field.delegate = self
         field.setAccessibilityIdentifier("workspace-search-field")
         field.translatesAutoresizingMaskIntoConstraints = false
+        includeField.placeholderString = "Include (glob, comma separated)"
+        excludeField.placeholderString = "Exclude (glob, comma separated)"
+        for control in [includeField, excludeField] {
+            control.font = .systemFont(ofSize: 12)
+            control.focusRingType = .none
+            control.bezelStyle = .roundedBezel
+            control.delegate = self
+            control.translatesAutoresizingMaskIntoConstraints = false
+        }
+        for button in [regexButton, caseButton, wordButton] {
+            button.setButtonType(.switch)
+            button.target = self
+            button.action = #selector(optionsChanged(_:))
+        }
 
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("match"))
         column.resizingMask = .autoresizingMask
@@ -62,14 +81,22 @@ final class WorkspaceSearch: NSView, NSTextFieldDelegate, NSTableViewDataSource,
         message.setAccessibilityIdentifier("workspace-search-message")
         message.translatesAutoresizingMaskIntoConstraints = false
 
-        addSubview(field); addSubview(scroll); addSubview(message)
-        heightConstraint = heightAnchor.constraint(equalToConstant: 48)
+        let options = NSStackView(views: [regexButton, caseButton, wordButton, includeField, excludeField])
+        options.spacing = 8
+        options.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(field); addSubview(options); addSubview(scroll); addSubview(message)
+        heightConstraint = heightAnchor.constraint(equalToConstant: 88)
         NSLayoutConstraint.activate([
             heightConstraint,
             field.topAnchor.constraint(equalTo: topAnchor, constant: 8),
             field.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
             field.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
-            scroll.topAnchor.constraint(equalTo: field.bottomAnchor, constant: 6),
+            options.topAnchor.constraint(equalTo: field.bottomAnchor, constant: 6),
+            options.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            options.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            includeField.widthAnchor.constraint(equalToConstant: 150),
+            excludeField.widthAnchor.constraint(equalToConstant: 150),
+            scroll.topAnchor.constraint(equalTo: options.bottomAnchor, constant: 6),
             scroll.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
             scroll.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
             scroll.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -4),
@@ -83,6 +110,9 @@ final class WorkspaceSearch: NSView, NSTextFieldDelegate, NSTableViewDataSource,
 
     func reset() {
         field.stringValue = ""
+        includeField.stringValue = ""
+        excludeField.stringValue = ""
+        regexButton.state = .off; caseButton.state = .off; wordButton.state = .off
         show([], message: "Type to search the workspace")
     }
 
@@ -91,7 +121,7 @@ final class WorkspaceSearch: NSView, NSTextFieldDelegate, NSTableViewDataSource,
         table.reloadData()
         table.deselectAll(nil)
         let visible = min(results.count, 10)
-        heightConstraint.constant = results.isEmpty ? 48 : 48 + CGFloat(visible) * Self.rowHeight
+        heightConstraint.constant = results.isEmpty ? 88 : 88 + CGFloat(visible) * Self.rowHeight
         self.message.stringValue = message ?? (results.isEmpty ? "No results" : "")
         self.message.isHidden = !results.isEmpty
     }
@@ -101,7 +131,18 @@ final class WorkspaceSearch: NSView, NSTextFieldDelegate, NSTableViewDataSource,
         field.selectText(nil)
     }
 
-    func controlTextDidChange(_ obj: Notification) { onSearch?(field.stringValue) }
+    func controlTextDidChange(_ obj: Notification) { searchChanged() }
+
+    @objc private func optionsChanged(_ sender: Any?) { searchChanged() }
+
+    private func searchChanged() {
+        onSearch?(field.stringValue, WorkspaceSearchOptions(
+            regex: regexButton.state == .on,
+            caseSensitive: caseButton.state == .on,
+            wholeWord: wordButton.state == .on,
+            include: includeField.stringValue,
+            exclude: excludeField.stringValue))
+    }
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
         switch commandSelector {

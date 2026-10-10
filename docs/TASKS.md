@@ -166,7 +166,8 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
 - [x] M5-01 — Workspace search `Cmd+Shift+F` dengan crate `ignore`, background search, dan hasil terbatas.
   - Status: panel Search in Workspace membuka dari `Cmd+Shift+F` dan command palette, memakai walker `ignore` dengan `.gitignore`, `.ignore`, dan exclude bawaan. Pencarian literal UTF-8 berjalan di background, hasil dibatasi 10.000 match, query lama tidak dapat menimpa query terbaru, dan hasil dapat membuka file langsung pada baris/kolom UTF-16 match. Regex, case, whole word, include/exclude glob, dan streaming per batch menjadi M5-02.
   - Hasil pertama < 100 ms pada repo 1 GB; dapat dibatalkan.
-- [ ] M5-02 — Opsi regex, case, whole word, include/exclude glob; batas 10k match.
+- [x] M5-02 — Opsi regex, case, whole word, include/exclude glob; batas 10k match.
+  - Status: Workspace Search memiliki opsi Regex, Match case, Whole word, Include glob, dan Exclude glob. Pencarian tetap berjalan di background, memakai regex linear dari crate `regex`, dan dibatasi 10.000 match. Glob mendukung `*`, `?`, dan `**/`; opsi invalid ditampilkan sebagai hasil kosong tanpa membuat UI crash. Rust dan Swift unit tests lulus. XCUITest masih memiliki kegagalan environment karena proses/session GUI membawa dokumen dari workspace sebelumnya saat test buffer baru dimulai.
 - [ ] M5-03 — Panel hasil search dengan konteks baris dan navigasi keyboard.
 - [ ] M5-04 — Integrasi dan uji `typescript-language-server`.
 - [ ] M5-05 — Integrasi dan uji `pyright-langserver`.

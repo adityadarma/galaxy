@@ -20,6 +20,7 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 
 use ignore::{DirEntry as WalkEntry, WalkBuilder};
+use regex::RegexBuilder;
 
 /// Directories hidden regardless of ignore files (PRD 7.1).
 pub const DEFAULT_EXCLUDES: &[&str] = &[".git", "node_modules", "target", "dist", "build"];
@@ -170,6 +171,49 @@ pub struct SearchMatch {
     pub line: usize,
     pub column: usize,
     pub text: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SearchOptions {
+    pub regex: bool,
+    pub case_sensitive: bool,
+    pub whole_word: bool,
+    pub include: String,
+    pub exclude: String,
+}
+
+fn split_globs(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|glob| !glob.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn glob_matches(glob: &str, path: &str) -> bool {
+    let mut pattern = String::from("^");
+    let mut chars = glob.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '*' if chars.peek() == Some(&'*') => {
+                chars.next();
+                if chars.peek() == Some(&'/') {
+                    chars.next();
+                    pattern.push_str("(?:.*/)?");
+                } else {
+                    pattern.push_str(".*");
+                }
+            }
+            '*' => pattern.push_str("[^/]*"),
+            '?' => pattern.push_str("[^/]"),
+            _ => pattern.push_str(&regex::escape(&ch.to_string())),
+        }
+    }
+    pattern.push('$');
+    RegexBuilder::new(&pattern)
+        .build()
+        .is_ok_and(|regex| regex.is_match(path))
 }
 
 impl Workspace {
@@ -370,10 +414,31 @@ impl Workspace {
     /// Searches readable UTF-8 files while walking with the same ignore rules
     /// as the explorer. Results are bounded so a broad query cannot flood the
     /// UI or retain an unbounded snapshot.
-    pub fn search(&self, query: &str, limit: usize) -> io::Result<Vec<SearchMatch>> {
+    pub fn search(
+        &self,
+        query: &str,
+        options: &SearchOptions,
+        limit: usize,
+    ) -> io::Result<Vec<SearchMatch>> {
         if query.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
+        let pattern = if options.regex {
+            query.to_string()
+        } else {
+            regex::escape(query)
+        };
+        let pattern = if options.whole_word {
+            format!(r"\b(?:{pattern})\b")
+        } else {
+            pattern
+        };
+        let regex = RegexBuilder::new(&pattern)
+            .case_insensitive(!options.case_sensitive)
+            .build()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        let includes = split_globs(&options.include);
+        let excludes = split_globs(&options.exclude);
         let walker = WalkBuilder::new(&self.root)
             .hidden(false)
             .ignore(true)
@@ -405,13 +470,18 @@ impl Workspace {
                 .map(|c| c.as_os_str().to_string_lossy())
                 .collect::<Vec<_>>()
                 .join("/");
+            if !includes.is_empty() && !includes.iter().any(|glob| glob_matches(glob, &rel_path)) {
+                continue;
+            }
+            if excludes.iter().any(|glob| glob_matches(glob, &rel_path)) {
+                continue;
+            }
             for (line, content) in text.lines().enumerate() {
-                let mut start = 0;
-                while let Some(offset) = content[start..].find(query) {
+                for found in regex.find_iter(content) {
                     if results.len() >= limit {
                         break;
                     }
-                    let byte_column = start + offset;
+                    let byte_column = found.start();
                     let column = content[..byte_column].encode_utf16().count();
                     results.push(SearchMatch {
                         rel_path: rel_path.clone(),
@@ -419,10 +489,6 @@ impl Workspace {
                         column,
                         text: content.to_string(),
                     });
-                    start = byte_column + query.len().max(1);
-                    if start >= content.len() {
-                        break;
-                    }
                 }
                 if results.len() >= limit {
                     break;
@@ -691,7 +757,7 @@ mod tests {
         fs::write(dir.path().join("node_modules/pkg/ignored.js"), "needle").unwrap();
         fs::write(dir.path().join("binary.bin"), [0, 159, 146, 150]).unwrap();
 
-        let matches = ws.search("needle", 20).unwrap();
+        let matches = ws.search("needle", &SearchOptions::default(), 20).unwrap();
         assert_eq!(matches.len(), 2);
         assert_eq!(matches[0].rel_path, "src/main.rs");
         assert_eq!((matches[0].line, matches[0].column), (0, 6));
@@ -701,8 +767,39 @@ mod tests {
     #[test]
     fn search_respects_result_limit_and_empty_query() {
         let (_dir, ws) = tree();
-        assert!(ws.search("x", 1).unwrap().len() <= 1);
-        assert!(ws.search("", 20).unwrap().is_empty());
+        assert!(ws.search("x", &SearchOptions::default(), 1).unwrap().len() <= 1);
+        assert!(
+            ws.search("", &SearchOptions::default(), 20)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn search_supports_regex_case_word_and_globs() {
+        let (dir, ws) = tree();
+        fs::write(dir.path().join("src/main.rs"), "Needle needle\nneedle2").unwrap();
+        let options = SearchOptions {
+            regex: true,
+            case_sensitive: true,
+            whole_word: true,
+            include: "src/**/*.rs".into(),
+            ..SearchOptions::default()
+        };
+        let matches = ws.search("[Nn]eedle", &options, 20).unwrap();
+        assert_eq!(matches.len(), 2);
+        assert!(
+            ws.search(
+                "needle",
+                &SearchOptions {
+                    exclude: "src/**".into(),
+                    ..SearchOptions::default()
+                },
+                20
+            )
+            .unwrap()
+            .is_empty()
+        );
     }
 
     #[test]

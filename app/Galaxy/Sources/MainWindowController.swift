@@ -1625,7 +1625,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         panel.isHidden = true
         panel.translatesAutoresizingMaskIntoConstraints = false
         panel.onClose = { [weak self] in self?.closeWorkspaceSearch() }
-        panel.onSearch = { [weak self] query in self?.searchWorkspace(query) }
+        panel.onSearch = { [weak self] query, options in self?.searchWorkspace(query, options: options) }
         panel.onOpen = { [weak self] match in self?.openWorkspaceSearchMatch(match) }
         window?.contentView?.addSubview(panel)
         NSLayoutConstraint.activate([
@@ -1647,14 +1647,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         panel.focus()
     }
 
-    private func searchWorkspace(_ query: String) {
+    private func searchWorkspace(_ query: String, options: WorkspaceSearchOptions) {
         guard let workspace else { return }
         searchGeneration += 1
         let generation = searchGeneration
         guard !query.isEmpty else { workspaceSearch.show([], message: "Type to search the workspace"); return }
         workspaceSearch.show([], message: "Searching…")
         Task.detached(priority: .userInitiated) { [weak self, workspace] in
-            let results = (try? workspace.search(query: query, limit: 10_000)) ?? []
+            let results = (try? workspace.search(query: query, options: options, limit: 10_000)) ?? []
             await MainActor.run {
                 guard let self, self.searchGeneration == generation, self.isWorkspaceSearchVisible else { return }
                 self.workspaceSearch.show(results, message: results.isEmpty ? "No results" : nil)
