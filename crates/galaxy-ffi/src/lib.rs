@@ -1094,6 +1094,8 @@ pub struct WorkspaceSearchMatch {
     pub line: u64,
     pub column: u64,
     pub text: String,
+    pub context_before: String,
+    pub context_after: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -1234,6 +1236,8 @@ impl Workspace {
                 line: m.line as u64,
                 column: m.column as u64,
                 text: m.text,
+                context_before: m.context_before,
+                context_after: m.context_after,
             })
             .collect())
     }

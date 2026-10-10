@@ -168,7 +168,8 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
   - Hasil pertama < 100 ms pada repo 1 GB; dapat dibatalkan.
 - [x] M5-02 — Opsi regex, case, whole word, include/exclude glob; batas 10k match.
   - Status: Workspace Search memiliki opsi Regex, Match case, Whole word, Include glob, dan Exclude glob. Pencarian tetap berjalan di background, memakai regex linear dari crate `regex`, dan dibatasi 10.000 match. Glob mendukung `*`, `?`, dan `**/`; opsi invalid ditampilkan sebagai hasil kosong tanpa membuat UI crash. Rust dan Swift unit tests lulus. XCUITest masih memiliki kegagalan environment karena proses/session GUI membawa dokumen dari workspace sebelumnya saat test buffer baru dimulai.
-- [ ] M5-03 — Panel hasil search dengan konteks baris dan navigasi keyboard.
+- [x] M5-03 — Panel hasil search dengan konteks baris dan navigasi keyboard.
+  - Status: Setiap hasil menampilkan path, lokasi UTF-16, baris match, serta satu baris konteks sebelum dan sesudahnya. Panel mempertahankan selection saat hasil diperbarui, mendukung Up/Down, Page Up/Page Down, Enter, klik, dan Escape. Hasil dibuka langsung pada lokasi match. Rust dan Swift unit tests lulus.
 - [ ] M5-04 — Integrasi dan uji `typescript-language-server`.
 - [ ] M5-05 — Integrasi dan uji `pyright-langserver`.
 - [ ] M5-06 — Integrasi dan uji `gopls`.

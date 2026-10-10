@@ -3,7 +3,7 @@ import AppKit
 @MainActor
 final class WorkspaceSearch: NSView, NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate {
     static let width: CGFloat = 680
-    static let rowHeight: CGFloat = 40
+    static let rowHeight: CGFloat = 76
 
     let field = NSTextField()
     let includeField = NSTextField()
@@ -117,9 +117,15 @@ final class WorkspaceSearch: NSView, NSTextFieldDelegate, NSTableViewDataSource,
     }
 
     func show(_ results: [WorkspaceSearchMatch], message: String? = nil) {
+        let selected = table.selectedRow
         self.results = results
         table.reloadData()
-        table.deselectAll(nil)
+        if selected >= 0, selected < results.count {
+            table.selectRowIndexes(IndexSet(integer: selected), byExtendingSelection: false)
+            table.scrollRowToVisible(selected)
+        } else {
+            table.deselectAll(nil)
+        }
         let visible = min(results.count, 10)
         heightConstraint.constant = results.isEmpty ? 88 : 88 + CGFloat(visible) * Self.rowHeight
         self.message.stringValue = message ?? (results.isEmpty ? "No results" : "")
@@ -152,6 +158,8 @@ final class WorkspaceSearch: NSView, NSTextFieldDelegate, NSTableViewDataSource,
             return true
         case #selector(NSResponder.moveDown(_:)): select(offset: 1); return true
         case #selector(NSResponder.moveUp(_:)): select(offset: -1); return true
+        case #selector(NSResponder.pageDown(_:)): select(offset: 5); return true
+        case #selector(NSResponder.pageUp(_:)): select(offset: -5); return true
         default: return false
         }
     }
@@ -169,6 +177,8 @@ final class WorkspaceSearch: NSView, NSTextFieldDelegate, NSTableViewDataSource,
         let cell = WorkspaceSearchCell()
         cell.path.stringValue = results[row].relPath
         cell.detail.stringValue = "\(results[row].line + 1):\(results[row].column + 1)  \(results[row].text.trimmingCharacters(in: .whitespacesAndNewlines))"
+        cell.before.stringValue = results[row].contextBefore.isEmpty ? "" : "… \(results[row].contextBefore)"
+        cell.after.stringValue = results[row].contextAfter.isEmpty ? "" : "  \(results[row].contextAfter) …"
         return cell
     }
 
@@ -184,13 +194,19 @@ final class WorkspaceSearch: NSView, NSTextFieldDelegate, NSTableViewDataSource,
 private final class WorkspaceSearchCell: NSTableCellView {
     let path = NSTextField(labelWithString: "")
     let detail = NSTextField(labelWithString: "")
+    let before = NSTextField(labelWithString: "")
+    let after = NSTextField(labelWithString: "")
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         path.font = .systemFont(ofSize: 13)
         detail.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
         detail.textColor = .secondaryLabelColor
-        let stack = NSStackView(views: [path, detail])
+        before.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+        after.font = before.font
+        before.textColor = .tertiaryLabelColor
+        after.textColor = .tertiaryLabelColor
+        let stack = NSStackView(views: [path, before, detail, after])
         stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 2
         stack.translatesAutoresizingMaskIntoConstraints = false
         addSubview(stack)

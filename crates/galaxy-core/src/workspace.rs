@@ -171,6 +171,8 @@ pub struct SearchMatch {
     pub line: usize,
     pub column: usize,
     pub text: String,
+    pub context_before: String,
+    pub context_after: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -476,7 +478,8 @@ impl Workspace {
             if excludes.iter().any(|glob| glob_matches(glob, &rel_path)) {
                 continue;
             }
-            for (line, content) in text.lines().enumerate() {
+            let lines: Vec<&str> = text.lines().collect();
+            for (line, content) in lines.iter().enumerate() {
                 for found in regex.find_iter(content) {
                     if results.len() >= limit {
                         break;
@@ -487,7 +490,14 @@ impl Workspace {
                         rel_path: rel_path.clone(),
                         line,
                         column,
-                        text: content.to_string(),
+                        text: (*content).to_string(),
+                        context_before: line
+                            .checked_sub(1)
+                            .and_then(|index| lines.get(index))
+                            .map_or_else(String::new, |line| (*line).to_string()),
+                        context_after: lines
+                            .get(line + 1)
+                            .map_or_else(String::new, |line| (*line).to_string()),
                     });
                 }
                 if results.len() >= limit {
@@ -761,7 +771,11 @@ mod tests {
         assert_eq!(matches.len(), 2);
         assert_eq!(matches[0].rel_path, "src/main.rs");
         assert_eq!((matches[0].line, matches[0].column), (0, 6));
+        assert_eq!(matches[0].context_before, "");
+        assert_eq!(matches[0].context_after, "😀 second needle");
         assert_eq!((matches[1].line, matches[1].column), (1, 10));
+        assert_eq!(matches[1].context_before, "first needle");
+        assert_eq!(matches[1].context_after, "");
     }
 
     #[test]
