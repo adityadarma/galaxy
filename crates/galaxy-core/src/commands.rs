@@ -271,6 +271,12 @@ const BUILTIN: &[(&str, &str, &str, &[&str])] = &[
     ("editor.action.clipboardPasteAction", "Edit", "Paste", &[]),
     ("editor.action.selectAll", "Selection", "Select All", &[]),
     (
+        "editor.action.commentLine",
+        "Edit",
+        "Toggle Line Comment",
+        &["cmd+/"],
+    ),
+    (
         "editor.action.addSelectionToNextFindMatch",
         "Selection",
         "Add Next Occurrence",

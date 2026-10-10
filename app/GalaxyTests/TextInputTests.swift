@@ -6,9 +6,9 @@ import XCTest
 /// Korean, the emoji picker) still needs manual testing.
 @MainActor
 final class TextInputTests: XCTestCase {
-    private func makeView(text: String, caretAt offset: UInt64 = 0) throws -> (EditorView, DocumentHandle, URL) {
+    private func makeView(text: String, caretAt offset: UInt64 = 0, extension ext: String = "txt") throws -> (EditorView, DocumentHandle, URL) {
         let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("galaxy-\(UUID().uuidString).txt")
+            .appendingPathComponent("galaxy-\(UUID().uuidString).\(ext)")
         try text.write(to: url, atomically: true, encoding: .utf8)
         let doc = try CoreBridge().openDocument(path: url.path)
         let view = EditorView(frame: NSRect(x: 0, y: 0, width: 600, height: 200))
@@ -99,6 +99,15 @@ final class TextInputTests: XCTestCase {
         // Replacement text from an input method is not auto-paired.
         view.insertText("\"", replacementRange: NSRange(location: 0, length: 1))
         XCTAssertEqual(doc.lines(first: 0, count: 1), ["\")"])
+    }
+
+    func testToggleCommentUsesDetectedLanguageMarker() throws {
+        let (view, doc, url) = try makeView(text: "  let value = 1", extension: "rs")
+        defer { try? FileManager.default.removeItem(at: url) }
+        view.toggleComment(nil)
+        XCTAssertEqual(doc.lines(first: 0, count: 1), ["  // let value = 1"])
+        view.toggleComment(nil)
+        XCTAssertEqual(doc.lines(first: 0, count: 1), ["  let value = 1"])
     }
 
     func testAttributedSubstringAndRangesAreDocumentWide() throws {

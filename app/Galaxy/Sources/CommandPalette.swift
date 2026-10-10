@@ -29,6 +29,7 @@ final class CommandPaletteView: NSView, NSTextFieldDelegate, NSTableViewDataSour
         "editor.action.clipboardCopyAction": #selector(EditorView.copy(_:)),
         "editor.action.clipboardPasteAction": #selector(EditorView.paste(_:)),
         "editor.action.selectAll": #selector(EditorView.selectAll(_:)),
+        "editor.action.commentLine": #selector(EditorView.toggleComment(_:)),
         "editor.action.addSelectionToNextFindMatch": #selector(EditorView.selectNextOccurrence(_:)),
         "editor.action.selectHighlights": #selector(EditorView.selectAllOccurrences(_:)),
         "editor.action.insertCursorAbove": #selector(EditorView.addCursorAbove(_:)),

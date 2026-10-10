@@ -77,6 +77,16 @@ impl SyntaxLanguage {
         }
     }
 
+    /// Preferred line-wise comment marker. Block-only languages intentionally
+    /// return none: inserting only an opening marker would create invalid code.
+    pub fn comment_marker(self) -> Option<&'static str> {
+        match self {
+            Self::Rust | Self::TypeScript | Self::Tsx | Self::JavaScript | Self::Go => Some("//"),
+            Self::Toml | Self::Yaml | Self::Python | Self::Bash => Some("#"),
+            Self::Json | Self::Html | Self::Css | Self::Markdown => None,
+        }
+    }
+
     pub fn grammar(self) -> Language {
         match self {
             Self::Rust => tree_sitter_rust::LANGUAGE.into(),
@@ -786,6 +796,14 @@ mod tests {
             Some(SyntaxLanguage::Bash)
         );
         assert_eq!(SyntaxLanguage::detect("notes.txt", "hello"), None);
+    }
+
+    #[test]
+    fn comment_markers_only_include_line_comment_languages() {
+        assert_eq!(SyntaxLanguage::Rust.comment_marker(), Some("//"));
+        assert_eq!(SyntaxLanguage::Python.comment_marker(), Some("#"));
+        assert_eq!(SyntaxLanguage::Json.comment_marker(), None);
+        assert_eq!(SyntaxLanguage::Html.comment_marker(), None);
     }
 
     #[test]

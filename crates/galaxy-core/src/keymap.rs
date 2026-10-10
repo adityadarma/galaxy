@@ -181,6 +181,7 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("cmd+c", "editor.action.clipboardCopyAction"),
     ("cmd+v", "editor.action.clipboardPasteAction"),
     ("cmd+a", "editor.action.selectAll"),
+    ("cmd+/", "editor.action.commentLine"),
     ("cmd+d", "editor.action.addSelectionToNextFindMatch"),
     ("cmd+shift+l", "editor.action.selectHighlights"),
     ("alt+cmd+up", "editor.action.insertCursorAbove"),

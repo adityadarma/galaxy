@@ -733,6 +733,7 @@ pub enum EditCommand {
     Newline,
     Indent,
     Outdent,
+    ToggleComment,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
@@ -1259,6 +1260,10 @@ impl DocumentHandle {
     pub fn edit(&self, command: EditCommand) {
         let mut st = self.lock();
         let cfg = st.indent;
+        let comment_marker = st
+            .syntax
+            .as_ref()
+            .and_then(|syntax| syntax.language.comment_marker());
         {
             let ed = &mut st.editor;
             let (doc, sel) = (&ed.doc, &ed.sel);
@@ -1286,6 +1291,10 @@ impl DocumentHandle {
                 EditCommand::Newline => (edit::newline(doc, sel, &cfg), EditKind::Other),
                 EditCommand::Indent => (edit::indent(doc, sel, &cfg), EditKind::Other),
                 EditCommand::Outdent => (edit::outdent(doc, sel, &cfg), EditKind::Other),
+                EditCommand::ToggleComment => match comment_marker {
+                    Some(marker) => (edit::toggle_comment(doc, sel, marker), EditKind::Other),
+                    None => return,
+                },
             };
             ed.apply(tx, kind, Instant::now());
         }

@@ -60,6 +60,12 @@ extension EditorView: @preconcurrency NSTextInputClient {
         didChangeDocument()
     }
 
+    @objc func toggleComment(_ sender: Any?) {
+        guard let document else { return }
+        document.edit(command: .toggleComment)
+        didChangeDocument()
+    }
+
     /// Refreshes size and drawing after the core changed, and keeps the
     /// primary caret in view.
     func didChangeDocument() {

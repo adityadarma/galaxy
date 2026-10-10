@@ -106,6 +106,7 @@ enum MainMenu {
         editMenu.addItem(withTitle: "Copy", action: #selector(EditorView.copy(_:)), keyEquivalent: "c")
         editMenu.addItem(withTitle: "Paste", action: #selector(EditorView.paste(_:)), keyEquivalent: "v")
         editMenu.addItem(withTitle: "Select All", action: #selector(EditorView.selectAll(_:)), keyEquivalent: "a")
+        editMenu.addItem(withTitle: "Toggle Line Comment", action: #selector(EditorView.toggleComment(_:)), keyEquivalent: "/")
         editItem.submenu = editMenu
         main.addItem(editItem)
         main.addItem(selectionItem)
