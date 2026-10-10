@@ -11,11 +11,144 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
+use std::time::Instant;
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::runtime::Runtime;
+
+use crate::change::ChangeSet;
+use crate::document::Document;
+
+pub const DOCUMENT_SYNC_DEBOUNCE: Duration = Duration::from_millis(50);
+
+/// One pending `textDocument/didChange` batch. Contiguous edits retain a
+/// UTF-16 range; a burst/multi-cursor batch falls back to full text safely.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingChange {
+    pub version: u64,
+    pub text: String,
+    pub range: Option<Range>,
+    pub range_length: Option<u64>,
+    due_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Range {
+    pub start_line: u64,
+    pub start_character: u64,
+    pub end_line: u64,
+    pub end_character: u64,
+}
+
+/// Tracks LSP document versions and debounces outgoing changes.
+#[derive(Debug)]
+pub struct DocumentSync {
+    uri: String,
+    language_id: String,
+    version: u64,
+    pending: Option<PendingChange>,
+}
+
+impl DocumentSync {
+    pub fn new(uri: String, language_id: String) -> Self {
+        Self {
+            uri,
+            language_id,
+            version: 1,
+            pending: None,
+        }
+    }
+
+    pub fn did_open(&self, doc: &Document) -> Value {
+        serde_json::json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":self.uri,"languageId":self.language_id,"version":self.version,"text":doc.text()}}})
+    }
+
+    /// Records a change made to `before`; `after` must be the resulting doc.
+    /// More than one change uses full text to avoid transformed offset bugs.
+    pub fn note_change(
+        &mut self,
+        before: &Document,
+        after: &Document,
+        changes: &ChangeSet,
+        now: Instant,
+    ) {
+        self.version += 1;
+        let range = (changes.len() == 1)
+            .then(|| changes.iter().next())
+            .flatten()
+            .map(|change| {
+                let start = before.char_to_utf16(change.start());
+                let end = before.char_to_utf16(change.end());
+                Range {
+                    start_line: start.line as u64,
+                    start_character: start.col as u64,
+                    end_line: end.line as u64,
+                    end_character: end.col as u64,
+                }
+            });
+        let range_length = (changes.len() == 1)
+            .then(|| changes.iter().next())
+            .flatten()
+            .map(|change| {
+                let start = before.rope().char_to_utf16_cu(change.start());
+                let end = before.rope().char_to_utf16_cu(change.end());
+                (end - start) as u64
+            });
+        let text = if let Some(change) = changes.iter().next().filter(|_| changes.len() == 1) {
+            change.text().to_owned()
+        } else {
+            after.text()
+        };
+        let incremental = range.is_some();
+        match &mut self.pending {
+            Some(pending) => {
+                // A second edit invalidates a former range against the server's
+                // version, so collapse this debounce batch to full text.
+                pending.version = self.version;
+                pending.text = after.text();
+                pending.range = None;
+                pending.range_length = None;
+                pending.due_at = now + DOCUMENT_SYNC_DEBOUNCE;
+            }
+            None => {
+                self.pending = Some(PendingChange {
+                    version: self.version,
+                    text,
+                    range: incremental.then_some(range.unwrap()),
+                    range_length: incremental.then_some(range_length.unwrap()),
+                    due_at: now + DOCUMENT_SYNC_DEBOUNCE,
+                })
+            }
+        }
+    }
+
+    pub fn flush(&mut self, now: Instant) -> Option<Value> {
+        let pending = self
+            .pending
+            .as_ref()
+            .filter(|pending| now >= pending.due_at)?;
+        let content = match pending.range {
+            Some(range) => {
+                serde_json::json!({"range":{"start":{"line":range.start_line,"character":range.start_character},"end":{"line":range.end_line,"character":range.end_character}},"rangeLength":pending.range_length,"text":pending.text})
+            }
+            None => serde_json::json!({"text":pending.text}),
+        };
+        let version = pending.version;
+        self.pending = None;
+        Some(
+            serde_json::json!({"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":self.uri,"version":version},"contentChanges":[content]}}),
+        )
+    }
+
+    pub fn did_save(&self) -> Value {
+        serde_json::json!({"jsonrpc":"2.0","method":"textDocument/didSave","params":{"textDocument":{"uri":self.uri}}})
+    }
+    pub fn did_close(&self) -> Value {
+        serde_json::json!({"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":self.uri}}})
+    }
+}
 
 /// A language server is shared by all documents with this language and root.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -161,6 +294,7 @@ struct ManagedServer {
 #[derive(Default)]
 pub struct LspManager {
     servers: HashMap<LspKey, ManagedServer>,
+    documents: HashMap<String, (LspKey, DocumentSync)>,
 }
 
 impl LspManager {
@@ -200,6 +334,74 @@ impl LspManager {
         self.servers.is_empty()
     }
 
+    /// Sends a notification to one initialized or initializing server.
+    pub fn send(&self, key: &LspKey, message: &Value) -> io::Result<()> {
+        self.servers
+            .get(key)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "language server is not running")
+            })?
+            .transport
+            .send(message)
+    }
+
+    /// Registers a document and immediately sends `didOpen` to its shared server.
+    pub fn open_document(
+        &mut self,
+        key: LspKey,
+        uri: String,
+        language_id: String,
+        doc: &Document,
+    ) -> io::Result<()> {
+        let sync = DocumentSync::new(uri.clone(), language_id);
+        self.send(&key, &sync.did_open(doc))?;
+        self.documents.insert(uri, (key, sync));
+        Ok(())
+    }
+
+    /// Queues a document change. Use [`Self::flush_changes`] from the app's
+    /// event loop; it sends only batches whose debounce deadline has passed.
+    pub fn note_document_change(
+        &mut self,
+        uri: &str,
+        before: &Document,
+        after: &Document,
+        changes: &ChangeSet,
+        now: Instant,
+    ) {
+        if let Some((_, sync)) = self.documents.get_mut(uri) {
+            sync.note_change(before, after, changes, now);
+        }
+    }
+
+    pub fn flush_changes(&mut self, now: Instant) -> Vec<io::Error> {
+        let ready: Vec<_> = self
+            .documents
+            .values_mut()
+            .filter_map(|(key, sync)| sync.flush(now).map(|message| (key.clone(), message)))
+            .collect();
+        ready
+            .into_iter()
+            .filter_map(|(key, message)| self.send(&key, &message).err())
+            .collect()
+    }
+
+    pub fn save_document(&self, uri: &str) -> io::Result<()> {
+        let (key, sync) = self
+            .documents
+            .get(uri)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "LSP document is not open"))?;
+        self.send(key, &sync.did_save())
+    }
+
+    pub fn close_document(&mut self, uri: &str) -> io::Result<()> {
+        let (key, sync) = self
+            .documents
+            .remove(uri)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "LSP document is not open"))?;
+        self.send(&key, &sync.did_close())
+    }
+
     /// Drains server output without blocking. An initialize response with ID 0
     /// transitions the server and emits the mandatory `initialized` notification.
     pub fn poll(&mut self) -> Vec<LspEvent> {
@@ -233,6 +435,7 @@ impl LspManager {
                 .send(&serde_json::json!({"jsonrpc": "2.0", "method": "exit", "params": {}}));
         }
         self.servers.clear();
+        self.documents.clear();
     }
 }
 
@@ -542,5 +745,92 @@ mod tests {
             find_in_path(&executable.to_string_lossy()),
             Some(executable)
         );
+    }
+
+    #[test]
+    fn document_sync_uses_utf16_ranges_and_debounces_bursts() {
+        let before = Document::from_text("a😀中b");
+        let mut after = before.clone();
+        let change = ChangeSet::new(
+            vec![crate::change::Change::new(1, 3, "X")],
+            before.len_chars(),
+        );
+        after.apply(&change);
+        let now = Instant::now();
+        let mut sync = DocumentSync::new("file:///test.rs".into(), "rust".into());
+        assert_eq!(
+            sync.did_open(&before)["params"]["textDocument"]["text"],
+            "a😀中b"
+        );
+        sync.note_change(&before, &after, &change, now);
+        assert!(sync.flush(now).is_none());
+        let message = sync.flush(now + DOCUMENT_SYNC_DEBOUNCE).unwrap();
+        let content = &message["params"]["contentChanges"][0];
+        assert_eq!(content["range"]["start"]["character"], 1);
+        assert_eq!(content["range"]["end"]["character"], 4);
+        assert_eq!(content["rangeLength"], 3);
+        assert_eq!(content["text"], "X");
+
+        let next = ChangeSet::new(
+            vec![crate::change::Change::insert(1, "!")],
+            after.len_chars(),
+        );
+        let mut newest = after.clone();
+        newest.apply(&next);
+        sync.note_change(&after, &newest, &next, now + DOCUMENT_SYNC_DEBOUNCE);
+        sync.note_change(
+            &newest,
+            &newest,
+            &ChangeSet::new(
+                vec![crate::change::Change::insert(0, "?")],
+                newest.len_chars(),
+            ),
+            now + DOCUMENT_SYNC_DEBOUNCE + Duration::from_millis(1),
+        );
+        let burst = sync.flush(now + DOCUMENT_SYNC_DEBOUNCE * 3).unwrap();
+        assert!(burst["params"]["contentChanges"][0].get("range").is_none());
+        assert_eq!(sync.did_save()["method"], "textDocument/didSave");
+        assert_eq!(sync.did_close()["method"], "textDocument/didClose");
+    }
+
+    #[test]
+    fn manager_sends_document_lifecycle_notifications() {
+        let args = vec![
+            "-c".to_owned(),
+            "read _; read _; body='{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{}}'; printf 'Content-Length: %s\\r\\n\\r\\n%s' \"${#body}\" \"$body\"; sleep 1".to_owned(),
+        ];
+        let key = LspKey {
+            language: "rust".into(),
+            root: PathBuf::from("/workspace"),
+        };
+        let config = ServerConfig {
+            program: "/bin/sh".into(),
+            args,
+            log_traffic: false,
+            initialization_options: Value::Null,
+        };
+        let mut manager = LspManager::default();
+        manager.ensure_server(key.clone(), &config).unwrap();
+        let doc = Document::from_text("a😀");
+        manager
+            .open_document(key, "file:///doc.rs".into(), "rust".into(), &doc)
+            .unwrap();
+        let change = ChangeSet::new(
+            vec![crate::change::Change::insert(doc.len_chars(), "!")],
+            doc.len_chars(),
+        );
+        let mut after = doc.clone();
+        after.apply(&change);
+        let now = Instant::now();
+        manager.note_document_change("file:///doc.rs", &doc, &after, &change, now);
+        assert!(manager.flush_changes(now).is_empty());
+        assert!(
+            manager
+                .flush_changes(now + DOCUMENT_SYNC_DEBOUNCE)
+                .is_empty()
+        );
+        manager.save_document("file:///doc.rs").unwrap();
+        manager.close_document("file:///doc.rs").unwrap();
+        assert!(manager.save_document("file:///doc.rs").is_err());
     }
 }
