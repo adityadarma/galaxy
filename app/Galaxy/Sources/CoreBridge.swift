@@ -120,6 +120,14 @@ final class CoreBridge {
         try document.save()
     }
 
+    func requestCodeActions(document: DocumentHandle, line: UInt64, character: UInt64) {
+        _ = core.requestCodeActions(document: document, line: line, character: character)
+    }
+
+    func codeActions(document: DocumentHandle) -> [CodeActionInfo] {
+        core.codeActions(document: document)
+    }
+
     fileprivate func deliver(_ event: CoreEvent) {
         lastEvent = event
         if case let .pong(message) = event {

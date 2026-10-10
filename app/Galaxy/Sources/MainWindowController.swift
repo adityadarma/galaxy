@@ -31,6 +31,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private let hoverPopover = HoverPopover()
     private let completionPopup = CompletionPopup()
     private let signaturePopup = SignaturePopup()
+    private let codeActionPopup = CodeActionPopup()
     private var completionQuery = ""
     private var completionPosition = TextPos(line: 0, colUtf16: 0)
     private var hoverPosition: TextPos?
@@ -102,6 +103,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private var definitionRequest: (document: DocumentHandle, position: TextPos)?
     private var referencesRequest: DocumentHandle?
     private var renameRequest: DocumentHandle?
+    private var codeActionRequest: DocumentHandle?
     private var keyMonitor: Any?
     /// Tabs in the order they were last shown, most recent first (⌃Tab).
     private var tabOrderByUse: [ObjectIdentifier] = []
@@ -512,6 +514,46 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             bridge.syncLSP(document: target)
         }
         updateEditedState()
+    }
+
+    @objc func showCodeActions(_ sender: Any?) {
+        guard let document = activeTab?.doc else { NSSound.beep(); return }
+        let position = document.viewport(firstLine: 0, count: 0).primary
+        codeActionRequest = document
+        bridge.requestCodeActions(document: document, line: position.line, character: position.colUtf16)
+    }
+
+    private func refreshCodeActions() {
+        guard let document = codeActionRequest else { return }
+        let actions = bridge.codeActions(document: document)
+        guard !actions.isEmpty else { return }
+        codeActionRequest = nil
+        codeActionPopup.update(actions)
+        codeActionPopup.isHidden = false
+        codeActionPopup.frame = NSRect(x: editorView.textOriginX + 8, y: editorView.metrics.lineHeight + 8, width: 420, height: 156)
+        window?.makeFirstResponder(editorView)
+    }
+
+    private func applyCodeAction(_ action: CodeActionInfo) {
+        codeActionPopup.isHidden = true
+        var grouped: [String: [RenameEdit]] = [:]
+        for edit in action.edits { grouped[edit.uri, default: []].append(edit) }
+        for (uri, edits) in grouped {
+            guard let path = URL(string: uri)?.path else { continue }
+            let wasOpen = tabs.contains { $0.doc.path() == path }
+            let target: DocumentHandle
+            if let tab = tabs.first(where: { $0.doc.path() == path }) {
+                target = tab.doc
+            } else {
+                guard let opened = try? bridge.openDocument(path: path) else { continue }
+                target = opened
+            }
+            _ = bridge.applyRenameEdits(document: target, edits: edits)
+            if !wasOpen { try? bridge.save(document: target) }
+            bridge.syncLSP(document: target)
+        }
+        updateEditedState()
+        editorView.needsDisplay = true
     }
 
     @objc func goToDefinition(_ sender: Any?) {

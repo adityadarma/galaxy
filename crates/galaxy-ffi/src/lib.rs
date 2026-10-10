@@ -709,6 +709,50 @@ impl Core {
             .collect()
     }
 
+    pub fn request_code_actions(
+        &self,
+        document: Arc<DocumentHandle>,
+        line: u64,
+        character: u64,
+    ) -> bool {
+        let path = document.path();
+        if path.is_empty() {
+            return false;
+        }
+        let uri = file_uri(Path::new(&path));
+        let mut lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
+        let diagnostics = lsp.diagnostics(&uri).to_vec();
+        let range = galaxy_core::lsp::Range {
+            start_line: line,
+            start_character: character,
+            end_line: line,
+            end_character: character,
+        };
+        lsp.request_code_actions(&uri, range, &diagnostics, Instant::now())
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    pub fn code_actions(&self, document: Arc<DocumentHandle>) -> Vec<CodeActionInfo> {
+        let path = document.path();
+        if path.is_empty() {
+            return Vec::new();
+        }
+        let uri = file_uri(Path::new(&path));
+        self.lsp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .code_actions(&uri)
+            .iter()
+            .map(|action| CodeActionInfo {
+                title: action.title.clone(),
+                kind: action.kind.clone(),
+                edits: action.edits.iter().map(rename_edit).collect(),
+            })
+            .collect()
+    }
+
     pub fn problems(&self) -> Vec<ProblemInfo> {
         let lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
         lsp.problems()
@@ -811,6 +855,24 @@ pub struct RenameEdit {
     pub end_line: u64,
     pub end_character: u64,
     pub new_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct CodeActionInfo {
+    pub title: String,
+    pub kind: Option<String>,
+    pub edits: Vec<RenameEdit>,
+}
+
+fn rename_edit(edit: &galaxy_core::lsp::RenameEdit) -> RenameEdit {
+    RenameEdit {
+        uri: edit.uri.clone(),
+        start_line: edit.range.start_line,
+        start_character: edit.range.start_character,
+        end_line: edit.range.end_line,
+        end_character: edit.range.end_character,
+        new_text: edit.new_text.clone(),
+    }
 }
 
 enum DefinitionKind {

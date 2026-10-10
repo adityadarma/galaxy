@@ -143,6 +143,8 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
   - Status: `textDocument/references`, parsing lokasi, panel hasil, navigasi ke file/baris, dan menu Find References selesai.
 - [x] M4-12 — Rename symbol: input inline, terapkan `WorkspaceEdit` ke file terbuka dan tertutup, satu langkah undo per file.
   - Status: request `textDocument/rename`, parsing `WorkspaceEdit`, input nama simbol, apply UTF-16 edits satu undo step per file, file tertutup disimpan, dan file terbuka tetap dirty selesai.
+- [x] M4-13 — Code actions / quick fix: tampilkan action LSP melalui `Cmd+.`, terapkan `WorkspaceEdit` ke file terbuka dan tertutup.
+  - Status: request `textDocument/codeAction` membawa diagnostics aktif, popup action, apply edit satu transaksi per file, dan file tertutup disimpan selesai.
 - [ ] M4-13 — Code actions / quick fix (`Cmd+.`).
 - [ ] M4-14 — Formatting dokumen dan format on save.
 - [ ] M4-15 — `$/progress` dan status server di status bar, termasuk RAM proses server.

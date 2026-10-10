@@ -77,6 +77,13 @@ pub struct RenameEdit {
     pub new_text: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeActionInfo {
+    pub title: String,
+    pub kind: Option<String>,
+    pub edits: Vec<RenameEdit>,
+}
+
 /// Latest server diagnostics, replaced atomically per URI by
 /// `textDocument/publishDiagnostics` as required by LSP.
 #[derive(Debug, Default)]
@@ -499,6 +506,8 @@ pub struct LspManager {
     reference_requests: HashMap<(LspKey, u64), String>,
     rename_edits: HashMap<String, Vec<RenameEdit>>,
     rename_requests: HashMap<(LspKey, u64), String>,
+    code_actions: HashMap<String, Vec<CodeActionInfo>>,
+    code_action_requests: HashMap<(LspKey, u64), String>,
 }
 
 impl LspManager {
@@ -729,6 +738,32 @@ impl LspManager {
         self.rename_edits.get(uri).map(Vec::as_slice).unwrap_or(&[])
     }
 
+    pub fn request_code_actions(
+        &mut self,
+        uri: &str,
+        range: Range,
+        diagnostics: &[Diagnostic],
+        now: Instant,
+    ) -> io::Result<Option<u64>> {
+        let Some(key) = self.documents.get(uri).map(|(key, _)| key.clone()) else {
+            return Ok(None);
+        };
+        self.code_actions.remove(uri);
+        let diagnostics = diagnostics.iter().map(|item| serde_json::json!({
+            "range": {"start":{"line":item.range.start_line,"character":item.range.start_character},"end":{"line":item.range.end_line,"character":item.range.end_character}},
+            "severity": match item.severity { DiagnosticSeverity::Error => 1, DiagnosticSeverity::Warning => 2, DiagnosticSeverity::Information => 3, DiagnosticSeverity::Hint => 4 }, "message": item.message
+        })).collect::<Vec<_>>();
+        let id = self.request(&key, "textDocument/codeAction".into(), serde_json::json!({
+            "textDocument": { "uri": uri }, "range": {"start":{"line":range.start_line,"character":range.start_character},"end":{"line":range.end_line,"character":range.end_character}}, "context": { "diagnostics": diagnostics }
+        }), Duration::from_millis(1000), now)?;
+        self.code_action_requests.insert((key, id), uri.to_owned());
+        Ok(Some(id))
+    }
+
+    pub fn code_actions(&self, uri: &str) -> &[CodeActionInfo] {
+        self.code_actions.get(uri).map(Vec::as_slice).unwrap_or(&[])
+    }
+
     /// Sends a notification to one initialized or initializing server.
     pub fn send(&self, key: &LspKey, message: &Value) -> io::Result<()> {
         self.servers
@@ -894,6 +929,9 @@ impl LspManager {
                         if let Some(uri) = self.rename_requests.remove(&(key.clone(), id))
                             && let Some(result) = message.get("result").and_then(parse_workspace_edit)
                         { self.rename_edits.insert(uri, result); }
+                        if let Some(uri) = self.code_action_requests.remove(&(key.clone(), id))
+                            && let Some(result) = message.get("result").and_then(parse_code_actions)
+                        { self.code_actions.insert(uri, result); }
                         if self.requests.remove(&(key.clone(), id)).is_some() {
                             events.push(LspEvent::Response {
                                 key: key.clone(), id,
@@ -1097,6 +1135,32 @@ fn parse_workspace_edit(value: &Value) -> Option<Vec<RenameEdit>> {
         }
     }
     Some(edits)
+}
+
+fn parse_code_actions(value: &Value) -> Option<Vec<CodeActionInfo>> {
+    let items = value.as_array()?;
+    Some(
+        items
+            .iter()
+            .filter_map(|item| {
+                let object = item.as_object()?;
+                let title = object.get("title")?.as_str()?.to_owned();
+                let edits = object
+                    .get("edit")
+                    .and_then(parse_workspace_edit)
+                    .unwrap_or_default();
+                Some(CodeActionInfo {
+                    title,
+                    kind: object
+                        .get("kind")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    edits,
+                })
+            })
+            .filter(|action| !action.edits.is_empty())
+            .collect(),
+    )
 }
 
 fn parse_text_edits(uri: &str, value: &Value, output: &mut Vec<RenameEdit>) {
