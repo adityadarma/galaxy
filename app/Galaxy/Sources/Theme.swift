@@ -3,6 +3,29 @@ import AppKit
 /// Galaxy's own look. Everything else uses system colors, so light and
 /// dark mode, increased contrast and the user's selection color still work.
 enum Theme {
+    private struct SyntaxTheme: Decodable {
+        let scopes: [String: String]
+    }
+
+    private static let lightSyntax = loadSyntaxTheme(named: "Galaxy Light")
+    private static let darkSyntax = loadSyntaxTheme(named: "Galaxy Dark")
+
+    /// A semantic syntax color for the current system appearance. JSON keeps
+    /// the palette editable without coupling the renderer to Rust scopes.
+    static func syntax(_ scope: String, appearance: NSAppearance) -> NSColor {
+        let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let hex = (dark ? darkSyntax : lightSyntax)[scope]
+        return hex.flatMap(NSColor.init(hex:)) ?? .textColor
+    }
+
+    private static func loadSyntaxTheme(named name: String) -> [String: String] {
+        guard let url = Bundle(for: AppDelegate.self).url(forResource: name, withExtension: "json"),
+              let data = try? Data(contentsOf: url),
+              let theme = try? JSONDecoder().decode(SyntaxTheme.self, from: data) else {
+            return [:]
+        }
+        return theme.scopes
+    }
     /// Soft copper: caret, find matches, the active activity item and tab.
     static let accent = NSColor(name: "GalaxyAccent") { appearance in
         let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
@@ -56,5 +79,14 @@ extension NSColor {
         var color = self
         appearance.performAsCurrentDrawingAppearance { color = self.usingColorSpace(.sRGB) ?? self }
         return color
+    }
+}
+
+extension NSColor {
+    fileprivate convenience init?(hex: String) {
+        guard hex.count == 7, hex.first == "#", let value = UInt32(hex.dropFirst(), radix: 16) else { return nil }
+        self.init(srgbRed: CGFloat((value >> 16) & 0xff) / 255,
+                  green: CGFloat((value >> 8) & 0xff) / 255,
+                  blue: CGFloat(value & 0xff) / 255, alpha: 1)
     }
 }

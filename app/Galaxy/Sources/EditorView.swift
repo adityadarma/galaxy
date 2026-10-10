@@ -120,6 +120,13 @@ final class EditorView: NSView {
     override var isOpaque: Bool { true }
     override var acceptsFirstResponder: Bool { true }
 
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        // Syntax CTLines contain resolved theme colors, unlike the cached
+        // monochrome layouts, so recreate them under the new appearance.
+        needsDisplay = true
+    }
+
     // MARK: Geometry
 
     /// Width of the line-number column; grows with the number of digits.
@@ -385,6 +392,7 @@ final class EditorView: NSView {
         // The view is flipped (y grows downward); flip glyphs back upright.
         context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
 
+        let stylesByLine = Dictionary(grouping: snapshot.styles, by: { $0.line })
         for line in snapshot.lines {
             let top = CGFloat(line.line) * lineHeight
             let hasCaret = !line.carets.isEmpty
@@ -415,11 +423,13 @@ final class EditorView: NSView {
                 context.fill(CGRect(x: x0, y: top, width: max(0, x1 - x0), height: lineHeight))
             }
 
-            // Text, in the context fill colour (see `layout(for:)`).
+            // Text uses a one-frame attributed layout only if Tree-sitter
+            // supplied semantic runs; otherwise the shared plain cache wins.
             if !line.text.isEmpty {
                 context.setFillColor(NSColor.textColor.cgColor)
                 context.textPosition = CGPoint(x: originX, y: top + metrics.ascent)
-                CTLineDraw(layout(for: line.text), context)
+                let styles = stylesByLine[line.line] ?? []
+                CTLineDraw(styles.isEmpty ? layout(for: line.text) : syntaxLayout(for: line.text, styles: styles), context)
             }
 
             // IME marked text: thin underline under the preedit.
@@ -470,5 +480,23 @@ final class EditorView: NSView {
         layouts.insert(line, for: text)
         layoutsCreated += 1
         return line
+    }
+
+    /// A colored layout is intentionally not cached: style runs, selection
+    /// and macOS appearance change independently while plain layouts are
+    /// shared for drawing, hit-testing and scrolling.
+    private func syntaxLayout(for text: String, styles: [StyleRun]) -> CTLine {
+        let fromContext = NSAttributedString.Key(kCTForegroundColorFromContextAttributeName as String)
+        let attributed = NSMutableAttributedString(string: text, attributes: [.font: font, fromContext: true])
+        let length = (text as NSString).length
+        for style in styles {
+            let start = min(Int(style.start), length)
+            let end = min(Int(style.end), length)
+            guard start < end else { continue }
+            attributed.addAttribute(.foregroundColor,
+                                    value: Theme.syntax(style.scope, appearance: effectiveAppearance),
+                                    range: NSRange(location: start, length: end - start))
+        }
+        return CTLineCreateWithAttributedString(attributed)
     }
 }

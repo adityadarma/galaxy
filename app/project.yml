@@ -37,6 +37,7 @@ targets:
     platform: macOS
     sources:
       - path: Galaxy/Sources
+      - path: Galaxy/Resources
       - path: Galaxy/Generated
         optional: true
     settings:
