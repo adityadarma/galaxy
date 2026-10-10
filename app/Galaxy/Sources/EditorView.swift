@@ -76,6 +76,7 @@ final class EditorView: NSView {
     /// record a far click in the back/forward history (M2-08).
     var onClickMove: ((CursorInfo, CursorInfo) -> Void)?
     var onHover: ((TextPos, NSPoint) -> Void)?
+    var onCompletionKey: ((NSEvent) -> Bool)?
     /// A change is waiting for the next frame.
     private(set) var hasPendingChange = false
     /// How many times pending work was flushed (tests check coalescing).
@@ -123,7 +124,7 @@ final class EditorView: NSView {
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         trackingAreas.forEach(removeTrackingArea)
-        let area = NSTrackingArea(rect: bounds, options: [.activeInKeyWindow, .mouseMoved, .mouseExited, .inVisibleRect], owner: self)
+        let area = NSTrackingArea(rect: bounds, options: [.activeInKeyWindow, .mouseMoved, .inVisibleRect], owner: self)
         addTrackingArea(area)
     }
 
@@ -132,7 +133,6 @@ final class EditorView: NSView {
         onHover?(textPosition(at: point), point)
     }
 
-    override func mouseExited(with event: NSEvent) { onHover?(TextPos(line: UInt64.max, colUtf16: 0), .zero) }
     override var acceptsFirstResponder: Bool { true }
 
     override func viewDidChangeEffectiveAppearance() {

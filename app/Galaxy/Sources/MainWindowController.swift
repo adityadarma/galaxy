@@ -28,6 +28,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private let scrollView = DiagnosticScrollView()
     private let problemsPanel = ProblemsPanel()
     private let hoverPopover = HoverPopover()
+    private let completionPopup = CompletionPopup()
+    private var completionQuery = ""
+    private var completionPosition = TextPos(line: 0, colUtf16: 0)
     private var hoverPosition: TextPos?
     private var hoverPoint = NSPoint.zero
     private var hoverDocument: DocumentHandle?
@@ -176,6 +179,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             self?.refreshFindStatus()
             if let document = self?.activeTab?.doc { self?.bridge.syncLSP(document: document) }
             self?.bridge.pollLSP()
+            self?.requestCompletionIfNeeded()
         }
         editorView.onClickMove = { [weak self] before, after in
             guard let self, let tab = self.activeTab else { return }
@@ -256,6 +260,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             Task { @MainActor [weak self] in
                 self?.bridge.pollLSP()
                 self?.refreshHover()
+                self?.refreshCompletion()
                 let problems = self?.bridge.core.problems() ?? []
                 self?.problemsPanel.update(problems)
                 self?.problemsPanel.isHidden = problems.isEmpty
@@ -279,6 +284,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         detailView.addSubview(scrollView)
         detailView.addSubview(problemsPanel)
         detailView.addSubview(hoverPopover)
+        detailView.addSubview(completionPopup)
         NSLayoutConstraint.activate([
             tabBar.topAnchor.constraint(equalTo: detailView.topAnchor),
             tabBar.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
@@ -301,6 +307,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         problemsPanel.onSelect = { [weak self] problem in self?.showProblem(problem) }
         problemsPanel.isHidden = true
         hoverPopover.isHidden = true
+        completionPopup.isHidden = true
+        completionPopup.onClose = { [weak self] in self?.closeCompletion() }
+        completionPopup.onSelect = { [weak self] item in self?.acceptCompletion(item) }
+        editorView.onCompletionKey = { [weak self] event in self?.handleCompletionKey(event) ?? false }
 
         buildSidebar()
 
@@ -368,6 +378,53 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         hoverPopover.isHidden = false
         hoverPopover.frame = NSRect(x: hoverPoint.x + 14, y: hoverPoint.y + 18, width: 360, height: 72)
         hoverPopover.needsDisplay = true
+    }
+
+    private func requestCompletionIfNeeded() {
+        guard let document = activeTab?.doc else { return }
+        let position = document.viewport(firstLine: 0, count: 0).primary
+        completionPosition = TextPos(line: position.line, colUtf16: position.colUtf16)
+        let line = document.displayLine(line: position.line)
+        let column = Int(position.colUtf16)
+        let prefix = String(line.prefix(max(0, min(column, line.count))))
+            .split(whereSeparator: { !$0.isLetter && !$0.isNumber && $0 != "_" }).last.map(String.init) ?? ""
+        completionQuery = prefix
+        bridge.requestCompletion(document: document, line: position.line, character: position.colUtf16)
+    }
+
+    private func refreshCompletion() {
+        guard let document = activeTab?.doc else { return }
+        let items = bridge.completions(document: document)
+        guard !items.isEmpty else {
+            completionPopup.isHidden = true
+            return
+        }
+        completionPopup.update(items, query: completionQuery)
+        completionPopup.isHidden = false
+        completionPopup.frame = NSRect(x: editorView.textOriginX + 8, y: CGFloat(completionPosition.line + 1) * editorView.metrics.lineHeight + 8, width: 420, height: 192)
+    }
+
+    private func closeCompletion() { completionPopup.isHidden = true }
+
+    private func handleCompletionKey(_ event: NSEvent) -> Bool {
+        guard !completionPopup.isHidden else { return false }
+        switch event.keyCode {
+        case 125: completionPopup.move(1); return true
+        case 126: completionPopup.move(-1); return true
+        case 36, 76: completionPopup.accept(); return true
+        case 53: completionPopup.cancel(); return true
+        default: return false
+        }
+    }
+
+    private func acceptCompletion(_ item: CompletionInfo) {
+        guard let document = activeTab?.doc else { return }
+        let text = item.isSnippet ? item.insertText.replacingOccurrences(of: #"\$\d+"#, with: "", options: .regularExpression) : item.insertText
+        let start = completionPosition.colUtf16 >= UInt64(completionQuery.utf16.count) ? completionPosition.colUtf16 - UInt64(completionQuery.utf16.count) : 0
+        let offset = document.utf16Offset(pos: TextPos(line: completionPosition.line, colUtf16: start))
+        document.commitText(text: text, replacement: Utf16Range(location: offset, length: UInt64(completionQuery.utf16.count)))
+        closeCompletion()
+        editorView.needsDisplay = true
     }
 
     private func buildSidebar() {

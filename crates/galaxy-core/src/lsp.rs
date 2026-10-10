@@ -47,6 +47,15 @@ pub struct HoverInfo {
     pub range: Option<Range>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionItem {
+    pub label: String,
+    pub detail: Option<String>,
+    pub insert_text: String,
+    pub is_snippet: bool,
+    pub sort_text: Option<String>,
+}
+
 /// Latest server diagnostics, replaced atomically per URI by
 /// `textDocument/publishDiagnostics` as required by LSP.
 #[derive(Debug, Default)]
@@ -459,6 +468,8 @@ pub struct LspManager {
     diagnostics: DiagnosticStore,
     hover: HashMap<String, HoverInfo>,
     hover_requests: HashMap<(LspKey, u64), String>,
+    completion: HashMap<String, Vec<CompletionItem>>,
+    completion_requests: HashMap<(LspKey, u64), String>,
 }
 
 impl LspManager {
@@ -538,6 +549,27 @@ impl LspManager {
 
     pub fn hover(&self, uri: &str) -> Option<&HoverInfo> {
         self.hover.get(uri)
+    }
+
+    pub fn request_completion(
+        &mut self,
+        uri: &str,
+        line: u64,
+        character: u64,
+        now: Instant,
+    ) -> io::Result<Option<u64>> {
+        let Some(key) = self.documents.get(uri).map(|(key, _)| key.clone()) else {
+            return Ok(None);
+        };
+        let id = self.request(&key, "textDocument/completion".into(), serde_json::json!({
+            "textDocument": { "uri": uri }, "position": { "line": line, "character": character }, "context": { "triggerKind": 1 }
+        }), Duration::from_millis(1000), now)?;
+        self.completion_requests.insert((key, id), uri.to_owned());
+        Ok(Some(id))
+    }
+
+    pub fn completions(&self, uri: &str) -> &[CompletionItem] {
+        self.completion.get(uri).map(Vec::as_slice).unwrap_or(&[])
     }
 
     /// Sends a notification to one initialized or initializing server.
@@ -690,6 +722,9 @@ impl LspManager {
                         {
                             self.hover.insert(uri, value);
                         }
+                        if let Some(uri) = self.completion_requests.remove(&(key.clone(), id))
+                            && let Some(result) = message.get("result").and_then(parse_completion)
+                        { self.completion.insert(uri, result); }
                         if self.requests.remove(&(key.clone(), id)).is_some() {
                             events.push(LspEvent::Response {
                                 key: key.clone(), id,
@@ -771,6 +806,43 @@ fn parse_hover(value: &Value) -> Option<HoverInfo> {
         contents: text,
         range,
     })
+}
+
+fn parse_completion(value: &Value) -> Option<Vec<CompletionItem>> {
+    let items = value
+        .get("items")
+        .or_else(|| value.as_array().map(|_| value))?
+        .as_array()?;
+    Some(
+        items
+            .iter()
+            .filter_map(|item| {
+                let object = item.as_object()?;
+                let label = object.get("label")?.as_str()?.to_owned();
+                let edit_text = object
+                    .get("textEdit")
+                    .and_then(|edit| edit.get("newText"))
+                    .and_then(Value::as_str);
+                let insert_text = edit_text
+                    .or_else(|| object.get("insertText").and_then(Value::as_str))
+                    .unwrap_or(&label)
+                    .to_owned();
+                Some(CompletionItem {
+                    label,
+                    detail: object
+                        .get("detail")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    insert_text,
+                    is_snippet: object.get("insertTextFormat").and_then(Value::as_u64) == Some(2),
+                    sort_text: object
+                        .get("sortText")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                })
+            })
+            .collect(),
+    )
 }
 
 impl Drop for LspManager {
@@ -1311,5 +1383,17 @@ mod tests {
                 end_character: 5
             })
         );
+    }
+
+    #[test]
+    fn parses_completion_list_and_snippet_format() {
+        let items = parse_completion(&serde_json::json!({"items":[
+            {"label":"println!","detail":"macro","insertText":"println!($0)","insertTextFormat":2},
+            {"label":"print","textEdit":{"newText":"print"}}
+        ]}))
+        .unwrap();
+        assert_eq!(items[0].label, "println!");
+        assert!(items[0].is_snippet);
+        assert_eq!(items[1].insert_text, "print");
     }
 }

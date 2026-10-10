@@ -496,6 +496,46 @@ impl Core {
             })
     }
 
+    pub fn request_completion(
+        &self,
+        document: Arc<DocumentHandle>,
+        line: u64,
+        character: u64,
+    ) -> bool {
+        let path = document.path();
+        if path.is_empty() {
+            return false;
+        }
+        let uri = file_uri(Path::new(&path));
+        self.lsp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .request_completion(&uri, line, character, Instant::now())
+            .ok()
+            .flatten()
+            .is_some()
+    }
+
+    pub fn completions(&self, document: Arc<DocumentHandle>) -> Vec<CompletionInfo> {
+        let path = document.path();
+        if path.is_empty() {
+            return Vec::new();
+        }
+        let uri = file_uri(Path::new(&path));
+        self.lsp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .completions(&uri)
+            .iter()
+            .map(|item| CompletionInfo {
+                label: item.label.clone(),
+                detail: item.detail.clone(),
+                insert_text: item.insert_text.clone(),
+                is_snippet: item.is_snippet,
+            })
+            .collect()
+    }
+
     pub fn problems(&self) -> Vec<ProblemInfo> {
         let lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
         lsp.problems()
@@ -565,6 +605,14 @@ pub struct HoverInfo {
     pub start_character: Option<u64>,
     pub end_line: Option<u64>,
     pub end_character: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct CompletionInfo {
+    pub label: String,
+    pub detail: Option<String>,
+    pub insert_text: String,
+    pub is_snippet: bool,
 }
 
 /// One row of the file explorer.

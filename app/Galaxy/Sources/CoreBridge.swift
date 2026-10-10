@@ -64,6 +64,14 @@ final class CoreBridge {
         core.hover(document: document)
     }
 
+    func requestCompletion(document: DocumentHandle, line: UInt64, character: UInt64) {
+        _ = core.requestCompletion(document: document, line: line, character: character)
+    }
+
+    func completions(document: DocumentHandle) -> [CompletionInfo] {
+        core.completions(document: document)
+    }
+
     fileprivate func deliver(_ event: CoreEvent) {
         lastEvent = event
         if case let .pong(message) = event {

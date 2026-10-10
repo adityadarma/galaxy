@@ -13,6 +13,7 @@ extension EditorView: @preconcurrency NSTextInputClient {
 
     override func keyDown(with event: NSEvent) {
         guard document != nil else { return super.keyDown(with: event) }
+        if onCompletionKey?(event) == true { return }
         LatencyProbe.shared.keyDown(event)
         beginKeyEvent()
         // Routes through the input context, so IMEs see each event once and
