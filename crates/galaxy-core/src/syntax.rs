@@ -125,6 +125,19 @@ impl SyntaxLanguage {
         }
     }
 
+    /// Upstream symbol query where the grammar ships one. Languages without
+    /// a stable tag query deliberately have no outline rather than guesses.
+    pub fn tags_query(self) -> Option<&'static str> {
+        match self {
+            Self::Rust => Some(tree_sitter_rust::TAGS_QUERY),
+            Self::TypeScript | Self::Tsx => Some(tree_sitter_typescript::TAGS_QUERY),
+            Self::JavaScript => Some(tree_sitter_javascript::TAGS_QUERY),
+            Self::Python => Some(tree_sitter_python::TAGS_QUERY),
+            Self::Go => Some(tree_sitter_go::TAGS_QUERY),
+            _ => None,
+        }
+    }
+
     /// Compiles the grammar's query against exactly its matching grammar.
     pub fn compile_highlights(self) -> Result<Query, tree_sitter::QueryError> {
         Query::new(&self.grammar(), self.highlight_query())
@@ -179,6 +192,63 @@ impl SyntaxLanguage {
             _ => None,
         }
     }
+}
+
+/// A definition captured from a completed Tree-sitter tag query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutlineSymbol {
+    pub name: String,
+    pub kind: String,
+    pub line: usize,
+    pub column_utf16: usize,
+}
+
+/// Extracts definitions from a completed tree. This never parses or blocks.
+pub fn outline_symbols(
+    doc: &Document,
+    tree: &Tree,
+    language: SyntaxLanguage,
+) -> Vec<OutlineSymbol> {
+    let Some(source) = language.tags_query() else {
+        return Vec::new();
+    };
+    let Ok(query) = Query::new(&language.grammar(), source) else {
+        return Vec::new();
+    };
+    let names = query.capture_names();
+    let mut cursor = QueryCursor::new();
+    let rope = doc.rope();
+    let source = rope.to_string();
+    let mut out = Vec::new();
+    let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+    while let Some(m) = matches.next() {
+        let mut name = None;
+        let mut kind = None;
+        for capture in m.captures {
+            let capture_name = names[capture.index as usize];
+            if capture_name == "name" {
+                name = Some(capture.node);
+            }
+            if let Some(definition) = capture_name.strip_prefix("definition.") {
+                kind = Some(definition);
+            }
+        }
+        let (Some(name), Some(kind)) = (name, kind) else {
+            continue;
+        };
+        let start = rope.byte_to_char(name.start_byte());
+        let end = rope.byte_to_char(name.end_byte());
+        let pos = doc.char_to_utf16(start);
+        out.push(OutlineSymbol {
+            name: rope.slice(start..end).to_string(),
+            kind: kind.to_owned(),
+            line: pos.line,
+            column_utf16: pos.col,
+        });
+    }
+    out.sort_by_key(|symbol| (symbol.line, symbol.column_utf16));
+    out.dedup_by_key(|symbol| (symbol.line, symbol.column_utf16));
+    out
 }
 
 // These two grammar crates do not export their upstream query. Keep a small,
@@ -804,6 +874,27 @@ mod tests {
         assert_eq!(SyntaxLanguage::Python.comment_marker(), Some("#"));
         assert_eq!(SyntaxLanguage::Json.comment_marker(), None);
         assert_eq!(SyntaxLanguage::Html.comment_marker(), None);
+    }
+
+    #[test]
+    fn extracts_rust_outline_from_completed_tree() {
+        let source = "struct Account;\nimpl Account { fn deposit(&self) {} }\nfn main() {}\n";
+        let doc = Document::from_text(source);
+        let mut parser = Parser::new();
+        parser
+            .set_language(&SyntaxLanguage::Rust.grammar())
+            .unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let symbols = outline_symbols(&doc, &tree, SyntaxLanguage::Rust);
+        assert_eq!(
+            symbols
+                .iter()
+                .map(|symbol| symbol.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Account", "deposit", "main"]
+        );
+        assert_eq!(symbols[0].kind, "class");
+        assert_eq!(symbols[1].kind, "method");
     }
 
     #[test]

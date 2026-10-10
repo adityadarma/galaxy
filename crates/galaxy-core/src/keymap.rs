@@ -170,7 +170,7 @@ pub struct Binding {
 pub const DEFAULTS: &[(&str, &str)] = &[
     ("cmd+n", "workbench.action.files.newUntitledFile"),
     ("cmd+o", "workbench.action.files.openFileFolder"),
-    ("cmd+shift+o", "workbench.action.files.openFolder"),
+    ("cmd+shift+o", "workbench.action.gotoSymbol"),
     ("cmd+s", "workbench.action.files.save"),
     ("cmd+shift+s", "workbench.action.files.saveAs"),
     ("cmd+w", "workbench.action.closeActiveEditor"),

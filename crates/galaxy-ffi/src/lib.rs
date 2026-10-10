@@ -22,7 +22,7 @@ use galaxy_core::multicursor;
 use galaxy_core::navigation::{self, Location, NavHistory};
 use galaxy_core::position::Utf16Position;
 use galaxy_core::selection::{Selection, SelectionSet};
-use galaxy_core::syntax::{SyntaxLanguage, SyntaxService, SyntaxSnapshot};
+use galaxy_core::syntax::{self, SyntaxLanguage, SyntaxService, SyntaxSnapshot};
 use galaxy_core::viewport;
 use galaxy_core::watcher::WorkspaceWatcher;
 use galaxy_core::workspace::Workspace as CoreWorkspace;
@@ -216,6 +216,15 @@ impl CommandPalette {
 pub struct LineTarget {
     pub line: u64,
     pub col: Option<u64>,
+}
+
+/// A definition in the active document's completed Tree-sitter outline.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct OutlineSymbol {
+    pub name: String,
+    pub kind: String,
+    pub line: u64,
+    pub column: u64,
 }
 
 /// Parses Go to Line input (`42`, `42:7`, `-1`). `None` if it is not one.
@@ -1076,6 +1085,31 @@ impl DocumentHandle {
             .is_some()
     }
 
+    /// Definitions from the current completed syntax tree. Parsing stays on
+    /// the syntax worker; callers receive an empty list while it catches up.
+    pub fn outline(&self) -> Vec<OutlineSymbol> {
+        let mut st = self.lock();
+        let revision = st.editor.doc.revision();
+        let (tree, language) = {
+            let Some(syntax) = st.syntax.as_mut() else {
+                return Vec::new();
+            };
+            let Some(snapshot) = syntax.poll(revision) else {
+                return Vec::new();
+            };
+            (snapshot.tree().clone(), syntax.language)
+        };
+        syntax::outline_symbols(&st.editor.doc, &tree, language)
+            .into_iter()
+            .map(|symbol| OutlineSymbol {
+                name: symbol.name,
+                kind: symbol.kind,
+                line: symbol.line as u64,
+                column: symbol.column_utf16 as u64,
+            })
+            .collect()
+    }
+
     /// Plain lines without selection info.
     pub fn lines(&self, first: u64, count: u64) -> Vec<String> {
         self.lock()
@@ -1862,6 +1896,35 @@ mod tests {
             .unwrap();
         assert_eq!(plain.syntax_language(), None);
         assert!(plain.viewport(0, 1).styles.is_empty());
+    }
+
+    #[test]
+    fn outline_uses_the_completed_current_syntax_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outline.rs");
+        std::fs::write(&path, "struct Item;\nfn make() -> Item { Item }\n").unwrap();
+        let doc = Core::new()
+            .open_document(path.to_string_lossy().into_owned())
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let outline = doc.outline();
+            if !outline.is_empty() {
+                assert_eq!(
+                    outline
+                        .iter()
+                        .map(|symbol| symbol.name.as_str())
+                        .collect::<Vec<_>>(),
+                    ["Item", "make"]
+                );
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "syntax worker did not return an outline"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     #[test]

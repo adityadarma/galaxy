@@ -73,6 +73,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private(set) var recentFiles: [String] = []
     private var loadedQuickOpen: QuickOpen?
     private var loadedGoToLine: GoToLine?
+    private var loadedOutlinePicker: OutlinePicker?
     private var loadedPalette: CommandPaletteView?
     /// Command registry (M2-09); kept for the window so recency survives
     /// closing the palette.
@@ -724,9 +725,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         _ = target.perform(action, with: self)
     }
 
-    /// Closes Go to File, Go to Line and the palette, whichever is open.
+    /// Closes Go to File, Go to Line, Go to Symbol and the palette, whichever is open.
     private func closeOverlays() {
         if isQuickOpenVisible { closeGoToFile() }
+        if isOutlinePickerVisible { closeGoToSymbol() }
         if isGoToLineVisible { closeGoToLine() }
         if isCommandPaletteVisible {
             commandPalette.isHidden = true
@@ -1060,6 +1062,60 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         editorView.didChangeSelection()
         editorView.revealLine(Int(min(line, tab.doc.lineCount() - 1)))
         window?.makeFirstResponder(editorView)
+    }
+
+    // MARK: Go to Symbol (M3-10)
+
+    var isOutlinePickerVisible: Bool { loadedOutlinePicker.map { !$0.isHidden } ?? false }
+
+    var outlinePicker: OutlinePicker {
+        if let panel = loadedOutlinePicker { return panel }
+        let panel = OutlinePicker()
+        panel.isHidden = true
+        panel.translatesAutoresizingMaskIntoConstraints = false
+        panel.onGo = { [weak self] symbol in self?.goTo(symbol) }
+        panel.onClose = { [weak self] in self?.closeGoToSymbol() }
+        window?.contentView?.addSubview(panel)
+        let preferred = panel.widthAnchor.constraint(equalToConstant: OutlinePicker.width)
+        preferred.priority = .defaultHigh
+        NSLayoutConstraint.activate([
+            panel.topAnchor.constraint(equalTo: tabBar.topAnchor, constant: 6),
+            panel.centerXAnchor.constraint(equalTo: detailView.centerXAnchor),
+            panel.widthAnchor.constraint(lessThanOrEqualTo: detailView.widthAnchor, constant: -24),
+            preferred,
+        ])
+        loadedOutlinePicker = panel
+        return panel
+    }
+
+    /// Shift-Command-O.
+    @objc func showGoToSymbol(_ sender: Any?) {
+        guard let doc = editorView.document else {
+            statusLabel.stringValue = "Open a file to use Go to Symbol."
+            return NSSound.beep()
+        }
+        if isOutlinePickerVisible { return outlinePicker.move(by: 1) }
+        closeOverlays()
+        let panel = outlinePicker
+        panel.reset(symbols: doc.outline())
+        panel.isHidden = false
+        panel.focus()
+    }
+
+    func closeGoToSymbol() {
+        guard isOutlinePickerVisible else { return }
+        outlinePicker.isHidden = true
+        window?.makeFirstResponder(editorView)
+    }
+
+    private func goTo(_ symbol: OutlineSymbol) {
+        closeGoToSymbol()
+        guard let tab = activeTab else { return }
+        let from = location(of: tab)
+        _ = navHistory.recordJump(
+            from: from,
+            to: NavLocation(key: tab.navKey, line: symbol.line, col: symbol.column))
+        move(tab, toLine: symbol.line, col: symbol.column)
     }
 
     /// Records where the caret was before this find session, once, if find

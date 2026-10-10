@@ -277,6 +277,12 @@ const BUILTIN: &[(&str, &str, &str, &[&str])] = &[
         &["cmd+/"],
     ),
     (
+        "workbench.action.gotoSymbol",
+        "Go",
+        "Go to Symbol…",
+        &["cmd+shift+o"],
+    ),
+    (
         "editor.action.addSelectionToNextFindMatch",
         "Selection",
         "Add Next Occurrence",
