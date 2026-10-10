@@ -86,6 +86,21 @@ final class TextInputTests: XCTestCase {
         XCTAssertEqual(doc.lines(first: 0, count: 1), [""])
     }
 
+    func testTypingPairsDelimitersAndSkipsTheClosingCharacter() throws {
+        let (view, doc, url) = try makeView(text: "")
+        defer { try? FileManager.default.removeItem(at: url) }
+        view.insertText("(", replacementRange: none)
+        XCTAssertEqual(doc.lines(first: 0, count: 1), ["()"])
+        XCTAssertEqual(view.selectedRange(), NSRange(location: 1, length: 0))
+        view.insertText(")", replacementRange: none)
+        XCTAssertEqual(doc.lines(first: 0, count: 1), ["()"])
+        XCTAssertEqual(view.selectedRange(), NSRange(location: 2, length: 0))
+
+        // Replacement text from an input method is not auto-paired.
+        view.insertText("\"", replacementRange: NSRange(location: 0, length: 1))
+        XCTAssertEqual(doc.lines(first: 0, count: 1), ["\")"])
+    }
+
     func testAttributedSubstringAndRangesAreDocumentWide() throws {
         let (view, _, url) = try makeView(text: "😀\nabc")
         defer { try? FileManager.default.removeItem(at: url) }

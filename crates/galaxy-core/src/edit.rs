@@ -83,6 +83,10 @@ impl Transaction {
         *sel = SelectionSet::new(self.selections, self.primary, doc);
         inverse
     }
+
+    pub(crate) fn apply_selections(self, doc: &Document, sel: &mut SelectionSet) {
+        *sel = SelectionSet::new(self.selections, self.primary, doc);
+    }
 }
 
 /// Types `text` at every selection (replacing selected text).
@@ -92,6 +96,71 @@ pub fn insert_text(doc: &Document, sel: &SelectionSet, text: &str) -> Transactio
         .map(|s| Item::new(s.start(), s.end(), text.to_string()))
         .collect();
     finish_with_carets(doc, sel, items)
+}
+
+/// Types an opening delimiter and its closing partner. Selections are wrapped;
+/// empty carets land between the pair. Quotes are only paired at a boundary so
+/// apostrophes in words keep ordinary typing behavior.
+pub fn insert_pair(doc: &Document, sel: &SelectionSet, open: char) -> Transaction {
+    let close = pair_for(open).expect("only paired delimiters call insert_pair");
+    let items = sel
+        .iter()
+        .map(|s| {
+            if s.is_empty() {
+                let before = (s.head > 0).then(|| doc.rope().char(s.head - 1));
+                let after = (s.head < doc.len_chars()).then(|| doc.rope().char(s.head));
+                if matches!(open, '\'' | '"')
+                    && before.is_some_and(is_word)
+                    && after.is_some_and(is_word)
+                {
+                    return Item::new(s.head, s.head, open.to_string());
+                }
+                let mut item = Item::new(s.head, s.head, format!("{open}{close}"));
+                item.caret = 1;
+                item
+            } else {
+                let body = doc.rope().slice(s.start()..s.end()).to_string();
+                let mut item = Item::new(s.start(), s.end(), format!("{open}{body}{close}"));
+                item.caret = body.chars().count() + 2;
+                item
+            }
+        })
+        .collect();
+    finish_with_carets(doc, sel, items)
+}
+
+/// Skips a closing delimiter already at every empty caret.
+pub fn skip_closing(doc: &Document, sel: &SelectionSet, close: char) -> Option<Transaction> {
+    if !sel
+        .iter()
+        .all(|s| s.is_empty() && s.head < doc.len_chars() && doc.rope().char(s.head) == close)
+    {
+        return None;
+    }
+    let items = sel
+        .iter()
+        .map(|s| {
+            let mut item = Item::new(s.head, s.head, String::new());
+            item.caret = 1;
+            item
+        })
+        .collect();
+    Some(finish_with_carets(doc, sel, items))
+}
+
+pub fn pair_for(open: char) -> Option<char> {
+    match open {
+        '(' => Some(')'),
+        '[' => Some(']'),
+        '{' => Some('}'),
+        '\'' => Some('\''),
+        '"' => Some('"'),
+        _ => None,
+    }
+}
+
+fn is_word(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
 }
 
 /// Pastes `text`. With several cursors and exactly as many clipboard lines,
@@ -506,6 +575,32 @@ mod tests {
         let doc = Document::from_text(&text);
         let sel = SelectionSet::new(sels, 0, &doc);
         (doc, sel)
+    }
+
+    #[test]
+    fn pairs_delimiters_wraps_selections_and_skips_closing() {
+        let (mut doc, mut sel) = setup("|");
+        insert_pair(&doc, &sel, '(').apply(&mut doc, &mut sel);
+        assert_eq!(doc.text(), "()");
+        assert_eq!(sel.primary().head, 1);
+        skip_closing(&doc, &sel, ')')
+            .unwrap()
+            .apply(&mut doc, &mut sel);
+        assert_eq!(doc.text(), "()");
+        assert_eq!(sel.primary().head, 2);
+
+        let (mut doc, mut sel) = setup("[word]");
+        insert_pair(&doc, &sel, '"').apply(&mut doc, &mut sel);
+        assert_eq!(doc.text(), "\"word\"");
+        assert_eq!(sel.primary().head, 6);
+    }
+
+    #[test]
+    fn apostrophe_inside_a_word_is_not_paired() {
+        let (mut doc, mut sel) = setup("don|t");
+        insert_pair(&doc, &sel, '\'').apply(&mut doc, &mut sel);
+        assert_eq!(doc.text(), "don't");
+        assert_eq!(sel.primary().head, 4);
     }
 
     /// Renders the document with selections marked the same way.

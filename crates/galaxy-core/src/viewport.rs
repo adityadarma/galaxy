@@ -55,6 +55,10 @@ pub struct ViewportLine {
     pub marked: Option<LineSpan>,
     /// `text` is only the first `MAX_LINE_DISPLAY_CHARS` chars of the line.
     pub truncated: bool,
+    /// Visual indentation columns for leading whitespace (tab-expanded).
+    pub indent_guides: Vec<usize>,
+    /// Brackets paired with a primary empty caret, in UTF-16 columns.
+    pub brackets: Vec<LineSpan>,
 }
 
 /// Primary cursor position for the status bar and scroll-into-view.
@@ -85,6 +89,7 @@ impl Editor {
     /// Snapshot of `count` lines starting at `first_line` (clamped).
     pub fn viewport(&self, first_line: usize, count: usize) -> ViewportSnapshot {
         let mut snap = snapshot(&self.doc, &self.sel, first_line, count);
+        add_bracket_match(&self.doc, &self.sel, &mut snap);
         if let Some((start, end)) = self.marked_range_chars() {
             for l in &mut snap.lines {
                 let ls = self.doc.line_to_char(l.line);
@@ -117,6 +122,83 @@ impl Editor {
         let mut snap = self.viewport(first_line, count);
         snap.styles = style_runs_for_viewport(&self.doc, tree, language, first_line, count);
         snap
+    }
+}
+
+fn add_bracket_match(doc: &Document, sel: &SelectionSet, snap: &mut ViewportSnapshot) {
+    let caret = sel.primary().head;
+    if !sel.primary().is_empty() {
+        return;
+    }
+    let rope = doc.rope();
+    let is_bracket = |c: char| matches!(c, '(' | ')' | '[' | ']' | '{' | '}');
+    let candidate = if caret < rope.len_chars() && is_bracket(rope.char(caret)) {
+        Some((caret, rope.char(caret)))
+    } else if caret > 0 && is_bracket(rope.char(caret - 1)) {
+        Some((caret - 1, rope.char(caret - 1)))
+    } else {
+        None
+    };
+    let Some((at, bracket)) = candidate else {
+        return;
+    };
+    let (open, close, forward) = match bracket {
+        '(' => ('(', ')', true),
+        '[' => ('[', ']', true),
+        '{' => ('{', '}', true),
+        ')' => ('(', ')', false),
+        ']' => ('[', ']', false),
+        '}' => ('{', '}', false),
+        _ => return,
+    };
+    let mut depth = 0usize;
+    let range: Box<dyn Iterator<Item = usize>> = if forward {
+        Box::new(at..rope.len_chars())
+    } else {
+        Box::new((0..=at).rev())
+    };
+    let mut mate = None;
+    for pos in range.take(100_000) {
+        let c = rope.char(pos);
+        if forward {
+            if c == open {
+                depth += 1;
+            }
+            if c == close {
+                if depth == 1 {
+                    mate = Some(pos);
+                    break;
+                } else {
+                    depth = depth.saturating_sub(1);
+                }
+            }
+        } else {
+            if c == close {
+                depth += 1;
+            }
+            if c == open {
+                if depth == 1 {
+                    mate = Some(pos);
+                    break;
+                } else {
+                    depth = depth.saturating_sub(1);
+                }
+            }
+        }
+    }
+    let Some(mate) = mate else { return };
+    for pos in [at, mate] {
+        let line = rope.char_to_line(pos);
+        let start = rope.line_to_char(line);
+        let base = rope.char_to_utf16_cu(start);
+        if let Some(view) = snap.lines.iter_mut().find(|view| view.line == line) {
+            let col = rope.char_to_utf16_cu(pos) - base;
+            view.brackets.push(LineSpan {
+                start: col,
+                end: col + rope.char(pos).len_utf16(),
+                includes_eol: false,
+            });
+        }
     }
 }
 
@@ -188,6 +270,8 @@ pub fn snapshot(
             carets,
             marked: None,
             truncated,
+            indent_guides: indent_guides(&slice.to_string(), 4),
+            brackets: Vec::new(),
         });
     }
 
@@ -205,6 +289,27 @@ pub fn snapshot(
         selection_count: sel.len(),
         styles: Vec::new(),
     }
+}
+
+fn indent_guides(text: &str, tab_size: usize) -> Vec<usize> {
+    let mut col = 0;
+    let mut guides = Vec::new();
+    for c in text.chars() {
+        match c {
+            ' ' => {
+                col += 1;
+                if col % tab_size == 0 {
+                    guides.push(col)
+                }
+            }
+            '\t' => {
+                col += tab_size - col % tab_size;
+                guides.push(col)
+            }
+            _ => break,
+        }
+    }
+    guides
 }
 
 #[cfg(test)]
@@ -245,6 +350,19 @@ mod tests {
         // Caret at the head only.
         assert_eq!(s.lines[2].carets, vec![1]);
         assert!(s.lines[0].carets.is_empty());
+    }
+
+    #[test]
+    fn snapshot_has_indent_guides_and_matching_brackets() {
+        let doc = Document::from_text("    if (x) {\n        y\n    }");
+        let caret = doc.text().find('(').unwrap() + 1;
+        let sel = SelectionSet::new(vec![Selection::caret(caret)], 0, &doc);
+        let snap = snapshot(&doc, &sel, 0, 3);
+        assert_eq!(snap.lines[0].indent_guides, vec![4]);
+        assert_eq!(snap.lines[1].indent_guides, vec![4, 8]);
+        let mut decorated = snap.clone();
+        add_bracket_match(&doc, &sel, &mut decorated);
+        assert_eq!(decorated.lines[0].brackets.len(), 2);
     }
 
     #[test]

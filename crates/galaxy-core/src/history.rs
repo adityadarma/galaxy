@@ -328,6 +328,8 @@ impl Editor {
         // (built from the current state) stays valid.
         self.unmark_text();
         if tx.is_noop() {
+            // Skip-closing-bracket moves a caret without touching text.
+            tx.apply_selections(&self.doc, &mut self.sel);
             return;
         }
         let before = self.sel.clone();

@@ -403,6 +403,21 @@ final class EditorView: NSView {
                 context.fill(CGRect(x: 0, y: top, width: bounds.width, height: lineHeight))
             }
 
+            // Leading-whitespace guides are quiet vertical rails at tab stops.
+            context.setFillColor(Theme.indentGuide.cgColor)
+            for column in line.indentGuides {
+                let x = originX + xOffset(in: line.text, column: column)
+                context.fill(CGRect(x: x, y: top, width: 1, height: lineHeight))
+            }
+
+            // Matching delimiter cells, below selections and above text.
+            context.setFillColor(Theme.bracketMatch.cgColor)
+            for span in line.brackets {
+                let x0 = originX + xOffset(in: line.text, column: span.start)
+                let x1 = originX + xOffset(in: line.text, column: span.end)
+                context.fill(CGRect(x: x0, y: top, width: max(metrics.spaceWidth, x1 - x0), height: lineHeight))
+            }
+
             // Find matches, under the selection so the current one stays clear.
             if !line.matches.isEmpty {
                 context.setFillColor(Self.matchColor.cgColor)

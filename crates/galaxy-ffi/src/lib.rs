@@ -754,6 +754,10 @@ pub struct ViewportLine {
     pub matches: Vec<LineSpan>,
     /// `text` is only the start of a very long line (see `display_line`).
     pub truncated: bool,
+    /// Tab-expanded leading indentation columns for vertical guides.
+    pub indent_guides: Vec<u64>,
+    /// Matching bracket cells on this line, when the primary caret is beside one.
+    pub brackets: Vec<LineSpan>,
 }
 
 /// Indentation used by Tab, Enter and Outdent.
@@ -913,6 +917,16 @@ impl From<viewport::ViewportSnapshot> for ViewportSnapshot {
                     }),
                     matches: Vec::new(),
                     truncated: l.truncated,
+                    indent_guides: l.indent_guides.into_iter().map(|c| c as u64).collect(),
+                    brackets: l
+                        .brackets
+                        .into_iter()
+                        .map(|sp| LineSpan {
+                            start: sp.start as u64,
+                            end: sp.end as u64,
+                            includes_eol: sp.includes_eol,
+                        })
+                        .collect(),
                 })
                 .collect(),
             primary: CursorInfo {
@@ -1250,7 +1264,21 @@ impl DocumentHandle {
             let (doc, sel) = (&ed.doc, &ed.sel);
             let (tx, kind) = match &command {
                 EditCommand::InsertText { text } => {
-                    (edit::insert_text(doc, sel, text), insert_kind(text))
+                    let character =
+                        (text.chars().count() == 1).then(|| text.chars().next().unwrap());
+                    if let Some(open) = character.filter(|c| edit::pair_for(*c).is_some()) {
+                        (edit::insert_pair(doc, sel, open), EditKind::Other)
+                    } else if let Some(close) =
+                        character.filter(|c| matches!(c, ')' | ']' | '}' | '\'' | '"'))
+                    {
+                        (
+                            edit::skip_closing(doc, sel, close)
+                                .unwrap_or_else(|| edit::insert_text(doc, sel, text)),
+                            insert_kind(text),
+                        )
+                    } else {
+                        (edit::insert_text(doc, sel, text), insert_kind(text))
+                    }
                 }
                 EditCommand::Paste { text } => (edit::paste(doc, sel, text), EditKind::Other),
                 EditCommand::Backspace => (edit::backspace(doc, sel, &cfg), EditKind::Delete),

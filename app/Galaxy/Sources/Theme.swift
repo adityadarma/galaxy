@@ -48,6 +48,10 @@ enum Theme {
     }
     /// Line numbers: quieter than body text; the caret line uses `accent`.
     static let gutterText = NSColor.secondaryLabelColor
+    static let indentGuide = NSColor.separatorColor.withAlphaComponent(0.55)
+    static let bracketMatch = NSColor(name: "GalaxyBracketMatch") { appearance in
+        accent.resolved(for: appearance).withAlphaComponent(0.28)
+    }
     /// Space above the first line, so text does not touch the path bar.
     static let editorTopInset: CGFloat = 6
 
