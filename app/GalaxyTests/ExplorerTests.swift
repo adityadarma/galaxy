@@ -190,8 +190,33 @@ final class ExplorerTests: XCTestCase {
         explorerButton.performClick(nil)
         XCTAssertTrue(controller.isSidebarVisible)
         XCTAssertEqual(activity.active, .explorer)
+        XCTAssertTrue(
+            controller.explorer.scrollView.superview === controller.sidebar,
+            "toggling the sidebar must preserve the explorer view hierarchy"
+        )
         RunLoop.current.run(until: Date().addingTimeInterval(0.2))
         XCTAssertGreaterThan(editorWide, controller.editorView.frame.width - 1, "editor regains space when hidden")
+    }
+
+    func testOptionJPanelToggleDoesNotRequireSynchronousLayout() throws {
+        let controller = MainWindowController(bridge: CoreBridge())
+        controller.showWindow(nil)
+        defer { controller.window?.orderOut(nil) }
+
+        XCTAssertFalse(controller.isBottomPanelVisible)
+        controller.toggleTerminal(nil)
+        XCTAssertTrue(controller.isBottomPanelVisible)
+        controller.toggleTerminal(nil)
+        XCTAssertFalse(controller.isBottomPanelVisible)
+    }
+
+    func testGitLineMarkersMergeDuplicateLines() {
+        let markers = MainWindowController.gitLineMarkers([
+            GitLineChangeInfo(line: 8, kind: .added),
+            GitLineChangeInfo(line: 8, kind: .modified),
+            GitLineChangeInfo(line: 8, kind: .deleted),
+        ])
+        XCTAssertEqual(markers, [8: .deleted])
     }
 
     func testDraggingTheDividerResizesTheSidebar() throws {
@@ -295,7 +320,10 @@ final class ExplorerTests: XCTestCase {
         XCTAssertEqual(titleFrame.maxY, content.bounds.maxY, accuracy: 0.5)
         XCTAssertEqual(titleFrame.width, content.bounds.width, accuracy: 0.5)
         XCTAssertEqual(titleFrame.minY, window.contentLayoutRect.maxY, accuracy: 0.5, "ends where the title bar ends")
-        XCTAssertTrue(controller.titleBar.subviews.allSatisfy { $0 is NSBox }, "no buttons or text in the title bar")
+        // Only the separator and VS Code-style layout toggles; no text.
+        XCTAssertTrue(controller.titleBar.subviews.allSatisfy { $0 is NSBox || $0 is NSStackView },
+                      "only layout toggles in the title bar")
+        XCTAssertFalse(controller.titleBar.subviews.contains { $0 is NSTextField }, "no text in the title bar")
         // The folder name appears once: the sidebar section.
         XCTAssertEqual(controller.sectionHeader.label.stringValue, root.lastPathComponent.uppercased())
 

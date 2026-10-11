@@ -21,7 +21,7 @@ final class ReferencesPanel: NSView, NSTableViewDataSource, NSTableViewDelegate 
         empty.font = .systemFont(ofSize: 11); empty.textColor = .secondaryLabelColor; empty.translatesAutoresizingMaskIntoConstraints = false
         addSubview(header); addSubview(scroll); addSubview(empty)
         NSLayoutConstraint.activate([
-            heightAnchor.constraint(equalToConstant: 150), header.topAnchor.constraint(equalTo: topAnchor, constant: 7), header.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10), header.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            header.topAnchor.constraint(equalTo: topAnchor, constant: 7), header.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10), header.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             scroll.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 4), scroll.leadingAnchor.constraint(equalTo: leadingAnchor), scroll.trailingAnchor.constraint(equalTo: trailingAnchor), scroll.bottomAnchor.constraint(equalTo: bottomAnchor), empty.centerXAnchor.constraint(equalTo: centerXAnchor), empty.centerYAnchor.constraint(equalTo: scroll.centerYAnchor)
         ])
     }

@@ -218,7 +218,9 @@ pub fn snapshot(
     count: usize,
 ) -> ViewportSnapshot {
     let rope = doc.rope();
-    let line_count = doc.line_count();
+    // Keep the two bounds defensive: a redraw can observe a snapshot request
+    // queued before the latest document mutation reached the FFI boundary.
+    let line_count = doc.line_count().min(rope.len_lines());
     let first = first_line.min(line_count);
     let last = first.saturating_add(count).min(line_count);
     let ranges = sel.as_slice();
@@ -412,6 +414,14 @@ mod tests {
         assert!(s.lines.iter().all(|l| l.carets == vec![0]));
         assert_eq!(s.selection_count, 1_000);
         assert_eq!(s.primary.line, 500);
+    }
+
+    #[test]
+    fn out_of_range_viewport_requests_are_clamped() {
+        let doc = Document::from_text("one\ntwo");
+        let selections = SelectionSet::new(vec![Selection::caret(0)], 0, &doc);
+        let snapshot = snapshot(&doc, &selections, usize::MAX, usize::MAX);
+        assert!(snapshot.lines.is_empty());
     }
 
     #[test]

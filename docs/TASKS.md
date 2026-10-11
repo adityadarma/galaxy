@@ -157,8 +157,10 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
 - [ ] M4-14 — Formatting dokumen dan format on save.
 - [ ] M4-15 — `$/progress` dan status server di status bar, termasuk RAM proses server.
   - Status: partial. `$/progress` begin/report/end diparse di `LspManager`, status server/progress/error diekspos melalui FFI, dan status bar menampilkan server ready, progress, atau error. RAM proses server belum tersedia karena transport belum mengekspos PID/process metrics.
-- [ ] M4-16 — Auto-restart server crash (maks 3x / 5 menit) dan command Restart/Stop server.
+- [x] M4-16 — Auto-restart server crash (maks 3x / 5 menit) dan command Restart/Stop server.
+  - Status: server menyimpan konfigurasi, mendeteksi `Closed`, menjadwalkan auto-restart dengan backoff default 0/1/2 detik, membatasi maksimal 3 crash dalam 5 menit, dan membatalkan retry saat Stop atau restart manual. `restartBackoffMs` menerima tiga nilai milidetik per server pada settings. Command `Restart Language Server`/`Stop Language Server` tersedia melalui menu Go serta Command Palette. PID dan RSS server di-sample melalui `ps` dengan cache lima detik dan tampil pada tooltip status bar.
 - [ ] M4-17 — Uji end-to-end dengan `rust-analyzer` pada repo `ripgrep`.
+  - Status: smoke test fixture Cargo memverifikasi lifecycle `initialize`, `didOpen`, completion request, response completion, dan shutdown bersih bila executable tersedia. Test opt-in `rust_analyzer_smoke_test_on_ripgrep_checkout_when_configured` membuka `crates/core/main.rs` dari checkout yang ditunjuk `GALAXY_RIPGREP_PATH`; test aman dilewati jika path atau executable tidak tersedia. Eksekusi nyata masih pending karena checkout dan executable belum tersedia di environment ini.
 - [x] M4-18 — Dogfooding: pakai Galaxy untuk mengembangkan Galaxy.
   - Status: Galaxy berhasil dibuka terhadap repository-nya sendiri melalui `-OpenPath`, lalu diverifikasi dengan suite Rust, Swift unit, dan XCUITest. Alur yang tercakup meliputi buffer baru, Explorer, membuka file, editing keyboard, undo, clipboard, multi-cursor, find/replace, dan session-independent launch. `AppDelegate` membaca `-OpenPath` langsung dari process arguments agar state launch lama tidak membuat buffer baru berisi file repo.
 
@@ -217,6 +219,7 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
 - [x] M7-03 — Respons memory pressure: kosongkan cache non-esensial.
   - Status: setiap window memasang `DispatchSourceMemoryPressure`. Warning pressure melepas CTLine cache, semantic/inlay decorations, caret geometry, dan FileFinder; critical pressure juga mensuspend syntax tree/worker tab nonaktif. Dokumen aktif, undo history, diagnostics, dan PTY tidak disentuh. Detail policy ada di `docs/MEMORY-PRESSURE.md`.
 - [ ] M7-04 — Soak test 8 jam (script edit + navigasi otomatis); RAM stabil ±10%.
+  - Status: `scripts/soak-test.sh` builds Release by default, opens a generated Rust fixture, drives edit/navigation/undo-redo through Accessibility, samples RSS each minute, writes `app/build/soak-results.csv`, and fails when min-to-max RSS spread exceeds 10%. The required eight-hour execution remains pending.
 - [x] M7-05 — Fuzz test edit ops dan parser JSON-RPC (`cargo-fuzz`).
   - Status: package fuzz terpisah berisi target `edit_operations` untuk text/selection/edit Unicode dan `json_rpc` untuk input arbitrary ke validator JSON-RPC. Script `scripts/fuzz.sh` dan prosedur `docs/FUZZING.md` tersedia; target sengaja tidak masuk workspace normal karena `libfuzzer-sys` membutuhkan nightly. Long fuzz campaign masih dijalankan di CI/nightly, bukan diklaim selesai dari smoke compile lokal.
 - [x] M7-06 — Crash reporting lokal (panic hook Rust + crash log macOS), tanpa upload otomatis.
@@ -227,6 +230,11 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
   - Status: panduan penggunaan ada di `docs/USER-GUIDE.md`; referensi settings, auto-save, language server, dan local data ada di `docs/CONFIGURATION.md`.
 - [ ] M7-09 — Rilis beta tertutup dan kumpulkan feedback.
   - Status: pending external execution. Checklist beta, template feedback, dan triage tersedia di `docs/BETA-README.md`, `docs/BETA-FEEDBACK.md`, dan `docs/BETA-TRIAGE.md`. Task belum ditandai selesai karena belum ada artifact beta yang didistribusikan ke tester eksternal dan belum ada feedback nyata.
+
+## M8 — Panel Bawah dan Workflow Debug
+
+- [ ] M8-01 — Bottom panel tabs: Problems, Output, Debug Console, Terminal, dan Ports.
+  - Status: tahap pertama selesai secara partial. Header panel bawah dengan tab Problems, Output, Debug Console, Terminal, dan Ports sudah tersedia. Problems dan Terminal memakai view nyata; Output menampilkan tail live `~/Library/Logs/Galaxy/core.log*` dengan batas 200.000 karakter; Ports menampilkan TCP listener lokal dari `lsof`, refresh otomatis 2 detik, dan refresh manual. Debug Console masih placeholder sampai engine debugger tersedia. `Cmd+J` menyembunyikan atau menampilkan header dan content sebagai satu panel; saat hidden editor memakai seluruh tinggi bawah.
 
 ## Task lintas milestone
 

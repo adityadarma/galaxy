@@ -393,6 +393,12 @@ const BUILTIN: &[(&str, &str, &str, &[&str])] = &[
         &["hide", "show", "explorer"],
     ),
     (
+        "workbench.action.togglePanel",
+        "View",
+        "Toggle Terminal",
+        &["panel", "bottom", "hide", "show", "console"],
+    ),
+    (
         "workbench.view.explorer",
         "View",
         "Show Explorer",

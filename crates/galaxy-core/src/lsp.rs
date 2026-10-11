@@ -4,11 +4,11 @@
 //! messages and forwards them through a standard channel so the rest of the
 //! editor can remain synchronous. No UI call waits for server output.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Command as StdCommand, Stdio};
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 use std::time::Instant;
@@ -385,6 +385,7 @@ pub struct ServerConfig {
     pub args: Vec<String>,
     pub log_traffic: bool,
     pub initialization_options: Value,
+    pub restart_backoff: [Duration; 3],
 }
 
 /// Server configuration supplied by global or workspace settings. The JSON
@@ -425,6 +426,32 @@ impl LspSettings {
                 })
                 .transpose()?
                 .unwrap_or_default();
+            let restart_backoff = object
+                .get("restartBackoffMs")
+                .map(|values| {
+                    let values = values.as_array().ok_or_else(|| {
+                        format!("restartBackoffMs for {language} must be an array")
+                    })?;
+                    if values.len() != 3 {
+                        return Err(format!(
+                            "restartBackoffMs for {language} must contain exactly three values"
+                        ));
+                    }
+                    let mut backoff = [Duration::ZERO; 3];
+                    for (index, value) in values.iter().enumerate() {
+                        let milliseconds = value.as_u64().ok_or_else(|| {
+                            format!("restartBackoffMs for {language} must contain milliseconds")
+                        })?;
+                        backoff[index] = Duration::from_millis(milliseconds);
+                    }
+                    Ok(backoff)
+                })
+                .transpose()?
+                .unwrap_or([
+                    Duration::ZERO,
+                    Duration::from_secs(1),
+                    Duration::from_secs(2),
+                ]);
             out.servers.insert(
                 language.to_ascii_lowercase(),
                 ServerConfig {
@@ -438,6 +465,7 @@ impl LspSettings {
                         .get("initializationOptions")
                         .cloned()
                         .unwrap_or(Value::Null),
+                    restart_backoff,
                 },
             );
         }
@@ -467,6 +495,11 @@ fn default_server(language: &str) -> Option<ServerConfig> {
         args: args.iter().map(|arg| (*arg).to_owned()).collect(),
         log_traffic: false,
         initialization_options: Value::Null,
+        restart_backoff: [
+            Duration::ZERO,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+        ],
     })
 }
 
@@ -532,6 +565,13 @@ struct ManagedServer {
     initialized: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerProcessInfo {
+    pub language: String,
+    pub pid: u32,
+    pub resident_memory_kib: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 struct PendingRequest {
     method: String,
@@ -543,6 +583,10 @@ struct PendingRequest {
 #[derive(Default)]
 pub struct LspManager {
     servers: HashMap<LspKey, ManagedServer>,
+    configs: HashMap<LspKey, ServerConfig>,
+    restart_history: HashMap<LspKey, Vec<Instant>>,
+    pending_restarts: HashMap<LspKey, Instant>,
+    stopped: HashSet<LspKey>,
     documents: HashMap<String, (LspKey, DocumentSync)>,
     requests: HashMap<(LspKey, u64), PendingRequest>,
     next_request_id: u64,
@@ -581,6 +625,7 @@ impl LspManager {
     /// Starts and initializes a server unless an equivalent key already runs.
     /// `true` means a child was spawned; `false` means the shared instance won.
     pub fn ensure_server(&mut self, key: LspKey, config: &ServerConfig) -> io::Result<bool> {
+        self.stopped.remove(&key);
         if self.servers.contains_key(&key) {
             return Ok(false);
         }
@@ -597,13 +642,83 @@ impl LspManager {
             }
         }))?;
         self.servers.insert(
-            key,
+            key.clone(),
             ManagedServer {
                 transport,
                 initialized: false,
             },
         );
+        self.configs.insert(key, config.clone());
         Ok(true)
+    }
+
+    pub fn stop_server(&mut self, key: &LspKey) -> bool {
+        self.stopped.insert(key.clone());
+        self.pending_restarts.remove(key);
+        self.requests
+            .retain(|(request_key, _), _| request_key != key);
+        self.servers.remove(key).is_some()
+    }
+
+    pub fn restart_server(&mut self, key: &LspKey) -> io::Result<bool> {
+        self.stopped.remove(key);
+        self.pending_restarts.remove(key);
+        let Some(config) = self.configs.get(key).cloned() else {
+            return Ok(false);
+        };
+        self.stop_running_server(key);
+        self.ensure_server(key.clone(), &config)
+    }
+
+    fn stop_running_server(&mut self, key: &LspKey) {
+        self.requests
+            .retain(|(request_key, _), _| request_key != key);
+        self.servers.remove(key);
+    }
+
+    fn auto_restart(&mut self, key: &LspKey, now: Instant) {
+        if self.stopped.contains(key) {
+            return;
+        }
+        let restart_count = self.restart_history.entry(key.clone()).or_default();
+        restart_count.retain(|started| now.duration_since(*started) < Duration::from_secs(300));
+        if restart_count.len() >= 3 {
+            self.server_errors.push(format!(
+                "LSP server restart limit reached: {}",
+                key.language
+            ));
+            return;
+        }
+        let delay = self
+            .configs
+            .get(key)
+            .map(|config| config.restart_backoff[restart_count.len()])
+            .unwrap_or(Duration::ZERO);
+        restart_count.push(now);
+        self.pending_restarts.insert(key.clone(), now + delay);
+    }
+
+    fn restart_due_servers(&mut self, now: Instant) {
+        let due: Vec<_> = self
+            .pending_restarts
+            .iter()
+            .filter(|(_, deadline)| **deadline <= now)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in due {
+            self.pending_restarts.remove(&key);
+            if self.stopped.contains(&key) {
+                continue;
+            }
+            let Some(config) = self.configs.get(&key).cloned() else {
+                continue;
+            };
+            self.stop_running_server(&key);
+            if let Err(error) = self.ensure_server(key.clone(), &config) {
+                self.server_errors
+                    .push(format!("LSP restart failed: {error}"));
+            }
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -1018,6 +1133,26 @@ impl LspManager {
     pub fn last_server_error(&self) -> Option<String> {
         self.server_errors.last().cloned()
     }
+    pub fn server_processes(&mut self) -> Vec<ServerProcessInfo> {
+        self.servers
+            .iter_mut()
+            .map(|(key, server)| ServerProcessInfo {
+                language: key.language.clone(),
+                pid: server.transport.pid(),
+                resident_memory_kib: server.transport.resident_memory_kib(),
+            })
+            .collect()
+    }
+    pub fn document_key(&self, uri: &str) -> Option<(LspKey, bool)> {
+        self.documents.get(uri).map(|(key, _)| {
+            (
+                key.clone(),
+                self.servers
+                    .get(key)
+                    .is_some_and(|server| server.initialized),
+            )
+        })
+    }
 
     fn request_formatting_variant(
         &mut self,
@@ -1181,6 +1316,7 @@ impl LspManager {
     /// Drains server output without blocking. An initialize response with ID 0
     /// transitions the server and emits the mandatory `initialized` notification.
     pub fn poll(&mut self) -> Vec<LspEvent> {
+        self.restart_due_servers(Instant::now());
         let mut events = Vec::new();
         for (key, server) in &mut self.servers {
             loop {
@@ -1260,6 +1396,16 @@ impl LspManager {
             if let LspEvent::Message(_, message) = event {
                 let _ = self.publish_progress(message);
             }
+        }
+        let closed: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                LspEvent::Closed(key) => Some(key.clone()),
+                _ => None,
+            })
+            .collect();
+        for key in closed {
+            self.auto_restart(&key, Instant::now());
         }
         events
     }
@@ -1701,6 +1847,7 @@ pub struct LspTransport {
     stdin: Arc<tokio::sync::Mutex<ChildStdin>>,
     incoming: mpsc::Receiver<Incoming>,
     log_traffic: bool,
+    rss_cache: Option<(Instant, Option<u64>)>,
 }
 
 impl LspTransport {
@@ -1734,6 +1881,7 @@ impl LspTransport {
             stdin: Arc::new(tokio::sync::Mutex::new(stdin)),
             incoming,
             log_traffic,
+            rss_cache: None,
         })
     }
 
@@ -1759,6 +1907,35 @@ impl LspTransport {
     /// Test and manager convenience; waits no longer than `timeout`.
     pub fn recv_timeout(&self, timeout: Duration) -> Result<Incoming, mpsc::RecvTimeoutError> {
         self.incoming.recv_timeout(timeout)
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.child.id().unwrap_or_default()
+    }
+
+    /// Samples RSS through macOS `ps` at most once per five seconds. This is
+    /// diagnostic data, so an unavailable process metric remains optional.
+    pub fn resident_memory_kib(&mut self) -> Option<u64> {
+        let now = Instant::now();
+        if let Some((sampled_at, value)) = self.rss_cache
+            && now.duration_since(sampled_at) < Duration::from_secs(5)
+        {
+            return value;
+        }
+        let pid = self.pid();
+        let value = if pid == 0 {
+            None
+        } else {
+            StdCommand::new("/bin/ps")
+                .args(["-o", "rss=", "-p", &pid.to_string()])
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .and_then(|output| output.trim().parse().ok())
+        };
+        self.rss_cache = Some((now, value));
+        value
     }
 }
 
@@ -1857,6 +2034,7 @@ async fn read_frame<R: AsyncRead + Unpin>(
 mod tests {
     use super::*;
     use std::fs;
+    use std::process::Command as StdCommand;
     use std::thread;
     use std::time::Instant;
     use tokio::io::AsyncWriteExt;
@@ -1969,6 +2147,11 @@ mod tests {
             args,
             log_traffic: false,
             initialization_options: Value::Null,
+            restart_backoff: [
+                Duration::ZERO,
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+            ],
         };
         let mut manager = LspManager::default();
         assert!(manager.ensure_server(key.clone(), &config).unwrap());
@@ -1987,6 +2170,37 @@ mod tests {
         }
         manager.shutdown_all();
         assert_eq!(manager.len(), 0);
+    }
+
+    #[test]
+    fn stop_server_prevents_restarting_until_explicit_start() {
+        let args = vec!["-c".to_owned(), "sleep 5".to_owned()];
+        let key = LspKey {
+            language: "rust".into(),
+            root: PathBuf::from("/workspace"),
+        };
+        let config = ServerConfig {
+            program: "/bin/sh".into(),
+            args,
+            log_traffic: false,
+            initialization_options: Value::Null,
+            restart_backoff: [
+                Duration::ZERO,
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+            ],
+        };
+        let mut manager = LspManager::default();
+        assert!(manager.ensure_server(key.clone(), &config).unwrap());
+        let processes = manager.server_processes();
+        assert_eq!(processes.len(), 1);
+        assert_eq!(processes[0].language, "rust");
+        assert!(processes[0].pid > 0);
+        assert!(manager.stop_server(&key));
+        assert_eq!(manager.len(), 0);
+        assert!(manager.restart_server(&key).unwrap());
+        assert_eq!(manager.len(), 1);
+        manager.shutdown_all();
     }
 
     #[test]
@@ -2020,7 +2234,8 @@ mod tests {
         let settings = LspSettings::from_json(&serde_json::json!({
             "servers": { "Rust": {
                 "command": "/bin/sh", "args": ["-c", "server"], "logTraffic": true,
-                "initializationOptions": { "checkOnSave": true }
+                "initializationOptions": { "checkOnSave": true },
+                "restartBackoffMs": [25, 50, 100]
             }}
         }))
         .unwrap();
@@ -2029,6 +2244,20 @@ mod tests {
         assert_eq!(config.args, ["-c", "server"]);
         assert!(config.log_traffic);
         assert_eq!(config.initialization_options["checkOnSave"], true);
+        assert_eq!(
+            config.restart_backoff,
+            [
+                Duration::from_millis(25),
+                Duration::from_millis(50),
+                Duration::from_millis(100)
+            ]
+        );
+        assert!(
+            LspSettings::from_json(&serde_json::json!({
+                "servers": { "Rust": { "command": "/bin/sh", "restartBackoffMs": [1, 2] } }
+            }))
+            .is_err()
+        );
     }
 
     #[test]
@@ -2063,6 +2292,11 @@ mod tests {
             args: Vec::new(),
             log_traffic: false,
             initialization_options: Value::Null,
+            restart_backoff: [
+                Duration::ZERO,
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+            ],
         };
         let mut manager = LspManager::default();
         manager.ensure_server(key.clone(), &config).unwrap();
@@ -2074,6 +2308,126 @@ mod tests {
             assert!(Instant::now() < deadline, "gopls did not initialize");
             thread::sleep(Duration::from_millis(10));
         }
+        manager.shutdown_all();
+    }
+
+    #[test]
+    fn real_rust_analyzer_completes_when_available() {
+        let Some(program) = find_in_path("rust-analyzer") else {
+            return;
+        };
+        if !StdCommand::new(&program)
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            return;
+        }
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[package]\nname = \"galaxy_lsp_fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(workspace.path().join("src")).unwrap();
+        let source = "fn main() {\n    let value = String::new();\n    value.\n}\n";
+        let source_path = workspace.path().join("src/main.rs");
+        std::fs::write(&source_path, source).unwrap();
+        let key = LspKey {
+            language: "rust".into(),
+            root: workspace.path().to_path_buf(),
+        };
+        let config = ServerConfig {
+            program: program.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            log_traffic: false,
+            initialization_options: Value::Null,
+            restart_backoff: [
+                Duration::ZERO,
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+            ],
+        };
+        let mut manager = LspManager::default();
+        manager.ensure_server(key.clone(), &config).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !manager.poll().contains(&LspEvent::Initialized(key.clone())) {
+            assert!(
+                Instant::now() < deadline,
+                "rust-analyzer did not initialize"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let uri = format!("file://{}", source_path.to_string_lossy());
+        let document = Document::from_text(source);
+        manager
+            .open_document(key.clone(), uri.clone(), "rust".into(), &document)
+            .unwrap();
+        manager
+            .request_completion(&uri, 2, 10, Instant::now())
+            .unwrap();
+        while manager.completions(&uri).is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "rust-analyzer returned no completions"
+            );
+            manager.poll();
+            thread::sleep(Duration::from_millis(10));
+        }
+        manager.shutdown_all();
+    }
+
+    #[test]
+    fn rust_analyzer_smoke_test_on_ripgrep_checkout_when_configured() {
+        let Ok(root) = std::env::var("GALAXY_RIPGREP_PATH") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let source_path = root.join("crates/core/main.rs");
+        if !root.join("Cargo.toml").is_file() || !source_path.is_file() {
+            return;
+        }
+        let Some(program) = find_in_path("rust-analyzer") else {
+            return;
+        };
+        if !StdCommand::new(&program)
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            return;
+        }
+        let source = std::fs::read_to_string(&source_path).unwrap();
+        let key = LspKey {
+            language: "rust".into(),
+            root,
+        };
+        let config = ServerConfig {
+            program: program.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            log_traffic: false,
+            initialization_options: Value::Null,
+            restart_backoff: [
+                Duration::ZERO,
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+            ],
+        };
+        let mut manager = LspManager::default();
+        manager.ensure_server(key.clone(), &config).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !manager.poll().contains(&LspEvent::Initialized(key.clone())) {
+            assert!(
+                Instant::now() < deadline,
+                "rust-analyzer did not initialize ripgrep"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let uri = format!("file://{}", source_path.to_string_lossy());
+        let document = Document::from_text(&source);
+        manager
+            .open_document(key, uri, "rust".into(), &document)
+            .unwrap();
         manager.shutdown_all();
     }
 
@@ -2153,6 +2507,11 @@ mod tests {
             args,
             log_traffic: false,
             initialization_options: Value::Null,
+            restart_backoff: [
+                Duration::ZERO,
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+            ],
         };
         let mut manager = LspManager::default();
         manager.ensure_server(key.clone(), &config).unwrap();
@@ -2191,6 +2550,11 @@ mod tests {
             args,
             log_traffic: false,
             initialization_options: Value::Null,
+            restart_backoff: [
+                Duration::ZERO,
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+            ],
         };
         let mut manager = LspManager::default();
         manager.ensure_server(key.clone(), &config).unwrap();
@@ -2247,6 +2611,11 @@ mod tests {
             args,
             log_traffic: false,
             initialization_options: Value::Null,
+            restart_backoff: [
+                Duration::ZERO,
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+            ],
         };
         let mut manager = LspManager::default();
         manager.ensure_server(key.clone(), &config).unwrap();

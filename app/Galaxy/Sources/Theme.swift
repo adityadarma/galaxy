@@ -105,7 +105,7 @@ extension NSColor {
 }
 
 extension NSColor {
-    fileprivate convenience init?(hex: String) {
+    convenience init?(hex: String) {
         guard hex.count == 7, hex.first == "#", let value = UInt32(hex.dropFirst(), radix: 16) else { return nil }
         self.init(srgbRed: CGFloat((value >> 16) & 0xff) / 255,
                   green: CGFloat((value >> 8) & 0xff) / 255,

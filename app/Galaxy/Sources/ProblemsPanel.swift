@@ -52,7 +52,6 @@ final class ProblemsPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         addSubview(scroll)
         addSubview(empty)
         NSLayoutConstraint.activate([
-            heightAnchor.constraint(equalToConstant: 150),
             header.topAnchor.constraint(equalTo: topAnchor, constant: 7),
             header.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
             header.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),

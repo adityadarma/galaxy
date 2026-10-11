@@ -50,6 +50,12 @@ final class CoreBridge {
 
     func lspStatus() -> LspStatusInfo { core.lspStatus() }
 
+    func stopLSP(document: DocumentHandle) -> Bool { core.stopLsp(document: document) }
+
+    func restartLSP(document: DocumentHandle, language: String, root: String) -> Bool {
+        (try? core.restartLsp(document: document, language: language, root: root)) ?? false
+    }
+
     func syncLSP(document: DocumentHandle) {
         core.syncLspDocument(document: document)
     }

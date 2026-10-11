@@ -96,6 +96,17 @@ final class KeybindingsTests: XCTestCase {
         XCTAssertFalse(c.performKeyBinding("cmd+k"), "unbound")
     }
 
+    func testCmdJTogglesTheBottomPanel() {
+        let c = MainWindowController(bridge: CoreBridge())
+        c.showWindow(nil)
+        defer { c.window?.orderOut(nil) }
+        XCTAssertFalse(c.isBottomPanelVisible)
+        XCTAssertTrue(c.performKeyBinding("cmd+j"))
+        XCTAssertTrue(c.isBottomPanelVisible)
+        XCTAssertTrue(c.performKeyBinding("cmd+j"))
+        XCTAssertFalse(c.isBottomPanelVisible)
+    }
+
     func testOpeningTheFileCreatesItAndSavingAppliesIt() throws {
         let c = MainWindowController(bridge: CoreBridge())
         c.showWindow(nil)

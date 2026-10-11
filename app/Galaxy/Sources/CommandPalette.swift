@@ -55,6 +55,8 @@ final class CommandPaletteView: NSView, NSTextFieldDelegate, NSTableViewDataSour
          "workbench.action.splitEditorRight": #selector(MainWindowController.splitEditorRight(_:)),
          "workbench.action.splitEditorDown": #selector(MainWindowController.splitEditorDown(_:)),
          "workbench.action.closeEditorSplit": #selector(MainWindowController.closeEditorSplit(_:)),
+         "galaxy.restartLanguageServer": #selector(MainWindowController.restartLanguageServer(_:)),
+         "galaxy.stopLanguageServer": #selector(MainWindowController.stopLanguageServer(_:)),
         "workbench.view.explorer": #selector(MainWindowController.showExplorer(_:)),
         "workbench.action.nextEditor": #selector(MainWindowController.showNextTab(_:)),
         "workbench.action.previousEditor": #selector(MainWindowController.showPreviousTab(_:)),

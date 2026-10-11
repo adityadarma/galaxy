@@ -477,7 +477,7 @@ impl Core {
     }
 
     pub fn lsp_status(&self) -> LspStatusInfo {
-        let lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
+        let mut lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
         LspStatusInfo {
             servers: lsp.server_count() as u64,
             progress: lsp
@@ -491,7 +491,73 @@ impl Core {
                 })
                 .collect(),
             error: lsp.last_server_error(),
+            processes: lsp
+                .server_processes()
+                .into_iter()
+                .map(|process| LspProcessInfo {
+                    language: process.language,
+                    pid: process.pid as u64,
+                    resident_memory_kib: process.resident_memory_kib,
+                })
+                .collect(),
         }
+    }
+
+    pub fn stop_lsp(&self, document: Arc<DocumentHandle>) -> bool {
+        let path = document.path();
+        if path.is_empty() {
+            return false;
+        }
+        let uri = file_uri(Path::new(&path));
+        let key = self
+            .lsp_documents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&uri)
+            .map(|_| ());
+        let Some(_) = key else {
+            return false;
+        };
+        let mut documents = self.lsp_documents.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((uri, _)) = documents
+            .iter()
+            .find(|(_, value)| value.path() == path)
+            .map(|(uri, value)| (uri.clone(), value.clone()))
+        else {
+            return false;
+        };
+        let mut lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((key, _)) = lsp.document_key(&uri) else {
+            return false;
+        };
+        let stopped = lsp.stop_server(&key);
+        documents.retain(|_, value| value.path() != path);
+        stopped
+    }
+
+    pub fn restart_lsp(
+        &self,
+        document: Arc<DocumentHandle>,
+        language: String,
+        root: String,
+    ) -> Result<bool, CoreError> {
+        let path = document.path();
+        if path.is_empty() {
+            return Ok(false);
+        }
+        let key = LspKey {
+            language: language.clone(),
+            root: PathBuf::from(root),
+        };
+        let restarted = self
+            .lsp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .restart_server(&key)?;
+        if restarted {
+            return Ok(true);
+        }
+        self.start_lsp(document, language, key.root.to_string_lossy().into_owned())
     }
 
     pub fn request_hover(&self, document: Arc<DocumentHandle>, line: u64, character: u64) -> bool {
@@ -1089,6 +1155,14 @@ pub struct LspStatusInfo {
     pub servers: u64,
     pub progress: Vec<LspProgressInfo>,
     pub error: Option<String>,
+    pub processes: Vec<LspProcessInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct LspProcessInfo {
+    pub language: String,
+    pub pid: u64,
+    pub resident_memory_kib: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -1238,13 +1312,66 @@ pub struct TerminalHandle {
     session: TerminalSession,
 }
 
+/// A terminal color as the program asked for it; the app maps it to its
+/// theme. `Indexed` 0–15 are the ANSI colors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum TerminalColorInfo {
+    Default,
+    Indexed { index: u8 },
+    Rgb { r: u8, g: u8, b: u8 },
+}
+
+impl From<galaxy_core::terminal::TerminalColor> for TerminalColorInfo {
+    fn from(color: galaxy_core::terminal::TerminalColor) -> Self {
+        use galaxy_core::terminal::TerminalColor;
+        match color {
+            TerminalColor::Default => Self::Default,
+            TerminalColor::Indexed(index) => Self::Indexed { index },
+            TerminalColor::Rgb(r, g, b) => Self::Rgb { r, g, b },
+        }
+    }
+}
+
+/// Consecutive cells of one line with the same style.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct TerminalRunInfo {
+    pub column: u16,
+    pub text: String,
+    pub foreground: TerminalColorInfo,
+    pub background: TerminalColorInfo,
+    pub bold: bool,
+    pub italic: bool,
+    pub dim: bool,
+    pub underline: bool,
+    pub strikeout: bool,
+    pub inverse: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct TerminalLineInfo {
+    /// Plain text without trailing blanks, for links and copying.
     pub text: String,
-    pub foreground: u8,
-    pub background: u8,
-    pub bold: bool,
-    pub underline: bool,
+    pub runs: Vec<TerminalRunInfo>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct TerminalCursorInfo {
+    pub row: u16,
+    pub column: u16,
+}
+
+/// The visible terminal screen. `version` changes whenever it may have.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct TerminalScreenInfo {
+    pub version: u64,
+    pub columns: u16,
+    pub lines: Vec<TerminalLineInfo>,
+    pub cursor: Option<TerminalCursorInfo>,
+    pub display_offset: u32,
+    pub history_size: u32,
+    pub app_cursor: bool,
+    pub bracketed_paste: bool,
+    pub alt_screen: bool,
 }
 
 #[uniffi::export]
@@ -1253,18 +1380,48 @@ impl TerminalHandle {
         self.session.take_output()
     }
 
-    pub fn snapshot(&self) -> Vec<TerminalLineInfo> {
-        self.session
-            .snapshot()
-            .into_iter()
-            .map(|line| TerminalLineInfo {
-                text: line.text,
-                foreground: line.foreground,
-                background: line.background,
-                bold: line.bold,
-                underline: line.underline,
-            })
-            .collect()
+    /// Cheap: compare with the last screen's `version` before asking for it.
+    pub fn version(&self) -> u64 {
+        self.session.version()
+    }
+
+    pub fn screen(&self) -> TerminalScreenInfo {
+        let screen = self.session.screen();
+        TerminalScreenInfo {
+            version: screen.version,
+            columns: screen.columns,
+            lines: screen
+                .lines
+                .into_iter()
+                .map(|line| TerminalLineInfo {
+                    text: line.text,
+                    runs: line
+                        .runs
+                        .into_iter()
+                        .map(|run| TerminalRunInfo {
+                            column: run.column,
+                            text: run.text,
+                            foreground: run.foreground.into(),
+                            background: run.background.into(),
+                            bold: run.bold,
+                            italic: run.italic,
+                            dim: run.dim,
+                            underline: run.underline,
+                            strikeout: run.strikeout,
+                            inverse: run.inverse,
+                        })
+                        .collect(),
+                })
+                .collect(),
+            cursor: screen
+                .cursor
+                .map(|(row, column)| TerminalCursorInfo { row, column }),
+            display_offset: screen.display_offset,
+            history_size: screen.history_size,
+            app_cursor: screen.app_cursor,
+            bracketed_paste: screen.bracketed_paste,
+            alt_screen: screen.alt_screen,
+        }
     }
 
     pub fn write(&self, input: String) -> Result<(), CoreError> {
@@ -1275,6 +1432,24 @@ impl TerminalHandle {
 
     pub fn resize(&self, cols: u16, rows: u16) -> Result<(), CoreError> {
         self.session.resize(cols, rows).map_err(CoreError::from)
+    }
+
+    /// Scrolls through history; positive `lines` goes back.
+    pub fn scroll(&self, lines: i32) {
+        self.session.scroll(lines);
+    }
+
+    /// The shell's name (`zsh`), for the panel's tab list.
+    pub fn shell_name(&self) -> String {
+        self.session.shell_name().to_owned()
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.session.is_running()
+    }
+
+    pub fn kill(&self) {
+        self.session.kill();
     }
 }
 

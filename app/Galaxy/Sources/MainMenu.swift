@@ -82,6 +82,8 @@ enum MainMenu {
         let line = goMenu.addItem(withTitle: "Go to Line…", action: #selector(MainWindowController.showGoToLine(_:)), keyEquivalent: "g")
         line.keyEquivalentModifierMask = [.control]
         goMenu.addItem(.separator())
+        goMenu.addItem(withTitle: "Restart Language Server", action: #selector(MainWindowController.restartLanguageServer(_:)), keyEquivalent: "")
+        goMenu.addItem(withTitle: "Stop Language Server", action: #selector(MainWindowController.stopLanguageServer(_:)), keyEquivalent: "")
         // The window's key monitor handles both keys; these show them.
         let back = goMenu.addItem(withTitle: "Back", action: #selector(MainWindowController.navigateBack(_:)), keyEquivalent: "-")
         back.keyEquivalentModifierMask = [.control]

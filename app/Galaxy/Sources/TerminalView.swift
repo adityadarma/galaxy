@@ -1,19 +1,38 @@
 import AppKit
-import CoreText
 
+/// Draws a PTY session's screen and sends keys to it.
+///
+/// The Rust core keeps the grid; this view polls it at 60 Hz but only
+/// copies it when `version()` changed. Each line arrives as styled runs
+/// positioned by grid column, so colors, bold, wide characters and
+/// full-screen programs (vim, htop) line up with the shell's idea of the
+/// screen.
 @MainActor
 final class TerminalView: NSView {
-    var onNewTab: (() -> Void)?
-    var onSelectTab: ((Int) -> Void)?
     var onOpenLink: ((String, UInt64, UInt64) -> Void)?
+    /// The shell exited; the controller drops the session.
+    var onExit: (() -> Void)?
+
     private var handle: TerminalHandle?
     private var timer: Timer?
-    private var lines: [TerminalLineInfo] = []
-    private let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-    private let tabControl = NSSegmentedControl()
-    private let newTabButton = NSButton(title: "+", target: nil, action: nil)
-    private var cellWidth: CGFloat { ("0" as NSString).size(withAttributes: [.font: font]).width }
-    private var lineHeight: CGFloat { ceil(font.pointSize * 1.35) }
+    private(set) var screen: TerminalScreenInfo?
+    private var lastSize: (cols: UInt16, rows: UInt16) = (0, 0)
+    private var cursorVisible = true
+    private var blinkTick = 0
+    private var scrollRemainder: CGFloat = 0
+
+    static let padding = NSEdgeInsets(top: 4, left: 20, bottom: 4, right: 12)
+
+    private var font: NSFont {
+        let size = max(10, min(24, UserDefaults.standard.object(forKey: "TerminalFontSize") as? CGFloat ?? 12))
+        if let name = UserDefaults.standard.string(forKey: "TerminalFontName"), let font = NSFont(name: name, size: size) {
+            return font
+        }
+        return Theme.editorFont.withSize(size)
+    }
+    private lazy var fonts = FontSet(font)
+    private var cellWidth: CGFloat { fonts.cellWidth }
+    private var lineHeight: CGFloat { fonts.lineHeight }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -23,70 +42,105 @@ final class TerminalView: NSView {
         setAccessibilityRole(.textArea)
         setAccessibilityIdentifier("terminal")
         setAccessibilityLabel("Terminal")
-        tabControl.segmentStyle = .texturedRounded
-        tabControl.target = self
-        tabControl.action = #selector(selectTab(_:))
-        tabControl.translatesAutoresizingMaskIntoConstraints = false
-        newTabButton.bezelStyle = .texturedRounded
-        newTabButton.target = self
-        newTabButton.action = #selector(addTab(_:))
-        newTabButton.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(tabControl)
-        addSubview(newTabButton)
-        NSLayoutConstraint.activate([
-            tabControl.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
-            tabControl.topAnchor.constraint(equalTo: topAnchor, constant: 4),
-            newTabButton.leadingAnchor.constraint(equalTo: tabControl.trailingAnchor, constant: 4),
-            newTabButton.centerYAnchor.constraint(equalTo: tabControl.centerYAnchor),
-            newTabButton.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -6),
-        ])
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
+    override var isFlipped: Bool { true }
+    override var isOpaque: Bool { true }
+
     func start(handle: TerminalHandle) {
+        let changed = self.handle !== handle
         self.handle = handle
-        timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.poll() }
+        if changed {
+            screen = nil
+            lastSize = (0, 0)
         }
+        timer?.invalidate()
+        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.tick() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
         resizeTerminal()
         poll()
-        window?.makeFirstResponder(self)
+        needsDisplay = true
     }
 
     func stop() {
         timer?.invalidate()
         timer = nil
         handle = nil
-        lines = []
+        screen = nil
+        lastSize = (0, 0)
         needsDisplay = true
     }
 
-    func setTabs(count: Int, selected: Int) {
-        tabControl.segmentCount = count
-        for index in 0..<count { tabControl.setLabel("Terminal \(index + 1)", forSegment: index) }
-        tabControl.selectedSegment = selected
+    /// Follows the editor font settings when they change.
+    func reloadFont() {
+        fonts = FontSet(font)
+        lastSize = (0, 0)
+        resizeTerminal()
+        needsDisplay = true
     }
 
-    @objc private func selectTab(_ sender: NSSegmentedControl) { onSelectTab?(sender.selectedSegment) }
-    @objc private func addTab(_ sender: Any?) { onNewTab?() }
+    private func tick() {
+        poll()
+        // Blink at ~1.9 Hz while focused, like VS Code's default.
+        blinkTick += 1
+        if blinkTick >= 32 {
+            blinkTick = 0
+            if isFocused {
+                cursorVisible.toggle()
+                setNeedsDisplayForCursor()
+            }
+        }
+    }
 
     private func poll() {
         guard let handle else { return }
         _ = handle.pollOutput()
-        let next = handle.snapshot()
-        if next != lines {
-            lines = next
-            needsDisplay = true
+        if screen?.version != handle.version() {
+            let next = handle.screen()
+            if next != screen {
+                screen = next
+                cursorVisible = true
+                blinkTick = 0
+                needsDisplay = true
+            }
+        }
+        if !handle.isRunning() {
+            timer?.invalidate()
+            timer = nil
+            onExit?()
         }
     }
 
+    private var isFocused: Bool { window?.firstResponder === self && window?.isKeyWindow == true }
+
+    private func setNeedsDisplayForCursor() {
+        guard let cursor = screen?.cursor else { return }
+        setNeedsDisplay(cellRect(row: Int(cursor.row), column: Int(cursor.column), width: 2).insetBy(dx: -2, dy: -2))
+    }
+
+    // MARK: Geometry
+
+    private func cellRect(row: Int, column: Int, width: Int = 1) -> NSRect {
+        NSRect(x: Self.padding.left + CGFloat(column) * cellWidth,
+               y: Self.padding.top + CGFloat(row) * lineHeight,
+               width: CGFloat(width) * cellWidth, height: lineHeight)
+    }
+
     private func resizeTerminal() {
-        guard let handle else { return }
-        let cols = UInt16(max(2, Int(bounds.width / cellWidth)))
-        let rows = UInt16(max(1, Int(bounds.height / lineHeight)))
+        guard let handle, bounds.width > 0, bounds.height > 0 else { return }
+        let usableWidth = bounds.width - Self.padding.left - Self.padding.right
+        let usableHeight = bounds.height - Self.padding.top - Self.padding.bottom
+        let cols = UInt16(clamping: max(2, Int(usableWidth / cellWidth)))
+        let rows = UInt16(clamping: max(1, Int(usableHeight / lineHeight)))
+        guard (cols, rows) != lastSize else { return }
+        lastSize = (cols, rows)
         try? handle.resize(cols: cols, rows: rows)
+        poll()
     }
 
     override func setFrameSize(_ newSize: NSSize) {
@@ -94,80 +148,407 @@ final class TerminalView: NSView {
         resizeTerminal()
     }
 
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+
+    // MARK: Focus
+
     override var acceptsFirstResponder: Bool { true }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
-    override func mouseDown(with event: NSEvent) {
-        window?.makeFirstResponder(self)
-        guard event.clickCount == 2 else { return }
-        let point = convert(event.locationInWindow, from: nil)
-        let row = Int((point.y - 4) / lineHeight)
-        guard lines.indices.contains(row) else { return }
-        let text = lines[row].text
-        let pattern = #"(?:^|\s)([^\s:]+(?:/[^\s:]+)*):(\d+)(?::(\d+))?"#
-        guard let regex = try? NSRegularExpression(pattern: pattern),
-              let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) else { return }
-        let path = (text as NSString).substring(with: match.range(at: 1))
-        let line = UInt64((text as NSString).substring(with: match.range(at: 2))) ?? 1
-        let col = match.range(at: 3).location == NSNotFound
-            ? 1
-            : UInt64((text as NSString).substring(with: match.range(at: 3))) ?? 1
-        onOpenLink?(path, line, col)
+    override func becomeFirstResponder() -> Bool {
+        cursorVisible = true
+        needsDisplay = true
+        return true
     }
 
+    override func resignFirstResponder() -> Bool {
+        needsDisplay = true
+        return true
+    }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .iBeam)
+    }
+
+    // MARK: Mouse
+
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        let point = convert(event.locationInWindow, from: nil)
+        let wantsLink = event.clickCount == 2 || event.modifierFlags.contains(.command)
+        guard wantsLink, let screen else { return }
+        let row = Int((point.y - Self.padding.top) / lineHeight)
+        guard screen.lines.indices.contains(row) else { return }
+        if let link = Self.fileLink(in: screen.lines[row].text) {
+            onOpenLink?(link.path, link.line, link.column)
+        }
+    }
+
+    /// `path:line[:col]` in a line of output, e.g. compiler errors.
+    static func fileLink(in text: String) -> (path: String, line: UInt64, column: UInt64)? {
+        let pattern = #"(?:^|[\s(\[])((?:\.{0,2}/)?[\w.\-@]+(?:/[\w.\-@]+)*\.\w+):(\d+)(?::(\d+))?"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) else { return nil }
+        let ns = text as NSString
+        let path = ns.substring(with: match.range(at: 1))
+        let line = UInt64(ns.substring(with: match.range(at: 2))) ?? 1
+        let column = match.range(at: 3).location == NSNotFound ? 1 : UInt64(ns.substring(with: match.range(at: 3))) ?? 1
+        return (path, line, column)
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        guard let handle, let screen else { return }
+        if screen.altScreen {
+            // Full-screen programs scroll by arrow keys, as other terminals do.
+            let lines = Int(event.scrollingDeltaY / (event.hasPreciseScrollingDeltas ? lineHeight : 1))
+            guard lines != 0 else { return }
+            let key = lines > 0 ? (screen.appCursor ? "\u{1b}OA" : "\u{1b}[A") : (screen.appCursor ? "\u{1b}OB" : "\u{1b}[B")
+            try? handle.write(input: String(repeating: key, count: min(abs(lines), 20)))
+            return
+        }
+        let delta = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY / lineHeight : event.scrollingDeltaY * 3
+        scrollRemainder += delta
+        let lines = Int(scrollRemainder)
+        guard lines != 0 else { return }
+        scrollRemainder -= CGFloat(lines)
+        handle.scroll(lines: Int32(lines))
+        poll()
+    }
+
+    // MARK: Edit menu
+
     @objc func copy(_ sender: Any?) {
-        let text = lines.map(\.text).joined(separator: "\n")
+        guard let screen else { return }
+        var lines = screen.lines.map(\.text)
+        while lines.last?.isEmpty == true { lines.removeLast() }
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
+        NSPasteboard.general.setString(lines.joined(separator: "\n"), forType: .string)
     }
 
     @objc func paste(_ sender: Any?) {
-        guard let handle, let text = NSPasteboard.general.string(forType: .string) else { return }
+        guard let handle, var text = NSPasteboard.general.string(forType: .string) else { return }
+        text = text.replacingOccurrences(of: "\r\n", with: "\r").replacingOccurrences(of: "\n", with: "\r")
+        if screen?.bracketedPaste == true { text = "\u{1b}[200~\(text)\u{1b}[201~" }
         try? handle.write(input: text)
     }
 
     @objc override func selectAll(_ sender: Any?) { copy(sender) }
 
+    /// Clears the screen and scrollback (⌘K in Terminal.app and VS Code).
+    @objc func clearTerminal(_ sender: Any?) {
+        try? handle?.write(input: "\u{0c}")
+    }
+
+    // MARK: Keys
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        guard window?.firstResponder === self else { return false }
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if flags == .command, event.charactersIgnoringModifiers == "k" {
+            clearTerminal(nil)
+            return true
+        }
+        // ⌃ letters must reach the shell (⌃C, ⌃D…), not the menu.
+        if flags.contains(.control), !flags.contains(.command) {
+            keyDown(with: event)
+            return true
+        }
+        return false
+    }
+
     override func keyDown(with event: NSEvent) {
         guard let handle else { return }
-        let bytes: String
-        switch event.keyCode {
-        case 36: bytes = "\r"
-        case 48: bytes = "\t"
-        case 51: bytes = "\u{7f}"
-        case 123: bytes = "\u{1b}[D"
-        case 124: bytes = "\u{1b}[C"
-        case 125: bytes = "\u{1b}[B"
-        case 126: bytes = "\u{1b}[A"
-        default: bytes = event.characters ?? ""
-        }
-        if !bytes.isEmpty { try? handle.write(input: bytes) }
+        let bytes = Self.bytes(for: event, appCursor: screen?.appCursor ?? false)
+        guard !bytes.isEmpty else { return }
+        cursorVisible = true
+        blinkTick = 0
+        try? handle.write(input: bytes)
+        poll()
     }
+
+    /// What a key sends, xterm style.
+    static func bytes(for event: NSEvent, appCursor: Bool) -> String {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let option = flags.contains(.option)
+        let control = flags.contains(.control)
+        let shift = flags.contains(.shift)
+        // xterm modifier parameter: 1 + shift + 2·alt + 4·ctrl.
+        let modifier = 1 + (shift ? 1 : 0) + (option ? 2 : 0) + (control ? 4 : 0)
+        func cursorKey(_ letter: String) -> String {
+            if modifier > 1 { return "\u{1b}[1;\(modifier)\(letter)" }
+            return (appCursor ? "\u{1b}O" : "\u{1b}[") + letter
+        }
+        func tildeKey(_ code: Int) -> String {
+            modifier > 1 ? "\u{1b}[\(code);\(modifier)~" : "\u{1b}[\(code)~"
+        }
+        switch event.keyCode {
+        case 36, 76: return option ? "\u{1b}\r" : "\r"
+        case 48: return shift ? "\u{1b}[Z" : "\t"
+        case 51: return option ? "\u{1b}\u{7f}" : (control ? "\u{08}" : "\u{7f}")
+        case 53: return "\u{1b}"
+        case 117: return tildeKey(3)
+        case 123: return option && !shift && !control ? "\u{1b}b" : cursorKey("D")
+        case 124: return option && !shift && !control ? "\u{1b}f" : cursorKey("C")
+        case 125: return cursorKey("B")
+        case 126: return cursorKey("A")
+        case 115: return cursorKey("H")
+        case 119: return cursorKey("F")
+        case 116: return tildeKey(5)
+        case 121: return tildeKey(6)
+        case 122: return "\u{1b}OP"
+        case 120: return "\u{1b}OQ"
+        case 99: return "\u{1b}OR"
+        case 118: return "\u{1b}OS"
+        case 96: return tildeKey(15)
+        case 97: return tildeKey(17)
+        case 98: return tildeKey(18)
+        case 100: return tildeKey(19)
+        case 101: return tildeKey(20)
+        case 109: return tildeKey(21)
+        case 103: return tildeKey(23)
+        case 111: return tildeKey(24)
+        default: break
+        }
+        if control, let plain = event.charactersIgnoringModifiers?.lowercased().unicodeScalars.first {
+            switch plain {
+            case "a"..."z": return String(UnicodeScalar(plain.value - 96)!)
+            case "@", " ", "2": return "\u{0}"
+            case "[", "3": return "\u{1b}"
+            case "\\", "4": return "\u{1c}"
+            case "]", "5": return "\u{1d}"
+            case "^", "6": return "\u{1e}"
+            case "_", "-", "7": return "\u{1f}"
+            default: break
+            }
+        }
+        // Option sends the character macOS composes (∆ for ⌥J), like
+        // Terminal.app without "Use Option as Meta key".
+        return event.characters ?? ""
+    }
+
+    // MARK: Drawing
 
     override func draw(_ dirtyRect: NSRect) {
-        super.draw(dirtyRect)
-        NSColor.textBackgroundColor.setFill()
+        let palette = TerminalPalette(appearance: effectiveAppearance)
+        palette.background.setFill()
         dirtyRect.fill()
-        guard !lines.isEmpty else { return }
-        let context = NSGraphicsContext.current?.cgContext
-        context?.saveGState()
-        defer { context?.restoreGState() }
-        for (row, line) in lines.enumerated() {
-            let top = CGFloat(row) * lineHeight
-            guard top <= dirtyRect.maxY, top + lineHeight >= dirtyRect.minY else { continue }
-            let attributes: [NSAttributedString.Key: Any] = [
-                .font: line.bold ? NSFont.monospacedSystemFont(ofSize: 12, weight: .bold) : font,
-                .foregroundColor: terminalColor(line.foreground),
-                .underlineStyle: line.underline ? NSUnderlineStyle.single.rawValue : 0,
-            ]
-            NSAttributedString(string: line.text, attributes: attributes)
-                .draw(at: NSPoint(x: 6, y: top + 1))
+        guard let screen, let context = NSGraphicsContext.current?.cgContext else { return }
+
+        let firstRow = max(0, Int((dirtyRect.minY - Self.padding.top) / lineHeight))
+        let lastRow = min(screen.lines.count - 1, Int((dirtyRect.maxY - Self.padding.top) / lineHeight))
+        guard firstRow <= lastRow else { return drawScrollIndicator(screen, palette) }
+
+        for row in firstRow...lastRow {
+            let line = screen.lines[row]
+            let y = Self.padding.top + CGFloat(row) * lineHeight
+            for run in line.runs {
+                let colors = palette.colors(for: run)
+                let width = CGFloat(run.text.unicodeScalars.reduce(0) { $0 + Self.cellCount($1) })
+                let rect = NSRect(x: Self.padding.left + CGFloat(run.column) * cellWidth, y: y,
+                                  width: width * cellWidth, height: lineHeight)
+                if let background = colors.background {
+                    background.setFill()
+                    rect.fill()
+                }
+                drawRun(run, in: rect, color: colors.foreground, context: context)
+            }
+        }
+        drawCursor(screen, palette)
+        drawScrollIndicator(screen, palette)
+    }
+
+    private func drawRun(_ run: TerminalRunInfo, in rect: NSRect, color: NSColor, context: CGContext) {
+        guard !run.text.allSatisfy({ $0 == " " }) || run.underline || run.strikeout else { return }
+        var attributes: [NSAttributedString.Key: Any] = [
+            .font: fonts.font(bold: run.bold, italic: run.italic),
+            .foregroundColor: color,
+            .ligature: 0,
+        ]
+        if run.underline { attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue }
+        if run.strikeout { attributes[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
+        // Place each cell at its grid column, so the shell's layout holds
+        // even where the font's glyphs are not exactly one cell wide.
+        let baseline = rect.minY + fonts.baselineOffset
+        if run.text.unicodeScalars.allSatisfy({ $0.isASCII }) {
+            let kern = cellWidth - fonts.asciiAdvance
+            if abs(kern) > 0.01 { attributes[.kern] = kern }
+            NSAttributedString(string: run.text, attributes: attributes)
+                .draw(with: NSRect(x: rect.minX, y: baseline - fonts.ascent, width: rect.width + 4, height: lineHeight),
+                      options: [.usesLineFragmentOrigin])
+            return
+        }
+        var column = 0
+        for character in run.text {
+            let cells = character.unicodeScalars.first.map(Self.cellCount) ?? 1
+            if character != " " {
+                let x = rect.minX + CGFloat(column) * cellWidth
+                NSAttributedString(string: String(character), attributes: attributes)
+                    .draw(with: NSRect(x: x, y: baseline - fonts.ascent, width: CGFloat(cells) * cellWidth + 8, height: lineHeight),
+                          options: [.usesLineFragmentOrigin])
+            }
+            column += cells
         }
     }
 
-    private func terminalColor(_ index: UInt8) -> NSColor {
-        let palette: [NSColor] = [.black, .systemRed, .systemGreen, .systemYellow,
-                                  .systemBlue, .systemPurple, .systemTeal, .white]
-        return palette[Int(index) % palette.count]
+    private func drawCursor(_ screen: TerminalScreenInfo, _ palette: TerminalPalette) {
+        guard let cursor = screen.cursor, screen.lines.indices.contains(Int(cursor.row)) else { return }
+        let rect = cellRect(row: Int(cursor.row), column: Int(cursor.column))
+        palette.cursor.set()
+        if isFocused {
+            guard cursorVisible else { return }
+            rect.fill()
+            // The character under a block cursor, in the background color.
+            if let character = character(at: cursor, in: screen), character != " " {
+                NSAttributedString(string: String(character), attributes: [
+                    .font: fonts.font(bold: false, italic: false),
+                    .foregroundColor: palette.background,
+                ]).draw(with: NSRect(x: rect.minX, y: rect.minY + fonts.baselineOffset - fonts.ascent,
+                                     width: cellWidth + 4, height: lineHeight),
+                        options: [.usesLineFragmentOrigin])
+            }
+        } else {
+            let outline = NSBezierPath(rect: rect.insetBy(dx: 0.5, dy: 0.5))
+            outline.lineWidth = 1
+            outline.stroke()
+        }
+    }
+
+    private func character(at cursor: TerminalCursorInfo, in screen: TerminalScreenInfo) -> Character? {
+        for run in screen.lines[Int(cursor.row)].runs {
+            var column = Int(run.column)
+            for character in run.text {
+                let cells = character.unicodeScalars.first.map(Self.cellCount) ?? 1
+                if (column..<(column + cells)).contains(Int(cursor.column)) { return character }
+                column += cells
+            }
+        }
+        return nil
+    }
+
+    /// A thin bar on the right while scrolled back, like VS Code's scrollbar.
+    private func drawScrollIndicator(_ screen: TerminalScreenInfo, _ palette: TerminalPalette) {
+        guard screen.displayOffset > 0, screen.historySize > 0 else { return }
+        let total = CGFloat(screen.historySize) + CGFloat(screen.lines.count)
+        let height = max(20, bounds.height * CGFloat(screen.lines.count) / total)
+        let fromBottom = CGFloat(screen.displayOffset) / CGFloat(screen.historySize)
+        let y = (bounds.height - height) * (1 - fromBottom)
+        NSColor.secondaryLabelColor.withAlphaComponent(0.4).setFill()
+        NSBezierPath(roundedRect: NSRect(x: bounds.width - 8, y: y, width: 5, height: height), xRadius: 2.5, yRadius: 2.5).fill()
+    }
+
+    /// Columns a character takes in the grid: 2 for East Asian wide and
+    /// most emoji, as the core's grid lays them out.
+    static func cellCount(_ scalar: Unicode.Scalar) -> Int {
+        let v = scalar.value
+        if v < 0x1100 { return 1 }
+        if (0x1100...0x115F).contains(v) || (0x2E80...0xA4CF).contains(v) || (0xAC00...0xD7A3).contains(v)
+            || (0xF900...0xFAFF).contains(v) || (0xFE30...0xFE4F).contains(v) || (0xFF00...0xFF60).contains(v)
+            || (0xFFE0...0xFFE6).contains(v) || (0x1F300...0x1F64F).contains(v) || (0x1F900...0x1F9FF).contains(v)
+            || (0x20000...0x3FFFD).contains(v) {
+            return 2
+        }
+        return 1
+    }
+}
+
+/// The terminal font in its four styles, with the grid metrics.
+private struct FontSet {
+    let regular: NSFont
+    let bold: NSFont
+    let italic: NSFont
+    let boldItalic: NSFont
+    let cellWidth: CGFloat
+    let asciiAdvance: CGFloat
+    let lineHeight: CGFloat
+    let ascent: CGFloat
+    let baselineOffset: CGFloat
+
+    init(_ font: NSFont) {
+        let manager = NSFontManager.shared
+        regular = font
+        bold = manager.convert(font, toHaveTrait: .boldFontMask)
+        italic = manager.convert(font, toHaveTrait: .italicFontMask)
+        boldItalic = manager.convert(bold, toHaveTrait: .italicFontMask)
+        asciiAdvance = ("M" as NSString).size(withAttributes: [.font: font]).width
+        cellWidth = ceil(asciiAdvance * 2) / 2
+        lineHeight = ceil((font.ascender - font.descender + font.leading) * 1.2)
+        ascent = font.ascender
+        // Center the glyphs in the taller line.
+        let natural = font.ascender - font.descender
+        baselineOffset = round((lineHeight - natural) / 2 + font.ascender)
+    }
+
+    func font(bold isBold: Bool, italic isItalic: Bool) -> NSFont {
+        switch (isBold, isItalic) {
+        case (true, true): boldItalic
+        case (true, false): bold
+        case (false, true): italic
+        case (false, false): regular
+        }
+    }
+}
+
+/// ANSI colors close to VS Code's Dark Modern and Light Modern terminal
+/// themes, so prompts look as they do there.
+struct TerminalPalette {
+    let background: NSColor
+    let foreground: NSColor
+    let cursor: NSColor
+    let ansi: [NSColor]
+
+    init(appearance: NSAppearance) {
+        let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        background = NSColor.textBackgroundColor.resolved(for: appearance)
+        if dark {
+            foreground = NSColor(hex: "#CCCCCC") ?? .textColor
+            cursor = NSColor(hex: "#AEAFAD") ?? .textColor
+            ansi = ["#000000", "#CD3131", "#0DBC79", "#E5E510", "#2472C8", "#BC3FBC", "#11A8CD", "#E5E5E5",
+                    "#666666", "#F14C4C", "#23D18B", "#F5F543", "#3B8EEA", "#D670D6", "#29B8DB", "#E5E5E5"]
+                .map { NSColor(hex: $0) ?? .textColor }
+        } else {
+            foreground = NSColor(hex: "#3B3B3B") ?? .textColor
+            cursor = NSColor(hex: "#005FB8") ?? .textColor
+            ansi = ["#000000", "#CD3131", "#107C10", "#949800", "#0451A5", "#BC05BC", "#0598BC", "#555555",
+                    "#666666", "#CD3131", "#14CE14", "#B5BA00", "#0451A5", "#BC05BC", "#0598BC", "#A5A5A5"]
+                .map { NSColor(hex: $0) ?? .textColor }
+        }
+    }
+
+    func color(_ color: TerminalColorInfo, isForeground: Bool) -> NSColor? {
+        switch color {
+        case .default: return isForeground ? foreground : nil
+        case .indexed(let index): return indexed(index)
+        case .rgb(let r, let g, let b):
+            return NSColor(srgbRed: CGFloat(r) / 255, green: CGFloat(g) / 255, blue: CGFloat(b) / 255, alpha: 1)
+        }
+    }
+
+    func colors(for run: TerminalRunInfo) -> (foreground: NSColor, background: NSColor?) {
+        var fg = color(run.foreground, isForeground: true) ?? foreground
+        var bg = color(run.background, isForeground: false)
+        // Bold ANSI 0–7 use the bright variant, as xterm does.
+        if run.bold, case .indexed(let index) = run.foreground, index < 8 { fg = ansi[Int(index) + 8] }
+        if run.inverse {
+            let swapped = bg ?? background
+            bg = fg
+            fg = swapped
+        }
+        if run.dim { fg = fg.withAlphaComponent(0.6) }
+        return (fg, bg)
+    }
+
+    private func indexed(_ index: UInt8) -> NSColor {
+        let i = Int(index)
+        if i < 16 { return ansi[i] }
+        if i < 232 {
+            let n = i - 16
+            let levels: [CGFloat] = [0, 95, 135, 175, 215, 255]
+            return NSColor(srgbRed: levels[n / 36] / 255, green: levels[(n / 6) % 6] / 255, blue: levels[n % 6] / 255, alpha: 1)
+        }
+        let gray = CGFloat(8 + (i - 232) * 10) / 255
+        return NSColor(srgbRed: gray, green: gray, blue: gray, alpha: 1)
     }
 }

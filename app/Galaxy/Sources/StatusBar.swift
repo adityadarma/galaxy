@@ -119,7 +119,11 @@ final class StatusBar: NSView {
             lsp.toolTip = progress.message
         } else if status.servers > 0 {
             lsp.stringValue = "LSP: \(status.servers) ready"
-            lsp.toolTip = nil
+            let processes = status.processes.map { process in
+                let memory = process.residentMemoryKib.map { " \($0 / 1024) MB" } ?? ""
+                return "\(process.language) (PID \(process.pid)\(memory))"
+            }
+            lsp.toolTip = processes.isEmpty ? nil : processes.joined(separator: "\n")
         } else {
             lsp.stringValue = ""
             lsp.toolTip = nil

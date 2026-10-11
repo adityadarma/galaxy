@@ -54,6 +54,21 @@ Language server dikonfigurasi melalui resolver built-in berdasarkan bahasa:
 Executable harus tersedia di `PATH`. Galaxy membagi satu server per kombinasi
 bahasa dan workspace bila lifecycle server mendukungnya.
 
+Override server dapat ditaruh dalam settings JSON melalui `servers`. Nilai
+`restartBackoffMs` berisi tepat tiga delay retry dalam milidetik; defaultnya
+`[0, 1000, 2000]` dan maksimum tetap tiga restart per lima menit.
+
+```json
+{
+  "servers": {
+    "rust": {
+      "command": "rust-analyzer",
+      "restartBackoffMs": [0, 1000, 2000]
+    }
+  }
+}
+```
+
 Feature LSP yang bergantung pada server nyata akan kosong atau dilewati jika
 executable tidak terpasang; editor tetap dapat dipakai sebagai editor biasa.
 

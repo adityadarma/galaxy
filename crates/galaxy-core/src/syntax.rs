@@ -9,6 +9,7 @@
 //! M3-03 supplies the bundled grammars. This layer intentionally knows
 //! neither language names nor highlight queries.
 
+use std::sync::OnceLock;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -418,16 +419,15 @@ pub fn style_runs_for_viewport(
     } else {
         rope.line_to_byte(last)
     };
-    let query = match language.compile_highlights() {
-        Ok(query) => query,
-        Err(_) => return Vec::new(), // grammar queries are validated in tests
+    let Some(query) = cached_highlight_query(language) else {
+        return Vec::new();
     };
     let names = query.capture_names();
     let mut cursor = QueryCursor::new();
     cursor.set_byte_range(start_byte..end_byte);
     let text = rope.to_string();
     let mut runs = Vec::new();
-    let mut matches = cursor.matches(&query, tree.root_node(), text.as_bytes());
+    let mut matches = cursor.matches(query, tree.root_node(), text.as_bytes());
     while let Some(m) = matches.next() {
         for capture in m.captures {
             let Some(scope) = HighlightScope::from_capture(names[capture.index as usize]) else {
@@ -464,6 +464,13 @@ pub fn style_runs_for_viewport(
     }
     runs.sort_by_key(|run| (run.line, run.start, run.end));
     runs
+}
+
+fn cached_highlight_query(language: SyntaxLanguage) -> Option<&'static Query> {
+    static QUERIES: [OnceLock<Option<Query>>; 13] = [const { OnceLock::new() }; 13];
+    let slot = &QUERIES[language as usize];
+    slot.get_or_init(|| language.compile_highlights().ok())
+        .as_ref()
 }
 
 struct Request {

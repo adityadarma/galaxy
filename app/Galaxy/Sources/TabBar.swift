@@ -85,7 +85,7 @@ final class TabBar: NSView {
         stack.orientation = .horizontal
         stack.spacing = 0
         stack.distribution = .fill
-        stack.alignment = .height
+        stack.alignment = .centerY
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.setHuggingPriority(.defaultHigh, for: .horizontal)
         addSubview(stack)
@@ -97,6 +97,7 @@ final class TabBar: NSView {
 
         NSLayoutConstraint.activate([
             heightAnchor.constraint(equalToConstant: Theme.tabHeight),
+            widthAnchor.constraint(greaterThanOrEqualToConstant: 0),
             stack.leadingAnchor.constraint(equalTo: leadingAnchor),
             rule.bottomAnchor.constraint(equalTo: bottomAnchor),
             rule.leadingAnchor.constraint(equalTo: leadingAnchor),
@@ -244,6 +245,7 @@ final class TabItemView: NSView {
         NSLayoutConstraint.activate([
             widthAnchor.constraint(greaterThanOrEqualToConstant: TabBar.minTabWidth),
             widthAnchor.constraint(lessThanOrEqualToConstant: TabBar.maxTabWidth),
+            heightAnchor.constraint(equalToConstant: Theme.tabHeight),
             icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
             icon.centerYAnchor.constraint(equalTo: centerYAnchor),
             icon.widthAnchor.constraint(equalToConstant: 16),

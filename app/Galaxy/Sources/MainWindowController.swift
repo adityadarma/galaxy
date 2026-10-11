@@ -35,6 +35,18 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private let problemsPanel = ProblemsPanel()
     private let referencesPanel = ReferencesPanel()
     private let terminalView = TerminalView()
+    private let outputPanel = OutputPanel()
+    private let portsPanel = PortsPanel()
+    private let bottomPanelHeader = BottomPanelHeader()
+    private let bottomPanelContent = BottomPanelContentView()
+    private var bottomPanelHeight: NSLayoutConstraint!
+    private var bottomPanelHeaderHeight: NSLayoutConstraint!
+    private var bottomPanelTab = BottomPanelHeader.Tab.terminal
+    var isBottomPanelVisible: Bool { bottomPanelHeight.constant > 0 }
+    /// Panel content height when open, and whether it fills the editor area.
+    private var bottomPanelOpenHeight: CGFloat = 240
+    private(set) var isBottomPanelMaximized = false
+    private let bottomPanelPlaceholder = NSTextField(labelWithString: "Debug console is not connected")
     private var terminalHandles: [TerminalHandle] = []
     private var activeTerminalIndex = 0
     private let hoverPopover = HoverPopover()
@@ -211,29 +223,112 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
 
     @objc func toggleTerminal(_ sender: Any?) {
-        terminalView.isHidden.toggle()
-        if !terminalView.isHidden {
-            ensureTerminal()
+        setBottomPanelOpen(!isBottomPanelVisible)
+        if isBottomPanelVisible { showBottomPanel(tab: bottomPanelTab) }
+    }
+
+    /// Opens or closes the panel by resizing it. Panels stay in the view
+    /// hierarchy: adding and removing views while AppKit updates tracking
+    /// areas crashed (`_NSViewSubviewMutationSafeApply`).
+    private func setBottomPanelOpen(_ open: Bool) {
+        if !open {
+            isBottomPanelMaximized = false
+            bottomPanelHeader.setMaximized(false)
+            // Typing goes back to the editor, as in VS Code.
+            if window?.firstResponder === terminalView { window?.makeFirstResponder(editorView) }
+            outputPanel.stop()
+            portsPanel.stop()
         }
+        bottomPanelHeight.constant = open ? currentBottomPanelHeight() : 0
+        bottomPanelHeaderHeight.constant = open ? BottomPanelHeader.height : 0
+        bottomPanelHeader.isHidden = !open
+        bottomPanelContent.isHidden = !open
+        titleBar.setPanelVisible(open)
+        detailView.needsLayout = true
+    }
+
+    private func currentBottomPanelHeight() -> CGFloat {
+        guard isBottomPanelMaximized else { return bottomPanelOpenHeight }
+        // Leave the tab strip and a sliver of editor, like VS Code.
+        let available = detailView.bounds.height - Theme.tabHeight - BottomPanelHeader.height - 40
+        return max(bottomPanelOpenHeight, available)
+    }
+
+    private func toggleBottomPanelMaximized() {
+        isBottomPanelMaximized.toggle()
+        bottomPanelHeader.setMaximized(isBottomPanelMaximized)
+        bottomPanelHeight.constant = currentBottomPanelHeight()
+        detailView.needsLayout = true
+    }
+
+    private func showBottomPanel(tab: BottomPanelHeader.Tab) {
+        bottomPanelTab = tab
+        bottomPanelHeader.select(tab)
+        terminalView.isHidden = tab != .terminal
+        problemsPanel.isHidden = tab != .problems
+        outputPanel.isHidden = tab != .output
+        portsPanel.isHidden = tab != .ports
+        bottomPanelPlaceholder.isHidden = tab != .debugConsole
+        if tab == .terminal {
+            ensureTerminal()
+            window?.makeFirstResponder(terminalView)
+        }
+        if tab == .output { outputPanel.start() } else { outputPanel.stop() }
+        if tab == .ports { portsPanel.start() } else { portsPanel.stop() }
     }
 
     private func ensureTerminal() {
-        guard let workspace else { return }
+        guard let workspace else {
+            bottomPanelHeader.setTerminals(names: [], selected: 0)
+            return
+        }
         if terminalHandles.isEmpty,
            let handle = bridge.terminal(workspace: workspace, cols: 100, rows: 24) {
             terminalHandles = [handle]
+            activeTerminalIndex = 0
         }
+        refreshTerminalPicker()
         guard terminalHandles.indices.contains(activeTerminalIndex) else { return }
-        terminalView.setTabs(count: terminalHandles.count, selected: activeTerminalIndex)
         terminalView.start(handle: terminalHandles[activeTerminalIndex])
+    }
+
+    private func refreshTerminalPicker() {
+        bottomPanelHeader.setTerminals(names: terminalHandles.map { $0.shellName() }, selected: activeTerminalIndex)
     }
 
     private func newTerminal() {
         guard let workspace,
-              let handle = bridge.terminal(workspace: workspace, cols: 100, rows: 24) else { return }
+              let handle = bridge.terminal(workspace: workspace, cols: 100, rows: 24) else { return NSSound.beep() }
         terminalHandles.append(handle)
         activeTerminalIndex = terminalHandles.count - 1
-        ensureTerminal()
+        if !isBottomPanelVisible { setBottomPanelOpen(true) }
+        showBottomPanel(tab: .terminal)
+    }
+
+    /// Kills the active terminal; the panel closes with the last one.
+    private func killActiveTerminal() {
+        guard terminalHandles.indices.contains(activeTerminalIndex) else { return }
+        terminalHandles.remove(at: activeTerminalIndex).kill()
+        removedTerminal()
+    }
+
+    /// The shell in the active terminal exited (`exit`, ⌃D).
+    private func terminalExited() {
+        guard terminalHandles.indices.contains(activeTerminalIndex),
+              !terminalHandles[activeTerminalIndex].isRunning() else { return }
+        terminalHandles.remove(at: activeTerminalIndex)
+        removedTerminal()
+    }
+
+    private func removedTerminal() {
+        terminalView.stop()
+        activeTerminalIndex = max(0, min(activeTerminalIndex, terminalHandles.count - 1))
+        if terminalHandles.isEmpty {
+            refreshTerminalPicker()
+            if bottomPanelTab == .terminal { setBottomPanelOpen(false) }
+        } else {
+            ensureTerminal()
+        }
     }
 
     init(bridge: CoreBridge) {
@@ -349,6 +444,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             // Clicking the active item collapses the sidebar, as in VSCode.
             self.setSidebarVisible(!self.isSidebarVisible)
         }
+        titleBar.onToggleSidebar = { [weak self] in self?.toggleSidebarVisibility(nil) }
+        titleBar.onTogglePanel = { [weak self] in self?.toggleTerminal(nil) }
+        titleBar.setSidebarVisible(true)
+        titleBar.setPanelVisible(false)
 
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = false
@@ -382,6 +481,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         editorSplitView.addSubview(scrollView)
 
         tabBar.translatesAutoresizingMaskIntoConstraints = false
+        tabBar.setContentHuggingPriority(.required, for: .vertical)
+        tabBar.setContentCompressionResistancePriority(.required, for: .vertical)
         tabBar.onSelect = { [weak self] i in self?.selectTab(i, fromTabBar: true) }
         tabBar.onClose = { [weak self] i in self?.closeTab(at: i) }
         tabBar.onMove = { [weak self] from, to in self?.moveTab(from: from, to: to) }
@@ -414,7 +515,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 self?.reloadSettings()
                 let problems = self?.bridge.core.problems() ?? []
                 self?.problemsPanel.update(problems)
-                self?.problemsPanel.isHidden = problems.isEmpty
+                self?.problemsPanel.isHidden = self?.bottomPanelTab != .problems
+                self?.bottomPanelHeader.setProblemCount(problems.count)
                 if let document = self?.activeTab?.doc {
                     let markers = problems.filter { $0.uri == "file://\(document.path())" }
                         .map { ($0.line, $0.severity) }
@@ -429,6 +531,28 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         breadcrumbBar.translatesAutoresizingMaskIntoConstraints = false
         breadcrumbBar.clear()
         findBarSlot.translatesAutoresizingMaskIntoConstraints = false
+        stickyScopeView.translatesAutoresizingMaskIntoConstraints = false
+        // `BottomPanelContentView.layout()` sizes these (never below its
+        // minimum). No autoresizing mask: one tied to the collapsed,
+        // zero-height container conflicts with the panels' own constraints.
+        for panel in [terminalView, outputPanel, portsPanel, problemsPanel] as [NSView] {
+            panel.translatesAutoresizingMaskIntoConstraints = true
+            panel.autoresizingMask = []
+            // A zero frame would become a `height == 0` constraint before
+            // the first layout.
+            panel.frame = NSRect(x: 0, y: 0, width: 800, height: BottomPanelContentView.minimumChildHeight)
+        }
+        bottomPanelHeader.translatesAutoresizingMaskIntoConstraints = false
+        bottomPanelHeader.clipsToBounds = true
+        bottomPanelContent.translatesAutoresizingMaskIntoConstraints = false
+        bottomPanelHeight = bottomPanelContent.heightAnchor.constraint(equalToConstant: 0)
+        bottomPanelHeaderHeight = bottomPanelHeader.heightAnchor.constraint(equalToConstant: 0)
+        bottomPanelHeader.isHidden = true
+        referencesPanel.translatesAutoresizingMaskIntoConstraints = true
+        referencesPanel.autoresizingMask = [.width]
+        hoverPopover.translatesAutoresizingMaskIntoConstraints = false
+        completionPopup.translatesAutoresizingMaskIntoConstraints = false
+        signaturePopup.translatesAutoresizingMaskIntoConstraints = false
         findBarSlot.isHidden = true
         findBarHeight = findBarSlot.heightAnchor.constraint(equalToConstant: 0)
         detailView.addSubview(tabBar)
@@ -437,9 +561,17 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         detailView.addSubview(findBarSlot)
         detailView.addSubview(editorSplitView)
         detailView.addSubview(stickyScopeView)
-        detailView.addSubview(terminalView)
-        detailView.addSubview(problemsPanel)
-        detailView.addSubview(referencesPanel)
+        detailView.addSubview(bottomPanelHeader)
+        detailView.addSubview(bottomPanelContent)
+        // Every panel is added once and switched with `isHidden`; see
+        // `setBottomPanelOpen`.
+        bottomPanelPlaceholder.textColor = .secondaryLabelColor
+        bottomPanelPlaceholder.alignment = .center
+        bottomPanelPlaceholder.isHidden = true
+        for panel in [terminalView, problemsPanel, outputPanel, portsPanel, bottomPanelPlaceholder] as [NSView] {
+            bottomPanelContent.addSubview(panel)
+        }
+        bottomPanelContent.isHidden = true
         detailView.addSubview(hoverPopover)
         detailView.addSubview(completionPopup)
         detailView.addSubview(signaturePopup)
@@ -447,6 +579,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             tabBar.topAnchor.constraint(equalTo: detailView.topAnchor),
             tabBar.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
             tabBar.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
+            tabBar.heightAnchor.constraint(equalToConstant: Theme.tabHeight),
             pathBar.topAnchor.constraint(equalTo: tabBar.bottomAnchor),
             pathBar.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
             pathBar.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
@@ -463,31 +596,45 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
              stickyScopeView.topAnchor.constraint(equalTo: editorSplitView.topAnchor),
              stickyScopeView.leadingAnchor.constraint(equalTo: editorSplitView.leadingAnchor),
              stickyScopeView.trailingAnchor.constraint(equalTo: editorSplitView.trailingAnchor),
-            problemsPanel.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
-            problemsPanel.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
-            problemsPanel.bottomAnchor.constraint(equalTo: detailView.bottomAnchor),
-            referencesPanel.leadingAnchor.constraint(equalTo: detailView.leadingAnchor), referencesPanel.trailingAnchor.constraint(equalTo: detailView.trailingAnchor), referencesPanel.bottomAnchor.constraint(equalTo: detailView.bottomAnchor),
-             terminalView.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
-             terminalView.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
-             terminalView.bottomAnchor.constraint(equalTo: problemsPanel.topAnchor),
-             terminalView.heightAnchor.constraint(equalToConstant: 180),
-             editorSplitView.bottomAnchor.constraint(equalTo: terminalView.topAnchor),
-         ])
+             // VS Code order: editor, panel title row, panel content.
+             editorSplitView.bottomAnchor.constraint(equalTo: bottomPanelHeader.topAnchor),
+             bottomPanelHeader.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
+             bottomPanelHeader.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
+             bottomPanelHeaderHeight,
+             bottomPanelContent.topAnchor.constraint(equalTo: bottomPanelHeader.bottomAnchor),
+             bottomPanelContent.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
+             bottomPanelContent.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
+             bottomPanelContent.bottomAnchor.constraint(equalTo: detailView.bottomAnchor),
+             bottomPanelHeight,
+          ])
         problemsPanel.onSelect = { [weak self] problem in self?.showProblem(problem) }
         referencesPanel.onSelect = { [weak self] location in self?.showReference(location) }
         problemsPanel.isHidden = true
-        referencesPanel.isHidden = true
+        outputPanel.isHidden = true
+        portsPanel.isHidden = true
+        referencesPanel.removeFromSuperview()
         terminalView.isHidden = true
-        stickyScopeView.isHidden = true
-        terminalView.onNewTab = { [weak self] in self?.newTerminal() }
-        terminalView.onOpenLink = { [weak self] path, line, col in
-            self?.openTerminalLink(path: path, line: line, col: col)
+        problemsPanel.isHidden = true
+        bottomPanelHeader.onSelect = { [weak self] tab in
+            guard let self else { return }
+            if !self.isBottomPanelVisible { self.setBottomPanelOpen(true) }
+            self.showBottomPanel(tab: tab)
         }
-        terminalView.onSelectTab = { [weak self] index in
+        bottomPanelHeader.onNewTerminal = { [weak self] in self?.newTerminal() }
+        bottomPanelHeader.onKillTerminal = { [weak self] in self?.killActiveTerminal() }
+        bottomPanelHeader.onToggleMaximize = { [weak self] in self?.toggleBottomPanelMaximized() }
+        bottomPanelHeader.onClose = { [weak self] in self?.setBottomPanelOpen(false) }
+        bottomPanelHeader.onSelectTerminal = { [weak self] index in
             guard let self, self.terminalHandles.indices.contains(index) else { return }
             self.activeTerminalIndex = index
             self.ensureTerminal()
+            self.window?.makeFirstResponder(self.terminalView)
         }
+        stickyScopeView.isHidden = true
+        terminalView.onOpenLink = { [weak self] path, line, col in
+            self?.openTerminalLink(path: path, line: line, col: col)
+        }
+        terminalView.onExit = { [weak self] in self?.terminalExited() }
         hoverPopover.isHidden = true
         completionPopup.isHidden = true
         signaturePopup.isHidden = true
@@ -660,12 +807,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         guard !locations.isEmpty else { return }
         referencesRequest = nil
         problemsPanel.isHidden = true
-        referencesPanel.update(locations); referencesPanel.isHidden = false
+        referencesPanel.update(locations)
+        if referencesPanel.superview == nil { detailView.addSubview(referencesPanel) }
+        referencesPanel.frame = NSRect(x: 0, y: 0, width: detailView.bounds.width, height: 150)
+        referencesPanel.isHidden = false
     }
 
     private func showReference(_ location: DefinitionLocation) {
         guard let path = URL(string: location.uri)?.path else { return }
-        referencesPanel.isHidden = true
+        referencesPanel.removeFromSuperview()
         let current = activeTab.map(location(of:))
         let target = NavLocation(key: path, line: location.line, col: location.column)
         if let current { _ = navHistory.recordJump(from: current, to: target) }
@@ -875,10 +1025,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             explorer.scrollView.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor),
             explorer.scrollView.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor),
             explorer.scrollView.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor),
-            emptyState.centerXAnchor.constraint(equalTo: sidebar.centerXAnchor),
+            emptyState.centerXAnchor.constraint(equalTo: sidebar.centerXAnchor).withPriority(.defaultHigh),
             emptyState.centerYAnchor.constraint(equalTo: sidebar.centerYAnchor, constant: -20),
-            emptyState.leadingAnchor.constraint(greaterThanOrEqualTo: sidebar.leadingAnchor, constant: 16),
-            emptyState.trailingAnchor.constraint(lessThanOrEqualTo: sidebar.trailingAnchor, constant: -16),
+            emptyState.leadingAnchor.constraint(greaterThanOrEqualTo: sidebar.leadingAnchor, constant: 16).withPriority(.defaultLow),
+            emptyState.trailingAnchor.constraint(lessThanOrEqualTo: sidebar.trailingAnchor, constant: -16).withPriority(.defaultLow),
         ])
     }
 
@@ -900,9 +1050,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             sidebar.isHidden = false
             splitView.setPosition(Self.sidebarWidth, ofDividerAt: 0)
         } else {
-            sidebar.isHidden = true
             splitView.setPosition(0, ofDividerAt: 0)
+            sidebar.isHidden = true
         }
+        titleBar.setSidebarVisible(visible)
         splitView.layoutSubtreeIfNeeded()
         editorView.needsLayout = true
         editorView.needsDisplay = true
@@ -964,10 +1115,25 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         let text = tab.doc.text()
         DispatchQueue.global(qos: .utility).async { [weak self, workspace, path, text] in
             let changes = (try? workspace.gitDiffLines(relPath: path, text: text)) ?? []
-            let mapped = Dictionary(uniqueKeysWithValues: changes.map { ($0.line, $0.kind) })
+            let mapped = Self.gitLineMarkers(changes)
             Task { @MainActor [weak self] in
                 guard let self, self.activeTab?.relPath == path else { return }
                 self.editorView.gitLineChanges = mapped
+            }
+        }
+    }
+
+    /// Pure helper called from the utility queue in `refreshGitDiff()`, so it
+    /// must not inherit the controller's main-actor isolation.
+    nonisolated static func gitLineMarkers(_ changes: [GitLineChangeInfo]) -> [UInt64: GitLineChangeKind] {
+        changes.reduce(into: [:]) { markers, change in
+            guard let current = markers[change.line] else {
+                markers[change.line] = change.kind
+                return
+            }
+            let priority: [GitLineChangeKind: Int] = [.added: 0, .modified: 1, .deleted: 2]
+            if priority[change.kind, default: 0] > priority[current, default: 0] {
+                markers[change.line] = change.kind
             }
         }
     }
@@ -978,6 +1144,24 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                             windowTitle: "Untitled", isPreview: false,
                             status: "Untitled. Type here, or press ⌘O to open a file or folder.")
         add(tab, replacing: nil)
+    }
+
+    @objc func restartLanguageServer(_ sender: Any?) {
+        guard let tab = activeTab, let workspace else { NSSound.beep(); return }
+        let language = tab.doc.syntaxLanguage() ?? StatusBar.language(for: tab.doc.path())
+        guard bridge.restartLSP(document: tab.doc, language: language, root: workspace.root()) else {
+            statusLabel.stringValue = "Language server could not be restarted."
+            return
+        }
+        statusLabel.stringValue = "Language server restarting."
+    }
+
+    @objc func stopLanguageServer(_ sender: Any?) {
+        guard let document = activeTab?.doc, bridge.stopLSP(document: document) else {
+            statusLabel.stringValue = "No language server is running."
+            return
+        }
+        statusLabel.stringValue = "Language server stopped."
     }
 
     // MARK: Tabs (M2-06)
@@ -2715,6 +2899,13 @@ final class SidebarView: NSView {
     }
 }
 
+private extension NSLayoutConstraint {
+    func withPriority(_ priority: NSLayoutConstraint.Priority) -> NSLayoutConstraint {
+        self.priority = priority
+        return self
+    }
+}
+
 /// Sidebar header, as in VSCode with one folder open: the folder name in
 /// caps (EXPLORER before a folder is open) and, on the right, New File,
 /// New Folder, Refresh, Collapse Folders and a "…" menu. Same height as the
@@ -2776,8 +2967,8 @@ final class SidebarSectionHeader: NSView {
         addSubview(row)
         NSLayoutConstraint.activate([
             heightAnchor.constraint(equalToConstant: Self.height),
-            row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 20),
-            row.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 20).withPriority(.defaultHigh),
+            row.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10).withPriority(.defaultHigh),
             row.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
     }

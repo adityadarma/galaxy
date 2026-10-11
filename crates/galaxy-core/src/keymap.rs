@@ -199,6 +199,7 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("ctrl+shift+-", "workbench.action.navigateForward"),
     ("cmd+shift+p", "workbench.action.showCommands"),
     ("cmd+b", "workbench.action.toggleSidebarVisibility"),
+    ("cmd+j", "workbench.action.togglePanel"),
     ("cmd+shift+e", "workbench.view.explorer"),
     ("cmd+shift+]", "workbench.action.nextEditor"),
     ("cmd+shift+[", "workbench.action.previousEditor"),
@@ -413,6 +414,12 @@ mod tests {
             );
             assert!(seen.insert(b.key.clone()), "{} is bound twice", b.key.id());
         }
+    }
+
+    #[test]
+    fn cmd_j_toggles_the_bottom_panel() {
+        let map = Keymap::defaults();
+        assert_eq!(keys_of(&map, "workbench.action.togglePanel"), ["cmd+j"]);
     }
 
     #[test]
