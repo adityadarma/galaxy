@@ -11,3 +11,11 @@
 /app/build/
 DerivedData/
 xcuserdata/
+
+# Fuzzing and profiling output
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/corpus/
+/fuzz/crashes/
+/fuzz/*.log
+/dhat-heap.json

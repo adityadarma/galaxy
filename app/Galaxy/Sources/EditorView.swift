@@ -13,6 +13,7 @@ import CoreText
 /// line number.
 @MainActor
 final class EditorView: NSView {
+    static let defaultFont = Theme.editorFont
     struct Metrics: Equatable {
         let ascent: CGFloat
         let descent: CGFloat
@@ -48,6 +49,20 @@ final class EditorView: NSView {
     private(set) var layoutsCreated = 0
     /// Lines drawn by the most recent `draw(_:)`, for tests and diagnostics.
     private(set) var lastDrawnLines: Range<Int> = 0..<0
+    var gitLineChanges: [UInt64: GitLineChangeKind] = [:] {
+        didSet { if gitLineChanges != oldValue { needsDisplay = true } }
+    }
+    var semanticTokens: [SemanticTokenInfo] = [] { didSet { needsDisplay = true } }
+    var inlayHints: [InlayHintInfo] = [] { didSet { needsDisplay = true } }
+
+    /// Drops derived Core Text/LSP decorations while retaining the document.
+    func releaseNonEssentialCaches() {
+        layouts.removeAll()
+        semanticTokens = []
+        inlayHints = []
+        caretRects.removeAll(keepingCapacity: false)
+        needsDisplay = true
+    }
 
     /// Tests can pin the caret on or off; `nil` means real focus and blink.
     var forcedCaretVisible: Bool?
@@ -104,8 +119,8 @@ final class EditorView: NSView {
     }
 
     override init(frame: NSRect) {
-        font = Theme.editorFont
-        metrics = Metrics(font: Theme.editorFont)
+        font = Self.defaultFont
+        metrics = Metrics(font: Self.defaultFont)
         super.init(frame: frame)
         wantsLayer = true
         // Redraw only when told to; the scroll view handles scrolling blits.
@@ -412,6 +427,11 @@ final class EditorView: NSView {
         for line in snapshot.lines {
             let top = CGFloat(line.line) * lineHeight
             let hasCaret = !line.carets.isEmpty
+            for hint in inlayHints where hint.line == line.line {
+                let x = originX + xOffset(in: line.text, column: hint.character)
+                NSColor.secondaryLabelColor.withAlphaComponent(0.7).setFill()
+                NSAttributedString(string: "  \(hint.label)", attributes: [.font: NSFont.monospacedSystemFont(ofSize: font.pointSize - 1, weight: .regular), .foregroundColor: NSColor.secondaryLabelColor]).draw(at: NSPoint(x: x, y: top + 1))
+            }
 
             // Current line: lines with a caret and no selection on them.
             if hasCaret, line.selections.isEmpty {
@@ -464,6 +484,12 @@ final class EditorView: NSView {
             }
 
             // LSP diagnostics sit above text decorations but beneath carets.
+            for token in semanticTokens where token.line == line.line {
+                let x0 = originX + xOffset(in: line.text, column: token.start)
+                let x1 = originX + xOffset(in: line.text, column: token.start + token.length)
+                semanticColor(token.tokenType).setFill()
+                context.fill(CGRect(x: x0, y: top + lineHeight - 1, width: max(1, x1 - x0), height: 1))
+            }
             for span in line.diagnostics {
                 let x0 = originX + xOffset(in: line.text, column: span.start)
                 let x1 = originX + xOffset(in: line.text, column: span.end)
@@ -501,7 +527,21 @@ final class EditorView: NSView {
                 context.setFillColor(Theme.diagnostic(severity).cgColor)
                 context.fill(CGRect(x: gutterRight + 3, y: top + lineHeight / 2 - 2, width: 4, height: 4))
             }
+            if let change = gitLineChanges[line.line + 1] {
+                let color: NSColor = switch change {
+                case .added: NSColor.systemGreen
+                case .modified: NSColor.systemYellow
+                case .deleted: NSColor.systemRed
+                }
+                context.setFillColor(color.cgColor)
+                let markerHeight: CGFloat = change == .deleted ? 3 : lineHeight
+                context.fill(CGRect(x: 1, y: top, width: 3, height: markerHeight))
+            }
         }
+    }
+
+    private func semanticColor(_ tokenType: UInt64) -> NSColor {
+        ([NSColor.systemBlue, .systemPurple, .systemTeal, .systemOrange, .systemGreen][Int(tokenType % 5)]).withAlphaComponent(0.65)
     }
 
     /// X offset of a UTF-16 column within a line's text.

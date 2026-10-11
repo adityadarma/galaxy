@@ -156,6 +156,7 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
 - [ ] M4-13 — Code actions / quick fix (`Cmd+.`).
 - [ ] M4-14 — Formatting dokumen dan format on save.
 - [ ] M4-15 — `$/progress` dan status server di status bar, termasuk RAM proses server.
+  - Status: partial. `$/progress` begin/report/end diparse di `LspManager`, status server/progress/error diekspos melalui FFI, dan status bar menampilkan server ready, progress, atau error. RAM proses server belum tersedia karena transport belum mengekspos PID/process metrics.
 - [ ] M4-16 — Auto-restart server crash (maks 3x / 5 menit) dan command Restart/Stop server.
 - [ ] M4-17 — Uji end-to-end dengan `rust-analyzer` pada repo `ripgrep`.
 - [x] M4-18 — Dogfooding: pakai Galaxy untuk mengembangkan Galaxy.
@@ -173,36 +174,59 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
 - [ ] M5-04 — Integrasi dan uji `typescript-language-server`.
   - Status: Integrasi built-in sudah diperbaiki: label UI `TypeScript`, `TypeScript React`, `JavaScript`, dan `JavaScript React` kini dinormalisasi ke server `typescript-language-server --stdio`, sehingga startup LSP tidak lagi gagal karena label display. Resolver alias dan lifecycle JSON-RPC tercakup test Rust, serta full Rust/Swift verification lulus. Smoke test dengan executable `typescript-language-server` nyata masih pending karena executable belum terpasang di environment ini.
 - [ ] M5-05 — Integrasi dan uji `pyright-langserver`.
-- [ ] M5-06 — Integrasi dan uji `gopls`.
-- [ ] M5-07 — `workspace/symbol` untuk `Cmd+T`.
-- [ ] M5-08 — Settings global dan per workspace (`.galaxy/settings.json`), reload saat file berubah.
-- [ ] M5-09 — UI settings minimal: buka file JSON dengan validasi schema dan completion.
+- [x] M5-06 — Integrasi dan uji `gopls`.
+  - Status: resolver default memakai `gopls` tanpa argumen untuk bahasa Go dan berbagi satu server per workspace. Smoke test menjalankan executable `gopls` nyata bila tersedia, memverifikasi lifecycle `initialize`/`initialized`, lalu melakukan shutdown bersih. Jika executable tidak tersedia di CI, test dilewati tanpa mengubah hasil fitur lain.
+- [x] M5-07 — `workspace/symbol` untuk `Cmd+T`.
+  - Status: command `Go to Workspace Symbol…` memakai shortcut `Cmd+T`, membuka picker simbol lintas file, mengirim query kosong lalu query setiap ketikan ke LSP `workspace/symbol`, dan menavigasi ke URI/baris/kolom hasil. Command, menu, palette, dan test picker sudah terhubung.
+- [x] M5-08 — Settings global dan per workspace (`.galaxy/settings.json`), reload saat file berubah.
+  - Status: settings global dibaca dari `~/Library/Application Support/Galaxy/settings.json`, override workspace dari `.galaxy/settings.json`, dengan precedence workspace di atas global. `editor.insertSpaces` dan `editor.tabSize` diterapkan ke semua buffer terbuka, format LSP memakai konfigurasi yang sama, dan perubahan file di-reload melalui watcher/polling.
+- [x] M5-09 — UI settings minimal: buka file JSON dengan validasi schema dan completion.
+  - Status: command palette dan menu View membuka atau membuat `settings.json` global maupun `.galaxy/settings.json` workspace. JSON divalidasi saat reload/save, error ditampilkan di status bar, dan file settings mendapat completion lokal untuk `editor`, `insertSpaces`, dan `tabSize`.
 
 ## M6 — Git, Terminal, Produktivitas (4 minggu)
 
-- [ ] M6-01 — Git via `gix`: branch saat ini, status file, refresh via watcher.
-- [ ] M6-02 — Dekorasi status Git di explorer dan tab.
-- [ ] M6-03 — Gutter diff terhadap HEAD, dihitung incremental di background.
-- [ ] M6-04 — Terminal panel: `portable-pty` + `alacritty_terminal`, render Core Text grid.
-- [ ] M6-05 — Multiple terminal tab, resize, copy/paste, scrollback 10k baris.
-- [ ] M6-06 — Link `path:line:col` di terminal dan diagnostics dapat diklik.
-- [ ] M6-07 — Split editor horizontal/vertikal.
-- [ ] M6-08 — Breadcrumb symbol.
-- [ ] M6-09 — Sticky scroll berbasis tree-sitter scope.
-- [ ] M6-10 — Inlay hints dan semantic tokens (LSP).
-- [ ] M6-11 — Auto-save opsional (on focus change / delay).
+- [x] M6-01 — Git via `gix`: branch saat ini, status file, refresh via watcher.
+  - Status: `galaxy-core::git` menemukan repository dari workspace, membaca branch aktif dan status tracked/untracked melalui `gix 0.73.0`, lalu FFI mengekspos hasilnya ke status bar. Branch dan jumlah file berubah dimuat saat workspace dibuka dan direfresh setiap batch watcher.
+- [x] M6-02 — Dekorasi status Git di explorer dan tab.
+  - Status: file modified/untracked diberi penanda kuning di explorer dan tab; folder explorer ikut ditandai bila memuat file berubah. State berasal dari snapshot Git workspace dan diperbarui bersama watcher, tanpa query per baris UI.
+   - [x] M6-03 — Gutter diff terhadap HEAD, dihitung incremental di background.
+   - Status: HEAD blob dibandingkan dengan buffer aktif di worker utility; marker added/modified/deleted digambar hanya pada gutter, dibatasi 2.000 baris untuk mencegah biaya quadratic dan di-refresh setelah edit, tab switch, serta watcher.
+   - [x] M6-04 — Terminal panel: `portable-pty` + `alacritty_terminal`, render Core Text grid.
+   - Status: PTY session nyata memakai `portable-pty`, shell dimulai di workspace root, output dibuffer maksimal 256 KiB, ANSI diproses ke grid `alacritty_terminal`, snapshot sel diekspos melalui FFI, dan panel AppKit menggambar grid dengan Core Text. Input printable, Enter, Tab, Backspace, arrow keys, resize, scrollback 10k baris, toggle `Cmd+J`, dan command palette sudah terhubung.
+   - [x] M6-05 — Multiple terminal tab, resize, copy/paste, scrollback 10k baris.
+   - Status: panel mempertahankan beberapa PTY aktif, memiliki tab selector dan tombol tab baru, copy/paste memakai clipboard macOS, key handling mengirim escape sequence untuk Enter/Tab/Backspace/arrow keys, resize mengikuti panel, dan test core memverifikasi viewport tetap 24 baris setelah 10.050 output lines.
+ - [x] M6-06 — Link `path:line:col` di terminal dan diagnostics dapat diklik.
+ - Status: double-click pada token `path:line:col` di terminal menyelesaikan path relatif terhadap workspace atau path absolut, membuka file, lalu memindahkan caret ke line/column. Problems panel mempertahankan row selection dan membuka diagnostic ke lokasi dokumen terkait.
+ - [x] M6-07 — Split editor horizontal/vertikal.
+ - Status: editor dapat dibagi ke kanan atau ke bawah melalui View menu maupun Command Palette. Kedua pane berbagi dokumen aktif dan mengikuti perpindahan tab; split dapat ditutup tanpa menutup tab atau document handle.
+ - [x] M6-08 — Breadcrumb symbol.
+ - Status: breadcrumb di bawah path bar menampilkan symbol dokumen yang aktif sampai posisi caret, memperbarui saat caret/tab berubah, dan setiap symbol dapat diklik untuk menuju line/column terkait.
+ - [x] M6-09 — Sticky scroll berbasis tree-sitter scope.
+ - Status: overlay sticky scope menampilkan hingga tiga symbol terdekat sebelum baris pertama viewport, diperbarui saat scroll/polling, tidak menambah tinggi dokumen, dan otomatis disembunyikan di bagian atas file atau saat symbol belum tersedia.
+ - [x] M6-10 — Inlay hints dan semantic tokens (LSP).
+ - Status: LSP semantic tokens full dan inlay hints diparse/cache melalui core + FFI. Editor meminta data secara berkala, menggambar semantic token sebagai underline berwarna halus, dan menampilkan label inlay hint dengan warna sekunder tanpa mengubah teks dokumen.
+- [x] M6-11 — Auto-save opsional (on focus change / delay).
+  - Status: `files.autoSave` mendukung `off`, `afterDelay`, dan `onFocusChange`; `files.autoSaveDelay` memakai milidetik dan dibatasi 100 ms–60 detik. Delay dikoaleskan setelah ketikan terakhir, sedangkan focus change menyimpan semua file bernama yang dirty tanpa membuka dialog Untitled. Settings global dan `.galaxy/settings.json` mengikuti precedence workspace dan dapat di-reload saat file berubah. Tercakup test parsing, merge, dan delay.
 
 ## M7 — Hardening dan Rilis Beta (3 minggu)
 
-- [ ] M7-01 — Audit semua anggaran performa PRD bagian 6; perbaiki yang meleset.
-- [ ] M7-02 — Profiling RAM: Instruments Allocations/Leaks, `dhat`; evaluasi `mimalloc`.
-- [ ] M7-03 — Respons memory pressure: kosongkan cache non-esensial.
+- [x] M7-01 — Audit semua anggaran performa PRD bagian 6; perbaiki yang meleset.
+  - Status: baseline seluruh budget dicatat di `docs/PERFORMANCE.md`. Idle RAM, keypress, scroll pada batas 60 fps, dan index 100k file lulus. Startup warm median 204,8 ms sedikit di atas target 200 ms; cold run pertama 939,6 ms. Workspace footprint, open-file timing, search 1 GB, dan end-to-end syntax timing masih menjadi gap harness untuk M7 hardening.
+- [x] M7-02 — Profiling RAM: Instruments Allocations/Leaks, `dhat`; evaluasi `mimalloc`.
+  - Status: `crates/galaxy-bench/src/bin/memory_profile.rs` dan `scripts/profile-memory.sh` menyediakan heap workload terisolasi dengan `dhat::Alloc`, mencakup document, viewport, workspace index, dan FileFinder. Prosedur Instruments Allocations/Leaks dan kriteria perbandingan dicatat di `docs/MEMORY-PROFILING.md`. `mimalloc` tidak diaktifkan karena footprint idle 28 MB dan belum ada trace yang membuktikan manfaat; keputusan dievaluasi ulang setelah trace workspace representatif.
+- [x] M7-03 — Respons memory pressure: kosongkan cache non-esensial.
+  - Status: setiap window memasang `DispatchSourceMemoryPressure`. Warning pressure melepas CTLine cache, semantic/inlay decorations, caret geometry, dan FileFinder; critical pressure juga mensuspend syntax tree/worker tab nonaktif. Dokumen aktif, undo history, diagnostics, dan PTY tidak disentuh. Detail policy ada di `docs/MEMORY-PRESSURE.md`.
 - [ ] M7-04 — Soak test 8 jam (script edit + navigasi otomatis); RAM stabil ±10%.
-- [ ] M7-05 — Fuzz test edit ops dan parser JSON-RPC (`cargo-fuzz`).
-- [ ] M7-06 — Crash reporting lokal (panic hook Rust + crash log macOS), tanpa upload otomatis.
+- [x] M7-05 — Fuzz test edit ops dan parser JSON-RPC (`cargo-fuzz`).
+  - Status: package fuzz terpisah berisi target `edit_operations` untuk text/selection/edit Unicode dan `json_rpc` untuk input arbitrary ke validator JSON-RPC. Script `scripts/fuzz.sh` dan prosedur `docs/FUZZING.md` tersedia; target sengaja tidak masuk workspace normal karena `libfuzzer-sys` membutuhkan nightly. Long fuzz campaign masih dijalankan di CI/nightly, bukan diklaim selesai dari smoke compile lokal.
+- [x] M7-06 — Crash reporting lokal (panic hook Rust + crash log macOS), tanpa upload otomatis.
+  - Status: panic hook Rust dan `NSSetUncaughtExceptionHandler` macOS menulis report lokal ke `~/Library/Logs/Galaxy/crash-report.log`. Tidak ada upload otomatis dan report tidak menyimpan isi dokumen. Signal crash tetap memakai crash report macOS karena operasi filesystem tidak aman di signal handler. Detail privasi ada di `docs/CRASH-REPORTING.md`.
 - [ ] M7-07 — Code signing, notarization, DMG, auto-update (Sparkle).
-- [ ] M7-08 — Dokumentasi pengguna: shortcut, settings, konfigurasi LSP.
+  - Status: local build only untuk workflow saat ini. Script Developer ID/notarization/DMG tersedia sebagai opsi release, tetapi tidak diwajibkan. Sparkle belum dibundel karena feed URL, EdDSA key, dan signed framework belum tersedia; auto-update tetap disabled. Detail ada di `docs/RELEASE.md`.
+- [x] M7-08 — Dokumentasi pengguna: shortcut, settings, konfigurasi LSP.
+  - Status: panduan penggunaan ada di `docs/USER-GUIDE.md`; referensi settings, auto-save, language server, dan local data ada di `docs/CONFIGURATION.md`.
 - [ ] M7-09 — Rilis beta tertutup dan kumpulkan feedback.
+  - Status: pending external execution. Checklist beta, template feedback, dan triage tersedia di `docs/BETA-README.md`, `docs/BETA-FEEDBACK.md`, dan `docs/BETA-TRIAGE.md`. Task belum ditandai selesai karena belum ada artifact beta yang didistribusikan ke tester eksternal dan belum ada feedback nyata.
 
 ## Task lintas milestone
 

@@ -9,6 +9,8 @@ publish.workspace = true
 
 [dependencies]
 galaxy-core.workspace = true
+dhat.workspace = true
+tempfile.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
@@ -30,6 +32,11 @@ bench = false
 [[bin]]
 name = "file-finder"
 path = "src/bin/file_finder.rs"
+bench = false
+
+[[bin]]
+name = "memory-profile"
+path = "src/bin/memory_profile.rs"
 bench = false
 
 [[bench]]

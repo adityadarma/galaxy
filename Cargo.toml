@@ -6,6 +6,7 @@ members = [
     "crates/galaxy-bench",
     "tools/uniffi-bindgen",
 ]
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.0"
@@ -24,6 +25,7 @@ tracing-subscriber = { version = "=0.3.20", default-features = false, features =
 tracing-appender = "=0.2.3"
 uniffi = "=0.29.4"
 criterion = { version = "=0.7.0", default-features = false, features = ["cargo_bench_support"] }
+dhat = "=0.3.3"
 tempfile = "=3.23.0"
 unicode-segmentation = "=1.13.3"
 # Workspace walking: gitignore-aware, same engine as ripgrep.
@@ -32,6 +34,8 @@ ignore = "=0.4.33"
 regex = "=1.13.1"
 # Go to File (M2-07). The matcher half of helix's nucleo; MPL-2.0.
 nucleo-matcher = "=0.3.1"
+# Git repository state (M6-01).
+gix = { version = "=0.73.0", default-features = false, features = ["status", "index", "worktree-mutation", "revision"] }
 # File watcher (M2-02): FSEvents on macOS. 8.x is the latest stable line.
 notify = { version = "=8.2.0", default-features = false, features = ["macos_fsevent"] }
 # Incremental concrete syntax trees. Grammars arrive in M3-03.
@@ -52,6 +56,9 @@ proptest = { version = "=1.11.0", default-features = false, features = ["std"] }
 # LSP JSON-RPC stdio transport. Kept feature-minimal: process, pipes and runtime.
 tokio = { version = "=1.48.0", default-features = false, features = ["io-util", "process", "rt-multi-thread", "sync"] }
 serde_json = "=1.0.145"
+# Embedded terminal PTY and ANSI grid (M6-04).
+portable-pty = "=0.9.0"
+alacritty_terminal = "=0.25.1"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

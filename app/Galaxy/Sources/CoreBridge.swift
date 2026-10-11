@@ -48,6 +48,8 @@ final class CoreBridge {
         _ = core.pollLsp()
     }
 
+    func lspStatus() -> LspStatusInfo { core.lspStatus() }
+
     func syncLSP(document: DocumentHandle) {
         core.syncLspDocument(document: document)
     }
@@ -120,6 +122,10 @@ final class CoreBridge {
         try document.save()
     }
 
+    func setIndent(document: DocumentHandle, useTabs: Bool, tabSize: UInt32) {
+        document.setIndent(useTabs: useTabs, tabSize: tabSize)
+    }
+
     func requestCodeActions(document: DocumentHandle, line: UInt64, character: UInt64) {
         _ = core.requestCodeActions(document: document, line: line, character: character)
     }
@@ -144,8 +150,27 @@ final class CoreBridge {
         core.workspaceSymbols(root: root)
     }
 
+    func requestSemanticTokens(document: DocumentHandle) { core.requestSemanticTokens(document: document) }
+    func requestInlayHints(document: DocumentHandle, startLine: UInt64, endLine: UInt64) {
+        core.requestInlayHints(document: document, startLine: startLine, endLine: endLine)
+    }
+    func semanticTokens(document: DocumentHandle) -> [SemanticTokenInfo] { core.semanticTokens(document: document) }
+    func inlayHints(document: DocumentHandle) -> [InlayHintInfo] { core.inlayHints(document: document) }
+
     func search(workspace: Workspace, query: String, options: WorkspaceSearchOptions, limit: UInt64) throws -> [WorkspaceSearchMatch] {
         try workspace.search(query: query, options: options, limit: limit)
+    }
+
+    func gitStatus(workspace: Workspace) -> GitStatusInfo? {
+        try? workspace.gitStatus()
+    }
+
+    func gitDiffLines(workspace: Workspace, path: String, text: String) -> [GitLineChangeInfo] {
+        (try? workspace.gitDiffLines(relPath: path, text: text)) ?? []
+    }
+
+    func terminal(workspace: Workspace, cols: UInt16, rows: UInt16) -> TerminalHandle? {
+        try? workspace.terminal(cols: cols, rows: rows)
     }
 
     func requestFormatting(document: DocumentHandle, tabSize: UInt64, insertSpaces: Bool) {

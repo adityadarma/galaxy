@@ -5,9 +5,9 @@ import XCTest
 final class OutlinePickerTests: XCTestCase {
     private func symbols() -> [OutlineSymbol] {
         [
-            OutlineSymbol(name: "Account", kind: "class", line: 2, column: 0),
-            OutlineSymbol(name: "deposit", kind: "method", line: 4, column: 4),
-            OutlineSymbol(name: "main", kind: "function", line: 10, column: 0),
+            OutlineSymbol(uri: nil, name: "Account", kind: "class", line: 2, column: 0),
+            OutlineSymbol(uri: nil, name: "deposit", kind: "method", line: 4, column: 4),
+            OutlineSymbol(uri: nil, name: "main", kind: "function", line: 10, column: 0),
         ]
     }
 

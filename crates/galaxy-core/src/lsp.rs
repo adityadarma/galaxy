@@ -23,6 +23,15 @@ use crate::document::Document;
 
 pub const DOCUMENT_SYNC_DEBOUNCE: Duration = Duration::from_millis(50);
 
+/// Fuzz-safe JSON-RPC payload validation shared by the transport tests.
+pub fn parse_json_rpc_payload(bytes: &[u8]) -> Result<Value, String> {
+    let value: Value = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    if !value.is_object() {
+        return Err("JSON-RPC payload must be an object".into());
+    }
+    Ok(value)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DiagnosticSeverity {
     Error,
@@ -91,6 +100,30 @@ pub struct DocumentSymbolInfo {
     pub kind: u64,
     pub range: Range,
     pub children: Vec<DocumentSymbolInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticTokenInfo {
+    pub line: u64,
+    pub start: u64,
+    pub length: u64,
+    pub token_type: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InlayHintInfo {
+    pub line: u64,
+    pub character: u64,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProgressInfo {
+    pub token: String,
+    pub title: String,
+    pub message: Option<String>,
+    pub percentage: Option<f64>,
+    pub active: bool,
 }
 
 /// Latest server diagnostics, replaced atomically per URI by
@@ -536,6 +569,12 @@ pub struct LspManager {
     document_symbol_requests: HashMap<(LspKey, u64), String>,
     workspace_symbols: HashMap<String, Vec<DocumentSymbolInfo>>,
     workspace_symbol_requests: HashMap<(LspKey, u64), String>,
+    semantic_tokens: HashMap<String, Vec<SemanticTokenInfo>>,
+    semantic_token_requests: HashMap<(LspKey, u64), String>,
+    inlay_hints: HashMap<String, Vec<InlayHintInfo>>,
+    inlay_hint_requests: HashMap<(LspKey, u64), String>,
+    progress: HashMap<String, ProgressInfo>,
+    server_errors: Vec<String>,
 }
 
 impl LspManager {
@@ -921,6 +960,65 @@ impl LspManager {
         }), now, false)
     }
 
+    pub fn request_semantic_tokens(&mut self, uri: &str, now: Instant) -> io::Result<Option<u64>> {
+        let Some(key) = self.documents.get(uri).map(|(key, _)| key.clone()) else {
+            return Ok(None);
+        };
+        let id = self.request(
+            &key,
+            "textDocument/semanticTokens/full".into(),
+            serde_json::json!({
+                "textDocument": { "uri": uri }
+            }),
+            Duration::from_millis(1500),
+            now,
+        )?;
+        self.semantic_token_requests
+            .insert((key, id), uri.to_owned());
+        Ok(Some(id))
+    }
+
+    pub fn request_inlay_hints(
+        &mut self,
+        uri: &str,
+        range: Range,
+        now: Instant,
+    ) -> io::Result<Option<u64>> {
+        let Some(key) = self.documents.get(uri).map(|(key, _)| key.clone()) else {
+            return Ok(None);
+        };
+        let id = self.request(
+            &key,
+            "textDocument/inlayHint".into(),
+            serde_json::json!({
+                "textDocument": { "uri": uri }, "range": range_to_value(&range)
+            }),
+            Duration::from_millis(1500),
+            now,
+        )?;
+        self.inlay_hint_requests.insert((key, id), uri.to_owned());
+        Ok(Some(id))
+    }
+
+    pub fn semantic_tokens(&self, uri: &str) -> &[SemanticTokenInfo] {
+        self.semantic_tokens
+            .get(uri)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+    pub fn inlay_hints(&self, uri: &str) -> &[InlayHintInfo] {
+        self.inlay_hints.get(uri).map(Vec::as_slice).unwrap_or(&[])
+    }
+    pub fn progress(&self) -> Vec<ProgressInfo> {
+        self.progress.values().cloned().collect()
+    }
+    pub fn server_count(&self) -> usize {
+        self.servers.len()
+    }
+    pub fn last_server_error(&self) -> Option<String> {
+        self.server_errors.last().cloned()
+    }
+
     fn request_formatting_variant(
         &mut self,
         uri: &str,
@@ -1133,6 +1231,12 @@ impl LspManager {
                         if let Some(root) = self.workspace_symbol_requests.remove(&(key.clone(), id))
                             && let Some(result) = message.get("result").and_then(parse_workspace_symbols)
                         { self.workspace_symbols.insert(root, result); }
+                        if let Some(uri) = self.semantic_token_requests.remove(&(key.clone(), id))
+                            && let Some(result) = message.get("result").and_then(parse_semantic_tokens)
+                        { self.semantic_tokens.insert(uri, result); }
+                        if let Some(uri) = self.inlay_hint_requests.remove(&(key.clone(), id))
+                            && let Some(result) = message.get("result").and_then(parse_inlay_hints)
+                        { self.inlay_hints.insert(uri, result); }
                         if self.requests.remove(&(key.clone(), id)).is_some() {
                             events.push(LspEvent::Response {
                                 key: key.clone(), id,
@@ -1141,8 +1245,8 @@ impl LspManager {
                         }
                     }
                     Ok(Incoming::Message(message)) => events.push(LspEvent::Message(key.clone(), message)),
-                    Ok(Incoming::Error(error)) => events.push(LspEvent::Error(key.clone(), error)),
-                    Ok(Incoming::Closed) => { events.push(LspEvent::Closed(key.clone())); break; }
+                    Ok(Incoming::Error(error)) => { self.server_errors.push(error.clone()); events.push(LspEvent::Error(key.clone(), error)); }
+                    Ok(Incoming::Closed) => { self.server_errors.push(format!("LSP server closed: {}", key.language)); events.push(LspEvent::Closed(key.clone())); break; }
                     Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
                 }
             }
@@ -1153,8 +1257,72 @@ impl LspManager {
             {
                 tracing::warn!(%error, "discarded invalid LSP diagnostics notification");
             }
+            if let LspEvent::Message(_, message) = event {
+                let _ = self.publish_progress(message);
+            }
         }
         events
+    }
+
+    fn publish_progress(&mut self, message: &Value) -> bool {
+        if message.get("method").and_then(Value::as_str) != Some("$/progress") {
+            return false;
+        }
+        let Some(params) = message.get("params").and_then(Value::as_object) else {
+            return false;
+        };
+        let Some(token) = params.get("token").map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| value.to_string())
+        }) else {
+            return false;
+        };
+        let Some(value) = params.get("value").and_then(Value::as_object) else {
+            return false;
+        };
+        match value.get("kind").and_then(Value::as_str) {
+            Some("begin") => {
+                self.progress.insert(
+                    token.clone(),
+                    ProgressInfo {
+                        token,
+                        title: value
+                            .get("title")
+                            .and_then(Value::as_str)
+                            .unwrap_or("Language server")
+                            .into(),
+                        message: value
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                        percentage: value.get("percentage").and_then(Value::as_f64),
+                        active: true,
+                    },
+                );
+            }
+            Some("report") => {
+                if let Some(progress) = self.progress.get_mut(&token) {
+                    progress.message = value
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    progress.percentage = value.get("percentage").and_then(Value::as_f64);
+                }
+            }
+            Some("end") => {
+                if let Some(progress) = self.progress.get_mut(&token) {
+                    progress.message = value
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    progress.active = false;
+                }
+            }
+            _ => return false,
+        }
+        true
     }
 
     /// Sends the graceful shutdown sequence to all children. Dropping their
@@ -1455,6 +1623,62 @@ fn parse_range(value: &Value) -> Option<Range> {
     })
 }
 
+fn range_to_value(range: &Range) -> Value {
+    serde_json::json!({
+        "start": { "line": range.start_line, "character": range.start_character },
+        "end": { "line": range.end_line, "character": range.end_character }
+    })
+}
+
+fn parse_semantic_tokens(value: &Value) -> Option<Vec<SemanticTokenInfo>> {
+    let data = value.get("data")?.as_array()?;
+    let mut line = 0;
+    let mut start = 0;
+    let mut output = Vec::new();
+    for chunk in data.chunks_exact(5) {
+        let delta_line = chunk[0].as_u64()?;
+        let delta_start = chunk[1].as_u64()?;
+        line += delta_line;
+        start = if delta_line == 0 {
+            start + delta_start
+        } else {
+            delta_start
+        };
+        output.push(SemanticTokenInfo {
+            line,
+            start,
+            length: chunk[2].as_u64()?,
+            token_type: chunk[3].as_u64()?,
+        });
+    }
+    Some(output)
+}
+
+fn parse_inlay_hints(value: &Value) -> Option<Vec<InlayHintInfo>> {
+    let items = value.as_array()?;
+    Some(
+        items
+            .iter()
+            .filter_map(|item| {
+                let position = item.get("position")?;
+                let label = match item.get("label")? {
+                    Value::String(text) => text.clone(),
+                    Value::Array(parts) => parts
+                        .iter()
+                        .filter_map(|part| part.get("value")?.as_str())
+                        .collect::<String>(),
+                    _ => return None,
+                };
+                Some(InlayHintInfo {
+                    line: position.get("line")?.as_u64()?,
+                    character: position.get("character")?.as_u64()?,
+                    label,
+                })
+            })
+            .collect(),
+    )
+}
+
 impl Drop for LspManager {
     fn drop(&mut self) {
         self.shutdown_all();
@@ -1638,6 +1862,39 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     #[test]
+    fn parses_delta_encoded_semantic_tokens() {
+        let value = serde_json::json!({ "data": [1, 2, 3, 4, 0, 0, 5, 2, 1, 0] });
+        let tokens = parse_semantic_tokens(&value).unwrap();
+        assert_eq!(
+            tokens[0],
+            SemanticTokenInfo {
+                line: 1,
+                start: 2,
+                length: 3,
+                token_type: 4
+            }
+        );
+        assert_eq!(
+            tokens[1],
+            SemanticTokenInfo {
+                line: 1,
+                start: 7,
+                length: 2,
+                token_type: 1
+            }
+        );
+    }
+
+    #[test]
+    fn parses_string_and_marked_inlay_labels() {
+        let value = serde_json::json!([
+            { "position": { "line": 2, "character": 4 }, "label": ": number" },
+            { "position": { "line": 3, "character": 1 }, "label": [{ "value": "->" }, { "value": " bool" }] }
+        ]);
+        assert_eq!(parse_inlay_hints(&value).unwrap()[1].label, "-> bool");
+    }
+
+    #[test]
     fn decodes_multiple_content_length_frames() {
         let runtime = Runtime::new().unwrap();
         runtime.block_on(async {
@@ -1733,6 +1990,32 @@ mod tests {
     }
 
     #[test]
+    fn tracks_lsp_progress_begin_report_and_end() {
+        let mut manager = LspManager::default();
+        let begin = serde_json::json!({
+            "jsonrpc": "2.0", "method": "$/progress",
+            "params": { "token": "index", "value": { "kind": "begin", "title": "Indexing", "percentage": 10 } }
+        });
+        assert!(manager.publish_progress(&begin));
+        assert_eq!(manager.progress()[0].title, "Indexing");
+        assert!(manager.progress()[0].active);
+
+        let report = serde_json::json!({
+            "jsonrpc": "2.0", "method": "$/progress",
+            "params": { "token": "index", "value": { "kind": "report", "message": "src", "percentage": 50 } }
+        });
+        assert!(manager.publish_progress(&report));
+        assert_eq!(manager.progress()[0].percentage, Some(50.0));
+
+        let end = serde_json::json!({
+            "jsonrpc": "2.0", "method": "$/progress",
+            "params": { "token": "index", "value": { "kind": "end", "message": "Done" } }
+        });
+        assert!(manager.publish_progress(&end));
+        assert!(!manager.progress()[0].active);
+    }
+
+    #[test]
     fn settings_parse_override_and_preserve_initialization_options() {
         let settings = LspSettings::from_json(&serde_json::json!({
             "servers": { "Rust": {
@@ -1763,6 +2046,35 @@ mod tests {
             );
         }
         assert_eq!(default_server_kind("TypeScript Server"), None);
+    }
+
+    #[test]
+    fn real_gopls_completes_initialize_when_available() {
+        let Some(program) = find_in_path("gopls") else {
+            return;
+        };
+        let workspace = tempfile::tempdir().unwrap();
+        let key = LspKey {
+            language: "go".into(),
+            root: workspace.path().to_path_buf(),
+        };
+        let config = ServerConfig {
+            program: program.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            log_traffic: false,
+            initialization_options: Value::Null,
+        };
+        let mut manager = LspManager::default();
+        manager.ensure_server(key.clone(), &config).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if manager.poll().contains(&LspEvent::Initialized(key.clone())) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "gopls did not initialize");
+            thread::sleep(Duration::from_millis(10));
+        }
+        manager.shutdown_all();
     }
 
     #[test]

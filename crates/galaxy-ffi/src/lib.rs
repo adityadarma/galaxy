@@ -26,6 +26,7 @@ use galaxy_core::navigation::{self, Location, NavHistory};
 use galaxy_core::position::Utf16Position;
 use galaxy_core::selection::{Selection, SelectionSet};
 use galaxy_core::syntax::{self, SyntaxLanguage, SyntaxService, SyntaxSnapshot};
+use galaxy_core::terminal::TerminalSession;
 use galaxy_core::viewport;
 use galaxy_core::watcher::WorkspaceWatcher;
 use galaxy_core::workspace::{
@@ -473,6 +474,24 @@ impl Core {
             }
         }
         events.len() as u64
+    }
+
+    pub fn lsp_status(&self) -> LspStatusInfo {
+        let lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
+        LspStatusInfo {
+            servers: lsp.server_count() as u64,
+            progress: lsp
+                .progress()
+                .into_iter()
+                .filter(|item| item.active)
+                .map(|item| LspProgressInfo {
+                    title: item.title,
+                    message: item.message,
+                    percentage: item.percentage,
+                })
+                .collect(),
+            error: lsp.last_server_error(),
+        }
     }
 
     pub fn request_hover(&self, document: Arc<DocumentHandle>, line: u64, character: u64) -> bool {
@@ -928,6 +947,74 @@ impl Core {
             );
     }
 
+    pub fn request_semantic_tokens(&self, document: Arc<DocumentHandle>) {
+        let path = document.path();
+        if path.is_empty() {
+            return;
+        }
+        let uri = file_uri(Path::new(&path));
+        let _ = self
+            .lsp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .request_semantic_tokens(&uri, Instant::now());
+    }
+
+    pub fn request_inlay_hints(
+        &self,
+        document: Arc<DocumentHandle>,
+        start_line: u64,
+        end_line: u64,
+    ) {
+        let path = document.path();
+        if path.is_empty() {
+            return;
+        }
+        let uri = file_uri(Path::new(&path));
+        let range = galaxy_core::lsp::Range {
+            start_line,
+            start_character: 0,
+            end_line,
+            end_character: u64::MAX,
+        };
+        let _ = self
+            .lsp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .request_inlay_hints(&uri, range, Instant::now());
+    }
+
+    pub fn semantic_tokens(&self, document: Arc<DocumentHandle>) -> Vec<SemanticTokenInfo> {
+        let uri = file_uri(Path::new(&document.path()));
+        self.lsp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .semantic_tokens(&uri)
+            .iter()
+            .map(|token| SemanticTokenInfo {
+                line: token.line,
+                start: token.start,
+                length: token.length,
+                token_type: token.token_type,
+            })
+            .collect()
+    }
+
+    pub fn inlay_hints(&self, document: Arc<DocumentHandle>) -> Vec<InlayHintInfo> {
+        let uri = file_uri(Path::new(&document.path()));
+        self.lsp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .inlay_hints(&uri)
+            .iter()
+            .map(|hint| InlayHintInfo {
+                line: hint.line,
+                character: hint.character,
+                label: hint.label.clone(),
+            })
+            .collect()
+    }
+
     pub fn problems(&self) -> Vec<ProblemInfo> {
         let lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
         lsp.problems()
@@ -988,6 +1075,35 @@ pub struct ProblemInfo {
     pub message: String,
     pub source: Option<String>,
     pub code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct LspProgressInfo {
+    pub title: String,
+    pub message: Option<String>,
+    pub percentage: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct LspStatusInfo {
+    pub servers: u64,
+    pub progress: Vec<LspProgressInfo>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SemanticTokenInfo {
+    pub line: u64,
+    pub start: u64,
+    pub length: u64,
+    pub token_type: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct InlayHintInfo {
+    pub line: u64,
+    pub character: u64,
+    pub label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -1096,6 +1212,70 @@ pub struct WorkspaceSearchMatch {
     pub text: String,
     pub context_before: String,
     pub context_after: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GitStatusInfo {
+    pub branch: Option<String>,
+    pub changed_paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum GitLineChangeKind {
+    Added,
+    Modified,
+    Deleted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct GitLineChangeInfo {
+    pub line: u64,
+    pub kind: GitLineChangeKind,
+}
+
+#[derive(uniffi::Object)]
+pub struct TerminalHandle {
+    session: TerminalSession,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct TerminalLineInfo {
+    pub text: String,
+    pub foreground: u8,
+    pub background: u8,
+    pub bold: bool,
+    pub underline: bool,
+}
+
+#[uniffi::export]
+impl TerminalHandle {
+    pub fn poll_output(&self) -> String {
+        self.session.take_output()
+    }
+
+    pub fn snapshot(&self) -> Vec<TerminalLineInfo> {
+        self.session
+            .snapshot()
+            .into_iter()
+            .map(|line| TerminalLineInfo {
+                text: line.text,
+                foreground: line.foreground,
+                background: line.background,
+                bold: line.bold,
+                underline: line.underline,
+            })
+            .collect()
+    }
+
+    pub fn write(&self, input: String) -> Result<(), CoreError> {
+        self.session
+            .write(input.as_bytes())
+            .map_err(CoreError::from)
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16) -> Result<(), CoreError> {
+        self.session.resize(cols, rows).map_err(CoreError::from)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -1209,6 +1389,41 @@ impl Workspace {
             tracing::info!(path = %st.path.display(), lines = st.editor.doc.line_count(), "opened workspace file");
         }
         Ok(Arc::new(handle))
+    }
+
+    pub fn git_status(&self) -> Result<Option<GitStatusInfo>, CoreError> {
+        Ok(self.inner.git_status()?.map(|status| GitStatusInfo {
+            branch: status.branch,
+            changed_paths: status.files.into_iter().map(|file| file.path).collect(),
+        }))
+    }
+
+    pub fn terminal(&self, cols: u16, rows: u16) -> Result<Arc<TerminalHandle>, CoreError> {
+        Ok(Arc::new(TerminalHandle {
+            session: TerminalSession::spawn(self.inner.root(), cols, rows)?,
+        }))
+    }
+
+    pub fn git_diff_lines(
+        &self,
+        rel_path: String,
+        text: String,
+    ) -> Result<Vec<GitLineChangeInfo>, CoreError> {
+        Ok(
+            galaxy_core::git::diff_lines(self.inner.root(), &rel_path, &text)?
+                .into_iter()
+                .map(|change| GitLineChangeInfo {
+                    line: change.line as u64,
+                    kind: match change.kind {
+                        galaxy_core::git::GitLineChangeKind::Added => GitLineChangeKind::Added,
+                        galaxy_core::git::GitLineChangeKind::Modified => {
+                            GitLineChangeKind::Modified
+                        }
+                        galaxy_core::git::GitLineChangeKind::Deleted => GitLineChangeKind::Deleted,
+                    },
+                })
+                .collect(),
+        )
     }
 
     pub fn search(

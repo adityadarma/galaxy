@@ -3,6 +3,8 @@
 //! Logs go to `<dir>/core.log` with daily rotation. The UI passes
 //! `~/Library/Logs/Galaxy`. Initialization is idempotent.
 
+use std::backtrace::Backtrace;
+use std::panic;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -11,6 +13,7 @@ use tracing_subscriber::fmt;
 use tracing_subscriber::prelude::*;
 
 static GUARD: OnceLock<WorkerGuard> = OnceLock::new();
+static CRASH_HOOK: OnceLock<()> = OnceLock::new();
 
 /// Initializes logging. Returns `false` if logging was already set up.
 ///
@@ -40,8 +43,41 @@ pub fn init(dir: &Path, filter: &str) -> std::io::Result<bool> {
         return Ok(false);
     }
     let _ = GUARD.set(guard);
+    install_panic_hook(dir);
     tracing::info!(version = crate::VERSION, "core logging initialized");
     Ok(true)
+}
+
+fn install_panic_hook(dir: &Path) {
+    if CRASH_HOOK.set(()).is_err() {
+        return;
+    }
+    let path = dir.join("crash-report.log");
+    let _ = std::fs::create_dir_all(dir);
+    panic::set_hook(Box::new(move |info| {
+        let backtrace = Backtrace::force_capture();
+        let location = info
+            .location()
+            .map(|location| location.to_string())
+            .unwrap_or_else(|| "unknown".into());
+        let message = info
+            .payload()
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
+            .unwrap_or("non-string panic");
+        let report = format!(
+            "Galaxy Rust panic\nlocation: {location}\nmessage: {message}\nbacktrace:\n{backtrace}\n\n"
+        );
+        use std::io::Write;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = file.write_all(report.as_bytes());
+        }
+    }));
 }
 
 fn parse_level(s: &str) -> tracing::Level {

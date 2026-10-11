@@ -283,6 +283,24 @@ const BUILTIN: &[(&str, &str, &str, &[&str])] = &[
         &["cmd+shift+o"],
     ),
     (
+        "workbench.action.gotoWorkspaceSymbol",
+        "Go",
+        "Go to Workspace Symbol…",
+        &["cmd+t"],
+    ),
+    (
+        "workbench.action.openUserSettingsJson",
+        "Preferences",
+        "Open User Settings (JSON)…",
+        &["settings"],
+    ),
+    (
+        "workbench.action.openWorkspaceSettingsJson",
+        "Preferences",
+        "Open Workspace Settings (JSON)…",
+        &["settings", "workspace"],
+    ),
+    (
         "editor.action.addSelectionToNextFindMatch",
         "Selection",
         "Add Next Occurrence",

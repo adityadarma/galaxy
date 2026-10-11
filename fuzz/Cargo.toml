@@ -1,0 +1,26 @@
+[package]
+name = "galaxy-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+galaxy-core = { path = "../crates/galaxy-core" }
+
+[[bin]]
+name = "edit_operations"
+path = "fuzz_targets/edit_operations.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "json_rpc"
+path = "fuzz_targets/json_rpc.rs"
+test = false
+doc = false
+bench = false

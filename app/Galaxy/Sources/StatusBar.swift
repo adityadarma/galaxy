@@ -11,6 +11,8 @@ final class StatusBar: NSView {
     let indent = StatusBar.label("status-indent")
     let lineEnding = StatusBar.label("status-eol")
     let encoding = StatusBar.label("status-encoding")
+    let git = StatusBar.label("status-git")
+    let lsp = StatusBar.label("status-lsp")
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -33,7 +35,7 @@ final class StatusBar: NSView {
 
         let left = NSStackView(views: [message, largeFileBadge])
         left.spacing = 8
-        let right = NSStackView(views: [cursor, language, indent, lineEnding, encoding])
+        let right = NSStackView(views: [cursor, language, indent, lineEnding, encoding, git, lsp])
         right.spacing = 14
         // The spacer takes the slack, so the facts sit on the right edge.
         let spacer = NSView()
@@ -97,6 +99,31 @@ final class StatusBar: NSView {
         encoding.stringValue = doc.hasBom() ? "\(name) with BOM" : name
         largeFileBadge.isHidden = !doc.isLarge()
         showCursor(of: doc)
+    }
+
+    func showGit(branch: String?, changedCount: Int) {
+        guard let branch else {
+            git.stringValue = ""
+            return
+        }
+        git.stringValue = changedCount == 0 ? "Git: \(branch)" : "Git: \(branch) · \(changedCount)"
+    }
+
+    func showLSP(_ status: LspStatusInfo) {
+        if let error = status.error {
+            lsp.stringValue = "LSP: Error"
+            lsp.toolTip = error
+        } else if let progress = status.progress.first {
+            let percent = progress.percentage.map { " \(Int($0))%" } ?? ""
+            lsp.stringValue = "LSP: \(progress.title)\(percent)"
+            lsp.toolTip = progress.message
+        } else if status.servers > 0 {
+            lsp.stringValue = "LSP: \(status.servers) ready"
+            lsp.toolTip = nil
+        } else {
+            lsp.stringValue = ""
+            lsp.toolTip = nil
+        }
     }
 
     /// Lightweight path detection for the status bar. Syntax parsers replace

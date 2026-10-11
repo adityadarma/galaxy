@@ -234,6 +234,10 @@ impl Workspace {
         &self.root
     }
 
+    pub fn git_status(&self) -> io::Result<Option<crate::git::GitStatus>> {
+        crate::git::read_status(&self.root)
+    }
+
     /// Folder name for titles; falls back to the full path for `/`.
     pub fn name(&self) -> String {
         self.root.file_name().map_or_else(

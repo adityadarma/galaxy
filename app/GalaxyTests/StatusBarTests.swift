@@ -14,6 +14,23 @@ final class StatusBarTests: XCTestCase {
         XCTAssertEqual(StatusBar.language(for: "/work/unknown.extension"), "Plain Text")
     }
 
+    func testGitStatusShowsBranchAndChangedCount() {
+        let bar = StatusBar()
+        bar.showGit(branch: "main", changedCount: 2)
+        XCTAssertEqual(bar.git.stringValue, "Git: main · 2")
+        bar.showGit(branch: "main", changedCount: 0)
+        XCTAssertEqual(bar.git.stringValue, "Git: main")
+        bar.showGit(branch: nil, changedCount: 0)
+        XCTAssertEqual(bar.git.stringValue, "")
+    }
+
+    func testGitDecorationsAreRepresentedByViewModels() {
+        let item = TabBar.Item(title: "main.rs", isPreview: false, isEdited: false, isGitChanged: true)
+        XCTAssertTrue(item.isGitChanged)
+        let clean = TabBar.Item(title: "main.rs", isPreview: false, isEdited: false, isGitChanged: false)
+        XCTAssertNotEqual(item, clean)
+    }
+
     func testDocumentFactsIncludeLanguageIndentEOLAndEncoding() throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("galaxy-status-\(UUID().uuidString).py")

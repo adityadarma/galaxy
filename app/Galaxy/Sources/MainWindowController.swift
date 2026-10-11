@@ -16,6 +16,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private let bridge: CoreBridge
     let statusBar = StatusBar()
     let pathBar = PathBar()
+    private let breadcrumbBar = BreadcrumbBar()
+    private let stickyScopeView = StickyScopeView()
+    private var documentSymbols: [OutlineSymbol] = []
+    private var lastSemanticRequest = Date.distantPast
     let titleBar = TitleBar()
     let activityBar = ActivityBar()
     let tabBar = TabBar()
@@ -26,13 +30,19 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// Left-hand message in the status bar.
     var statusLabel: NSTextField { statusBar.message }
     private let scrollView = DiagnosticScrollView()
+    private let secondaryScrollView = DiagnosticScrollView()
+    private let editorSplitView = NSSplitView()
     private let problemsPanel = ProblemsPanel()
     private let referencesPanel = ReferencesPanel()
+    private let terminalView = TerminalView()
+    private var terminalHandles: [TerminalHandle] = []
+    private var activeTerminalIndex = 0
     private let hoverPopover = HoverPopover()
     private let completionPopup = CompletionPopup()
     private let signaturePopup = SignaturePopup()
     private let codeActionPopup = CodeActionPopup()
     private var completionQuery = ""
+    private var localCompletionItems: [CompletionInfo]?
     private var completionPosition = TextPos(line: 0, colUtf16: 0)
     private var hoverPosition: TextPos?
     private var hoverPoint = NSPoint.zero
@@ -91,6 +101,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private var loadedPalette: CommandPaletteView?
     private var syntaxEvictionTimer: Timer?
     private var lspTimer: Timer?
+    private var memoryPressureSource: DispatchSourceMemoryPressure?
+    var globalSettingsURL = GalaxySettings.globalURL
+    private var settingsModified: Date?
+    private var workspaceSettingsModified: Date?
+    private(set) var settingsProblems: [String] = []
+    private var autoSaveMode: AutoSaveMode = .off
+    private var autoSaveDelay: TimeInterval = 1.0
+    private var autoSaveWorkItem: DispatchWorkItem?
     static let syntaxEvictionInterval: TimeInterval = 5 * 60
     /// Command registry (M2-09); kept for the window so recency survives
     /// closing the palette.
@@ -113,6 +131,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// Tabs in the order they were last shown, most recent first (⌃Tab).
     private var tabOrderByUse: [ObjectIdentifier] = []
     let editorView = EditorView(frame: .zero)
+    private let secondaryEditorView = EditorView(frame: .zero)
+    private var isEditorSplit = false
 
     enum SaveChoice { case save, discard, cancel }
 
@@ -168,6 +188,54 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     var isSidebarVisible: Bool { !sidebar.isHidden }
 
+    @objc func splitEditorRight(_ sender: Any?) { setEditorSplit(vertical: true) }
+    @objc func splitEditorDown(_ sender: Any?) { setEditorSplit(vertical: false) }
+    @objc func closeEditorSplit(_ sender: Any?) {
+        isEditorSplit = false
+        secondaryScrollView.removeFromSuperview()
+        editorSplitView.isVertical = true
+        editorSplitView.adjustSubviews()
+        secondaryEditorView.document = nil
+    }
+
+    private func setEditorSplit(vertical: Bool) {
+        isEditorSplit = true
+        editorSplitView.isVertical = vertical
+        if secondaryScrollView.superview == nil {
+            editorSplitView.addSubview(secondaryScrollView)
+        }
+        secondaryEditorView.document = activeTab?.doc
+        editorSplitView.layoutSubtreeIfNeeded()
+        editorSplitView.adjustSubviews()
+        secondaryEditorView.requestDocumentRefresh(scrollCaret: false)
+    }
+
+    @objc func toggleTerminal(_ sender: Any?) {
+        terminalView.isHidden.toggle()
+        if !terminalView.isHidden {
+            ensureTerminal()
+        }
+    }
+
+    private func ensureTerminal() {
+        guard let workspace else { return }
+        if terminalHandles.isEmpty,
+           let handle = bridge.terminal(workspace: workspace, cols: 100, rows: 24) {
+            terminalHandles = [handle]
+        }
+        guard terminalHandles.indices.contains(activeTerminalIndex) else { return }
+        terminalView.setTabs(count: terminalHandles.count, selected: activeTerminalIndex)
+        terminalView.start(handle: terminalHandles[activeTerminalIndex])
+    }
+
+    private func newTerminal() {
+        guard let workspace,
+              let handle = bridge.terminal(workspace: workspace, cols: 100, rows: 24) else { return }
+        terminalHandles.append(handle)
+        activeTerminalIndex = terminalHandles.count - 1
+        ensureTerminal()
+    }
+
     init(bridge: CoreBridge) {
         self.bridge = bridge
         let window = NSWindow(
@@ -186,12 +254,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         super.init(window: window)
         window.delegate = self
         buildContent()
+        installMemoryPressureHandler()
         editorView.onChange = { [weak self] in
             self?.updateEditedState()
+            self?.scheduleAutoSave()
             self?.refreshFindStatus()
             if let document = self?.activeTab?.doc { self?.bridge.syncLSP(document: document) }
             self?.bridge.pollLSP()
             self?.requestCompletionIfNeeded()
+            self?.refreshGitDiff()
         }
         editorView.onClickMove = { [weak self] before, after in
             guard let self, let tab = self.activeTab else { return }
@@ -207,6 +278,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
         editorView.onCursorChange = { [weak self] primary, count in
             self?.statusBar.showCursor(primary: primary, count: count)
+            self?.breadcrumbBar.show(symbols: self?.documentSymbols ?? [], atLine: primary.line)
+        }
+        breadcrumbBar.onSelect = { [weak self] symbol in
+            guard let self, let tab = self.activeTab else { return }
+            self.move(tab, toLine: symbol.line, col: symbol.column)
         }
         window.contentView?.layoutSubtreeIfNeeded()
         splitView.setPosition(Self.sidebarWidth, ofDividerAt: 0)
@@ -225,6 +301,31 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 }
             }
         }
+    }
+
+    private func installMemoryPressureHandler() {
+        let source = DispatchSource.makeMemoryPressureSource(eventMask: [.warning, .critical], queue: .main)
+        source.setEventHandler { [weak self] in
+            self?.handleMemoryPressure(source.data)
+        }
+        source.resume()
+        memoryPressureSource = source
+    }
+
+    private func handleMemoryPressure(_ event: DispatchSource.MemoryPressureEvent) {
+        editorView.releaseNonEssentialCaches()
+        secondaryEditorView.releaseNonEssentialCaches()
+        loadedQuickOpen?.finder = nil
+        fileFinder = nil
+        finderGeneration += 1
+        if event.contains(.critical) {
+            evictInactiveSyntax(now: .now, includeRecentlyInactive: true)
+        } else {
+            evictInactiveSyntax(now: .now)
+        }
+        statusLabel.stringValue = event.contains(.critical)
+            ? "Memory pressure: released inactive editor caches."
+            : "Memory pressure: released editor caches."
     }
 
     @available(*, unavailable)
@@ -260,9 +361,25 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         scrollView.drawsBackground = true
         scrollView.backgroundColor = .textBackgroundColor
         scrollView.borderType = .noBorder
-        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.translatesAutoresizingMaskIntoConstraints = true
+        scrollView.autoresizingMask = [.width, .height]
         editorView.autoresizingMask = [.width]
         scrollView.documentView = editorView
+        secondaryScrollView.hasVerticalScroller = true
+        secondaryScrollView.hasHorizontalScroller = false
+        secondaryScrollView.scrollerStyle = .overlay
+        secondaryScrollView.automaticallyAdjustsContentInsets = false
+        secondaryScrollView.contentInsets = scrollView.contentInsets
+        secondaryScrollView.drawsBackground = true
+        secondaryScrollView.backgroundColor = .textBackgroundColor
+        secondaryScrollView.translatesAutoresizingMaskIntoConstraints = true
+        secondaryScrollView.autoresizingMask = [.width, .height]
+        secondaryEditorView.autoresizingMask = [.width]
+        secondaryScrollView.documentView = secondaryEditorView
+        editorSplitView.isVertical = true
+        editorSplitView.dividerStyle = .thin
+        editorSplitView.translatesAutoresizingMaskIntoConstraints = false
+        editorSplitView.addSubview(scrollView)
 
         tabBar.translatesAutoresizingMaskIntoConstraints = false
         tabBar.onSelect = { [weak self] i in self?.selectTab(i, fromTabBar: true) }
@@ -274,6 +391,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         lspTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.bridge.pollLSP()
+                if let self { self.statusBar.showLSP(self.bridge.lspStatus()) }
                 self?.refreshHover()
             self?.refreshCompletion()
                 self?.refreshSignatureHelp()
@@ -283,6 +401,17 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 self?.refreshCodeActions()
                 self?.refreshFormatting()
                 self?.refreshDocumentSymbols()
+                if let document = self?.activeTab?.doc {
+                    if Date().timeIntervalSince(self?.lastSemanticRequest ?? .distantPast) > 0.5 {
+                        self?.lastSemanticRequest = .now
+                        self?.bridge.requestSemanticTokens(document: document)
+                        self?.bridge.requestInlayHints(document: document, startLine: 0, endLine: document.lineCount())
+                    }
+                    self?.editorView.semanticTokens = self?.bridge.semanticTokens(document: document) ?? []
+                    self?.editorView.inlayHints = self?.bridge.inlayHints(document: document) ?? []
+                }
+                self?.updateStickyScope()
+                self?.reloadSettings()
                 let problems = self?.bridge.core.problems() ?? []
                 self?.problemsPanel.update(problems)
                 self?.problemsPanel.isHidden = problems.isEmpty
@@ -297,13 +426,18 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         tabBar.titleBar = titleBar
         pathBar.translatesAutoresizingMaskIntoConstraints = false
         pathBar.show([])
+        breadcrumbBar.translatesAutoresizingMaskIntoConstraints = false
+        breadcrumbBar.clear()
         findBarSlot.translatesAutoresizingMaskIntoConstraints = false
         findBarSlot.isHidden = true
         findBarHeight = findBarSlot.heightAnchor.constraint(equalToConstant: 0)
         detailView.addSubview(tabBar)
         detailView.addSubview(pathBar)
+        detailView.addSubview(breadcrumbBar)
         detailView.addSubview(findBarSlot)
-        detailView.addSubview(scrollView)
+        detailView.addSubview(editorSplitView)
+        detailView.addSubview(stickyScopeView)
+        detailView.addSubview(terminalView)
         detailView.addSubview(problemsPanel)
         detailView.addSubview(referencesPanel)
         detailView.addSubview(hoverPopover)
@@ -316,23 +450,44 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             pathBar.topAnchor.constraint(equalTo: tabBar.bottomAnchor),
             pathBar.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
             pathBar.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
-            findBarSlot.topAnchor.constraint(equalTo: pathBar.bottomAnchor),
+            breadcrumbBar.topAnchor.constraint(equalTo: pathBar.bottomAnchor),
+            breadcrumbBar.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
+            breadcrumbBar.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
+            findBarSlot.topAnchor.constraint(equalTo: breadcrumbBar.bottomAnchor),
             findBarSlot.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
             findBarSlot.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
             findBarHeight,
-            scrollView.topAnchor.constraint(equalTo: findBarSlot.bottomAnchor),
-            scrollView.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
-            scrollView.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
+             editorSplitView.topAnchor.constraint(equalTo: findBarSlot.bottomAnchor),
+             editorSplitView.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
+             editorSplitView.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
+             stickyScopeView.topAnchor.constraint(equalTo: editorSplitView.topAnchor),
+             stickyScopeView.leadingAnchor.constraint(equalTo: editorSplitView.leadingAnchor),
+             stickyScopeView.trailingAnchor.constraint(equalTo: editorSplitView.trailingAnchor),
             problemsPanel.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
             problemsPanel.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
             problemsPanel.bottomAnchor.constraint(equalTo: detailView.bottomAnchor),
             referencesPanel.leadingAnchor.constraint(equalTo: detailView.leadingAnchor), referencesPanel.trailingAnchor.constraint(equalTo: detailView.trailingAnchor), referencesPanel.bottomAnchor.constraint(equalTo: detailView.bottomAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: problemsPanel.topAnchor),
-        ])
+             terminalView.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
+             terminalView.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
+             terminalView.bottomAnchor.constraint(equalTo: problemsPanel.topAnchor),
+             terminalView.heightAnchor.constraint(equalToConstant: 180),
+             editorSplitView.bottomAnchor.constraint(equalTo: terminalView.topAnchor),
+         ])
         problemsPanel.onSelect = { [weak self] problem in self?.showProblem(problem) }
         referencesPanel.onSelect = { [weak self] location in self?.showReference(location) }
         problemsPanel.isHidden = true
         referencesPanel.isHidden = true
+        terminalView.isHidden = true
+        stickyScopeView.isHidden = true
+        terminalView.onNewTab = { [weak self] in self?.newTerminal() }
+        terminalView.onOpenLink = { [weak self] path, line, col in
+            self?.openTerminalLink(path: path, line: line, col: col)
+        }
+        terminalView.onSelectTab = { [weak self] index in
+            guard let self, self.terminalHandles.indices.contains(index) else { return }
+            self.activeTerminalIndex = index
+            self.ensureTerminal()
+        }
         hoverPopover.isHidden = true
         completionPopup.isHidden = true
         signaturePopup.isHidden = true
@@ -386,6 +541,23 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         editorView.window?.makeFirstResponder(editorView)
     }
 
+    private func openTerminalLink(path: String, line: UInt64, col: UInt64) {
+        guard let workspace else { return }
+        let url: URL
+        if path.hasPrefix("/") {
+            url = URL(fileURLWithPath: path)
+        } else {
+            url = URL(fileURLWithPath: workspace.root()).appendingPathComponent(path)
+        }
+        do {
+            try openFile(at: url)
+            activeTab?.doc.goToLine(line: max(1, line) - 1, col: max(1, col) - 1)
+            editorView.revealLine(Int(max(1, line) - 1))
+        } catch {
+            statusLabel.stringValue = "Cannot open terminal link: \(path)"
+        }
+    }
+
     private func beginHover(at position: TextPos, point: NSPoint) {
         guard position.line != UInt64.max, let document = activeTab?.doc else {
             hoverPopover.isHidden = true
@@ -418,12 +590,18 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         let prefix = String(line.prefix(max(0, min(column, line.count))))
             .split(whereSeparator: { !$0.isLetter && !$0.isNumber && $0 != "_" }).last.map(String.init) ?? ""
         completionQuery = prefix
+        if isSettingsDocument(document) {
+            localCompletionItems = GalaxySettings.completionItems()
+            refreshCompletion()
+            return
+        }
+        localCompletionItems = nil
         bridge.requestCompletion(document: document, line: position.line, character: position.colUtf16)
     }
 
     private func refreshCompletion() {
         guard let document = activeTab?.doc else { return }
-        let items = bridge.completions(document: document)
+        let items = localCompletionItems ?? bridge.completions(document: document)
         guard !items.isEmpty else {
             completionPopup.isHidden = true
             return
@@ -434,6 +612,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func closeCompletion() { completionPopup.isHidden = true }
+
+    private func isSettingsDocument(_ document: DocumentHandle) -> Bool {
+        let path = Self.fileKey(document.path())
+        let global = Self.fileKey(globalSettingsURL.path)
+        let workspace = self.workspace.map { Self.fileKey(GalaxySettings.workspaceURL(root: $0.root()).path) }
+        return path == global || path == workspace
+    }
 
     private func refreshSignatureHelp() {
         guard let document = activeTab?.doc else { signaturePopup.isHidden = true; return }
@@ -570,9 +755,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         let selected = document.selectedRange()
         formattingRequest = document
         if selected.length > 0 {
-            bridge.requestRangeFormatting(document: document, range: selected, tabSize: 4, insertSpaces: true)
+        let indent = document.indentSettings()
+        bridge.requestRangeFormatting(document: document, range: selected, tabSize: UInt64(indent.tabSize), insertSpaces: !indent.useTabs)
         } else {
-            bridge.requestFormatting(document: document, tabSize: 4, insertSpaces: true)
+        let indent = document.indentSettings()
+        bridge.requestFormatting(document: document, tabSize: UInt64(indent.tabSize), insertSpaces: !indent.useTabs)
         }
     }
 
@@ -582,7 +769,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         let position = document.selectedRange().location
         let cursor = document.positionAt(offset: position)
         formattingRequest = document
-        bridge.requestOnTypeFormatting(document: document, line: cursor.line, character: cursor.colUtf16, trigger: trigger, tabSize: 4, insertSpaces: true)
+        let indent = document.indentSettings()
+        bridge.requestOnTypeFormatting(document: document, line: cursor.line, character: cursor.colUtf16, trigger: trigger, tabSize: UInt64(indent.tabSize), insertSpaces: !indent.useTabs)
     }
 
     private func refreshFormatting() {
@@ -724,6 +912,66 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         editorView.setFont(Theme.editorFont)
     }
 
+    func reloadSettings(force: Bool = false) {
+        let globalDate = (try? globalSettingsURL.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+        let workspaceURL = workspace.map { GalaxySettings.workspaceURL(root: $0.root()) }
+        let workspaceDate = workspaceURL.flatMap {
+            (try? $0.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+        }
+        guard force || globalDate != settingsModified || workspaceDate != workspaceSettingsModified else { return }
+        settingsModified = globalDate
+        workspaceSettingsModified = workspaceDate
+        do {
+            let global = FileManager.default.fileExists(atPath: globalSettingsURL.path)
+                ? try GalaxySettings.load(from: globalSettingsURL) : .empty
+            let workspace = workspaceURL.flatMap { url in
+                FileManager.default.fileExists(atPath: url.path) ? try? GalaxySettings.load(from: url) : nil
+            } ?? .empty
+            settingsProblems = []
+            let settings = global.merged(with: workspace)
+            autoSaveMode = settings.effectiveAutoSave
+            autoSaveDelay = settings.effectiveAutoSaveDelay
+            if autoSaveMode != .afterDelay { autoSaveWorkItem?.cancel(); autoSaveWorkItem = nil }
+            for tab in tabs {
+                bridge.setIndent(document: tab.doc, useTabs: settings.useTabs, tabSize: settings.effectiveTabSize)
+            }
+            statusBar.show(document: activeTab?.doc, path: activeTab?.doc.path())
+        } catch {
+            settingsProblems = ["settings.json could not be read: \(error.localizedDescription)"]
+            statusLabel.stringValue = settingsProblems[0]
+            Log.ui.error("settings: \(String(describing: error), privacy: .public)")
+        }
+    }
+
+    private func refreshGitStatus() {
+        guard let workspace, let status = bridge.gitStatus(workspace: workspace) else {
+            statusBar.showGit(branch: nil, changedCount: 0)
+            explorer.gitChangedPaths = []
+            refreshTabBar()
+            return
+        }
+        statusBar.showGit(branch: status.branch, changedCount: status.changedPaths.count)
+        explorer.gitChangedPaths = Set(status.changedPaths)
+        refreshTabBar()
+        refreshGitDiff()
+    }
+
+    private func refreshGitDiff() {
+        guard let workspace, let tab = activeTab, let path = tab.relPath else {
+            editorView.gitLineChanges = [:]
+            return
+        }
+        let text = tab.doc.text()
+        DispatchQueue.global(qos: .utility).async { [weak self, workspace, path, text] in
+            let changes = (try? workspace.gitDiffLines(relPath: path, text: text)) ?? []
+            let mapped = Dictionary(uniqueKeysWithValues: changes.map { ($0.line, $0.kind) })
+            Task { @MainActor [weak self] in
+                guard let self, self.activeTab?.relPath == path else { return }
+                self.editorView.gitLineChanges = mapped
+            }
+        }
+    }
+
     /// Starts an empty "Untitled" buffer in a new tab, ready for typing.
     @objc func newDocument(_ sender: Any?) {
         let tab = EditorTab(doc: bridge.newDocument(), title: "Untitled", pathComponents: ["Untitled"],
@@ -741,6 +989,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         if let old = activeTab, old !== tabs[index] {
             recordFindOrigin()
             noteLeaving(old)
+            if autoSaveMode == .onFocusChange { autoSave(tab: old) }
         }
         if let old = activeTab {
             old.scrollY = scrollView.contentView.bounds.origin.y
@@ -748,6 +997,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
         activeIndex = index
         let tab = tabs[index]
+        refreshGitDiff()
         tab.lastActiveAt = .now
         _ = tab.doc.resumeSyntax()
         let id = ObjectIdentifier(tab)
@@ -755,6 +1005,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         tabOrderByUse.insert(id, at: 0)
         pathBar.show(tab.pathComponents)
         editorView.document = tab.doc
+        secondaryEditorView.document = isEditorSplit ? tab.doc : nil
         let root = workspace?.root() ?? (tab.doc.path() as NSString).deletingLastPathComponent
         _ = bridge.startLSP(document: tab.doc, language: tab.doc.syntaxLanguage() ?? StatusBar.language(for: tab.doc.path()), root: root)
         if let y = tab.scrollY {
@@ -780,7 +1031,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// Releases parser workers/trees for tabs that stayed hidden long enough.
     /// Called by the timer and directly by tests with a deterministic clock.
     func evictInactiveSyntax(now: Date) {
-        for tab in tabs where tab !== activeTab && now.timeIntervalSince(tab.lastActiveAt) >= Self.syntaxEvictionInterval {
+        evictInactiveSyntax(now: now, includeRecentlyInactive: false)
+    }
+
+    private func evictInactiveSyntax(now: Date, includeRecentlyInactive: Bool) {
+        for tab in tabs where tab !== activeTab && (includeRecentlyInactive || now.timeIntervalSince(tab.lastActiveAt) >= Self.syntaxEvictionInterval) {
             _ = tab.doc.suspendSyntax()
         }
     }
@@ -869,6 +1124,42 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         reloadKeybindings()
     }
 
+    func windowDidResignKey(_ notification: Notification) {
+        guard autoSaveMode == .onFocusChange else { return }
+        autoSaveModifiedDocuments()
+    }
+
+    private func scheduleAutoSave() {
+        guard autoSaveMode == .afterDelay else { return }
+        autoSaveWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            Task { @MainActor [weak self] in self?.autoSaveModifiedDocuments() }
+        }
+        autoSaveWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + autoSaveDelay, execute: item)
+    }
+
+    private func autoSaveModifiedDocuments() {
+        autoSaveWorkItem = nil
+        editorView.flushPendingUpdates()
+        let selected = activeIndex
+        for index in tabs.indices where tabs[index].doc.isModified() && !tabs[index].doc.path().isEmpty {
+            autoSave(tab: tabs[index])
+        }
+        if let selected, tabs.indices.contains(selected), activeIndex != selected { selectTab(selected) }
+    }
+
+    private func autoSave(tab: EditorTab) {
+        guard tab.doc.isModified(), !tab.doc.path().isEmpty else { return }
+        do {
+            try tab.doc.save()
+            bridge.saveLSP(document: tab.doc)
+            tab.isEdited = false
+        } catch {
+            Log.ui.error("auto-save failed for \(tab.doc.path(), privacy: .public): \(String(describing: error), privacy: .public)")
+        }
+    }
+
     /// ⌃Tab: the tab shown before this one. Pressed again, it goes back.
     @objc func selectLastUsedTab(_ sender: Any?) {
         let live = Set(tabs.map(ObjectIdentifier.init))
@@ -936,7 +1227,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func refreshTabBar() {
-        tabBar.set(items: tabs.map { TabBar.Item(title: $0.displayTitle, isPreview: $0.isPreview, isEdited: $0.isEdited) },
+        let gitPaths = explorer.gitChangedPaths
+        tabBar.set(items: tabs.map { tab in
+            TabBar.Item(title: tab.displayTitle, isPreview: tab.isPreview, isEdited: tab.isEdited,
+                        isGitChanged: tab.relPath.map(gitPaths.contains) ?? false)
+        },
                    selected: activeIndex)
     }
 
@@ -1471,7 +1766,33 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         panel.focus()
     }
 
+    /// Command-T: searches symbols across the active workspace.
+    @objc func showGoToWorkspaceSymbol(_ sender: Any?) {
+        guard let root = workspace?.root() else {
+            statusLabel.stringValue = "Open a workspace to use Go to Workspace Symbol."
+            return NSSound.beep()
+        }
+        if isOutlinePickerVisible { return outlinePicker.move(by: 1) }
+        closeOverlays()
+        let panel = outlinePicker
+        panel.reset(symbols: [])
+        workspaceSymbolRoot = root
+        outlineRequest = nil
+        bridge.requestWorkspaceSymbols(root: root, query: "")
+        panel.isHidden = false
+        panel.focus()
+    }
+
     private func refreshDocumentSymbols() {
+        if let document = activeTab?.doc {
+            let symbols = bridge.documentSymbols(document: document)
+            documentSymbols = symbols.map { OutlineSymbol(uri: $0.uri, name: $0.name, kind: $0.kind, line: $0.line, column: $0.column) }
+            let line = editorView.document?.viewport(firstLine: 0, count: 0).primary.line ?? 0
+            breadcrumbBar.show(symbols: documentSymbols, atLine: line)
+        } else {
+            documentSymbols = []
+            breadcrumbBar.clear()
+        }
         if let root = workspaceSymbolRoot {
             let symbols = bridge.workspaceSymbols(root: root)
             if !symbols.isEmpty {
@@ -1485,6 +1806,23 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         guard !symbols.isEmpty else { return }
         outlineRequest = nil
         outlinePicker.reset(symbols: symbols.map { OutlineSymbol(uri: $0.uri, name: $0.name, kind: $0.kind, line: $0.line, column: $0.column) })
+    }
+
+    private func updateStickyScope() {
+        guard activeTab != nil, !documentSymbols.isEmpty else {
+            stickyScopeView.show([])
+            return
+        }
+        let lineHeight = editorView.metrics.lineHeight
+        let firstVisible = UInt64(max(0, Int(floor(scrollView.contentView.bounds.origin.y / lineHeight))))
+        guard firstVisible > 0 else {
+            stickyScopeView.show([])
+            return
+        }
+        let scopes = documentSymbols
+            .filter { $0.line < firstVisible }
+            .sorted { $0.line == $1.line ? $0.column < $1.column : $0.line < $1.line }
+        stickyScopeView.show(Array(scopes.suffix(3)))
     }
 
     private func requestWorkspaceSymbols(query: String) {
@@ -1613,6 +1951,30 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         } catch {
             report(error, while: "open keybindings.json")
         }
+    }
+
+    private func openJSONSettings(at url: URL, action: String) {
+        do {
+            if !FileManager.default.fileExists(atPath: url.path) {
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try "{\n  \"editor\": {\n    \"insertSpaces\": true,\n    \"tabSize\": 4\n  }\n}\n".write(to: url, atomically: true, encoding: .utf8)
+            }
+            try openFile(at: url)
+        } catch {
+            report(error, while: action)
+        }
+    }
+
+    @objc func openUserSettingsJson(_ sender: Any?) {
+        openJSONSettings(at: globalSettingsURL, action: "open user settings")
+    }
+
+    @objc func openWorkspaceSettingsJson(_ sender: Any?) {
+        guard let workspace else {
+            statusLabel.stringValue = "Open a workspace to use workspace settings."
+            return NSSound.beep()
+        }
+        openJSONSettings(at: GalaxySettings.workspaceURL(root: workspace.root()), action: "open workspace settings")
     }
 
     // MARK: Go to File (M2-07)
@@ -1790,10 +2152,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             explorer.refresh()
             checkOpenFiles()
             rebuildFileFinder()
+            refreshGitStatus()
             onWorkspaceChangesApplied?(batch)
             return
         }
         explorer.refresh(changed: batch.paths)
+        refreshGitStatus()
         checkOpenFiles(changed: batch.paths)
         updateFileFinder(changed: batch.paths) { [weak self] in
             self?.onWorkspaceChangesApplied?(batch)
@@ -2100,6 +2464,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             reloadKeybindings(force: true)
             if keybindings.problems.isEmpty { statusLabel.stringValue = "Keyboard shortcuts updated." }
         }
+        if isSettingsDocument(doc) {
+            reloadSettings(force: true)
+            if settingsProblems.isEmpty { statusLabel.stringValue = "Settings updated." }
+        }
     }
 
     /// `true` when it is safe to close the window or quit: every tab with
@@ -2211,6 +2579,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        autoSaveWorkItem?.cancel()
+        autoSaveWorkItem = nil
         saveSession()
         syntaxEvictionTimer?.invalidate()
         syntaxEvictionTimer = nil
@@ -2262,6 +2632,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     func openWorkspace(at url: URL) throws {
         let ws = try bridge.core.openWorkspace(path: url.path)
         workspace = ws
+        workspaceSettingsModified = nil
         fileFinder = nil
         recentFiles = []
         // Paths are relative to the new root (or outside it).
@@ -2271,6 +2642,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         // Ready by the time ⌘P is pressed in all but huge folders.
         rebuildFileFinder()
         startWatching(ws)
+        refreshGitStatus()
         explorer.setWorkspace(ws)
         explorer.scrollView.isHidden = false
         emptyState.isHidden = true

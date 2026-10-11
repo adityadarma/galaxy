@@ -125,6 +125,9 @@ final class CommandPaletteTests: XCTestCase {
                    "actions.find", "workbench.files.action.refreshFilesExplorer"] {
             XCTAssertTrue(open.contains(id), id)
         }
+        XCTAssertTrue(open.contains("workbench.action.gotoWorkspaceSymbol"))
+        XCTAssertTrue(open.contains("workbench.action.openUserSettingsJson"))
+        XCTAssertTrue(open.contains("workbench.action.openWorkspaceSettingsJson"))
         XCTAssertFalse(open.contains("undo"), "nothing to undo yet")
     }
 
@@ -166,5 +169,14 @@ final class CommandPaletteTests: XCTestCase {
         let item = try XCTUnwrap(menu.item(withTitle: "Command Palette…"))
         XCTAssertEqual(item.keyEquivalent, "p")
         XCTAssertEqual(item.keyEquivalentModifierMask, [.command, .shift])
+    }
+
+    func testWorkspaceSymbolCommandOpensPicker() throws {
+        let c = makeController()
+        defer { c.window?.orderOut(nil) }
+        try c.openWorkspace(at: root)
+        c.showGoToWorkspaceSymbol(nil)
+        XCTAssertTrue(c.isOutlinePickerVisible)
+        XCTAssertTrue(c.window?.firstResponder === c.outlinePicker.field.currentEditor())
     }
 }

@@ -19,6 +19,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        CrashReporter.install()
         StartupProbe.mark("did_finish_launching")
         Log.app.info("launch started")
         bridge.start()

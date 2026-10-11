@@ -58,6 +58,7 @@ final class TabBar: NSView {
         var title: String
         var isPreview: Bool
         var isEdited: Bool
+        var isGitChanged: Bool
     }
 
     static let minTabWidth: CGFloat = 96
@@ -202,6 +203,7 @@ final class TabItemView: NSView {
     let icon = NSImageView()
     let closeButton = NSButton()
     let editedDot = NSTextField(labelWithString: "●")
+    let gitDot = NSTextField(labelWithString: "●")
     private var isHovered = false { didSet { if isHovered != oldValue { refresh() } } }
 
     init(item: TabBar.Item) {
@@ -233,8 +235,12 @@ final class TabItemView: NSView {
         editedDot.alignment = .center
         editedDot.setAccessibilityElement(false)
         editedDot.translatesAutoresizingMaskIntoConstraints = false
+        gitDot.font = .systemFont(ofSize: 9)
+        gitDot.textColor = .systemYellow
+        gitDot.setAccessibilityElement(false)
+        gitDot.translatesAutoresizingMaskIntoConstraints = false
 
-        for view in [icon, label, closeButton, editedDot] { addSubview(view) }
+        for view in [icon, label, closeButton, editedDot, gitDot] { addSubview(view) }
         NSLayoutConstraint.activate([
             widthAnchor.constraint(greaterThanOrEqualToConstant: TabBar.minTabWidth),
             widthAnchor.constraint(lessThanOrEqualToConstant: TabBar.maxTabWidth),
@@ -250,6 +256,8 @@ final class TabItemView: NSView {
             closeButton.heightAnchor.constraint(equalToConstant: 16),
             editedDot.centerXAnchor.constraint(equalTo: closeButton.centerXAnchor),
             editedDot.centerYAnchor.constraint(equalTo: closeButton.centerYAnchor),
+            gitDot.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -3),
+            gitDot.centerYAnchor.constraint(equalTo: closeButton.centerYAnchor),
         ])
         refresh()
     }
@@ -274,6 +282,7 @@ final class TabItemView: NSView {
         icon.contentTintColor = glyph.color
         icon.alphaValue = isSelected ? 1 : 0.8
         editedDot.isHidden = !showsEditedDot
+        gitDot.isHidden = !item.isGitChanged || showsEditedDot
         closeButton.isHidden = showsEditedDot || !(isSelected || isHovered)
         closeButton.setAccessibilityLabel("Close \(item.title)")
         toolTip = item.isPreview ? "\(item.title) (preview: double-click the file to keep it open)" : item.title

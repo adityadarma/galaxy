@@ -22,6 +22,8 @@ ignore.workspace = true
 regex.workspace = true
 # Fuzzy file search for Go to File.
 nucleo-matcher.workspace = true
+# Git branch and worktree status.
+gix.workspace = true
 # Workspace file watcher (FSEvents).
 notify.workspace = true
 # Parser worker behind M3 syntax highlighting.
@@ -40,6 +42,8 @@ tree-sitter-css.workspace = true
 tree-sitter-bash.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
+portable-pty.workspace = true
+alacritty_terminal.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

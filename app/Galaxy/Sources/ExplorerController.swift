@@ -39,6 +39,9 @@ final class ExplorerController: NSObject {
     var dirtyPaths: Set<String> = [] {
         didSet { if dirtyPaths != oldValue { refreshDirtyMarks() } }
     }
+    var gitChangedPaths: Set<String> = [] {
+        didSet { if gitChangedPaths != oldValue { refreshGitMarks() } }
+    }
     /// Set while a folder click selects its row, so the selection change
     /// does not toggle the folder a second time.
     private var selectingFromClick = false
@@ -152,6 +155,12 @@ final class ExplorerController: NSObject {
         return dirtyPaths.contains { $0.hasPrefix(prefix) }
     }
 
+    func isGitChanged(_ entry: FileEntry) -> Bool {
+        if !entry.isDir { return gitChangedPaths.contains(entry.relPath) }
+        let prefix = entry.relPath.isEmpty ? "" : entry.relPath + "/"
+        return gitChangedPaths.contains { $0.hasPrefix(prefix) }
+    }
+
     /// Updates the rows on screen; others pick it up when they are made.
     private func refreshDirtyMarks() {
         let rows = outlineView.rows(in: outlineView.visibleRect)
@@ -161,6 +170,17 @@ final class ExplorerController: NSObject {
                   let cell = outlineView.view(atColumn: 0, row: row, makeIfNecessary: false) as? ExplorerCell
             else { continue }
             cell.isDirty = isDirty(node.entry)
+        }
+    }
+
+    private func refreshGitMarks() {
+        let rows = outlineView.rows(in: outlineView.visibleRect)
+        guard rows.length > 0 else { return }
+        for row in rows.location..<(rows.location + rows.length) {
+            guard let node = outlineView.item(atRow: row) as? ExplorerNode,
+                  let cell = outlineView.view(atColumn: 0, row: row, makeIfNecessary: false) as? ExplorerCell
+            else { continue }
+            cell.isGitChanged = isGitChanged(node.entry)
         }
     }
 
@@ -367,6 +387,7 @@ extension ExplorerController: NSOutlineViewDelegate {
             ?? ExplorerCell()
         cell.show(node.entry, expanded: outlineView.isItemExpanded(node))
         cell.isDirty = isDirty(node.entry)
+        cell.isGitChanged = isGitChanged(node.entry)
         return cell
     }
 
@@ -452,12 +473,20 @@ final class ExplorerCell: NSTableCellView {
     let label = NSTextField(labelWithString: "")
     /// Copper dot on the right for unsaved changes, as on the tab.
     let dirtyDot = NSTextField(labelWithString: "●")
+    let gitDot = NSTextField(labelWithString: "●")
     private(set) var isFolder = false
 
     var isDirty = false {
         didSet {
             dirtyDot.isHidden = !isDirty
             label.setAccessibilityLabel(isDirty ? "\(label.stringValue), unsaved changes" : nil)
+        }
+    }
+
+    var isGitChanged = false {
+        didSet {
+            gitDot.isHidden = !isGitChanged
+            label.textColor = isGitChanged ? .systemYellow : .labelColor
         }
     }
 
@@ -483,10 +512,14 @@ final class ExplorerCell: NSTableCellView {
         dirtyDot.isHidden = true
         dirtyDot.setAccessibilityElement(false)
         dirtyDot.setContentCompressionResistancePriority(.required, for: .horizontal)
+        gitDot.font = .systemFont(ofSize: 9)
+        gitDot.textColor = .systemYellow
+        gitDot.isHidden = true
+        gitDot.setContentCompressionResistancePriority(.required, for: .horizontal)
 
         let spacer = NSView()
         spacer.setContentHuggingPriority(.init(1), for: .horizontal)
-        let row = NSStackView(views: [chevron, icon, label, spacer, dirtyDot])
+        let row = NSStackView(views: [chevron, icon, label, spacer, gitDot, dirtyDot])
         row.orientation = .horizontal
         row.spacing = 4
         row.translatesAutoresizingMaskIntoConstraints = false

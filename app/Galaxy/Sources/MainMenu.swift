@@ -77,6 +77,8 @@ enum MainMenu {
         goMenu.addItem(withTitle: "Go to File…", action: #selector(MainWindowController.showGoToFile(_:)), keyEquivalent: "p")
         let symbol = goMenu.addItem(withTitle: "Go to Symbol…", action: #selector(MainWindowController.showGoToSymbol(_:)), keyEquivalent: "o")
         symbol.keyEquivalentModifierMask = [.command, .shift]
+        let workspaceSymbol = goMenu.addItem(withTitle: "Go to Workspace Symbol…", action: #selector(MainWindowController.showGoToWorkspaceSymbol(_:)), keyEquivalent: "t")
+        workspaceSymbol.keyEquivalentModifierMask = [.command]
         let line = goMenu.addItem(withTitle: "Go to Line…", action: #selector(MainWindowController.showGoToLine(_:)), keyEquivalent: "g")
         line.keyEquivalentModifierMask = [.control]
         goMenu.addItem(.separator())
@@ -93,6 +95,11 @@ enum MainMenu {
         palette.keyEquivalentModifierMask = [.command, .shift]
         viewMenu.addItem(.separator())
         viewMenu.addItem(withTitle: "Toggle Sidebar", action: #selector(MainWindowController.toggleSidebarVisibility(_:)), keyEquivalent: "b")
+        let terminal = viewMenu.addItem(withTitle: "Toggle Terminal", action: #selector(MainWindowController.toggleTerminal(_:)), keyEquivalent: "j")
+        terminal.keyEquivalentModifierMask = [.command]
+        viewMenu.addItem(withTitle: "Split Editor Right", action: #selector(MainWindowController.splitEditorRight(_:)), keyEquivalent: "")
+        viewMenu.addItem(withTitle: "Split Editor Down", action: #selector(MainWindowController.splitEditorDown(_:)), keyEquivalent: "")
+        viewMenu.addItem(withTitle: "Close Editor Split", action: #selector(MainWindowController.closeEditorSplit(_:)), keyEquivalent: "")
         let search = viewMenu.addItem(withTitle: "Search in Workspace…", action: #selector(MainWindowController.showWorkspaceSearch(_:)), keyEquivalent: "f")
         search.keyEquivalentModifierMask = [.command, .shift]
         let explorer = viewMenu.addItem(withTitle: "Show Explorer", action: #selector(MainWindowController.showExplorer(_:)), keyEquivalent: "e")
@@ -109,6 +116,8 @@ enum MainMenu {
         viewMenu.addItem(withTitle: "Show Typing Latency", action: #selector(MainWindowController.showTypingLatency(_:)), keyEquivalent: "")
         viewMenu.addItem(.separator())
         viewMenu.addItem(withTitle: "Keyboard Shortcuts…", action: #selector(MainWindowController.openKeybindingsFile(_:)), keyEquivalent: "")
+        viewMenu.addItem(withTitle: "Open User Settings (JSON)…", action: #selector(MainWindowController.openUserSettingsJson(_:)), keyEquivalent: "")
+        viewMenu.addItem(withTitle: "Open Workspace Settings (JSON)…", action: #selector(MainWindowController.openWorkspaceSettingsJson(_:)), keyEquivalent: "")
         viewItem.submenu = viewMenu
 
         let editItem = NSMenuItem()
