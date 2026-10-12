@@ -41,9 +41,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let url = pendingURL {
             pendingURL = nil
             controller.open(url: url)
+        } else if Self.shouldRestoreSession, restoreSession(in: controller) {
+            // The prior workspace and its tabs are restored only after a quit.
         } else {
-        // Do not restore the previous session automatically. A stale project,
-        // tab, or language-server state must never prevent the app from opening.
             controller.newDocument(nil)
         }
 
@@ -94,15 +94,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Off for benchmarks (startup must not depend on what was open last),
-    /// for the unit-test host, and with `-RestoreSession NO` (UI tests).
+    /// Off for benchmarks, tests, and an explicit no-restore launch.
     private static var shouldRestoreSession: Bool {
         let env = ProcessInfo.processInfo.environment
         if env["GALAXY_BENCH"] != nil || env["XCTestConfigurationFilePath"] != nil
             || LatencyBench.requestedCount != nil || ScrollBench.requestedFrames != nil {
             return false
         }
-        return false
+        let arguments = ProcessInfo.processInfo.arguments
+        if let index = arguments.firstIndex(of: "-RestoreSession"),
+           arguments.index(after: index) < arguments.endIndex,
+           arguments[arguments.index(after: index)].uppercased() == "NO" {
+            return false
+        }
+        return true
     }
 
     private func restoreSession(in controller: MainWindowController) -> Bool {
@@ -111,12 +116,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        // Quitting with the window open does not close it first.
-        windowController?.saveSession()
+        windowController?.saveSessionForQuit()
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        windowController?.confirmDiscardChanges() ?? true ? .terminateNow : .terminateCancel
+        guard let windowController else { return .terminateNow }
+        guard windowController.confirmDiscardChanges() else { return .terminateCancel }
+        return .terminateNow
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

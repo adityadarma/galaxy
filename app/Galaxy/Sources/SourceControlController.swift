@@ -43,12 +43,75 @@ final class CountPillView: NSView {
     }
 }
 
+// MARK: - Generate Commit Icon Button
+
+@MainActor
+final class GenerateCommitIconButton: NSButton {
+    private var isHovered = false {
+        didSet { updateAppearance() }
+    }
+    private var trackingArea: NSTrackingArea?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setup()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError() }
+
+    private func setup() {
+        wantsLayer = true
+        isBordered = false
+        imagePosition = .imageOnly
+        focusRingType = .none
+        translatesAutoresizingMaskIntoConstraints = false
+
+        let config = NSImage.SymbolConfiguration(pointSize: 11, weight: .regular)
+        let img = (NSImage(systemSymbolName: "wand.and.stars", accessibilityDescription: "Generate Commit Message")
+            ?? NSImage(systemSymbolName: "sparkles", accessibilityDescription: "Generate Commit Message"))?
+            .withSymbolConfiguration(config)
+        img?.isTemplate = true
+        self.image = img
+
+        toolTip = "Generate Commit Message"
+        setAccessibilityLabel("Generate Commit Message")
+        setAccessibilityRole(.button)
+
+        layer?.cornerRadius = 3
+        layer?.masksToBounds = true
+        updateAppearance()
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let trackingArea { removeTrackingArea(trackingArea) }
+        let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeInActiveApp, .assumeInside], owner: self, userInfo: nil)
+        addTrackingArea(area)
+        self.trackingArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) { isHovered = true }
+    override func mouseExited(with event: NSEvent) { isHovered = false }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+
+    private func updateAppearance() {
+        contentTintColor = isHovered ? .labelColor : .secondaryLabelColor
+        layer?.backgroundColor = isHovered
+            ? NSColor.labelColor.withAlphaComponent(0.08).cgColor
+            : NSColor.clear.cgColor
+    }
+}
+
 // MARK: - Commit Message Input Container
 
 @MainActor
 final class CommitMessageInputContainer: NSView {
     let textField = NSTextField()
-    let generateButton = NSButton()
+    let generateButton = GenerateCommitIconButton()
 
     var onGenerate: (() -> Void)?
 
@@ -58,8 +121,12 @@ final class CommitMessageInputContainer: NSView {
         layer?.cornerRadius = 4
         layer?.masksToBounds = true
         layer?.borderWidth = 1
-        layer?.borderColor = NSColor(white: 0.28, alpha: 1.0).cgColor
-        layer?.backgroundColor = NSColor(white: 0.15, alpha: 1.0).cgColor
+
+        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        layer?.borderColor = (isDark ? NSColor(white: 0.24, alpha: 1.0) : NSColor.separatorColor.withAlphaComponent(0.6)).cgColor
+        layer?.backgroundColor = isDark
+            ? (NSColor(hex: "#1E2227") ?? NSColor(white: 0.14, alpha: 1.0)).cgColor
+            : NSColor.textBackgroundColor.cgColor
 
         textField.isBordered = false
         textField.drawsBackground = false
@@ -75,46 +142,36 @@ final class CommitMessageInputContainer: NSView {
         textField.lineBreakMode = .byClipping
         textField.translatesAutoresizingMaskIntoConstraints = false
 
-        generateButton.title = "Generate "
-        generateButton.image = NSImage(systemSymbolName: "sparkles", accessibilityDescription: "Generate with AI")?
-            .withSymbolConfiguration(.init(pointSize: 10, weight: .semibold))
-        generateButton.imagePosition = .imageRight
-        generateButton.isBordered = false
-        generateButton.wantsLayer = true
-        generateButton.layer?.cornerRadius = 3
-        generateButton.layer?.masksToBounds = true
-        generateButton.layer?.backgroundColor = NSColor(srgbRed: 0/255.0, green: 120/255.0, blue: 212/255.0, alpha: 1.0).cgColor
-        generateButton.contentTintColor = .white
-        generateButton.font = .systemFont(ofSize: 11, weight: .medium)
-        generateButton.toolTip = "Generate Commit Message"
         generateButton.target = self
         generateButton.action = #selector(generateClicked(_:))
-        generateButton.translatesAutoresizingMaskIntoConstraints = false
 
         addSubview(textField)
         addSubview(generateButton)
 
         NSLayoutConstraint.activate([
-            heightAnchor.constraint(equalToConstant: 30),
+            heightAnchor.constraint(equalToConstant: 28),
 
             textField.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
             textField.centerYAnchor.constraint(equalTo: centerYAnchor),
             textField.heightAnchor.constraint(equalToConstant: 20),
-            textField.trailingAnchor.constraint(equalTo: generateButton.leadingAnchor, constant: -6),
+            textField.trailingAnchor.constraint(equalTo: generateButton.leadingAnchor, constant: -4),
 
-            generateButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -3),
+            generateButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
             generateButton.centerYAnchor.constraint(equalTo: centerYAnchor),
-            generateButton.heightAnchor.constraint(equalToConstant: 24),
-            generateButton.widthAnchor.constraint(equalToConstant: 86),
+            generateButton.widthAnchor.constraint(equalToConstant: 22),
+            generateButton.heightAnchor.constraint(equalToConstant: 22),
         ])
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
     func setFocused(_ focused: Bool) {
-        layer?.borderColor = focused
-            ? NSColor(srgbRed: 0/255.0, green: 120/255.0, blue: 212/255.0, alpha: 1.0).cgColor
-            : NSColor(white: 0.28, alpha: 1.0).cgColor
+        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let accentColor = NSColor(srgbRed: 0/255.0, green: 120/255.0, blue: 212/255.0, alpha: 1.0)
+        let normalBorder = isDark ? NSColor(white: 0.24, alpha: 1.0) : NSColor.separatorColor.withAlphaComponent(0.6)
+
+        layer?.borderColor = focused ? accentColor.cgColor : normalBorder.cgColor
+        layer?.borderWidth = focused ? 1.5 : 1.0
     }
 
     @objc private func generateClicked(_ sender: Any?) { onGenerate?() }
@@ -552,23 +609,70 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         onRefresh?()
     }
 
+    private func heuristicCommitMessage(for targets: [GitChangeInfo]) -> String {
+        let fileNames = targets.map { ($0.path as NSString).lastPathComponent }
+        if fileNames.count == 1 {
+            return "Update \(fileNames[0])"
+        } else if fileNames.count == 2 {
+            return "Update \(fileNames[0]) and \(fileNames[1])"
+        } else {
+            return "Update \(fileNames[0]), \(fileNames[1]) and \(fileNames.count - 2) others"
+        }
+    }
+
     func generateCommitMessage() {
         let targets = !stagedChanges.isEmpty ? stagedChanges : unstagedChanges
         guard !targets.isEmpty else { return }
 
-        let fileNames = targets.map { ($0.path as NSString).lastPathComponent }
-        let generated: String
-        if fileNames.count == 1 {
-            generated = "Update \(fileNames[0])"
-        } else if fileNames.count == 2 {
-            generated = "Update \(fileNames[0]) and \(fileNames[1])"
-        } else {
-            generated = "Update \(fileNames[0]), \(fileNames[1]) and \(fileNames.count - 2) others"
+        let fallback = heuristicCommitMessage(for: targets)
+
+        // If AI / LLM is not configured, immediately use Option 1
+        guard AICommitService.shared.isConfigured else {
+            messageContainer.textField.stringValue = fallback
+            updateCommitButtonState()
+            focusMessageInput()
+            return
         }
 
-        messageContainer.textField.stringValue = generated
-        updateCommitButtonState()
-        focusMessageInput()
+        // Retrieve git diff (prefer staged changes; fallback to unstaged)
+        var (_, diff) = runGit(args: ["diff", "--cached"])
+        if diff.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            (_, diff) = runGit(args: ["diff"])
+        }
+
+        guard !diff.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            messageContainer.textField.stringValue = fallback
+            updateCommitButtonState()
+            focusMessageInput()
+            return
+        }
+
+        // Show generating feedback
+        messageContainer.textField.stringValue = ""
+        messageContainer.textField.placeholderString = "Generating with AI…"
+        messageContainer.generateButton.isEnabled = false
+
+        Task { [weak self] in
+            let generated = await AICommitService.shared.generateCommitMessage(diff: diff)
+            await MainActor.run {
+                guard let self else { return }
+                self.messageContainer.generateButton.isEnabled = true
+                if let branch = self.currentBranch, !branch.isEmpty {
+                    self.messageContainer.textField.placeholderString = "Message (⌘Enter to commit on '\(branch)')"
+                } else {
+                    self.messageContainer.textField.placeholderString = "Message (⌘Enter to commit)"
+                }
+
+                if let generated, !generated.isEmpty {
+                    self.messageContainer.textField.stringValue = generated
+                } else {
+                    // Graceful fallback to Option 1
+                    self.messageContainer.textField.stringValue = fallback
+                }
+                self.updateCommitButtonState()
+                self.focusMessageInput()
+            }
+        }
     }
 
     @objc func commit(_ sender: Any?) {

@@ -501,6 +501,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         sourceControl.onRefresh = { [weak self] in self?.refreshGitStatus() }
         searchSidebar.onSearch = { [weak self] query, options in self?.searchSidebarWorkspace(query, options: options) }
         searchSidebar.onOpen = { [weak self] match in self?.openSearchSidebarMatch(match) }
+        searchSidebar.onReplaceAll = { [weak self] query, replacement, options in
+            self?.searchSidebarReplaceAll(query: query, replacement: replacement, options: options)
+        }
 
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = false
@@ -1163,6 +1166,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         sectionHeader.onScmRefresh = { [weak self] in self?.refreshGitStatus() }
         sectionHeader.onScmHistory = { [weak self] in self?.showGitBranchPicker() }
         sectionHeader.scmMoreMenu = { [weak self] in self?.sourceControl.moreActionsMenu() ?? NSMenu() }
+        sectionHeader.onSearchRefresh = { [weak self] in self?.searchSidebar.refresh() }
+        sectionHeader.onSearchClear = { [weak self] in self?.searchSidebar.clearQuery() }
+        sectionHeader.onSearchToggleReplace = { [weak self] in self?.searchSidebar.toggleReplace() }
+        sectionHeader.onSearchToggleDetails = { [weak self] in self?.searchSidebar.toggleDetails() }
+        sectionHeader.searchMoreMenu = { [weak self] in self?.searchSidebar.moreMenu() ?? NSMenu() }
 
         // Shown until a folder is opened.
         let message = NSTextField(wrappingLabelWithString: "No folder open")
@@ -1396,6 +1404,25 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         guard let workspace else { return }
         openWorkspaceFile(workspace, FileEntry(name: (match.relPath as NSString).lastPathComponent, relPath: match.relPath, isDir: false), preview: false)
         activeTab?.doc.goToLine(line: match.line, col: match.column)
+    }
+
+    private func searchSidebarReplaceAll(query: String, replacement: String, options: WorkspaceSearchOptions) {
+        guard !query.isEmpty else { return }
+        var totalReplaced = 0
+        for tab in tabs {
+            _ = tab.doc.setFind(pattern: query, config: FindConfig(caseSensitive: options.caseSensitive, wholeWord: options.wholeWord, regex: options.regex))
+            let count = tab.doc.replaceAll(replacement: replacement)
+            if count > 0 {
+                totalReplaced += Int(count)
+                if tab === activeTab {
+                    editorView.didChangeDocument()
+                }
+            }
+        }
+        if totalReplaced > 0 {
+            statusLabel.stringValue = "Replaced \(totalReplaced) occurrence\(totalReplaced == 1 ? "" : "s") in open editors"
+        }
+        searchSidebarWorkspace(query, options: options)
     }
 
     private func showSourceControl(_ visible: Bool) {
@@ -3056,6 +3083,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     /// Where the session is saved. Tests point it elsewhere.
     var sessionURL = Session.defaultURL
+    private var didCloseWindow = false
 
     /// The folder, the file tabs with caret and scroll, and the active tab.
     func currentSession() -> Session {
@@ -3083,6 +3111,47 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
+    private func saveWorkspaceSession() {
+        guard let workspace else { return }
+        do {
+            try currentSession().save(to: Session.workspaceURL(for: workspace.root()))
+        } catch {
+            Log.app.error("saving workspace session failed: \(String(describing: error), privacy: .public)")
+        }
+    }
+
+    private func restoreTabs(from session: Session) {
+        var restored: [(EditorTab, CGFloat?)] = []
+        var target: EditorTab?
+        for (i, saved) in session.tabs.enumerated() {
+            guard FileManager.default.fileExists(atPath: saved.path) else { continue }
+            if let workspace, let rel = relativePath(saved.path) {
+                let entry = FileEntry(name: (rel as NSString).lastPathComponent, relPath: rel, isDir: false)
+                openWorkspaceFile(workspace, entry, preview: saved.isPreview)
+            } else {
+                try? openFile(at: URL(fileURLWithPath: saved.path))
+            }
+            guard let index = tabIndex(forPath: saved.path) else { continue }
+            let tab = tabs[index]
+            tab.doc.goToLine(line: saved.line, col: saved.col)
+            restored.append((tab, saved.scrollY.map { CGFloat($0) }))
+            if i == session.active { target = tab }
+        }
+        for (tab, y) in restored { tab.scrollY = y }
+        if let current = activeTab {
+            scrollView.contentView.scroll(to: NSPoint(x: 0, y: current.scrollY ?? 0))
+            scrollView.reflectScrolledClipView(scrollView.contentView)
+            if let target, target !== current, let i = tabs.firstIndex(where: { $0 === target }) {
+                selectTab(i)
+            }
+            editorView.didChangeSelection()
+        }
+    }
+
+    func saveSessionForQuit() {
+        if !didCloseWindow { saveSession() }
+    }
+
     /// Reopens what `session` had: the folder if it still exists, and the
     /// tabs whose files still exist, with caret and scroll. Returns
     /// `false` if nothing could be restored.
@@ -3102,34 +3171,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 }
             }
         }
-        var restored: [(EditorTab, CGFloat?)] = []
-        var target: EditorTab?
-        for (i, saved) in session.tabs.enumerated() {
-            guard FileManager.default.fileExists(atPath: saved.path) else { continue }
-            if let workspace, let rel = relativePath(saved.path) {
-                let entry = FileEntry(name: (rel as NSString).lastPathComponent, relPath: rel, isDir: false)
-                openWorkspaceFile(workspace, entry, preview: saved.isPreview)
-            } else {
-                try? openFile(at: URL(fileURLWithPath: saved.path))
-            }
-            guard let index = tabIndex(forPath: saved.path) else { continue }
-            let tab = tabs[index]
-            tab.doc.goToLine(line: saved.line, col: saved.col)
-            restored.append((tab, saved.scrollY.map { CGFloat($0) }))
-            if i == session.active { target = tab }
-        }
+        restoreTabs(from: session)
         if restoredWorkspace { setSidebarVisible(session.sidebarVisible) }
-        // Opening each tab recorded the scroll of the one before it; put
-        // the saved positions back, then show the active tab.
-        for (tab, y) in restored { tab.scrollY = y }
-        if let current = self.activeTab {
-            scrollView.contentView.scroll(to: NSPoint(x: 0, y: current.scrollY ?? 0))
-            scrollView.reflectScrolledClipView(scrollView.contentView)
-            if let target, target !== current, let i = tabs.firstIndex(where: { $0 === target }) {
-                selectTab(i)
-            }
-            editorView.didChangeSelection()
-        }
         Log.app.info("restored session: workspace \(restoredWorkspace), \(self.tabs.count) of \(session.tabs.count) tabs")
         return restoredWorkspace || !tabs.isEmpty
     }
@@ -3137,7 +3180,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         autoSaveWorkItem?.cancel()
         autoSaveWorkItem = nil
-        saveSession()
+        // Closing the window is an intentional fresh start. If closing the
+        // last window also terminates the app, `saveSessionForQuit` sees this.
+        didCloseWindow = true
+        Session.remove(at: sessionURL)
         syntaxEvictionTimer?.invalidate()
         syntaxEvictionTimer = nil
         lspTimer?.invalidate()
@@ -3193,6 +3239,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             if activeTab !== tab { selectTab(tabs.firstIndex { $0 === tab } ?? 0) }
             guard confirmDiscardActive() else { return }
         }
+        saveWorkspaceSession()
         tabs.removeAll()
         activeIndex = nil
         snippetSession = nil
@@ -3217,6 +3264,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         if tabs.isEmpty { pathBar.show([]) }
         updateEditedState()
         statusLabel.stringValue = "\(ws.name()): choose a file in the sidebar."
+        if let session = Session.load(from: Session.workspaceURL(for: ws.root())) {
+            restoreTabs(from: session)
+        }
     }
 
     @objc func openRecentProject(_ sender: Any?) {
@@ -3354,6 +3404,13 @@ final class SidebarSectionHeader: NSView {
          scmCommitButton, scmRefreshButton, scmHistoryButton, scmMoreButton]
     }
 
+    let searchRefreshButton = SidebarSectionHeader.tool("arrow.clockwise", "Refresh Search")
+    let searchClearButton = SidebarSectionHeader.tool("line.3.horizontal.decrease.circle", "Clear Search")
+    let searchReplaceButton = SidebarSectionHeader.tool("doc.badge.plus", "Toggle Replace")
+    let searchFilterButton = SidebarSectionHeader.tool("line.3.horizontal.decrease", "Search Filters")
+    let searchMoreButton = SidebarSectionHeader.tool("ellipsis", "More Search Actions…")
+    var searchTools: [NSButton] { [searchRefreshButton, searchClearButton, searchReplaceButton, searchFilterButton, searchMoreButton] }
+
     var onNewFile: (() -> Void)?
     var onNewFolder: (() -> Void)?
     var onRefresh: (() -> Void)?
@@ -3369,6 +3426,11 @@ final class SidebarSectionHeader: NSView {
     var onScmRefresh: (() -> Void)?
     var onScmHistory: (() -> Void)?
     var scmMoreMenu: (() -> NSMenu)?
+    var onSearchRefresh: (() -> Void)?
+    var onSearchClear: (() -> Void)?
+    var onSearchToggleReplace: (() -> Void)?
+    var onSearchToggleDetails: (() -> Void)?
+    var searchMoreMenu: (() -> NSMenu)?
 
     /// Folder name; empty shows EXPLORER.
     var title = "" {
@@ -3436,7 +3498,19 @@ final class SidebarSectionHeader: NSView {
             button.isHidden = true
         }
 
-        let row = NSStackView(views: [scmChevron, label] + tools + scmTools)
+        for (button, action) in [
+            (searchRefreshButton, #selector(searchRefreshAction(_:))),
+            (searchClearButton, #selector(searchClearAction(_:))),
+            (searchReplaceButton, #selector(searchReplaceAction(_:))),
+            (searchFilterButton, #selector(searchFilterAction(_:))),
+            (searchMoreButton, #selector(searchMoreAction(_:))),
+        ] {
+            button.target = self
+            button.action = action
+            button.isHidden = true
+        }
+
+        let row = NSStackView(views: [scmChevron, label] + tools + scmTools + searchTools)
         row.spacing = 3
         row.setCustomSpacing(6, after: label)
         row.translatesAutoresizingMaskIntoConstraints = false
@@ -3457,17 +3531,20 @@ final class SidebarSectionHeader: NSView {
         case .explorer:
             scmChevron.isHidden = true
             scmTools.forEach { $0.isHidden = true }
+            searchTools.forEach { $0.isHidden = true }
             tools.forEach { $0.isHidden = !showsTools }
             label.stringValue = title.isEmpty ? "EXPLORER" : title.uppercased()
         case .sourceControl:
             scmChevron.isHidden = false
             tools.forEach { $0.isHidden = true }
             scmTools.forEach { $0.isHidden = false }
+            searchTools.forEach { $0.isHidden = true }
             label.stringValue = "Changes"
         case .search:
             scmChevron.isHidden = true
             tools.forEach { $0.isHidden = true }
             scmTools.forEach { $0.isHidden = true }
+            searchTools.forEach { $0.isHidden = false }
             label.stringValue = "SEARCH"
         }
     }
@@ -3513,6 +3590,14 @@ final class SidebarSectionHeader: NSView {
     @objc private func scmMoreAction(_ sender: Any?) {
         guard let menu = scmMoreMenu?() else { return }
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: scmMoreButton.bounds.maxY + 4), in: scmMoreButton)
+    }
+    @objc private func searchRefreshAction(_ sender: Any?) { onSearchRefresh?() }
+    @objc private func searchClearAction(_ sender: Any?) { onSearchClear?() }
+    @objc private func searchReplaceAction(_ sender: Any?) { onSearchToggleReplace?() }
+    @objc private func searchFilterAction(_ sender: Any?) { onSearchToggleDetails?() }
+    @objc private func searchMoreAction(_ sender: Any?) {
+        guard let menu = searchMoreMenu?() else { return }
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: searchMoreButton.bounds.maxY + 4), in: searchMoreButton)
     }
 }
 

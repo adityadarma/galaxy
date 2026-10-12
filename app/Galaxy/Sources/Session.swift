@@ -35,6 +35,19 @@ struct Session: Codable, Equatable {
             .appendingPathComponent("Galaxy/session.json")
     }
 
+    /// A stable, filesystem-safe filename for a workspace-specific tab state.
+    static func workspaceURL(for path: String) -> URL {
+        var hash: UInt64 = 0xcbf29ce484222325
+        for byte in path.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 0x100000001b3
+        }
+        let filename = String(format: "%016llx.json", hash)
+        return defaultURL.deletingLastPathComponent()
+            .appendingPathComponent("workspaces", isDirectory: true)
+            .appendingPathComponent(filename)
+    }
+
     /// `nil` when there is no session, or it cannot be read (then it is
     /// logged and ignored: a bad session must never stop the app opening).
     static func load(from url: URL) -> Session? {
@@ -57,5 +70,14 @@ struct Session: Codable, Equatable {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try encoder.encode(self).write(to: url, options: .atomic)
+    }
+
+    static func remove(at url: URL) {
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        do {
+            try FileManager.default.removeItem(at: url)
+        } catch {
+            Log.app.error("removing session failed: \(String(describing: error), privacy: .public)")
+        }
     }
 }
