@@ -23,6 +23,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     let titleBar = TitleBar()
     let activityBar = ActivityBar()
     private let sourceControl = SourceControlController()
+    private let searchSidebar = SearchSidebarController()
     private(set) var activeSidebarTab: ActivityBar.Item = .explorer
     let tabBar = TabBar()
     /// Open documents, in tab order (M2-06).
@@ -481,7 +482,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 } else {
                     self.showSourceControlTab()
                 }
-            case .search: break
+            case .search:
+                if self.isSidebarVisible && self.activeSidebarTab == .search {
+                    self.setSidebarVisible(false)
+                } else {
+                    self.showSearchTab()
+                }
             }
         }
         titleBar.onToggleSidebar = { [weak self] in self?.toggleSidebarVisibility(nil) }
@@ -493,6 +499,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             self.openWorkspaceFile(workspace, FileEntry(name: (relPath as NSString).lastPathComponent, relPath: relPath, isDir: false), preview: false)
         }
         sourceControl.onRefresh = { [weak self] in self?.refreshGitStatus() }
+        searchSidebar.onSearch = { [weak self] query, options in self?.searchSidebarWorkspace(query, options: options) }
+        searchSidebar.onOpen = { [weak self] match in self?.openSearchSidebarMatch(match) }
 
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = false
@@ -1185,6 +1193,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         sidebar.addSubview(sectionHeader)
         sidebar.addSubview(explorer.scrollView)
         sidebar.addSubview(sourceControl.view)
+        sidebar.addSubview(searchSidebar.view)
         sidebar.addSubview(emptyState)
         NSLayoutConstraint.activate([
             sectionHeader.topAnchor.constraint(equalTo: sidebar.topAnchor),
@@ -1198,12 +1207,17 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             sourceControl.view.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor),
             sourceControl.view.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor),
             sourceControl.view.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor),
+            searchSidebar.view.topAnchor.constraint(equalTo: sectionHeader.bottomAnchor),
+            searchSidebar.view.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor),
+            searchSidebar.view.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor),
+            searchSidebar.view.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor),
             emptyState.centerXAnchor.constraint(equalTo: sidebar.centerXAnchor).withPriority(.defaultHigh),
             emptyState.centerYAnchor.constraint(equalTo: sidebar.centerYAnchor, constant: -20),
             emptyState.leadingAnchor.constraint(greaterThanOrEqualTo: sidebar.leadingAnchor, constant: 16).withPriority(.defaultLow),
             emptyState.trailingAnchor.constraint(lessThanOrEqualTo: sidebar.trailingAnchor, constant: -16).withPriority(.defaultLow),
         ])
         sourceControl.view.isHidden = true
+        searchSidebar.view.isHidden = true
     }
 
     // MARK: Sidebar
@@ -1312,15 +1326,18 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         switch activeSidebarTab {
         case .explorer:
             sourceControl.view.isHidden = true
+            searchSidebar.view.isHidden = true
             let hasWorkspace = workspace != nil
             explorer.scrollView.isHidden = !hasWorkspace
             emptyState.isHidden = hasWorkspace
-            sectionHeader.title = workspace?.name() ?? ""
+            sectionHeader.mode = .explorer
+            sectionHeader.title = ""
             sectionHeader.showsTools = hasWorkspace
             activityBar.setActive(isSidebarVisible ? .explorer : nil)
         case .sourceControl:
             explorer.scrollView.isHidden = true
             emptyState.isHidden = true
+            searchSidebar.view.isHidden = true
             sourceControl.view.isHidden = false
             sourceControl.workspace = workspace
             sourceControl.refresh(status: workspace.flatMap { bridge.gitStatus(workspace: $0) })
@@ -1328,7 +1345,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             sectionHeader.title = "SOURCE CONTROL"
             activityBar.setActive(isSidebarVisible ? .sourceControl : nil)
         case .search:
-            break
+            explorer.scrollView.isHidden = true
+            sourceControl.view.isHidden = true
+            emptyState.isHidden = true
+            searchSidebar.view.isHidden = false
+            sectionHeader.mode = .search
+            sectionHeader.title = "SEARCH"
+            activityBar.setActive(isSidebarVisible ? .search : nil)
         }
     }
 
@@ -1344,6 +1367,35 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         updateSidebarContent()
         setSidebarVisible(true)
         sourceControl.focusMessageInput()
+    }
+
+    func showSearchTab() {
+        activeSidebarTab = .search
+        updateSidebarContent()
+        setSidebarVisible(true)
+        searchSidebar.reset()
+        searchSidebar.focus()
+    }
+
+    private func searchSidebarWorkspace(_ query: String, options: WorkspaceSearchOptions) {
+        guard let workspace else { return }
+        searchGeneration += 1
+        let generation = searchGeneration
+        guard !query.isEmpty else { searchSidebar.show([], message: "Type to search the workspace"); return }
+        searchSidebar.show([], message: "Searching…")
+        Task.detached(priority: .userInitiated) { [weak self, workspace] in
+            let results = (try? workspace.search(query: query, options: options, limit: 10_000)) ?? []
+            await MainActor.run {
+                guard let self, self.searchGeneration == generation, self.activeSidebarTab == .search else { return }
+                self.searchSidebar.show(results)
+            }
+        }
+    }
+
+    private func openSearchSidebarMatch(_ match: WorkspaceSearchMatch) {
+        guard let workspace else { return }
+        openWorkspaceFile(workspace, FileEntry(name: (match.relPath as NSString).lastPathComponent, relPath: match.relPath, isDir: false), preview: false)
+        activeTab?.doc.goToLine(line: match.line, col: match.column)
     }
 
     private func showSourceControl(_ visible: Bool) {
@@ -3148,6 +3200,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         showNoDocument()
         let ws = try bridge.core.openWorkspace(path: url.path)
         workspace = ws
+        titleBar.setProjectTitle(ws.name())
         Self.rememberProject(url.path)
         workspaceSettingsModified = nil
         fileFinder = nil
@@ -3267,6 +3320,7 @@ final class SidebarSectionHeader: NSView {
     enum Mode {
         case explorer
         case sourceControl
+        case search
     }
 
     static var height: CGFloat { Theme.tabHeight }
@@ -3410,6 +3464,11 @@ final class SidebarSectionHeader: NSView {
             tools.forEach { $0.isHidden = true }
             scmTools.forEach { $0.isHidden = false }
             label.stringValue = "Changes"
+        case .search:
+            scmChevron.isHidden = true
+            tools.forEach { $0.isHidden = true }
+            scmTools.forEach { $0.isHidden = true }
+            label.stringValue = "SEARCH"
         }
     }
 

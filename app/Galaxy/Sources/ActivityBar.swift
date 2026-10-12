@@ -27,12 +27,12 @@ final class ActivityBar: NSView {
             "activity-" + title.lowercased().replacingOccurrences(of: " ", with: "-")
         }
 
-        var isAvailable: Bool { self != .search }
+        var isAvailable: Bool { true }
 
         var tooltip: String {
             switch self {
             case .explorer: "Explorer (⇧⌘E)"
-            case .search: "Search: planned for M5"
+            case .search: "Search in Workspace (⇧⌘F)"
             case .sourceControl: "Source Control (⌃⇧G)"
             }
         }

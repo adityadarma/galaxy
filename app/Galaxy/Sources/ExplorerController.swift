@@ -550,7 +550,7 @@ final class ExplorerCell: NSTableCellView {
         chevron.imageScaling = .scaleNone
         chevron.contentTintColor = .secondaryLabelColor
         chevron.setAccessibilityElement(false)
-        icon.imageScaling = .scaleNone
+        icon.imageScaling = .scaleProportionallyDown
         icon.setAccessibilityElement(false)
         label.font = .systemFont(ofSize: 13)
         label.lineBreakMode = .byTruncatingMiddle
@@ -572,6 +572,7 @@ final class ExplorerCell: NSTableCellView {
         let row = NSStackView(views: [chevron, icon, label, spacer, gitDot, dirtyDot])
         row.orientation = .horizontal
         row.spacing = 4
+        row.setCustomSpacing(6, after: icon)
         row.translatesAutoresizingMaskIntoConstraints = false
         addSubview(row)
         NSLayoutConstraint.activate([
@@ -604,10 +605,14 @@ final class ExplorerCell: NSTableCellView {
         label.stringValue = entry.name
         isFolder = entry.isDir
         isExpanded = expanded
-        icon.isHidden = entry.isDir
         if entry.isDir {
+            let folder = ExplorerIcon.folder(named: entry.name)
+            icon.isHidden = folder.image == nil
+            icon.image = folder.image
+            icon.contentTintColor = nil
             updateChevron()
         } else {
+            icon.isHidden = false
             chevron.image = nil
             let glyph = FileGlyph.for(name: entry.name)
             icon.image = glyph.image
@@ -674,6 +679,32 @@ final class ExplorerRowView: NSTableRowView {
     override func mouseExited(with event: NSEvent) { isHovered = false }
 }
 
+/// Material Icon Theme assets are kept as SVG so the Explorer stays sharp at
+/// every macOS scale. Unsupported types retain the existing SF Symbol fallback.
+@MainActor
+enum ExplorerIcon {
+    struct Icon {
+        let image: NSImage?
+        let isMaterial: Bool
+    }
+
+    private static var cache: [String: NSImage?] = [:]
+
+    static func folder(named name: String) -> Icon {
+        let asset = ["src", "sources", "source"].contains(name.lowercased()) ? "folder-src" : "folder-base"
+        return Icon(image: image(named: asset), isMaterial: true)
+    }
+
+    static func image(named name: String) -> NSImage? {
+        if let hit = cache[name] { return hit }
+        // Xcode copies resource folders into the bundle's flat Resources root.
+        let url = Bundle.main.url(forResource: name, withExtension: "svg")
+        let image = url.flatMap(NSImage.init(contentsOf:))
+        cache[name] = image
+        return image
+    }
+}
+
 /// Small colored glyph per file type, in the spirit of VSCode's Seti icons.
 @MainActor
 enum FileGlyph {
@@ -686,35 +717,38 @@ enum FileGlyph {
 
     static func `for`(name: String) -> Glyph {
         let ext = (name as NSString).pathExtension.lowercased()
-        let key = name.hasPrefix(".git") ? ".git" : ext
+        let key = name.hasSuffix(".blade.php") ? "blade.php" : (name.hasPrefix(".git") ? ".git" : ext)
         if let hit = cache[key] { return hit }
-        let (symbol, color) = style(for: key)
-        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
+        let (asset, symbol, color) = style(for: key)
+        let image = asset.flatMap(ExplorerIcon.image(named:)) ?? NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
             .withSymbolConfiguration(.init(pointSize: 11, weight: .medium))
         let glyph = Glyph(image: image, color: color)
         cache[key] = glyph
         return glyph
     }
 
-    private static func style(for key: String) -> (String, NSColor) {
+    private static func style(for key: String) -> (String?, String, NSColor) {
         switch key {
-        case "rs": ("gearshape.fill", Theme.accent)
-        case "swift": ("swift", .systemOrange)
-        case "md", "markdown": ("info.circle.fill", .systemBlue)
-        case "json": ("curlybraces", .systemYellow)
+        case "php", "phtml": ("php", "doc", .labelColor)
+        case "blade.php": ("laravel", "doc", .labelColor)
+        case "rs": ("rust", "gearshape.fill", .labelColor)
+        case "swift": ("swift", "swift", .labelColor)
+        case "md", "markdown": (nil, "info.circle.fill", .systemBlue)
+        case "json": (nil, "curlybraces", .systemYellow)
         case "toml", "lock", "yml", "yaml", "ini", "cfg", "plist", "xcconfig":
-            ("slider.horizontal.3", .secondaryLabelColor)
-        case "sh", "zsh", "bash", "fish": ("terminal", .systemGreen)
-        case "js", "mjs", "cjs", "jsx": ("j.square.fill", .systemYellow)
-        case "ts", "tsx": ("t.square.fill", .systemBlue)
-        case "html", "htm", "xml": ("chevron.left.forwardslash.chevron.right", .systemOrange)
-        case "css", "scss": ("number", .systemBlue)
-        case "py": ("p.square.fill", .systemTeal)
-        case "c", "h", "cpp", "hpp", "m", "mm": ("c.square.fill", .systemIndigo)
-        case "png", "jpg", "jpeg", "gif", "svg", "webp", "icns": ("photo", .systemPurple)
-        case ".git": ("arrow.triangle.branch", .systemRed)
-        case "txt", "log": ("doc.text", .secondaryLabelColor)
-        default: ("doc", .secondaryLabelColor)
+            (nil, "slider.horizontal.3", .secondaryLabelColor)
+        case "sh", "zsh", "bash", "fish": (nil, "terminal", .systemGreen)
+        case "js", "mjs", "cjs", "jsx": ("javascript", "j.square.fill", .labelColor)
+        case "ts", "tsx": ("typescript", "t.square.fill", .labelColor)
+        case "html", "htm", "xml": (nil, "chevron.left.forwardslash.chevron.right", .systemOrange)
+        case "css", "scss": ("css", "number", .labelColor)
+        case "py": ("python", "p.square.fill", .labelColor)
+        case "go": ("go", "doc", .labelColor)
+        case "c", "h", "cpp", "hpp", "m", "mm": (nil, "c.square.fill", .systemIndigo)
+        case "png", "jpg", "jpeg", "gif", "svg", "webp", "icns": ("image", "photo", .labelColor)
+        case ".git": (nil, "arrow.triangle.branch", .systemRed)
+        case "txt", "log": (nil, "doc.text", .secondaryLabelColor)
+        default: (nil, "doc", .secondaryLabelColor)
         }
     }
 }

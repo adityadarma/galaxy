@@ -10,6 +10,7 @@ final class TitleBar: NSView {
 
     let sidebarButton = TitleBar.toggle(symbol: "sidebar.left", title: "Toggle Primary Side Bar (⌘B)")
     let panelButton = TitleBar.toggle(symbol: "rectangle.bottomthird.inset.filled", title: "Toggle Panel (⌘J)")
+    private let projectTitle = NSTextField(labelWithString: "")
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -32,14 +33,26 @@ final class TitleBar: NSView {
         buttons.translatesAutoresizingMaskIntoConstraints = false
         addSubview(buttons)
 
+        projectTitle.font = .systemFont(ofSize: 13, weight: .medium)
+        projectTitle.textColor = .secondaryLabelColor
+        projectTitle.lineBreakMode = .byTruncatingMiddle
+        projectTitle.alignment = .center
+        projectTitle.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(projectTitle)
+
         NSLayoutConstraint.activate([
             separator.bottomAnchor.constraint(equalTo: bottomAnchor),
             separator.leadingAnchor.constraint(equalTo: leadingAnchor),
             separator.trailingAnchor.constraint(equalTo: trailingAnchor),
             buttons.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             buttons.centerYAnchor.constraint(equalTo: centerYAnchor),
+            projectTitle.centerXAnchor.constraint(equalTo: centerXAnchor),
+            projectTitle.centerYAnchor.constraint(equalTo: centerYAnchor),
+            projectTitle.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, multiplier: 0.45),
         ])
     }
+
+    func setProjectTitle(_ name: String?) { projectTitle.stringValue = name ?? "" }
 
     /// Filled when the part is shown, as VS Code tints its layout controls.
     func setSidebarVisible(_ visible: Bool) {
