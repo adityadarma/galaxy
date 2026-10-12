@@ -4,14 +4,14 @@ import os
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let bridge = CoreBridge()
-    private var windowController: MainWindowController?
+    private var windowControllers: [MainWindowController] = []
     private var preferencesController: PreferencesWindowController?
     /// A path handed to us before the window existed (`Galaxy <path>`).
     private var pendingURL: URL?
 
     func application(_ application: NSApplication, open urls: [URL]) {
         guard let url = urls.first else { return }
-        if let windowController {
+        if let windowController = activeWindowController {
             windowController.open(url: url)
         } else {
             pendingURL = url
@@ -28,11 +28,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         NSApp.mainMenu = MainMenu.build()
         StartupProbe.mark("menu")
-        let controller = MainWindowController(bridge: bridge)
+        let controller = makeWindowController()
         StartupProbe.mark("window_built")
         controller.showWindow(nil)
         StartupProbe.mark("window_shown")
-        windowController = controller
         // `Galaxy -OpenPath <file or folder>`; UI tests use this instead of
         // driving the open panel.
         if pendingURL == nil, let path = Self.launchOpenPath {
@@ -79,7 +78,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func showPreferences(_ sender: Any?) {
         let controller = PreferencesWindowController { [weak self] in
             self?.applyAppearancePreference()
-            self?.windowController?.applyPreferences()
+            self?.windowControllers.forEach { $0.applyPreferences() }
         }
         preferencesController = controller
         controller.showWindow(sender)
@@ -116,12 +115,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        windowController?.saveSessionForQuit()
+        // Session is captured in `applicationShouldTerminate` before AppKit
+        // starts closing any windows.
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        guard let windowController else { return .terminateNow }
-        guard windowController.confirmDiscardChanges() else { return .terminateCancel }
+        guard windowControllers.allSatisfy({ $0.confirmDiscardChanges() }) else { return .terminateCancel }
+        activeWindowController?.saveSessionForQuit()
+        windowControllers.forEach {
+            $0.saveWorkspaceSessionForQuit()
+            $0.prepareForApplicationQuit()
+        }
         return .terminateNow
     }
 
@@ -131,5 +135,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool {
         true
+    }
+
+    @objc func newWindow(_ sender: Any?) {
+        let controller = makeWindowController()
+        controller.showWindow(sender)
+        controller.newDocument(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private var activeWindowController: MainWindowController? {
+        guard let keyWindow = NSApp.keyWindow else { return windowControllers.last }
+        return windowControllers.first { $0.window === keyWindow } ?? windowControllers.last
+    }
+
+    private func makeWindowController() -> MainWindowController {
+        let controller = MainWindowController(bridge: bridge)
+        controller.onWindowClosed = { [weak self, weak controller] in
+            guard let self, let controller else { return }
+            self.windowControllers.removeAll { $0 === controller }
+            if self.windowControllers.isEmpty && !controller.isClosingForApplicationTermination {
+                Session.remove(at: Session.defaultURL)
+            }
+        }
+        windowControllers.append(controller)
+        return controller
     }
 }

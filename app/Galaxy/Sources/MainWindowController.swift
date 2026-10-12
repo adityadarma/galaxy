@@ -98,6 +98,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     let emptyState = NSStackView()
     let explorer = ExplorerController()
     private(set) var workspace: Workspace?
+    var onWindowClosed: (() -> Void)?
     /// Go to File index of `workspace`, built in the background.
     private(set) var fileFinder: FileFinder?
     private var finderGeneration = 0
@@ -1311,6 +1312,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private func refreshGitStatus() {
         guard let workspace, let status = bridge.gitStatus(workspace: workspace) else {
             statusBar.showGit(branch: nil, changedCount: 0)
+            activityBar.setBadge(0, for: .sourceControl)
             explorer.gitStatusMap = [:]
             explorer.gitChangedPaths = []
             sourceControl.refresh(status: nil)
@@ -1318,6 +1320,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             return
         }
         statusBar.showGit(branch: status.branch, changedCount: status.changedPaths.count)
+        activityBar.setBadge(status.changedPaths.count, for: .sourceControl)
 
         var map: [String: GitFileStatus] = [:]
         for change in status.changes {
@@ -3084,6 +3087,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// Where the session is saved. Tests point it elsewhere.
     var sessionURL = Session.defaultURL
     private var didCloseWindow = false
+    private var isTerminatingApplication = false
+    var isClosingForApplicationTermination: Bool { isTerminatingApplication }
 
     /// The folder, the file tabs with caret and scroll, and the active tab.
     func currentSession() -> Session {
@@ -3120,6 +3125,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
+    func saveWorkspaceSessionForQuit() { saveWorkspaceSession() }
+
     private func restoreTabs(from session: Session) {
         var restored: [(EditorTab, CGFloat?)] = []
         var target: EditorTab?
@@ -3152,6 +3159,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         if !didCloseWindow { saveSession() }
     }
 
+    func prepareForApplicationQuit() { isTerminatingApplication = true }
+
     /// Reopens what `session` had: the folder if it still exists, and the
     /// tabs whose files still exist, with caret and scroll. Returns
     /// `false` if nothing could be restored.
@@ -3183,7 +3192,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         // Closing the window is an intentional fresh start. If closing the
         // last window also terminates the app, `saveSessionForQuit` sees this.
         didCloseWindow = true
-        Session.remove(at: sessionURL)
         syntaxEvictionTimer?.invalidate()
         syntaxEvictionTimer = nil
         lspTimer?.invalidate()
@@ -3192,6 +3200,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         keyMonitor = nil
         workspaceWatch?.stop()
         workspaceWatch = nil
+        onWindowClosed?()
     }
 
     /// ⌘O: pick a file or a folder.
@@ -3263,7 +3272,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         setSidebarVisible(true)
         if tabs.isEmpty { pathBar.show([]) }
         updateEditedState()
-        statusLabel.stringValue = "\(ws.name()): choose a file in the sidebar."
+        statusLabel.stringValue = ""
         if let session = Session.load(from: Session.workspaceURL(for: ws.root())) {
             restoreTabs(from: session)
         }

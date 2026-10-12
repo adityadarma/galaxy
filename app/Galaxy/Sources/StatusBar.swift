@@ -145,11 +145,19 @@ final class StatusBar: NSView {
         guard let branch else {
             git.title = ""
             git.stringValue = ""
+            git.image = nil
             return
         }
-        let text = changedCount > 0 ? "Git: \(branch) · \(changedCount)" : "Git: \(branch)"
+        git.image = NSImage(systemSymbolName: "arrow.triangle.branch", accessibilityDescription: "Git branch")?
+            .withSymbolConfiguration(.init(pointSize: 12, weight: .regular))
+        git.imagePosition = .imageLeading
+        git.imageHugsTitle = true
+        git.imageScaling = .scaleNone
+        git.contentTintColor = .secondaryLabelColor
+        let text = branch
         git.title = text
         git.stringValue = text
+        git.toolTip = branch
     }
 
     @objc private func gitClicked(_ sender: Any?) { onGitClick?() }

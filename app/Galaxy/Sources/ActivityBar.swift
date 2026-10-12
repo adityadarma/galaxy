@@ -95,6 +95,10 @@ final class ActivityBar: NSView {
         for (key, button) in buttons { button.isActive = key == item }
     }
 
+    func setBadge(_ value: Int, for item: Item) {
+        buttons[item]?.badgeValue = value
+    }
+
     @objc private func clicked(_ sender: ActivityBarButton) {
         onSelect?(sender.item)
     }
@@ -104,6 +108,7 @@ final class ActivityBar: NSView {
 final class ActivityBarButton: NSButton {
     let item: ActivityBar.Item
     var isActive = false { didSet { if isActive != oldValue { refresh() } } }
+    var badgeValue = 0 { didSet { if badgeValue != oldValue { needsDisplay = true } } }
 
     init(item: ActivityBar.Item) {
         self.item = item
@@ -139,5 +144,16 @@ final class ActivityBarButton: NSButton {
             NSRect(x: 0, y: 8, width: 2, height: max(0, bounds.height - 16)).fill()
         }
         super.draw(dirtyRect)
+        guard badgeValue > 0 else { return }
+        let text = badgeValue > 99 ? "99+" : "\(badgeValue)"
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
+        let attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.white]
+        let size = (text as NSString).size(withAttributes: attributes)
+        let badgeWidth = max(20, ceil(size.width) + 10)
+        let rect = NSRect(x: bounds.maxX - badgeWidth - 3, y: bounds.maxY - 18, width: badgeWidth, height: 18)
+        Theme.accent.setFill()
+        NSBezierPath(roundedRect: rect, xRadius: 9, yRadius: 9).fill()
+        let origin = NSPoint(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2)
+        (text as NSString).draw(at: origin, withAttributes: attributes)
     }
 }

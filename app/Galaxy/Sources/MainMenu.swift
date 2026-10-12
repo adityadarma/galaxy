@@ -25,6 +25,8 @@ enum MainMenu {
 
         let fileItem = NSMenuItem()
         let fileMenu = NSMenu(title: "File")
+        let newWindow = fileMenu.addItem(withTitle: "New Window", action: #selector(AppDelegate.newWindow(_:)), keyEquivalent: "n")
+        newWindow.keyEquivalentModifierMask = [.command, .shift]
         fileMenu.addItem(withTitle: "New", action: #selector(MainWindowController.newDocument(_:)), keyEquivalent: "n")
         fileMenu.addItem(withTitle: "Open File or Folder…", action: #selector(MainWindowController.openDocument(_:)), keyEquivalent: "o")
         let openFolder = fileMenu.addItem(withTitle: "Open Folder…", action: #selector(MainWindowController.openFolder(_:)), keyEquivalent: "o")
