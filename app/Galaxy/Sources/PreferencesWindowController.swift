@@ -8,13 +8,14 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
     private let fontSize = NSStepper(frame: .zero)
     private let fontSizeLabel = NSTextField(labelWithString: "")
 
-    // AI Commit settings
-    private let aiProvider = NSPopUpButton(frame: .zero, pullsDown: false)
+    // AI Commit settings (OpenAI-compatible API)
+    private let baseURLField = NSTextField()
+    private let modelField = NSTextField()
     private let apiKeyField = NSSecureTextField()
 
     init(onChange: @escaping () -> Void) {
         self.onChange = onChange
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 280),
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 380),
                               styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "Settings"
         window.isReleasedWhenClosed = false
@@ -61,19 +62,29 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
         stack.addArrangedSubview(separator)
         separator.widthAnchor.constraint(equalToConstant: 370).isActive = true
 
-        // AI Commit Provider
-        aiProvider.addItems(withTitles: ["OpenAI", "Gemini", "Ollama"])
-        aiProvider.selectItem(withTitle: UserDefaults.standard.string(forKey: "AICommitProvider") ?? "OpenAI")
-        aiProvider.target = self; aiProvider.action = #selector(saveAIProvider(_:))
-        stack.addArrangedSubview(row("AI Provider", aiProvider))
+        // AI commit message: OpenAI-compatible endpoint
+        let aiTitle = NSTextField(labelWithString: "AI Commit Message (OpenAI-compatible)")
+        aiTitle.font = .systemFont(ofSize: 12, weight: .semibold)
+        stack.addArrangedSubview(aiTitle)
 
-        // AI API Key
-        apiKeyField.placeholderString = "Optional: Paste API Key (sk-...)"
-        apiKeyField.stringValue = UserDefaults.standard.string(forKey: "AICommitApiKey") ?? ""
-        apiKeyField.delegate = self
-        apiKeyField.translatesAutoresizingMaskIntoConstraints = false
-        apiKeyField.widthAnchor.constraint(equalToConstant: 220).isActive = true
-        stack.addArrangedSubview(row("AI API Key", apiKeyField))
+        configure(baseURLField, key: AICommitService.Keys.baseURL,
+                  placeholder: AICommitService.defaultBaseURL, label: "AI base URL")
+        stack.addArrangedSubview(row("Base URL", baseURLField))
+
+        configure(modelField, key: AICommitService.Keys.model,
+                  placeholder: AICommitService.defaultModel, label: "AI model")
+        stack.addArrangedSubview(row("Model", modelField))
+
+        configure(apiKeyField, key: AICommitService.Keys.apiKey,
+                  placeholder: "sk-… (optional for local servers)", label: "AI API key")
+        stack.addArrangedSubview(row("API Key", apiKeyField))
+
+        let hint = NSTextField(wrappingLabelWithString: "Uses <Base URL>/chat/completions. Works with OpenAI, OpenRouter, LM Studio, Ollama (http://localhost:11434/v1) and other compatible servers.")
+        hint.font = .systemFont(ofSize: 11)
+        hint.textColor = .secondaryLabelColor
+        hint.preferredMaxLayoutWidth = 370
+        hint.widthAnchor.constraint(equalToConstant: 370).isActive = true
+        stack.addArrangedSubview(hint)
 
         NSLayoutConstraint.activate([
             stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
@@ -107,21 +118,27 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
         onChange()
     }
 
-    @objc private func saveAIProvider(_ sender: Any?) {
-        guard let item = aiProvider.titleOfSelectedItem else { return }
-        UserDefaults.standard.set(item, forKey: "AICommitProvider")
-        if item == "Ollama" {
-            apiKeyField.placeholderString = "Not needed (http://localhost:11434)"
-        } else if item == "Gemini" {
-            apiKeyField.placeholderString = "Paste Gemini API Key"
-        } else {
-            apiKeyField.placeholderString = "Paste OpenAI API Key (sk-...)"
-        }
+    private func configure(_ field: NSTextField, key: String, placeholder: String, label: String) {
+        field.placeholderString = placeholder
+        field.stringValue = UserDefaults.standard.string(forKey: key) ?? ""
+        field.identifier = NSUserInterfaceItemIdentifier(key)
+        field.delegate = self
+        field.setAccessibilityLabel(label)
+        field.translatesAutoresizingMaskIntoConstraints = false
+        field.widthAnchor.constraint(equalToConstant: 238).isActive = true
     }
 
+    /// Saves each AI field as it is typed; an empty field falls back to the default.
     func controlTextDidChange(_ obj: Notification) {
-        guard let field = obj.object as? NSSecureTextField, field === apiKeyField else { return }
-        UserDefaults.standard.set(field.stringValue, forKey: "AICommitApiKey")
+        guard let field = obj.object as? NSTextField, let key = field.identifier?.rawValue,
+              [AICommitService.Keys.baseURL, AICommitService.Keys.model, AICommitService.Keys.apiKey].contains(key)
+        else { return }
+        let value = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if value.isEmpty {
+            UserDefaults.standard.removeObject(forKey: key)
+        } else {
+            UserDefaults.standard.set(value, forKey: key)
+        }
     }
 
     private func updateFontSizeLabel() { fontSizeLabel.stringValue = "\(Int(fontSize.doubleValue)) pt" }

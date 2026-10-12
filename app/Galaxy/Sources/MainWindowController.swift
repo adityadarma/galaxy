@@ -1161,6 +1161,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         sectionHeader.showsTools = false
 
         sectionHeader.onScmGenerate = { [weak self] in self?.sourceControl.generateCommitMessage() }
+        sourceControl.onGeneratingChanged = { [weak self] generating in
+            self?.sectionHeader.setScmGenerating(generating)
+        }
         sectionHeader.onScmPull = { [weak self] in self?.sourceControl.pull() }
         sectionHeader.onScmBranch = { [weak self] in self?.showGitBranchPicker() }
         sectionHeader.onScmCommit = { [weak self] in self?.sourceControl.commit(nil) }
@@ -3561,6 +3564,17 @@ final class SidebarSectionHeader: NSView {
     override func draw(_ dirtyRect: NSRect) {
         NSColor.separatorColor.setFill()
         NSRect(x: 0, y: 0, width: bounds.width, height: 1).intersection(dirtyRect).fill()
+    }
+
+    /// Swaps the header's sparkles button to a stop button while generating.
+    func setScmGenerating(_ generating: Bool) {
+        let title = generating ? "Stop Generating Commit Message" : "Generate Commit Message"
+        let symbol = generating ? "stop.fill" : "sparkles"
+        scmGenerateButton.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)?
+            .withSymbolConfiguration(.init(pointSize: generating ? 10 : 12, weight: .regular))
+        scmGenerateButton.contentTintColor = generating ? Theme.accent : .secondaryLabelColor
+        scmGenerateButton.toolTip = title
+        scmGenerateButton.setAccessibilityLabel(title)
     }
 
     private static func tool(_ symbol: String, _ title: String) -> NSButton {

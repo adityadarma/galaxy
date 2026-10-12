@@ -19,18 +19,20 @@ final class CountPillView: NSView {
         wantsLayer = true
         layer?.cornerRadius = 9
         layer?.masksToBounds = true
-        layer?.backgroundColor = NSColor(white: 1.0, alpha: 0.16).cgColor
+        // VS Code-style badge: muted blue chip with light blue digits.
+        layer?.backgroundColor = NSColor(srgbRed: 0.30, green: 0.45, blue: 0.62, alpha: 0.45).cgColor
 
         label.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
-        label.textColor = .white
+        label.textColor = NSColor(srgbRed: 0.62, green: 0.80, blue: 1.0, alpha: 1.0)
         label.alignment = .center
         label.translatesAutoresizingMaskIntoConstraints = false
         addSubview(label)
 
         NSLayoutConstraint.activate([
             heightAnchor.constraint(equalToConstant: 18),
-            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
-            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
+            widthAnchor.constraint(greaterThanOrEqualToConstant: 18),
+            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 5),
+            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -5),
             label.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
     }
@@ -52,6 +54,16 @@ final class GenerateCommitIconButton: NSButton {
     }
     private var trackingArea: NSTrackingArea?
 
+    var isGenerating: Bool = false {
+        didSet {
+            updateIcon()
+            updateAppearance()
+            if isGenerating != oldValue { onGeneratingChanged?(isGenerating) }
+        }
+    }
+    /// Lets other controls (the sidebar header button) mirror the state.
+    var onGeneratingChanged: ((Bool) -> Void)?
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         setup()
@@ -67,20 +79,27 @@ final class GenerateCommitIconButton: NSButton {
         focusRingType = .none
         translatesAutoresizingMaskIntoConstraints = false
 
-        let config = NSImage.SymbolConfiguration(pointSize: 11, weight: .regular)
-        let img = (NSImage(systemSymbolName: "wand.and.stars", accessibilityDescription: "Generate Commit Message")
-            ?? NSImage(systemSymbolName: "sparkles", accessibilityDescription: "Generate Commit Message"))?
+        layer?.cornerRadius = 4
+        layer?.masksToBounds = true
+        updateIcon()
+        updateAppearance()
+    }
+
+    private func updateIcon() {
+        let config = NSImage.SymbolConfiguration(pointSize: isGenerating ? 10 : 12, weight: .medium)
+        let symbolName = isGenerating ? "stop.fill" : "sparkles"
+        let fallbackName = isGenerating ? "stop" : "wand.and.stars"
+        let description = isGenerating ? "Stop Generating Commit Message" : "Generate Commit Message"
+
+        let img = (NSImage(systemSymbolName: symbolName, accessibilityDescription: description)
+            ?? NSImage(systemSymbolName: fallbackName, accessibilityDescription: description))?
             .withSymbolConfiguration(config)
         img?.isTemplate = true
         self.image = img
 
-        toolTip = "Generate Commit Message"
-        setAccessibilityLabel("Generate Commit Message")
+        toolTip = description
+        setAccessibilityLabel(description)
         setAccessibilityRole(.button)
-
-        layer?.cornerRadius = 3
-        layer?.masksToBounds = true
-        updateAppearance()
     }
 
     override func updateTrackingAreas() {
@@ -99,10 +118,16 @@ final class GenerateCommitIconButton: NSButton {
     }
 
     private func updateAppearance() {
-        contentTintColor = isHovered ? .labelColor : .secondaryLabelColor
-        layer?.backgroundColor = isHovered
-            ? NSColor.labelColor.withAlphaComponent(0.08).cgColor
-            : NSColor.clear.cgColor
+        if isGenerating {
+            // Stop state: accent-tinted square on a soft accent chip.
+            contentTintColor = Theme.accent
+            layer?.backgroundColor = Theme.accent.withAlphaComponent(isHovered ? 0.28 : 0.18).cgColor
+        } else {
+            contentTintColor = isHovered ? .labelColor : .secondaryLabelColor
+            layer?.backgroundColor = isHovered
+                ? NSColor.labelColor.withAlphaComponent(0.08).cgColor
+                : NSColor.clear.cgColor
+        }
     }
 }
 
@@ -110,6 +135,7 @@ final class GenerateCommitIconButton: NSButton {
 
 @MainActor
 final class CommitMessageInputContainer: NSView {
+    override var isFlipped: Bool { true }
     let textField = NSTextField()
     let generateButton = GenerateCommitIconButton()
 
@@ -118,7 +144,7 @@ final class CommitMessageInputContainer: NSView {
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
-        layer?.cornerRadius = 4
+        layer?.cornerRadius = 6
         layer?.masksToBounds = true
         layer?.borderWidth = 1
 
@@ -139,7 +165,8 @@ final class CommitMessageInputContainer: NSView {
         textField.cell?.wraps = false
         textField.cell?.isScrollable = true
         textField.cell?.usesSingleLineMode = true
-        textField.lineBreakMode = .byClipping
+        textField.lineBreakMode = .byTruncatingTail
+        textField.cell?.truncatesLastVisibleLine = true
         textField.translatesAutoresizingMaskIntoConstraints = false
 
         generateButton.target = self
@@ -149,14 +176,13 @@ final class CommitMessageInputContainer: NSView {
         addSubview(generateButton)
 
         NSLayoutConstraint.activate([
-            heightAnchor.constraint(equalToConstant: 28),
+            heightAnchor.constraint(equalToConstant: 32),
 
-            textField.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            textField.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
             textField.centerYAnchor.constraint(equalTo: centerYAnchor),
-            textField.heightAnchor.constraint(equalToConstant: 20),
-            textField.trailingAnchor.constraint(equalTo: generateButton.leadingAnchor, constant: -4),
+            textField.trailingAnchor.constraint(equalTo: generateButton.leadingAnchor, constant: -6),
 
-            generateButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
+            generateButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -5),
             generateButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             generateButton.widthAnchor.constraint(equalToConstant: 22),
             generateButton.heightAnchor.constraint(equalToConstant: 22),
@@ -200,7 +226,8 @@ final class CommitSplitButton: NSView {
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
-        layer?.cornerRadius = 4
+        // Same corner radius as the message field above it.
+        layer?.cornerRadius = 6
         layer?.masksToBounds = true
         layer?.backgroundColor = NSColor(srgbRed: 0/255.0, green: 120/255.0, blue: 212/255.0, alpha: 1.0).cgColor
 
@@ -217,14 +244,14 @@ final class CommitSplitButton: NSView {
         checkIcon.contentTintColor = .white
         checkIcon.translatesAutoresizingMaskIntoConstraints = false
 
-        commitLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        commitLabel.font = .systemFont(ofSize: 12, weight: .semibold)
         commitLabel.textColor = .white
         commitLabel.alignment = .center
         commitLabel.translatesAutoresizingMaskIntoConstraints = false
 
         let contentStack = NonInteractiveStackView(views: [checkIcon, commitLabel])
         contentStack.orientation = .horizontal
-        contentStack.spacing = 6
+        contentStack.spacing = 3
         contentStack.alignment = .centerY
         contentStack.translatesAutoresizingMaskIntoConstraints = false
         mainButton.addSubview(contentStack)
@@ -250,7 +277,7 @@ final class CommitSplitButton: NSView {
         addSubview(dropdownButton)
 
         NSLayoutConstraint.activate([
-            heightAnchor.constraint(equalToConstant: 28),
+            heightAnchor.constraint(equalToConstant: 30),
 
             mainButton.leadingAnchor.constraint(equalTo: leadingAnchor),
             mainButton.topAnchor.constraint(equalTo: topAnchor),
@@ -270,8 +297,9 @@ final class CommitSplitButton: NSView {
             dropdownButton.trailingAnchor.constraint(equalTo: trailingAnchor),
             dropdownButton.topAnchor.constraint(equalTo: topAnchor),
             dropdownButton.bottomAnchor.constraint(equalTo: bottomAnchor),
-            dropdownButton.widthAnchor.constraint(equalToConstant: 28),
+            dropdownButton.widthAnchor.constraint(equalToConstant: 30),
         ])
+        divider.layer?.backgroundColor = NSColor(white: 1.0, alpha: 0.3).cgColor
     }
 
     required init?(coder: NSCoder) { fatalError() }
@@ -315,14 +343,20 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
     private var isStagedCollapsed: Bool = false
     private var isChangesCollapsed: Bool = false
     private var currentBranch: String?
+    private var generateTask: Task<Void, Never>?
 
     var workspace: Workspace?
     var onOpen: ((String) -> Void)?
     var onRefresh: (() -> Void)?
+    /// Called when AI commit message generation starts or stops.
+    var onGeneratingChanged: ((Bool) -> Void)?
 
     override init() {
         super.init()
         view.translatesAutoresizingMaskIntoConstraints = false
+        messageContainer.generateButton.onGeneratingChanged = { [weak self] generating in
+            self?.onGeneratingChanged?(generating)
+        }
 
         messageContainer.textField.delegate = self
         messageContainer.textField.placeholderString = "Message (⌘Enter to commit)"
@@ -344,7 +378,10 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         column.resizingMask = .autoresizingMask
         table.addTableColumn(column)
         table.headerView = nil
-        table.rowHeight = 26
+        // Plain style: no automatic sidebar inset or extra row gaps.
+        table.style = .plain
+        table.intercellSpacing = .zero
+        table.rowHeight = 24
         table.dataSource = self
         table.delegate = self
         table.backgroundColor = .clear
@@ -385,7 +422,7 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
             splitCommitButton.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 10),
             commitTrailing,
 
-            scroll.topAnchor.constraint(equalTo: splitCommitButton.bottomAnchor, constant: 8),
+            scroll.topAnchor.constraint(equalTo: splitCommitButton.bottomAnchor, constant: 6),
             scroll.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             scrollTrailing,
             scroll.bottomAnchor.constraint(equalTo: view.bottomAnchor),
@@ -400,11 +437,7 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
 
     func refresh(status: GitStatusInfo?) {
         currentBranch = status?.branch
-        if let branch = currentBranch, !branch.isEmpty {
-            messageContainer.textField.placeholderString = "Message (⌘Enter to commit on '\(branch)')"
-        } else {
-            messageContainer.textField.placeholderString = "Message (⌘Enter to commit)"
-        }
+        updatePlaceholderString()
 
         let changes = status?.changes ?? []
         stagedChanges = changes.filter { isStagedChange($0) }
@@ -498,7 +531,9 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         return false
     }
 
-    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat { 26 }
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        24
+    }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
         guard row >= 0, row < rows.count else { return nil }
@@ -620,7 +655,28 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         }
     }
 
+    private func updatePlaceholderString() {
+        // Short placeholder so it fits a narrow sidebar; the branch is in the tooltip.
+        messageContainer.textField.placeholderString = "Message (⌘↩ to commit)"
+        if let branch = currentBranch, !branch.isEmpty {
+            messageContainer.textField.toolTip = "⌘Enter to commit on '\(branch)'"
+        } else {
+            messageContainer.textField.toolTip = "⌘Enter to commit"
+        }
+    }
+
     func generateCommitMessage() {
+        if messageContainer.generateButton.isGenerating {
+            // Cancel currently active AI generation
+            generateTask?.cancel()
+            generateTask = nil
+            messageContainer.generateButton.isGenerating = false
+            updatePlaceholderString()
+            updateCommitButtonState()
+            focusMessageInput()
+            return
+        }
+
         let targets = !stagedChanges.isEmpty ? stagedChanges : unstagedChanges
         guard !targets.isEmpty else { return }
 
@@ -650,18 +706,18 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         // Show generating feedback
         messageContainer.textField.stringValue = ""
         messageContainer.textField.placeholderString = "Generating with AI…"
-        messageContainer.generateButton.isEnabled = false
+        messageContainer.generateButton.isGenerating = true
+        messageContainer.generateButton.isEnabled = true
 
-        Task { [weak self] in
+        generateTask?.cancel()
+        generateTask = Task { [weak self] in
             let generated = await AICommitService.shared.generateCommitMessage(diff: diff)
             await MainActor.run {
                 guard let self else { return }
-                self.messageContainer.generateButton.isEnabled = true
-                if let branch = self.currentBranch, !branch.isEmpty {
-                    self.messageContainer.textField.placeholderString = "Message (⌘Enter to commit on '\(branch)')"
-                } else {
-                    self.messageContainer.textField.placeholderString = "Message (⌘Enter to commit)"
-                }
+                guard !Task.isCancelled else { return }
+                self.messageContainer.generateButton.isGenerating = false
+                self.generateTask = nil
+                self.updatePlaceholderString()
 
                 if let generated, !generated.isEmpty {
                     self.messageContainer.textField.stringValue = generated
@@ -677,6 +733,9 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
 
     @objc func commit(_ sender: Any?) {
         guard let workspace else { return }
+        generateTask?.cancel()
+        generateTask = nil
+        messageContainer.generateButton.isGenerating = false
         var msg = messageContainer.textField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         if msg.isEmpty {
             // Auto-generate if message was left blank
@@ -970,8 +1029,10 @@ final class SourceControlHeaderCellView: NSTableCellView {
         chevronButton.translatesAutoresizingMaskIntoConstraints = false
         chevronButton.contentTintColor = .secondaryLabelColor
 
-        titleLabel.font = .systemFont(ofSize: 11, weight: .semibold)
+        titleLabel.font = .systemFont(ofSize: 13, weight: .regular)
         titleLabel.textColor = .labelColor
+        titleLabel.lineBreakMode = .byTruncatingTail
+        titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
 
         countPill.translatesAutoresizingMaskIntoConstraints = false
@@ -997,35 +1058,56 @@ final class SourceControlHeaderCellView: NSTableCellView {
         addSubview(discardAllButton)
         addSubview(actionButton)
 
+        // Section actions appear on hover only, like VS Code.
+        discardAllButton.alphaValue = 0
+        actionButton.alphaValue = 0
+
         NSLayoutConstraint.activate([
-            chevronButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
+            chevronButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
             chevronButton.centerYAnchor.constraint(equalTo: centerYAnchor),
-            chevronButton.widthAnchor.constraint(equalToConstant: 16),
-            chevronButton.heightAnchor.constraint(equalToConstant: 16),
+            chevronButton.widthAnchor.constraint(equalToConstant: 14),
+            chevronButton.heightAnchor.constraint(equalToConstant: 14),
 
             titleLabel.leadingAnchor.constraint(equalTo: chevronButton.trailingAnchor, constant: 4),
             titleLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+            titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: discardAllButton.leadingAnchor, constant: -6),
 
-            countPill.leadingAnchor.constraint(equalTo: titleLabel.trailingAnchor, constant: 6),
+            // Count sits on the right edge; hover actions appear left of it.
+            countPill.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             countPill.centerYAnchor.constraint(equalTo: centerYAnchor),
 
-            actionButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            actionButton.trailingAnchor.constraint(equalTo: countPill.leadingAnchor, constant: -6),
             actionButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             actionButton.widthAnchor.constraint(equalToConstant: 18),
             actionButton.heightAnchor.constraint(equalToConstant: 18),
 
-            discardAllButton.trailingAnchor.constraint(equalTo: actionButton.leadingAnchor, constant: -4),
+            discardAllButton.trailingAnchor.constraint(equalTo: actionButton.leadingAnchor, constant: -2),
             discardAllButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             discardAllButton.widthAnchor.constraint(equalToConstant: 18),
             discardAllButton.heightAnchor.constraint(equalToConstant: 18),
         ])
     }
 
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
+                                       owner: self, userInfo: nil))
+    }
+
+    override func mouseEntered(with event: NSEvent) { setActionsVisible(true) }
+    override func mouseExited(with event: NSEvent) { setActionsVisible(false) }
+
+    private func setActionsVisible(_ visible: Bool) {
+        discardAllButton.alphaValue = visible ? 1 : 0
+        actionButton.alphaValue = visible ? 1 : 0
+    }
+
     func configure(title: String, count: Int, isCollapsed: Bool, isStaged: Bool) {
         let chevronImage = NSImage(
             systemSymbolName: isCollapsed ? "chevron.right" : "chevron.down",
             accessibilityDescription: isCollapsed ? "Expand section" : "Collapse section"
-        )?.withSymbolConfiguration(.init(pointSize: 10, weight: .bold))
+        )?.withSymbolConfiguration(.init(pointSize: 9, weight: .semibold))
         chevronButton.image = chevronImage
 
         titleLabel.stringValue = title
@@ -1052,6 +1134,7 @@ final class SourceControlHeaderCellView: NSTableCellView {
 final class SourceControlItemCellView: NSTableCellView {
     static let reuseIdentifier = NSUserInterfaceItemIdentifier("scm-item-cell")
 
+    let indentGuide = NSView()
     let iconView = NSImageView()
     let nameLabel = NSTextField(labelWithString: "")
     let dirLabel = NSTextField(labelWithString: "")
@@ -1074,19 +1157,23 @@ final class SourceControlItemCellView: NSTableCellView {
         iconView.translatesAutoresizingMaskIntoConstraints = false
         iconView.imageScaling = .scaleProportionallyDown
 
-        nameLabel.font = .systemFont(ofSize: 12, weight: .regular)
+        indentGuide.wantsLayer = true
+        indentGuide.layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.14).cgColor
+        indentGuide.translatesAutoresizingMaskIntoConstraints = false
+
+        nameLabel.font = .systemFont(ofSize: 13, weight: .regular)
         nameLabel.textColor = .labelColor
         nameLabel.lineBreakMode = .byTruncatingTail
         nameLabel.translatesAutoresizingMaskIntoConstraints = false
         nameLabel.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
 
-        dirLabel.font = .systemFont(ofSize: 11, weight: .regular)
+        dirLabel.font = .systemFont(ofSize: 12, weight: .regular)
         dirLabel.textColor = NSColor(white: 0.55, alpha: 1.0)
         dirLabel.lineBreakMode = .byTruncatingMiddle
         dirLabel.translatesAutoresizingMaskIntoConstraints = false
         dirLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        statusBadge.font = .systemFont(ofSize: 11, weight: .medium)
+        statusBadge.font = .monospacedSystemFont(ofSize: 11, weight: .semibold)
         statusBadge.alignment = .right
         statusBadge.translatesAutoresizingMaskIntoConstraints = false
 
@@ -1107,6 +1194,7 @@ final class SourceControlItemCellView: NSTableCellView {
         actionButton.contentTintColor = .secondaryLabelColor
         actionButton.isHidden = true
 
+        addSubview(indentGuide)
         addSubview(iconView)
         addSubview(nameLabel)
         addSubview(dirLabel)
@@ -1115,7 +1203,14 @@ final class SourceControlItemCellView: NSTableCellView {
         addSubview(statusBadge)
 
         NSLayoutConstraint.activate([
-            iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
+            // Vertical guide under the section chevron (x = 6 + 14 / 2).
+            indentGuide.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
+            indentGuide.topAnchor.constraint(equalTo: topAnchor),
+            indentGuide.bottomAnchor.constraint(equalTo: bottomAnchor),
+            indentGuide.widthAnchor.constraint(equalToConstant: 1),
+
+            // Aligned under the section title (chevron 6 + 14 + 4).
+            iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 24),
             iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
             iconView.widthAnchor.constraint(equalToConstant: 16),
             iconView.heightAnchor.constraint(equalToConstant: 16),
@@ -1137,9 +1232,9 @@ final class SourceControlItemCellView: NSTableCellView {
             actionButton.widthAnchor.constraint(equalToConstant: 16),
             actionButton.heightAnchor.constraint(equalToConstant: 16),
 
-            statusBadge.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            statusBadge.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
             statusBadge.centerYAnchor.constraint(equalTo: centerYAnchor),
-            statusBadge.widthAnchor.constraint(equalToConstant: 16),
+            statusBadge.widthAnchor.constraint(equalToConstant: 14),
         ])
     }
 
