@@ -405,6 +405,12 @@ const BUILTIN: &[(&str, &str, &str, &[&str])] = &[
         &["files", "sidebar"],
     ),
     (
+        "workbench.view.scm",
+        "View",
+        "Show Source Control",
+        &["git", "scm", "changes", "sidebar"],
+    ),
+    (
         "workbench.action.nextEditor",
         "View",
         "Show Next Tab",

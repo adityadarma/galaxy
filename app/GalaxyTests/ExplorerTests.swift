@@ -173,7 +173,7 @@ final class ExplorerTests: XCTestCase {
         XCTAssertEqual(activity.active, .explorer)
         XCTAssertTrue(activity.isEnabled(.explorer))
         XCTAssertFalse(activity.isEnabled(.search), "not built yet")
-        XCTAssertFalse(activity.isEnabled(.sourceControl), "not built yet")
+        XCTAssertTrue(activity.isEnabled(.sourceControl))
 
         // Status bar along the bottom, full width.
         let bar = controller.statusBar

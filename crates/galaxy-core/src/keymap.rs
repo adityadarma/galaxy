@@ -201,6 +201,7 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("cmd+b", "workbench.action.toggleSidebarVisibility"),
     ("cmd+j", "workbench.action.togglePanel"),
     ("cmd+shift+e", "workbench.view.explorer"),
+    ("ctrl+shift+g", "workbench.view.scm"),
     ("cmd+shift+]", "workbench.action.nextEditor"),
     ("cmd+shift+[", "workbench.action.previousEditor"),
     (

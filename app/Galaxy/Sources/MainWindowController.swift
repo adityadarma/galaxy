@@ -23,6 +23,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     let titleBar = TitleBar()
     let activityBar = ActivityBar()
     private let sourceControl = SourceControlController()
+    private(set) var activeSidebarTab: ActivityBar.Item = .explorer
     let tabBar = TabBar()
     /// Open documents, in tab order (M2-06).
     private(set) var tabs: [EditorTab] = []
@@ -469,10 +470,17 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             guard let self else { return }
             switch item {
             case .explorer:
-                self.showSourceControl(false)
-                self.setSidebarVisible(true)
+                if self.isSidebarVisible && self.activeSidebarTab == .explorer {
+                    self.setSidebarVisible(false)
+                } else {
+                    self.showExplorerTab()
+                }
             case .sourceControl:
-                self.showSourceControl(true)
+                if self.isSidebarVisible && self.activeSidebarTab == .sourceControl {
+                    self.setSidebarVisible(false)
+                } else {
+                    self.showSourceControlTab()
+                }
             case .search: break
             }
         }
@@ -1197,15 +1205,31 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
 
     @objc func showExplorer(_ sender: Any?) {
-        setSidebarVisible(true)
-        if workspace != nil { window?.makeFirstResponder(explorer.outlineView) }
+        if isSidebarVisible && activeSidebarTab == .explorer {
+            if workspace != nil { window?.makeFirstResponder(explorer.outlineView) }
+        } else {
+            showExplorerTab()
+        }
+    }
+
+    @objc func showSourceControlAction(_ sender: Any?) {
+        if isSidebarVisible && activeSidebarTab == .sourceControl {
+            setSidebarVisible(false)
+        } else {
+            showSourceControlTab()
+        }
+    }
+
+    @objc func toggleSourceControl(_ sender: Any?) {
+        showSourceControlAction(sender)
     }
 
     func setSidebarVisible(_ visible: Bool) {
         guard visible != isSidebarVisible else { return }
-        activityBar.setActive(visible ? .explorer : nil)
+        activityBar.setActive(visible ? activeSidebarTab : nil)
         if visible {
             sidebar.isHidden = false
+            updateSidebarContent()
             splitView.setPosition(Self.sidebarWidth, ofDividerAt: 0)
         } else {
             splitView.setPosition(0, ofDividerAt: 0)
@@ -1269,8 +1293,17 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         refreshGitDiff()
     }
 
-    private func showSourceControl(_ visible: Bool) {
-        if visible {
+    func updateSidebarContent() {
+        switch activeSidebarTab {
+        case .explorer:
+            sourceControl.view.isHidden = true
+            let hasWorkspace = workspace != nil
+            explorer.scrollView.isHidden = !hasWorkspace
+            emptyState.isHidden = hasWorkspace
+            sectionHeader.title = workspace?.name() ?? ""
+            sectionHeader.showsTools = hasWorkspace
+            activityBar.setActive(isSidebarVisible ? .explorer : nil)
+        case .sourceControl:
             explorer.scrollView.isHidden = true
             emptyState.isHidden = true
             sourceControl.view.isHidden = false
@@ -1278,15 +1311,31 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             sourceControl.refresh(status: workspace.flatMap { bridge.gitStatus(workspace: $0) })
             sectionHeader.title = "SOURCE CONTROL"
             sectionHeader.showsTools = false
-            activityBar.setActive(.sourceControl)
-            setSidebarVisible(true)
+            activityBar.setActive(isSidebarVisible ? .sourceControl : nil)
+        case .search:
+            break
+        }
+    }
+
+    func showExplorerTab() {
+        activeSidebarTab = .explorer
+        updateSidebarContent()
+        setSidebarVisible(true)
+        if workspace != nil { window?.makeFirstResponder(explorer.outlineView) }
+    }
+
+    func showSourceControlTab() {
+        activeSidebarTab = .sourceControl
+        updateSidebarContent()
+        setSidebarVisible(true)
+        sourceControl.focusMessageInput()
+    }
+
+    private func showSourceControl(_ visible: Bool) {
+        if visible {
+            showSourceControlTab()
         } else {
-            sourceControl.view.isHidden = true
-            explorer.scrollView.isHidden = workspace == nil
-            emptyState.isHidden = workspace != nil
-            sectionHeader.title = workspace?.name() ?? ""
-            sectionHeader.showsTools = workspace != nil
-            if workspace != nil { activityBar.setActive(.explorer) }
+            showExplorerTab()
         }
     }
 
@@ -3083,10 +3132,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         startWatching(ws)
         refreshGitStatus()
         explorer.setWorkspace(ws)
-        explorer.scrollView.isHidden = false
-        emptyState.isHidden = true
-        sectionHeader.title = ws.name()
-        sectionHeader.showsTools = true
+        updateSidebarContent()
         setSidebarVisible(true)
         if tabs.isEmpty { pathBar.show([]) }
         updateEditedState()

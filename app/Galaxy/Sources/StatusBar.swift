@@ -1,12 +1,20 @@
 import AppKit
 
+@MainActor
+final class StatusBarGitButton: NSButton {
+    override var stringValue: String {
+        get { title }
+        set { title = newValue }
+    }
+}
+
 /// Bottom status bar: a message on the left, document facts (cursor,
 /// indentation, line ending, encoding) on the right.
 @MainActor
 final class StatusBar: NSView {
     let message = NSTextField(labelWithString: "")
     let largeFileBadge = NSTextField(labelWithString: "Large file")
-    let git = NSButton(title: "", target: nil, action: nil)
+    let git = StatusBarGitButton(title: "", target: nil, action: nil)
     var onGitClick: (() -> Void)?
     let cursor = StatusBar.label("status-cursor")
     let language = StatusBar.label("status-language")
@@ -136,9 +144,12 @@ final class StatusBar: NSView {
     func showGit(branch: String?, changedCount: Int) {
         guard let branch else {
             git.title = ""
+            git.stringValue = ""
             return
         }
-        git.title = "Git: \(branch)"
+        let text = changedCount > 0 ? "Git: \(branch) · \(changedCount)" : "Git: \(branch)"
+        git.title = text
+        git.stringValue = text
     }
 
     @objc private func gitClicked(_ sender: Any?) { onGitClick?() }

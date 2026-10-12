@@ -33,7 +33,7 @@ final class ActivityBar: NSView {
             switch self {
             case .explorer: "Explorer (⇧⌘E)"
             case .search: "Search: planned for M5"
-            case .sourceControl: "Source Control"
+            case .sourceControl: "Source Control (⌃⇧G)"
             }
         }
     }
