@@ -10,12 +10,16 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
 
     // AI Commit settings (OpenAI-compatible API)
     private let baseURLField = NSTextField()
-    private let modelField = NSTextField()
+    private let modelPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let modelRefreshButton = NSButton()
+    private let modelStatus = NSTextField(labelWithString: "")
     private let apiKeyField = NSSecureTextField()
+    private var modelLoadTask: Task<Void, Never>?
+    private var modelReloadWork: DispatchWorkItem?
 
     init(onChange: @escaping () -> Void) {
         self.onChange = onChange
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 380),
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 420),
                               styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "Settings"
         window.isReleasedWhenClosed = false
@@ -71,9 +75,29 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
                   placeholder: AICommitService.defaultBaseURL, label: "AI base URL")
         stack.addArrangedSubview(row("Base URL", baseURLField))
 
-        configure(modelField, key: AICommitService.Keys.model,
-                  placeholder: AICommitService.defaultModel, label: "AI model")
-        stack.addArrangedSubview(row("Model", modelField))
+        modelPopup.target = self
+        modelPopup.action = #selector(saveModel(_:))
+        modelPopup.setAccessibilityLabel("AI model")
+        modelPopup.translatesAutoresizingMaskIntoConstraints = false
+        modelPopup.widthAnchor.constraint(equalToConstant: 208).isActive = true
+        modelRefreshButton.bezelStyle = .texturedRounded
+        modelRefreshButton.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "Reload models")
+        modelRefreshButton.imagePosition = .imageOnly
+        modelRefreshButton.toolTip = "Reload models from the server"
+        modelRefreshButton.target = self
+        modelRefreshButton.action = #selector(reloadModels(_:))
+        modelRefreshButton.widthAnchor.constraint(equalToConstant: 26).isActive = true
+        let modelControls = NSStackView(views: [modelPopup, modelRefreshButton])
+        modelControls.spacing = 4
+        stack.addArrangedSubview(row("Model", modelControls))
+        showModels([], selecting: AICommitService.shared.model)
+
+        modelStatus.font = .systemFont(ofSize: 11)
+        modelStatus.textColor = .secondaryLabelColor
+        modelStatus.lineBreakMode = .byTruncatingTail
+        modelStatus.translatesAutoresizingMaskIntoConstraints = false
+        modelStatus.widthAnchor.constraint(equalToConstant: 238).isActive = true
+        stack.addArrangedSubview(row("", modelStatus))
 
         configure(apiKeyField, key: AICommitService.Keys.apiKey,
                   placeholder: "sk-… (optional for local servers)", label: "AI API key")
@@ -91,6 +115,61 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
             stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 24),
             stack.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -24),
         ])
+        loadModels()
+    }
+
+    // MARK: AI model picker
+
+    /// Fills the popup. The saved model is always present, even when the
+    /// server does not list it, so a choice is never silently replaced.
+    private func showModels(_ models: [String], selecting selected: String) {
+        modelPopup.removeAllItems()
+        var titles = models
+        if !titles.contains(selected) { titles.insert(selected, at: 0) }
+        modelPopup.addItems(withTitles: titles)
+        if !models.isEmpty, !models.contains(selected) {
+            modelPopup.item(withTitle: selected)?.toolTip = "Not offered by this server"
+        }
+        modelPopup.selectItem(withTitle: selected)
+    }
+
+    private func loadModels() {
+        modelLoadTask?.cancel()
+        modelRefreshButton.isEnabled = false
+        modelStatus.textColor = .secondaryLabelColor
+        modelStatus.stringValue = "Loading models…"
+        modelLoadTask = Task { [weak self] in
+            let result: Result<[String], Error>
+            do { result = .success(try await AICommitService.shared.fetchModels()) } catch { result = .failure(error) }
+            guard let self, !Task.isCancelled else { return }
+            self.modelRefreshButton.isEnabled = true
+            let selected = AICommitService.shared.model
+            switch result {
+            case .success(let models):
+                self.showModels(models, selecting: selected)
+                if models.isEmpty {
+                    self.modelStatus.stringValue = "Server returned no models."
+                } else if models.contains(selected) {
+                    self.modelStatus.stringValue = "\(models.count) models available."
+                } else {
+                    self.modelStatus.textColor = .systemOrange
+                    self.modelStatus.stringValue = "'\(selected)' is not on this server."
+                }
+            case .failure(let error):
+                self.showModels([], selecting: selected)
+                self.modelStatus.textColor = .systemRed
+                self.modelStatus.stringValue = "Could not load models: \(error)"
+            }
+        }
+    }
+
+    @objc private func reloadModels(_ sender: Any?) { loadModels() }
+
+    @objc private func saveModel(_ sender: Any?) {
+        guard let model = modelPopup.titleOfSelectedItem, !model.isEmpty else { return }
+        UserDefaults.standard.set(model, forKey: AICommitService.Keys.model)
+        modelStatus.textColor = .secondaryLabelColor
+        modelStatus.stringValue = "Using \(model)."
     }
 
     private func row(_ title: String, _ control: NSView) -> NSStackView {
@@ -131,7 +210,7 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
     /// Saves each AI field as it is typed; an empty field falls back to the default.
     func controlTextDidChange(_ obj: Notification) {
         guard let field = obj.object as? NSTextField, let key = field.identifier?.rawValue,
-              [AICommitService.Keys.baseURL, AICommitService.Keys.model, AICommitService.Keys.apiKey].contains(key)
+              [AICommitService.Keys.baseURL, AICommitService.Keys.apiKey].contains(key)
         else { return }
         let value = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         if value.isEmpty {
@@ -139,6 +218,11 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
         } else {
             UserDefaults.standard.set(value, forKey: key)
         }
+        // Base URL or key changed: reload the list once typing pauses.
+        modelReloadWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.loadModels() }
+        modelReloadWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8, execute: work)
     }
 
     private func updateFontSizeLabel() { fontSizeLabel.stringValue = "\(Int(fontSize.doubleValue)) pt" }

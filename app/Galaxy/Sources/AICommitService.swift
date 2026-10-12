@@ -46,6 +46,52 @@ final class AICommitService {
         return url
     }
 
+    /// `<base>/models`, for the model picker in Settings.
+    var modelsEndpoint: URL? {
+        var base = baseURL
+        if base.hasSuffix("/chat/completions") { base = String(base.dropLast("/chat/completions".count)) }
+        guard let url = URL(string: base + "/models"), let scheme = url.scheme?.lowercased(),
+              scheme == "https" || scheme == "http", url.host != nil else { return nil }
+        return url
+    }
+
+    enum ModelListError: Error, CustomStringConvertible {
+        case invalidURL
+        case http(Int)
+        case unreadable
+
+        var description: String {
+            switch self {
+            case .invalidURL: "Invalid base URL"
+            case .http(401), .http(403): "API key rejected (HTTP \(self.status))"
+            case .http(let code): "Server returned HTTP \(code)"
+            case .unreadable: "Unexpected response from /models"
+            }
+        }
+
+        private var status: Int { if case .http(let code) = self { code } else { 0 } }
+    }
+
+    /// Model IDs from `GET <base>/models`, sorted.
+    func fetchModels() async throws -> [String] {
+        guard let url = modelsEndpoint else { throw ModelListError.invalidURL }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 15
+        if let apiKey {
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        }
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw ModelListError.unreadable }
+        guard http.statusCode == 200 else { throw ModelListError.http(http.statusCode) }
+        struct List: Decodable {
+            struct Model: Decodable { let id: String }
+            let data: [Model]
+        }
+        guard let list = try? JSONDecoder().decode(List.self, from: data) else { throw ModelListError.unreadable }
+        return Array(Set(list.data.map(\.id)))
+            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
     /// The official OpenAI endpoint needs a key; a custom server may not.
     var isConfigured: Bool {
         guard let endpoint else { return false }
