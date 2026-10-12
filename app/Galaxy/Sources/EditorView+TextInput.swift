@@ -53,11 +53,13 @@ extension EditorView: @preconcurrency NSTextInputClient {
 
     @objc func undoEdit(_ sender: Any?) {
         guard let document, document.undo() else { return }
+        onSnippetInvalidated?()
         didChangeDocument()
     }
 
     @objc func redoEdit(_ sender: Any?) {
         guard let document, document.redo() else { return }
+        onSnippetInvalidated?()
         didChangeDocument()
     }
 

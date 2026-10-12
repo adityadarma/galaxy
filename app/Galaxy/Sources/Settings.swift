@@ -7,6 +7,7 @@ struct GalaxySettings: Equatable {
     var tabSize: UInt32?
     var autoSave: AutoSaveMode?
     var autoSaveDelay: TimeInterval?
+    var renderWhitespace: WhitespaceRendering? = nil
 
     static let empty = GalaxySettings(insertSpaces: nil, tabSize: nil, autoSave: nil, autoSaveDelay: nil)
 
@@ -15,9 +16,12 @@ struct GalaxySettings: Equatable {
             insertSpaces: override.insertSpaces ?? insertSpaces,
             tabSize: override.tabSize ?? tabSize,
             autoSave: override.autoSave ?? autoSave,
-            autoSaveDelay: override.autoSaveDelay ?? autoSaveDelay
+            autoSaveDelay: override.autoSaveDelay ?? autoSaveDelay,
+            renderWhitespace: override.renderWhitespace ?? renderWhitespace
         )
     }
+
+    var effectiveRenderWhitespace: WhitespaceRendering { renderWhitespace ?? .all }
 
     var useTabs: Bool { !(insertSpaces ?? true) }
     var effectiveTabSize: UInt32 { max(tabSize ?? 4, 1) }
@@ -47,8 +51,15 @@ struct GalaxySettings: Equatable {
         default: autoSave = nil
         }
         let autoSaveDelay = (files["autoSaveDelay"] as? NSNumber).map { max($0.doubleValue / 1000, 0.1) }
+        let renderWhitespace: WhitespaceRendering? = switch editor["renderWhitespace"] as? String {
+        case "none": WhitespaceRendering.none
+        case "boundary": .boundary
+        case "all", "selection", "trailing": .all
+        default: nil
+        }
         return GalaxySettings(insertSpaces: insertSpaces, tabSize: tabSize,
-                              autoSave: autoSave, autoSaveDelay: autoSaveDelay)
+                              autoSave: autoSave, autoSaveDelay: autoSaveDelay,
+                              renderWhitespace: renderWhitespace)
     }
 
     static func completionItems() -> [CompletionInfo] {
@@ -56,10 +67,19 @@ struct GalaxySettings: Equatable {
             CompletionInfo(label: "editor", detail: "object", insertText: "editor", isSnippet: false),
             CompletionInfo(label: "insertSpaces", detail: "boolean", insertText: "insertSpaces", isSnippet: false),
             CompletionInfo(label: "tabSize", detail: "number", insertText: "tabSize", isSnippet: false),
+            CompletionInfo(label: "renderWhitespace", detail: "none | boundary | all", insertText: "renderWhitespace", isSnippet: false),
             CompletionInfo(label: "files.autoSave", detail: "off | afterDelay | onFocusChange", insertText: "files.autoSave", isSnippet: false),
             CompletionInfo(label: "files.autoSaveDelay", detail: "milliseconds", insertText: "files.autoSaveDelay", isSnippet: false),
         ]
     }
+}
+
+/// `editor.renderWhitespace`, with VSCode's values (`selection` and
+/// `trailing` are not drawn differently yet and fall back to `all`).
+enum WhitespaceRendering: String, Equatable {
+    case none
+    case boundary
+    case all
 }
 
 enum AutoSaveMode: String, Equatable {

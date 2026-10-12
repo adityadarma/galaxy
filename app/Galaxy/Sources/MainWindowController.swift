@@ -22,6 +22,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private var lastSemanticRequest = Date.distantPast
     let titleBar = TitleBar()
     let activityBar = ActivityBar()
+    private let sourceControl = SourceControlController()
     let tabBar = TabBar()
     /// Open documents, in tab order (M2-06).
     private(set) var tabs: [EditorTab] = []
@@ -55,6 +56,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private let codeActionPopup = CodeActionPopup()
     private var completionQuery = ""
     private var localCompletionItems: [CompletionInfo]?
+    private var snippetCompletionItems: [CompletionInfo] = []
+    private var snippetSession: SnippetSession?
+    private var snippetDocumentKey: String?
+    private var completionDismissed = false
     private var completionPosition = TextPos(line: 0, colUtf16: 0)
     private var hoverPosition: TextPos?
     private var hoverPoint = NSPoint.zero
@@ -111,6 +116,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private var loadedGoToLine: GoToLine?
     private var loadedOutlinePicker: OutlinePicker?
     private var loadedPalette: CommandPaletteView?
+    private var loadedGitPicker: GitBranchPicker?
     private var syntaxEvictionTimer: Timer?
     private var lspTimer: Timer?
     private var memoryPressureSource: DispatchSourceMemoryPressure?
@@ -351,6 +357,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         buildContent()
         installMemoryPressureHandler()
         editorView.onChange = { [weak self] in
+            if let document = self?.activeTab?.doc,
+               var session = self?.snippetSession {
+                session.noteDocumentChange(length: document.lenUtf16())
+                self?.snippetSession = session
+            }
             self?.updateEditedState()
             self?.scheduleAutoSave()
             self?.refreshFindStatus()
@@ -358,6 +369,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             self?.bridge.pollLSP()
             self?.requestCompletionIfNeeded()
             self?.refreshGitDiff()
+        }
+        editorView.onSnippetInvalidated = { [weak self] in
+            self?.snippetSession = nil
+            self?.snippetDocumentKey = nil
         }
         editorView.onClickMove = { [weak self] before, after in
             guard let self, let tab = self.activeTab else { return }
@@ -372,6 +387,16 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             self?.requestDefinition(at: position) ?? false
         }
         editorView.onCursorChange = { [weak self] primary, count in
+            if let self,
+               let document = self.activeTab?.doc,
+               let session = self.snippetSession,
+               let span = session.span {
+                let caret = document.utf16Offset(pos: TextPos(line: primary.line, colUtf16: primary.colUtf16))
+                if caret < span.start || caret > span.end {
+                    self.snippetSession = nil
+                    self.snippetDocumentKey = nil
+                }
+            }
             self?.statusBar.showCursor(primary: primary, count: count)
             self?.breadcrumbBar.show(symbols: self?.documentSymbols ?? [], atLine: primary.line)
         }
@@ -396,6 +421,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 }
             }
         }
+        statusBar.onGitClick = { [weak self] in self?.showGitBranchPicker() }
     }
 
     private func installMemoryPressureHandler() {
@@ -440,14 +466,25 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         activityBar.translatesAutoresizingMaskIntoConstraints = false
         activityBar.setActive(.explorer)
         activityBar.onSelect = { [weak self] item in
-            guard let self, item == .explorer else { return }
-            // Clicking the active item collapses the sidebar, as in VSCode.
-            self.setSidebarVisible(!self.isSidebarVisible)
+            guard let self else { return }
+            switch item {
+            case .explorer:
+                self.showSourceControl(false)
+                self.setSidebarVisible(true)
+            case .sourceControl:
+                self.showSourceControl(true)
+            case .search: break
+            }
         }
         titleBar.onToggleSidebar = { [weak self] in self?.toggleSidebarVisibility(nil) }
         titleBar.onTogglePanel = { [weak self] in self?.toggleTerminal(nil) }
         titleBar.setSidebarVisible(true)
         titleBar.setPanelVisible(false)
+        sourceControl.onOpen = { [weak self] relPath in
+            guard let self, let workspace = self.workspace else { return }
+            self.openWorkspaceFile(workspace, FileEntry(name: (relPath as NSString).lastPathComponent, relPath: relPath, isDir: false), preview: false)
+        }
+        sourceControl.onRefresh = { [weak self] in self?.refreshGitStatus() }
 
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = false
@@ -641,7 +678,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         completionPopup.onClose = { [weak self] in self?.closeCompletion() }
         completionPopup.onSelect = { [weak self] item in self?.acceptCompletion(item) }
         editorView.onCompletionKey = { [weak self] event in self?.handleCompletionKey(event) ?? false }
-        editorView.onTextInput = { [weak self] text in self?.requestOnTypeFormatting(trigger: text) }
+        editorView.onTextInput = { [weak self] text in
+            self?.completionDismissed = false
+            self?.requestOnTypeFormatting(trigger: text)
+        }
 
         buildSidebar()
 
@@ -737,6 +777,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         let prefix = String(line.prefix(max(0, min(column, line.count))))
             .split(whereSeparator: { !$0.isLetter && !$0.isNumber && $0 != "_" }).last.map(String.init) ?? ""
         completionQuery = prefix
+        let beforePrefix = String(line.prefix(max(0, min(column, line.count))))
+        let lspTrigger = beforePrefix.hasSuffix(".") || beforePrefix.hasSuffix("::") || beforePrefix.hasSuffix("->")
+        guard !prefix.isEmpty || lspTrigger else {
+            snippetCompletionItems = []
+            completionPopup.isHidden = true
+            return
+        }
         if isSettingsDocument(document) {
             localCompletionItems = GalaxySettings.completionItems()
             refreshCompletion()
@@ -744,21 +791,36 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
         localCompletionItems = nil
         bridge.requestCompletion(document: document, line: position.line, character: position.colUtf16)
+        snippetCompletionItems = prefix.isEmpty ? [] : bridge.snippetCompletions(document: document)
+            .filter { $0.label.lowercased().hasPrefix(prefix.lowercased()) }
+        refreshCompletion()
     }
 
     private func refreshCompletion() {
         guard let document = activeTab?.doc else { return }
-        let items = localCompletionItems ?? bridge.completions(document: document)
+        guard !completionDismissed else { return }
+        let position = document.viewport(firstLine: 0, count: 0).primary
+        guard position.line == completionPosition.line,
+              position.colUtf16 == completionPosition.colUtf16 else {
+            completionPopup.isHidden = true
+            return
+        }
+        let lspItems = bridge.completions(document: document)
+        let items = localCompletionItems ?? (lspItems + snippetCompletionItems)
         guard !items.isEmpty else {
             completionPopup.isHidden = true
             return
         }
         completionPopup.update(items, query: completionQuery)
-        completionPopup.isHidden = false
+        if completionPopup.isHidden { return }
         completionPopup.frame = NSRect(x: editorView.textOriginX + 8, y: CGFloat(completionPosition.line + 1) * editorView.metrics.lineHeight + 8, width: 420, height: 192)
     }
 
-    private func closeCompletion() { completionPopup.isHidden = true }
+    private func closeCompletion() {
+        completionPopup.isHidden = true
+        completionDismissed = true
+        snippetCompletionItems = []
+    }
 
     private func isSettingsDocument(_ document: DocumentHandle) -> Bool {
         let path = Self.fileKey(document.path())
@@ -845,6 +907,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         let edits = bridge.renameEdits(document: document)
         guard !edits.isEmpty else { return }
         renameRequest = nil
+        snippetSession = nil
+        snippetDocumentKey = nil
         var grouped: [String: [RenameEdit]] = [:]
         for edit in edits { grouped[edit.uri, default: []].append(edit) }
         for (uri, fileEdits) in grouped {
@@ -880,6 +944,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     private func applyCodeAction(_ action: CodeActionInfo) {
         codeActionPopup.isHidden = true
+        snippetSession = nil
+        snippetDocumentKey = nil
         var grouped: [String: [RenameEdit]] = [:]
         for edit in action.edits { grouped[edit.uri, default: []].append(edit) }
         for (uri, edits) in grouped {
@@ -928,6 +994,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         let edits = bridge.formattingEdits(document: document)
         guard !edits.isEmpty else { return }
         formattingRequest = nil
+        snippetSession = nil
+        snippetDocumentKey = nil
         _ = bridge.applyFormattingEdits(document: document, edits: edits)
         bridge.syncLSP(document: document)
         updateEditedState()
@@ -955,11 +1023,22 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func handleCompletionKey(_ event: NSEvent) -> Bool {
+        if completionPopup.isHidden, let session = snippetSession {
+            switch event.keyCode {
+            case 48: // Tab
+                return moveSnippetStop(direction: event.modifierFlags.contains(.shift) ? -1 : 1)
+            case 53: // Escape
+                snippetSession = nil
+                return true
+            default: break
+            }
+            _ = session
+        }
         guard !completionPopup.isHidden else { return false }
         switch event.keyCode {
         case 125: completionPopup.move(1); return true
         case 126: completionPopup.move(-1); return true
-        case 36, 76: completionPopup.accept(); return true
+        case 36, 48, 76: completionPopup.accept(); return true
         case 53: completionPopup.cancel(); return true
         default: return false
         }
@@ -967,12 +1046,85 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     private func acceptCompletion(_ item: CompletionInfo) {
         guard let document = activeTab?.doc else { return }
-        let text = item.isSnippet ? item.insertText.replacingOccurrences(of: #"\$\d+"#, with: "", options: .regularExpression) : item.insertText
         let start = completionPosition.colUtf16 >= UInt64(completionQuery.utf16.count) ? completionPosition.colUtf16 - UInt64(completionQuery.utf16.count) : 0
         let offset = document.utf16Offset(pos: TextPos(line: completionPosition.line, colUtf16: start))
+        let text: String
+        var firstStopIndex: UInt32?
+        var firstStops: [SnippetStopInfo] = []
+        if item.isSnippet {
+            let line = document.displayLine(line: completionPosition.line)
+            let indent = String(line.prefix { $0 == " " || $0 == "\t" })
+            let settings = document.indentSettings()
+            let unit = settings.useTabs ? "\t" : String(repeating: " ", count: Int(settings.tabSize))
+            let selectedText = document.textInRange(range: document.selectedRange())
+            let year = String(Calendar.current.component(.year, from: Date()))
+            let expansion = bridge.expandedSnippet(body: item.insertText, baseIndent: indent, indentUnit: unit,
+                                                   filename: (document.path() as NSString).lastPathComponent,
+                                                   selectedText: selectedText, currentYear: year)
+            text = expansion.text
+            firstStopIndex = expansion.stops.first(where: { $0.index != 0 })?.index
+        if let firstStopIndex {
+                firstStops = expansion.stops.filter { $0.index == firstStopIndex }
+            }
+            snippetSession = makeSnippetSession(expansion.stops, insertionOffset: offset,
+                                                documentLength: document.lenUtf16() + UInt64(text.utf16.count) - UInt64(completionQuery.utf16.count))
+            snippetDocumentKey = Self.fileKey(document.path())
+        } else {
+            text = item.insertText
+        }
         document.commitText(text: text, replacement: Utf16Range(location: offset, length: UInt64(completionQuery.utf16.count)))
+        if firstStopIndex != nil {
+            let selections = firstStops.map { stop in
+                let absolute = Utf16Range(location: offset + stop.range.location, length: stop.range.length)
+                return TextSelection(anchor: document.positionAt(offset: absolute.location),
+                                     head: document.positionAt(offset: absolute.location + absolute.length))
+            }
+            document.setSelections(selections: selections, primary: 0)
+        }
         closeCompletion()
-        editorView.needsDisplay = true
+        editorView.didChangeDocument()
+    }
+
+    private func makeSnippetSession(_ stops: [SnippetStopInfo], insertionOffset: UInt64,
+                                    documentLength: UInt64) -> SnippetSession? {
+        let groups = Dictionary(grouping: stops, by: \ .index)
+            .sorted { lhs, rhs in
+                if lhs.key == 0 { return false }
+                if rhs.key == 0 { return true }
+                return lhs.key < rhs.key
+            }
+        let ranges = groups.map { index, values in
+            values.map { stop in
+                SnippetSession.Stop(index: index,
+                                    location: insertionOffset + stop.range.location,
+                                    length: stop.range.length)
+            }
+        }
+        guard !ranges.isEmpty else { return nil }
+        return SnippetSession(stops: ranges, documentLength: documentLength)
+    }
+
+    private func moveSnippetStop(direction: Int) -> Bool {
+        guard var session = snippetSession,
+              let document = activeTab?.doc,
+              snippetDocumentKey == Self.fileKey(document.path()) else {
+            snippetSession = nil
+            snippetDocumentKey = nil
+            return false
+        }
+        session.noteDocumentChange(length: document.lenUtf16())
+        guard let stop = session.move(direction) else {
+            snippetSession = nil
+            return true
+        }
+        let selections = stop.map { range in
+            TextSelection(anchor: document.positionAt(offset: range.location),
+                          head: document.positionAt(offset: range.location + range.length))
+        }
+        document.setSelections(selections: selections, primary: 0)
+        snippetSession = session
+        editorView.didChangeSelection()
+        return true
     }
 
     private func buildSidebar() {
@@ -1016,6 +1168,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
         sidebar.addSubview(sectionHeader)
         sidebar.addSubview(explorer.scrollView)
+        sidebar.addSubview(sourceControl.view)
         sidebar.addSubview(emptyState)
         NSLayoutConstraint.activate([
             sectionHeader.topAnchor.constraint(equalTo: sidebar.topAnchor),
@@ -1025,11 +1178,16 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             explorer.scrollView.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor),
             explorer.scrollView.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor),
             explorer.scrollView.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor),
+            sourceControl.view.topAnchor.constraint(equalTo: sectionHeader.bottomAnchor),
+            sourceControl.view.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor),
+            sourceControl.view.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor),
+            sourceControl.view.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor),
             emptyState.centerXAnchor.constraint(equalTo: sidebar.centerXAnchor).withPriority(.defaultHigh),
             emptyState.centerYAnchor.constraint(equalTo: sidebar.centerYAnchor, constant: -20),
             emptyState.leadingAnchor.constraint(greaterThanOrEqualTo: sidebar.leadingAnchor, constant: 16).withPriority(.defaultLow),
             emptyState.trailingAnchor.constraint(lessThanOrEqualTo: sidebar.trailingAnchor, constant: -16).withPriority(.defaultLow),
         ])
+        sourceControl.view.isHidden = true
     }
 
     // MARK: Sidebar
@@ -1086,6 +1244,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             for tab in tabs {
                 bridge.setIndent(document: tab.doc, useTabs: settings.useTabs, tabSize: settings.effectiveTabSize)
             }
+            editorView.renderWhitespace = settings.effectiveRenderWhitespace
+            secondaryEditorView.renderWhitespace = settings.effectiveRenderWhitespace
             statusBar.show(document: activeTab?.doc, path: activeTab?.doc.path())
         } catch {
             settingsProblems = ["settings.json could not be read: \(error.localizedDescription)"]
@@ -1098,13 +1258,91 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         guard let workspace, let status = bridge.gitStatus(workspace: workspace) else {
             statusBar.showGit(branch: nil, changedCount: 0)
             explorer.gitChangedPaths = []
+            sourceControl.refresh(status: nil)
             refreshTabBar()
             return
         }
         statusBar.showGit(branch: status.branch, changedCount: status.changedPaths.count)
         explorer.gitChangedPaths = Set(status.changedPaths)
+        sourceControl.refresh(status: status)
         refreshTabBar()
         refreshGitDiff()
+    }
+
+    private func showSourceControl(_ visible: Bool) {
+        if visible {
+            explorer.scrollView.isHidden = true
+            emptyState.isHidden = true
+            sourceControl.view.isHidden = false
+            sourceControl.workspace = workspace
+            sourceControl.refresh(status: workspace.flatMap { bridge.gitStatus(workspace: $0) })
+            sectionHeader.title = "SOURCE CONTROL"
+            sectionHeader.showsTools = false
+            activityBar.setActive(.sourceControl)
+            setSidebarVisible(true)
+        } else {
+            sourceControl.view.isHidden = true
+            explorer.scrollView.isHidden = workspace == nil
+            emptyState.isHidden = workspace != nil
+            sectionHeader.title = workspace?.name() ?? ""
+            sectionHeader.showsTools = workspace != nil
+            if workspace != nil { activityBar.setActive(.explorer) }
+        }
+    }
+
+    private func showGitBranchPicker() {
+        guard let workspace else { return }
+        let picker = loadedGitPicker ?? GitBranchPicker()
+        if loadedGitPicker == nil {
+            picker.onClose = { [weak self] in self?.closeGitBranchPicker() }
+            picker.onCheckout = { [weak self] name in self?.checkoutGitBranch(name) }
+            picker.onCreate = { [weak self] in self?.createGitBranch() }
+            window?.contentView?.addSubview(picker)
+            NSLayoutConstraint.activate([
+                picker.topAnchor.constraint(equalTo: tabBar.bottomAnchor, constant: 8),
+                picker.centerXAnchor.constraint(equalTo: detailView.centerXAnchor),
+                picker.widthAnchor.constraint(equalToConstant: 620),
+            ])
+            loadedGitPicker = picker
+        }
+        picker.reset(branches: bridge.gitBranches(workspace: workspace))
+        picker.isHidden = false
+        window?.makeFirstResponder(picker)
+    }
+
+    private func closeGitBranchPicker() {
+        loadedGitPicker?.isHidden = true
+        window?.makeFirstResponder(activeTab == nil ? explorer.outlineView : editorView)
+    }
+
+    private func checkoutGitBranch(_ name: String) {
+        guard let workspace else { return }
+        guard bridge.gitCheckout(workspace: workspace, name: name) else {
+            statusLabel.stringValue = "Could not checkout \(name)."
+            return
+        }
+        closeGitBranchPicker()
+        refreshGitStatus()
+        statusLabel.stringValue = ""
+    }
+
+    private func createGitBranch() {
+        let alert = NSAlert()
+        alert.messageText = "Create new branch"
+        let field = NSTextField(string: "")
+        field.placeholderString = "Branch name"
+        field.frame = NSRect(x: 0, y: 0, width: 320, height: 24)
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Create")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn, let workspace else { return }
+        guard bridge.gitCreateBranch(workspace: workspace, name: field.stringValue) else {
+            statusLabel.stringValue = "Could not create branch."
+            return
+        }
+        closeGitBranchPicker()
+        refreshGitStatus()
+        statusLabel.stringValue = ""
     }
 
     private func refreshGitDiff() {
@@ -1170,6 +1408,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// explorer selection is cleared so clicking that file again opens it.
     func selectTab(_ index: Int, fromTabBar: Bool = false) {
         guard tabs.indices.contains(index) else { return }
+        if activeIndex != index {
+            snippetSession = nil
+            snippetDocumentKey = nil
+        }
         if let old = activeTab, old !== tabs[index] {
             recordFindOrigin()
             noteLeaving(old)
@@ -1203,7 +1445,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         if let rel = tab.relPath { noteRecent(rel) }
         refreshTabBar()
         updateEditedState()
-        if fromTabBar { explorer.outlineView.deselectAll(nil) }
+        if let rel = tab.relPath {
+            explorer.reveal(relPath: rel)
+        }
         if isFindVisible {
             applyFind(select: false)
         } else {
@@ -2814,13 +3058,24 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func openWorkspace(at url: URL) throws {
+        // A new folder is a new project session. Do not carry files from the
+        // previous workspace into the new tab bar.
+        editorView.flushPendingUpdates()
+        for tab in tabs where tab.doc.isModified() {
+            if activeTab !== tab { selectTab(tabs.firstIndex { $0 === tab } ?? 0) }
+            guard confirmDiscardActive() else { return }
+        }
+        tabs.removeAll()
+        activeIndex = nil
+        snippetSession = nil
+        snippetDocumentKey = nil
+        showNoDocument()
         let ws = try bridge.core.openWorkspace(path: url.path)
         workspace = ws
+        Self.rememberProject(url.path)
         workspaceSettingsModified = nil
         fileFinder = nil
         recentFiles = []
-        // Paths are relative to the new root (or outside it).
-        for tab in tabs { tab.relPath = relativePath(tab.doc.path()) }
         if isQuickOpenVisible { closeGoToFile() }
         loadedQuickOpen?.finder = nil
         // Ready by the time ⌘P is pressed in all but huge folders.
@@ -2838,17 +3093,39 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         statusLabel.stringValue = "\(ws.name()): choose a file in the sidebar."
     }
 
+    @objc func openRecentProject(_ sender: Any?) {
+        guard let path = (sender as? NSMenuItem)?.representedObject as? String else { return }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            statusLabel.stringValue = "Recent project no longer exists: \(path)"
+            return
+        }
+        open(url: URL(fileURLWithPath: path))
+    }
+
+    static func recentProjectPaths() -> [String] {
+        UserDefaults.standard.stringArray(forKey: "RecentProjectPaths") ?? []
+    }
+
+    private static func rememberProject(_ path: String) {
+        let key = fileKey(path) ?? path
+        var paths = recentProjectPaths().filter { fileKey($0) != key }
+        paths.insert(path, at: 0)
+        UserDefaults.standard.set(Array(paths.prefix(10)), forKey: "RecentProjectPaths")
+        MainMenu.refreshRecentProjects()
+    }
+
     /// Opens a file in its own tab (or shows its tab if already open).
     func openFile(at url: URL) throws {
         if let i = tabIndex(forPath: url.path) {
             tabs[i].isPreview = false
             return selectTab(i)
         }
-        let start = ContinuousClock.now
         let doc = try bridge.openDocument(path: url.path)
         let name = url.lastPathComponent
+        let branch = workspace.flatMap { bridge.gitStatus(workspace: $0)?.branch }
         let tab = EditorTab(doc: doc, title: name, pathComponents: [name], windowTitle: name,
-                            isPreview: false, status: describe(doc, name: name, since: start))
+                            isPreview: false, status: describe(branch: branch))
         tab.fileKey = Self.fileKey(doc.path())
         tab.relPath = relativePath(doc.path())
         add(tab, replacing: slotForOpening(preview: false))
@@ -2860,28 +3137,30 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         let path = URL(fileURLWithPath: workspace.root()).appendingPathComponent(entry.relPath).path
         if let i = tabIndex(forPath: path) {
             if !preview { tabs[i].isPreview = false }
-            return selectTab(i)
+            selectTab(i)
+            window?.makeFirstResponder(editorView)
+            return
         }
         do {
-            let start = ContinuousClock.now
             let doc = try workspace.openFile(relPath: entry.relPath)
+            let branch = bridge.gitStatus(workspace: workspace)?.branch
             let tab = EditorTab(
                 doc: doc, title: entry.name,
                 pathComponents: entry.relPath.split(separator: "/").map(String.init),
                 windowTitle: "\(entry.name) — \(workspace.name())", isPreview: preview,
-                status: describe(doc, name: entry.relPath, since: start))
+                status: describe(branch: branch))
             tab.fileKey = Self.fileKey(doc.path())
             tab.relPath = entry.relPath
             add(tab, replacing: slotForOpening(preview: preview))
+            window?.makeFirstResponder(editorView)
         } catch {
             report(error, while: "open \(entry.relPath)")
         }
     }
 
-    private func describe(_ doc: DocumentHandle, name: String, since start: ContinuousClock.Instant) -> String {
-        let parts = (ContinuousClock.now - start).components
-        let ms = Double(parts.seconds) * 1000 + Double(parts.attoseconds) / 1e15
-        return "\(name): \(doc.lineCount()) lines, \(doc.lenBytes()) bytes, opened in \(String(format: "%.1f", ms)) ms"
+    private func describe(branch: String?) -> String {
+        // The branch is shown once in the left status-bar Git label.
+        return branch == nil ? "No Git branch" : ""
     }
 
     private func report(_ error: Error, while action: String) {

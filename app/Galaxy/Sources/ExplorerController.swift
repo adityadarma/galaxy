@@ -201,6 +201,11 @@ final class ExplorerController: NSObject {
     /// Expands the folders down to `relPath` and selects it, without
     /// opening or toggling anything.
     func reveal(relPath: String) {
+        guard workspace != nil, !relPath.isEmpty else { return }
+        if roots == nil {
+            _ = children(of: nil)
+            outlineView.reloadData()
+        }
         let parts = relPath.split(separator: "/").map(String.init)
         var prefix = ""
         for (i, part) in parts.enumerated() {

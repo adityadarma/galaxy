@@ -219,6 +219,7 @@ extension EditorView {
     @objc func cut(_ sender: Any?) {
         guard let document else { return }
         write(document.cut())
+        onSnippetInvalidated?()
         didChangeDocument()
     }
 
@@ -227,6 +228,7 @@ extension EditorView {
         // The flag only counts if the text is still what we copied.
         let linewise = pasteboard.string(forType: Self.linewiseType) == text
         document.pasteClipboard(text: text, linewise: linewise)
+        onSnippetInvalidated?()
         didChangeDocument()
     }
 

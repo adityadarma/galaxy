@@ -14,6 +14,8 @@ final class SyntaxThemeTests: XCTestCase {
         }
         XCTAssertNotEqual(Theme.syntax("keyword", appearance: light).resolved(for: light),
                           Theme.syntax("keyword", appearance: dark).resolved(for: dark))
+        XCTAssertEqual(Theme.syntax("keyword", appearance: dark).resolved(for: dark), NSColor(hex: "#C678DD")?.resolved(for: dark))
+        XCTAssertEqual(Theme.syntax("function", appearance: dark).resolved(for: dark), NSColor(hex: "#61AFEF")?.resolved(for: dark))
     }
 
     func testSyntaxRunsProduceColoredCoreTextAttributes() throws {
@@ -35,5 +37,33 @@ final class SyntaxThemeTests: XCTestCase {
                                 range: NSRange(location: Int(comment.start), length: Int(comment.end - comment.start)))
         let color = attributed.attribute(.foregroundColor, at: Int(comment.start), effectiveRange: nil) as? NSColor
         XCTAssertEqual(color, Theme.syntax("comment", appearance: NSAppearance.current))
+    }
+
+    /// Regression: the editor's syntax layout used
+    /// `kCTForegroundColorFromContextAttributeName`, so CoreText painted every
+    /// run in the context fill color and all code rendered as plain text.
+    func testEditorSyntaxLayoutDrawsThemeColorsNotContextFill() {
+        let view = EditorView(frame: NSRect(x: 0, y: 0, width: 400, height: 100))
+        view.appearance = NSAppearance(named: .darkAqua)
+        let text = "fn main"
+        let line = view.syntaxLayout(for: text, styles: [StyleRun(line: 0, start: 0, end: 2, scope: "keyword")])
+
+        let width = 200, height = 40
+        let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4,
+                                space: CGColorSpace(name: CGColorSpace.sRGB)!,
+                                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        // Same as the editor: plain text color as the context fill.
+        context.setFillColor(NSColor.white.cgColor)
+        context.textPosition = CGPoint(x: 2, y: 12)
+        CTLineDraw(line, context)
+
+        // Keyword is #FF9AA9 in Galaxy Dark: count clearly pink pixels.
+        let pixels = context.data!.bindMemory(to: UInt8.self, capacity: width * height * 4)
+        var pink = 0
+        for i in 0..<(width * height) where pixels[i * 4 + 3] > 120 {
+            let r = Int(pixels[i * 4]), g = Int(pixels[i * 4 + 1])
+            if r - g > 40 { pink += 1 }
+        }
+        XCTAssertGreaterThan(pink, 10, "keyword run must use its theme color, not the context fill")
     }
 }

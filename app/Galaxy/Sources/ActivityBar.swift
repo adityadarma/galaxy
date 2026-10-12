@@ -1,8 +1,7 @@
 import AppKit
 
 /// Narrow icon strip on the far left, as in VSCode and JetBrains' tool
-/// window bar. Clicking the active item hides the sidebar; Search and
-/// Source Control are present but disabled until those features exist.
+/// window bar. Clicking the active item hides the sidebar.
 @MainActor
 final class ActivityBar: NSView {
     enum Item: CaseIterable {
@@ -28,13 +27,13 @@ final class ActivityBar: NSView {
             "activity-" + title.lowercased().replacingOccurrences(of: " ", with: "-")
         }
 
-        var isAvailable: Bool { self == .explorer }
+        var isAvailable: Bool { self != .search }
 
         var tooltip: String {
             switch self {
             case .explorer: "Explorer (⇧⌘E)"
             case .search: "Search: planned for M5"
-            case .sourceControl: "Source Control: planned for M6"
+            case .sourceControl: "Source Control"
             }
         }
     }

@@ -42,7 +42,7 @@ jobs:
       - name: Build and test
         run: |
           xcodebuild -project app/Galaxy.xcodeproj -scheme Galaxy \
-            -configuration Debug -derivedDataPath app/build test
+            -configuration Debug -derivedDataPath app/build-test test
 
   bench:
     name: Benchmarks

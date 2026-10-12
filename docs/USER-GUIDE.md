@@ -60,7 +60,8 @@ positions, multi-cursor, IME melalui `NSTextInputClient`, dan undo transaction.
 
 ## Navigasi Kode
 
-Jika language server tersedia, Galaxy menyediakan:
+Jika language server tersedia dan berhasil menyelesaikan handshake, Galaxy
+menyediakan:
 
 - Hover.
 - Completion.
@@ -76,6 +77,12 @@ Jika language server tersedia, Galaxy menyediakan:
 Klik diagnostic di Problems panel untuk membuka file dan lokasi terkait.
 Breadcrumb di bawah path file menunjukkan symbol aktif. Klik breadcrumb untuk
 menuju deklarasinya.
+
+Go to Definition (`F12`, atau `Cmd`-klik) mengirim request ke language server
+aktif. Untuk TypeScript/JavaScript, buka folder parent yang memuat frontend dan
+backend agar root workspace dapat menemukan `package.json` atau `tsconfig.json`.
+Untuk PHP/Blade, buka root Laravel yang memuat `artisan` dan install
+`laravel/lsp` terlebih dahulu.
 
 ## Terminal
 

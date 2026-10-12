@@ -8,7 +8,7 @@ enum Theme {
     }
 
     private static let lightSyntax = loadSyntaxTheme(named: "Galaxy Light")
-    private static let darkSyntax = loadSyntaxTheme(named: "Galaxy Dark")
+    private static let darkSyntax = loadSyntaxTheme(named: "One Dark Pro")
 
     /// A semantic syntax color for the current system appearance. JSON keeps
     /// the palette editable without coupling the renderer to Rust scopes.
@@ -50,6 +50,8 @@ enum Theme {
     /// Line numbers: quieter than body text; the caret line uses `accent`.
     static let gutterText = NSColor.secondaryLabelColor
     static let indentGuide = NSColor.separatorColor.withAlphaComponent(0.55)
+    /// Space/tab markers: visible on close look, quieter than comments.
+    static let whitespace = NSColor.secondaryLabelColor.withAlphaComponent(0.38)
     static let bracketMatch = NSColor(name: "GalaxyBracketMatch") { appearance in
         accent.resolved(for: appearance).withAlphaComponent(0.28)
     }
@@ -69,14 +71,14 @@ enum Theme {
     static let chrome = NSColor(name: "GalaxyChrome") { appearance in
         let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         return dark
-            ? NSColor(srgbRed: 0.145, green: 0.141, blue: 0.137, alpha: 1)
+            ? NSColor(hex: "#21252B") ?? .windowBackgroundColor
             : NSColor(srgbRed: 0.949, green: 0.945, blue: 0.937, alpha: 1)
     }
     /// Sidebar: between chrome and editor.
     static let sidebar = NSColor(name: "GalaxySidebar") { appearance in
         let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         return dark
-            ? NSColor(srgbRed: 0.125, green: 0.122, blue: 0.118, alpha: 1)
+            ? NSColor(hex: "#282C34") ?? .controlBackgroundColor
             : NSColor(srgbRed: 0.969, green: 0.965, blue: 0.957, alpha: 1)
     }
     static let tabHeight: CGFloat = 34
@@ -84,10 +86,12 @@ enum Theme {
     static var editorFont: NSFont {
         let defaults = UserDefaults.standard
         let size = max(10, min(24, defaults.object(forKey: "EditorFontSize") as? CGFloat ?? 13))
-        guard let name = defaults.string(forKey: "EditorFontName"), name != "System Monospaced" else {
+        guard let name = defaults.string(forKey: "EditorFontName"),
+              name != "System Monospaced",
+              let selected = NSFont(name: name, size: size) else {
             return .monospacedSystemFont(ofSize: size, weight: .regular)
         }
-        return NSFont(name: name, size: size) ?? .monospacedSystemFont(ofSize: size, weight: .regular)
+        return selected
     }
 
     /// Status bar: compact, secondary text.

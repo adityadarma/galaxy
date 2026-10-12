@@ -258,21 +258,23 @@ pub struct DocumentSync {
     uri: String,
     language_id: String,
     version: u64,
+    initial_text: String,
     pending: Option<PendingChange>,
 }
 
 impl DocumentSync {
-    pub fn new(uri: String, language_id: String) -> Self {
+    pub fn new(uri: String, language_id: String, initial_text: String) -> Self {
         Self {
             uri,
             language_id,
             version: 1,
+            initial_text,
             pending: None,
         }
     }
 
-    pub fn did_open(&self, doc: &Document) -> Value {
-        serde_json::json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":self.uri,"languageId":self.language_id,"version":self.version,"text":doc.text()}}})
+    pub fn did_open(&self) -> Value {
+        serde_json::json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":self.uri,"languageId":self.language_id,"version":self.version,"text":self.initial_text}}})
     }
 
     pub fn note_full_text(&mut self, text: String, now: Instant) {
@@ -488,6 +490,7 @@ fn default_server(language: &str) -> Option<ServerConfig> {
         "typescript" => ("typescript-language-server", &["--stdio"] as &[&str]),
         "python" => ("pyright-langserver", &["--stdio"] as &[&str]),
         "go" => ("gopls", &[] as &[&str]),
+        "php" => ("laravel-lsp", &[] as &[&str]),
         _ => return None,
     };
     find_in_path(program).map(|program| ServerConfig {
@@ -512,6 +515,7 @@ fn default_server_kind(language: &str) -> Option<&'static str> {
         }
         "python" => Some("python"),
         "go" => Some("go"),
+        "php" | "blade" => Some("php"),
         _ => None,
     }
 }
@@ -523,11 +527,32 @@ pub fn find_in_path(program: &str) -> Option<PathBuf> {
     if path.components().count() > 1 {
         return is_executable(path).then(|| path.to_path_buf());
     }
-    env::var_os("PATH")?
-        .as_os_str()
-        .to_str()?
-        .split(':')
-        .map(Path::new)
+    let mut directories = env::var_os("PATH")
+        .into_iter()
+        .flat_map(|value| {
+            value
+                .to_string_lossy()
+                .split(':')
+                .map(PathBuf::from)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    if let Some(home) = env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        directories.extend([home.join(".composer/vendor/bin"), home.join(".local/bin")]);
+        let nvm_bin = home.join(".nvm/versions/node");
+        if let Ok(entries) = std::fs::read_dir(nvm_bin) {
+            for entry in entries.flatten() {
+                directories.push(entry.path().join("bin"));
+            }
+        }
+    }
+    directories.extend([
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/usr/local/bin"),
+    ]);
+    directories
+        .into_iter()
         .map(|dir| dir.join(program))
         .find(|candidate| is_executable(candidate))
 }
@@ -629,7 +654,8 @@ impl LspManager {
         if self.servers.contains_key(&key) {
             return Ok(false);
         }
-        let transport = LspTransport::spawn(&config.program, &config.args, config.log_traffic)?;
+        let transport =
+            LspTransport::spawn(&config.program, &config.args, config.log_traffic, &key.root)?;
         transport.send(&serde_json::json!({
             "jsonrpc": "2.0",
             "id": 0,
@@ -1204,6 +1230,16 @@ impl LspManager {
         timeout: Duration,
         now: Instant,
     ) -> io::Result<u64> {
+        if !self
+            .servers
+            .get(key)
+            .is_some_and(|server| server.initialized)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "language server is not initialized",
+            ));
+        }
         let id = self.next_request_id.max(2);
         self.next_request_id = id.checked_add(1).unwrap_or(2);
         self.send(
@@ -1258,8 +1294,14 @@ impl LspManager {
         language_id: String,
         doc: &Document,
     ) -> io::Result<()> {
-        let sync = DocumentSync::new(uri.clone(), language_id);
-        self.send(&key, &sync.did_open(doc))?;
+        let sync = DocumentSync::new(uri.clone(), language_id, doc.text());
+        if self
+            .servers
+            .get(&key)
+            .is_some_and(|server| server.initialized)
+        {
+            self.send(&key, &sync.did_open())?;
+        }
         self.documents.insert(uri, (key, sync));
         Ok(())
     }
@@ -1323,7 +1365,21 @@ impl LspManager {
                 match server.transport.try_recv() {
                     Ok(Incoming::Message(message)) if !server.initialized && message.get("id") == Some(&Value::from(0)) => {
                         match server.transport.send(&serde_json::json!({"jsonrpc": "2.0", "method": "initialized", "params": {}})) {
-                            Ok(()) => { server.initialized = true; events.push(LspEvent::Initialized(key.clone())); }
+                            Ok(()) => {
+                                server.initialized = true;
+                                let opens: Vec<_> = self
+                                    .documents
+                                    .values()
+                                    .filter(|(document_key, _)| document_key == key)
+                                    .map(|(_, sync)| sync.did_open())
+                                    .collect();
+                                for open in opens {
+                                    if let Err(error) = server.transport.send(&open) {
+                                        events.push(LspEvent::Error(key.clone(), error.to_string()));
+                                    }
+                                }
+                                events.push(LspEvent::Initialized(key.clone()));
+                            }
                             Err(error) => events.push(LspEvent::Error(key.clone(), error.to_string())),
                         }
                     }
@@ -1853,11 +1909,19 @@ pub struct LspTransport {
 impl LspTransport {
     /// Starts `program args...` with piped stdio. `log_traffic` writes JSON
     /// payloads to the tracing debug target `galaxy_lsp_traffic`.
-    pub fn spawn(program: &str, args: &[String], log_traffic: bool) -> io::Result<Self> {
+    pub fn spawn(
+        program: &str,
+        args: &[String],
+        log_traffic: bool,
+        root: &Path,
+    ) -> io::Result<Self> {
         let runtime = Runtime::new()?;
         let mut command = Command::new(program);
+        command.args(args);
+        if root.is_dir() {
+            command.current_dir(root);
+        }
         command
-            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -2122,7 +2186,7 @@ mod tests {
             "-c".to_owned(),
             "read _; read _; body='{\"jsonrpc\":\"2.0\",\"method\":\"ready\"}'; printf 'Content-Length: %s\\r\\n\\r\\n%s' \"${#body}\" \"$body\"".to_owned(),
         ];
-        let transport = LspTransport::spawn("/bin/sh", &args, false).unwrap();
+        let transport = LspTransport::spawn("/bin/sh", &args, false, Path::new("/tmp")).unwrap();
         transport
             .send(&serde_json::json!({"jsonrpc": "2.0", "method": "initialize"}))
             .unwrap();
@@ -2456,11 +2520,8 @@ mod tests {
         );
         after.apply(&change);
         let now = Instant::now();
-        let mut sync = DocumentSync::new("file:///test.rs".into(), "rust".into());
-        assert_eq!(
-            sync.did_open(&before)["params"]["textDocument"]["text"],
-            "a😀中b"
-        );
+        let mut sync = DocumentSync::new("file:///test.rs".into(), "rust".into(), before.text());
+        assert_eq!(sync.did_open()["params"]["textDocument"]["text"], "a😀中b");
         sync.note_change(&before, &after, &change, now);
         assert!(sync.flush(now).is_none());
         let message = sync.flush(now + DOCUMENT_SYNC_DEBOUNCE).unwrap();
@@ -2540,7 +2601,11 @@ mod tests {
 
     #[test]
     fn requests_get_ids_and_stale_work_is_cancelled_or_timed_out() {
-        let args = vec!["-c".to_owned(), "sleep 1".to_owned()];
+        let args = vec![
+            "-c".to_owned(),
+            "read _; read _; body='{".to_owned()
+                + "\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"capabilities\":{}}}'; printf 'Content-Length: %s\\r\\n\\r\\n%s' \"${#body}\" \"$body\"; sleep 1",
+        ];
         let key = LspKey {
             language: "rust".into(),
             root: PathBuf::from("/workspace"),
@@ -2558,6 +2623,15 @@ mod tests {
         };
         let mut manager = LspManager::default();
         manager.ensure_server(key.clone(), &config).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !manager
+            .poll()
+            .iter()
+            .any(|event| matches!(event, LspEvent::Initialized(_)))
+        {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
         let now = Instant::now();
         let cancelled = manager
             .request(
@@ -2600,7 +2674,7 @@ mod tests {
     fn matching_response_completes_a_tracked_request() {
         let args = vec![
             "-c".to_owned(),
-            "read _; read _; read _; read _; body='{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"value\":1}}'; printf 'Content-Length: %s\\r\\n\\r\\n%s' \"${#body}\" \"$body\"; sleep 1".to_owned(),
+            "read _; read _; body='{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"capabilities\":{}}}'; printf 'Content-Length: %s\\r\\n\\r\\n%s' \"${#body}\" \"$body\"; read _; read _; body='{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"value\":1}}'; printf 'Content-Length: %s\\r\\n\\r\\n%s' \"${#body}\" \"$body\"; sleep 1".to_owned(),
         ];
         let key = LspKey {
             language: "rust".into(),
@@ -2619,6 +2693,15 @@ mod tests {
         };
         let mut manager = LspManager::default();
         manager.ensure_server(key.clone(), &config).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !manager
+            .poll()
+            .iter()
+            .any(|event| matches!(event, LspEvent::Initialized(_)))
+        {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
         manager
             .request(
                 &key,
@@ -2645,6 +2728,73 @@ mod tests {
             assert!(Instant::now() < deadline, "response was not observed");
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    #[test]
+    fn definition_request_round_trips_after_initialize() {
+        let args = vec![
+            "-c".to_owned(),
+            "read _; read _; body='{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"capabilities\":{}}}'; printf 'Content-Length: %s\\r\\n\\r\\n%s' \"${#body}\" \"$body\"; read _; read _; read _; read _; body='{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":[{\"uri\":\"file:///workspace/src/lib.rs\",\"range\":{\"start\":{\"line\":4,\"character\":2},\"end\":{\"line\":4,\"character\":8}}}]}'; printf 'Content-Length: %s\\r\\n\\r\\n%s' \"${#body}\" \"$body\"; sleep 1".to_owned(),
+        ];
+        let key = LspKey {
+            language: "rust".into(),
+            root: PathBuf::from("/workspace"),
+        };
+        let config = ServerConfig {
+            program: "/bin/sh".into(),
+            args,
+            log_traffic: false,
+            initialization_options: Value::Null,
+            restart_backoff: [
+                Duration::ZERO,
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+            ],
+        };
+        let mut manager = LspManager::default();
+        manager.ensure_server(key.clone(), &config).unwrap();
+        let document = Document::from_text("fn call() { target(); }\nfn target() {}\n");
+        manager
+            .open_document(
+                key.clone(),
+                "file:///workspace/src/main.rs".into(),
+                "rust".into(),
+                &document,
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !manager
+            .poll()
+            .iter()
+            .any(|event| matches!(event, LspEvent::Initialized(_)))
+        {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        manager
+            .request_definition("file:///workspace/src/main.rs", 0, 13, Instant::now())
+            .unwrap();
+        while manager
+            .definition_locations("file:///workspace/src/main.rs")
+            .is_empty()
+        {
+            assert!(Instant::now() < deadline);
+            manager.poll();
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            manager.definition_locations("file:///workspace/src/main.rs")[0],
+            DefinitionLocation {
+                uri: "file:///workspace/src/lib.rs".into(),
+                range: Range {
+                    start_line: 4,
+                    start_character: 2,
+                    end_line: 4,
+                    end_character: 8,
+                },
+            }
+        );
+        manager.shutdown_all();
     }
 
     #[test]

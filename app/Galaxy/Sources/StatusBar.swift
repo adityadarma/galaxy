@@ -6,12 +6,13 @@ import AppKit
 final class StatusBar: NSView {
     let message = NSTextField(labelWithString: "")
     let largeFileBadge = NSTextField(labelWithString: "Large file")
+    let git = NSButton(title: "", target: nil, action: nil)
+    var onGitClick: (() -> Void)?
     let cursor = StatusBar.label("status-cursor")
     let language = StatusBar.label("status-language")
     let indent = StatusBar.label("status-indent")
     let lineEnding = StatusBar.label("status-eol")
     let encoding = StatusBar.label("status-encoding")
-    let git = StatusBar.label("status-git")
     let lsp = StatusBar.label("status-lsp")
 
     override init(frame: NSRect) {
@@ -33,9 +34,18 @@ final class StatusBar: NSView {
         largeFileBadge.setAccessibilityIdentifier("large-file-banner")
         largeFileBadge.isHidden = true
 
-        let left = NSStackView(views: [message, largeFileBadge])
+        git.isBordered = false
+        git.bezelStyle = .inline
+        git.font = Theme.statusFont
+        git.contentTintColor = .secondaryLabelColor
+        git.alignment = .left
+        git.setAccessibilityIdentifier("status-git")
+        git.target = self
+        git.action = #selector(gitClicked(_:))
+
+        let left = NSStackView(views: [git, message, largeFileBadge])
         left.spacing = 8
-        let right = NSStackView(views: [cursor, language, indent, lineEnding, encoding, git, lsp])
+        let right = NSStackView(views: [cursor, language, indent, lineEnding, encoding, lsp])
         right.spacing = 14
         // The spacer takes the slack, so the facts sit on the right edge.
         let spacer = NSView()
@@ -101,17 +111,10 @@ final class StatusBar: NSView {
         showCursor(of: doc)
     }
 
-    func showGit(branch: String?, changedCount: Int) {
-        guard let branch else {
-            git.stringValue = ""
-            return
-        }
-        git.stringValue = changedCount == 0 ? "Git: \(branch)" : "Git: \(branch) · \(changedCount)"
-    }
-
     func showLSP(_ status: LspStatusInfo) {
         if let error = status.error {
-            lsp.stringValue = "LSP: Error"
+            let detail = error.components(separatedBy: ": ").last ?? error
+            lsp.stringValue = "LSP: Error (\(detail))"
             lsp.toolTip = error
         } else if let progress = status.progress.first {
             let percent = progress.percentage.map { " \(Int($0))%" } ?? ""
@@ -129,6 +132,16 @@ final class StatusBar: NSView {
             lsp.toolTip = nil
         }
     }
+
+    func showGit(branch: String?, changedCount: Int) {
+        guard let branch else {
+            git.title = ""
+            return
+        }
+        git.title = "Git: \(branch)"
+    }
+
+    @objc private func gitClicked(_ sender: Any?) { onGitClick?() }
 
     /// Lightweight path detection for the status bar. Syntax parsers replace
     /// this in M3, but the label is useful before highlighting exists.

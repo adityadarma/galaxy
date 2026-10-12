@@ -52,6 +52,7 @@ tree-sitter-go = "=0.25.0"
 tree-sitter-html = "=0.23.2"
 tree-sitter-css = "=0.25.0"
 tree-sitter-bash = "=0.25.1"
+tree-sitter-php = "=0.25.1"
 proptest = { version = "=1.11.0", default-features = false, features = ["std"] }
 # LSP JSON-RPC stdio transport. Kept feature-minimal: process, pipes and runtime.
 tokio = { version = "=1.48.0", default-features = false, features = ["io-util", "process", "rt-multi-thread", "sync"] }

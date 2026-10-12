@@ -25,6 +25,7 @@ pub mod multicursor;
 pub mod navigation;
 pub mod position;
 pub mod selection;
+pub mod snippets;
 pub mod syntax;
 pub mod terminal;
 pub mod viewport;

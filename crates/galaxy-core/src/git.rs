@@ -2,13 +2,14 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-
-use gix::bstr::ByteSlice;
+use std::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitFileStatus {
     pub path: String,
     pub kind: GitFileStatusKind,
+    pub staged: bool,
+    pub code: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +22,79 @@ pub struct GitStatus {
     pub root: PathBuf,
     pub branch: Option<String>,
     pub files: Vec<GitFileStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitBranch {
+    pub name: String,
+    pub current: bool,
+    pub remote: bool,
+}
+
+pub fn branches(root: &Path) -> io::Result<Vec<GitBranch>> {
+    let output = Command::new("git")
+        .args([
+            "-C",
+            &root.to_string_lossy(),
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads",
+            "refs/remotes",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        ));
+    }
+    let current = read_status(root)?
+        .and_then(|status| status.branch)
+        .unwrap_or_default();
+    let mut result = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|name| !name.ends_with("/HEAD"))
+        .map(|name| {
+            let remote = name.starts_with("origin/") || name.contains('/');
+            GitBranch {
+                name: name.to_owned(),
+                current: name == current,
+                remote,
+            }
+        })
+        .collect::<Vec<_>>();
+    result.sort_by_key(|branch| (!branch.current, branch.remote, branch.name.clone()));
+    result.dedup_by(|a, b| a.name == b.name);
+    Ok(result)
+}
+
+pub fn checkout(root: &Path, name: &str) -> io::Result<()> {
+    if name.is_empty() || name.contains('\n') || name.contains('\0') {
+        return Err(io::Error::other("invalid branch name"));
+    }
+    let status = Command::new("git")
+        .args(["-C", &root.to_string_lossy(), "checkout", name])
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("git checkout failed for {name}")))
+    }
+}
+
+pub fn create_branch(root: &Path, name: &str) -> io::Result<()> {
+    if name.is_empty() || name.contains('\n') || name.contains('\0') {
+        return Err(io::Error::other("invalid branch name"));
+    }
+    let status = Command::new("git")
+        .args(["-C", &root.to_string_lossy(), "switch", "-c", name])
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!(
+            "git branch creation failed for {name}"
+        )))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -122,19 +196,38 @@ pub fn read_status(root: &Path) -> io::Result<Option<GitStatus>> {
         .head_name()
         .map_err(io::Error::other)?
         .map(|name| name.shorten().to_string());
+    let output = Command::new("git")
+        .args([
+            "-C",
+            &root.to_string_lossy(),
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+        ])
+        .output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        ));
+    }
     let mut files = Vec::new();
-    let platform = repo
-        .status(gix::progress::Discard)
-        .map_err(io::Error::other)?;
-    let mut iter = platform
-        .untracked_files(gix::status::UntrackedFiles::Files)
-        .into_iter(std::iter::empty::<gix::bstr::BString>())
-        .map_err(io::Error::other)?;
-    while let Some(item) = iter.next().transpose().map_err(io::Error::other)? {
-        let path = item.location().to_str_lossy().into_owned();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if line.len() < 3 {
+            continue;
+        }
+        let code = line[..2].to_owned();
+        let path = line[3..]
+            .strip_prefix('"')
+            .unwrap_or(&line[3..])
+            .rsplit(" -> ")
+            .next()
+            .unwrap_or(&line[3..])
+            .to_owned();
         files.push(GitFileStatus {
             path,
             kind: GitFileStatusKind::Changed,
+            staged: code.as_bytes()[0] != b' ' && code.as_bytes()[0] != b'?',
+            code,
         });
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -148,6 +241,41 @@ pub fn read_status(root: &Path) -> io::Result<Option<GitStatus>> {
         branch,
         files,
     }))
+}
+
+pub fn stage(root: &Path, path: &str) -> io::Result<()> {
+    git_path_command(root, ["add", "--", path])
+}
+
+pub fn unstage(root: &Path, path: &str) -> io::Result<()> {
+    git_path_command(root, ["restore", "--staged", "--", path])
+}
+
+pub fn commit(root: &Path, message: &str) -> io::Result<()> {
+    if message.trim().is_empty() {
+        return Err(io::Error::other("commit message is empty"));
+    }
+    let status = Command::new("git")
+        .args(["-C", &root.to_string_lossy(), "commit", "-m", message])
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other("git commit failed"))
+    }
+}
+
+fn git_path_command<const N: usize>(root: &Path, args: [&str; N]) -> io::Result<()> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other("git operation failed"))
+    }
 }
 
 #[cfg(test)]

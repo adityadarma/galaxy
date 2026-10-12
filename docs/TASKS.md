@@ -137,8 +137,8 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
   - Status: Request completion, parsing item/textEdit, fuzzy subsequence filter, keyboard popup, dan snippet placeholder removal selesai. `completionItem/resolve` belum diperlukan untuk server yang mengembalikan detail langsung.
 - [x] M4-09 — Signature help.
   - Status: `textDocument/signatureHelp`, signature/parameter parsing, active parameter highlighting, and editor popup selesai.
-- [x] M4-10 — Go to definition / type definition / implementation (`F12`, `Cmd+Click`).
-  - Status: request LSP definition/typeDefinition/implementation, parsing Location/LocationLink, pembukaan file target, navigation history, menu, `F12`, dan `Cmd+Click` selesai.
+- [ ] M4-10 — Go to definition / type definition / implementation (`F12`, `Cmd+Click`).
+  - Status: request LSP definition/typeDefinition/implementation, parsing Location/LocationLink, pembukaan file target, navigation history, menu, `F12`, dan `Cmd+Click` sudah diimplementasikan. Acceptance end-to-end masih pending untuk rust-analyzer, TypeScript, dan Laravel LSP.
 - [x] M4-11 — Find references dengan panel hasil.
   - Status: `textDocument/references`, parsing lokasi, panel hasil, navigasi ke file/baris, dan menu Find References selesai.
 - [x] M4-12 — Rename symbol: input inline, terapkan `WorkspaceEdit` ke file terbuka dan tertutup, satu langkah undo per file.
@@ -153,10 +153,8 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
   - Status: request `textDocument/documentSymbol`, parsing nested `DocumentSymbol` dan flat `SymbolInformation`, refresh Go to Symbol saat response tersedia, fallback Tree-sitter dipertahankan selesai.
 - [x] M4-17 — Workspace symbols search dari LSP.
   - Status: request `workspace/symbol` mengikuti query picker, hasil lintas file ditampilkan di Go to Symbol, URI target dinavigasi, dan fallback outline lokal dipertahankan selesai.
-- [ ] M4-13 — Code actions / quick fix (`Cmd+.`).
-- [ ] M4-14 — Formatting dokumen dan format on save.
-- [ ] M4-15 — `$/progress` dan status server di status bar, termasuk RAM proses server.
-  - Status: partial. `$/progress` begin/report/end diparse di `LspManager`, status server/progress/error diekspos melalui FFI, dan status bar menampilkan server ready, progress, atau error. RAM proses server belum tersedia karena transport belum mengekspos PID/process metrics.
+- M4-15 — `$/progress` dan status server di status bar, termasuk RAM proses server.
+  - Status: sebagian selesai. `$/progress` begin/report/end diparse di `LspManager`, status server/progress/error diekspos melalui FFI, dan status bar menampilkan server ready, progress, atau error. PID/RSS process sudah diekspos melalui transport, tetapi verifikasi lintas server nyata masih pending.
 - [x] M4-16 — Auto-restart server crash (maks 3x / 5 menit) dan command Restart/Stop server.
   - Status: server menyimpan konfigurasi, mendeteksi `Closed`, menjadwalkan auto-restart dengan backoff default 0/1/2 detik, membatasi maksimal 3 crash dalam 5 menit, dan membatalkan retry saat Stop atau restart manual. `restartBackoffMs` menerima tiga nilai milidetik per server pada settings. Command `Restart Language Server`/`Stop Language Server` tersedia melalui menu Go serta Command Palette. PID dan RSS server di-sample melalui `ps` dengan cache lima detik dan tampil pada tooltip status bar.
 - [ ] M4-17 — Uji end-to-end dengan `rust-analyzer` pada repo `ripgrep`.
@@ -174,7 +172,7 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
 - [x] M5-03 — Panel hasil search dengan konteks baris dan navigasi keyboard.
   - Status: Setiap hasil menampilkan path, lokasi UTF-16, baris match, serta satu baris konteks sebelum dan sesudahnya. Panel mempertahankan selection saat hasil diperbarui, mendukung Up/Down, Page Up/Page Down, Enter, klik, dan Escape. Hasil dibuka langsung pada lokasi match. Rust dan Swift unit tests lulus.
 - [ ] M5-04 — Integrasi dan uji `typescript-language-server`.
-  - Status: Integrasi built-in sudah diperbaiki: label UI `TypeScript`, `TypeScript React`, `JavaScript`, dan `JavaScript React` kini dinormalisasi ke server `typescript-language-server --stdio`, sehingga startup LSP tidak lagi gagal karena label display. Resolver alias dan lifecycle JSON-RPC tercakup test Rust, serta full Rust/Swift verification lulus. Smoke test dengan executable `typescript-language-server` nyata masih pending karena executable belum terpasang di environment ini.
+  - Status: resolver alias, fallback path Node/nvm, dan lifecycle handshake sudah tersedia. Test fixture definition lulus; smoke test executable nyata dan verifikasi UI masih pending.
 - [ ] M5-05 — Integrasi dan uji `pyright-langserver`.
 - [x] M5-06 — Integrasi dan uji `gopls`.
   - Status: resolver default memakai `gopls` tanpa argumen untuk bahasa Go dan berbagi satu server per workspace. Smoke test menjalankan executable `gopls` nyata bila tersedia, memverifikasi lifecycle `initialize`/`initialized`, lalu melakukan shutdown bersih. Jika executable tidak tersedia di CI, test dilewati tanpa mengubah hasil fitur lain.

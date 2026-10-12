@@ -53,6 +53,10 @@ final class EditorView: NSView {
         didSet { if gitLineChanges != oldValue { needsDisplay = true } }
     }
     var semanticTokens: [SemanticTokenInfo] = [] { didSet { needsDisplay = true } }
+    /// `editor.renderWhitespace`; dots everywhere unless settings say otherwise.
+    var renderWhitespace: WhitespaceRendering = .all {
+        didSet { if renderWhitespace != oldValue { needsDisplay = true } }
+    }
     var inlayHints: [InlayHintInfo] = [] { didSet { needsDisplay = true } }
 
     /// Drops derived Core Text/LSP decorations while retaining the document.
@@ -92,6 +96,7 @@ final class EditorView: NSView {
     var onHover: ((TextPos, NSPoint) -> Void)?
     var onCompletionKey: ((NSEvent) -> Bool)?
     var onTextInput: ((String) -> Void)?
+    var onSnippetInvalidated: (() -> Void)?
     var onDefinitionClick: ((TextPos) -> Bool)?
     /// A change is waiting for the next frame.
     private(set) var hasPendingChange = false
@@ -439,11 +444,23 @@ final class EditorView: NSView {
                 context.fill(CGRect(x: 0, y: top, width: bounds.width, height: lineHeight))
             }
 
-            // Leading-whitespace guides are quiet vertical rails at tab stops.
-            context.setFillColor(Theme.indentGuide.cgColor)
-            for column in line.indentGuides {
-                let x = originX + xOffset(in: line.text, column: column)
-                context.fill(CGRect(x: x, y: top, width: 1, height: lineHeight))
+            // Subtle divider between line numbers and source text.
+            context.setFillColor(NSColor.separatorColor.withAlphaComponent(0.28).cgColor)
+            context.fill(CGRect(x: gutterWidth - 1, y: top, width: 1, height: lineHeight))
+
+            // Indent guides sit behind text and whitespace markers. Draw one
+            // guide for each complete four-space indentation level.
+            let indentColumns = leadingIndentColumns(in: line.text)
+            if indentColumns >= 4 {
+                context.setFillColor(NSColor.separatorColor.withAlphaComponent(0.16).cgColor)
+                var column = 4
+                // The deepest guide sits immediately beside the text and is
+                // visually noisy; keep only the parent-level guides.
+                while column < indentColumns {
+                    let x = originX + CGFloat(column) * metrics.spaceWidth - 0.5
+                    context.fill(CGRect(x: x, y: top, width: 1, height: lineHeight))
+                    column += 4
+                }
             }
 
             // Matching delimiter cells, below selections and above text.
@@ -462,6 +479,12 @@ final class EditorView: NSView {
                     let x1 = originX + xOffset(in: line.text, column: span.end)
                     context.fill(CGRect(x: x0, y: top, width: max(0, x1 - x0), height: lineHeight))
                 }
+            }
+
+            // Whitespace markers sit under selection fills, so selecting a
+            // line keeps the selection color uniform.
+            if renderWhitespace != .none, !line.text.isEmpty {
+                drawWhitespace(in: line.text, originX: originX, top: top, context: context)
             }
 
             // Selections. A span that continues past the line end is
@@ -540,6 +563,56 @@ final class EditorView: NSView {
         }
     }
 
+    /// UTF-16 columns of the whitespace that `renderWhitespace` marks in
+    /// `text`. `.boundary` skips single spaces between words, as in VSCode.
+    static func whitespaceColumns(in text: String, mode: WhitespaceRendering) -> [Int] {
+        guard mode != .none else { return [] }
+        let units = Array(text.utf16)
+        let space = UInt16(UInt8(ascii: " ")), tab = UInt16(UInt8(ascii: "\t"))
+        let isBlank = { (i: Int) in i >= 0 && i < units.count && (units[i] == space || units[i] == tab) }
+        var columns: [Int] = []
+        for i in units.indices where isBlank(i) {
+            if mode == .boundary, units[i] == space, !isBlank(i - 1), !isBlank(i + 1), i > 0, i < units.count - 1 {
+                continue
+            }
+            columns.append(i)
+        }
+        return columns
+    }
+
+    private func leadingIndentColumns(in text: String) -> Int {
+        var columns = 0
+        for character in text {
+            switch character {
+            case " ": columns += 1
+            case "\t": columns += 4
+            default: return columns
+            }
+        }
+        return columns
+    }
+
+    private func drawWhitespace(in text: String, originX: CGFloat, top: CGFloat, context: CGContext) {
+        let columns = Self.whitespaceColumns(in: text, mode: renderWhitespace)
+        guard !columns.isEmpty else { return }
+        let units = Array(text.utf16)
+        let tab = UInt16(UInt8(ascii: "\t"))
+        // Centered on the x-height, where VSCode puts its middle dots.
+        let midY = top + metrics.ascent - max(font.xHeight, 1) / 2
+        let radius = max(1, (font.pointSize / 13).rounded(.down)) * 0.9
+        context.setFillColor(Theme.whitespace.cgColor)
+        for column in columns {
+            let x0 = originX + xOffset(in: text, column: UInt64(column))
+            let x1 = originX + xOffset(in: text, column: UInt64(column + 1))
+            if units[column] == tab {
+                context.fill(CGRect(x: x0 + 2, y: midY - 0.5, width: max(1, x1 - x0 - 4), height: 1))
+            } else {
+                let cx = (x0 + x1) / 2
+                context.fillEllipse(in: CGRect(x: cx - radius, y: midY - radius, width: radius * 2, height: radius * 2))
+            }
+        }
+    }
+
     private func semanticColor(_ tokenType: UInt64) -> NSColor {
         ([NSColor.systemBlue, .systemPurple, .systemTeal, .systemOrange, .systemGreen][Int(tokenType % 5)]).withAlphaComponent(0.65)
     }
@@ -568,9 +641,12 @@ final class EditorView: NSView {
     /// A colored layout is intentionally not cached: style runs, selection
     /// and macOS appearance change independently while plain layouts are
     /// shared for drawing, hit-testing and scrolling.
-    private func syntaxLayout(for text: String, styles: [StyleRun]) -> CTLine {
-        let fromContext = NSAttributedString.Key(kCTForegroundColorFromContextAttributeName as String)
-        let attributed = NSMutableAttributedString(string: text, attributes: [.font: font, fromContext: true])
+    func syntaxLayout(for text: String, styles: [StyleRun]) -> CTLine {
+        // No `kCTForegroundColorFromContextAttributeName` here: it makes
+        // CoreText draw every run in the context's fill color, so all syntax
+        // colors came out as `textColor`. Unstyled text gets it explicitly.
+        let base = NSColor.textColor.resolved(for: effectiveAppearance)
+        let attributed = NSMutableAttributedString(string: text, attributes: [.font: font, .foregroundColor: base])
         let length = (text as NSString).length
         for style in styles {
             let start = min(Int(style.start), length)

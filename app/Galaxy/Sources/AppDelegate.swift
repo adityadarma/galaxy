@@ -41,8 +41,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let url = pendingURL {
             pendingURL = nil
             controller.open(url: url)
-        } else if !Self.shouldRestoreSession || !restoreSession(in: controller) {
-            // Start in an empty buffer so the window is usable immediately.
+        } else {
+        // Do not restore the previous session automatically. A stale project,
+        // tab, or language-server state must never prevent the app from opening.
             controller.newDocument(nil)
         }
 
@@ -101,7 +102,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             || LatencyBench.requestedCount != nil || ScrollBench.requestedFrames != nil {
             return false
         }
-        return UserDefaults.standard.object(forKey: "RestoreSession") as? Bool ?? true
+        return false
     }
 
     private func restoreSession(in controller: MainWindowController) -> Bool {

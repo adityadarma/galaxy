@@ -80,6 +80,17 @@ final class CoreBridge {
         core.completions(document: document)
     }
 
+    func snippetCompletions(document: DocumentHandle) -> [CompletionInfo] {
+        document.snippetCompletions()
+    }
+
+    func expandedSnippet(body: String, baseIndent: String, indentUnit: String,
+                         filename: String, selectedText: String, currentYear: String) -> SnippetExpansionInfo {
+        expandSnippet(body: body, baseIndent: baseIndent, indentUnit: indentUnit,
+                      filename: filename, selectedText: selectedText, currentYear: currentYear)
+    }
+
+
     func requestSignatureHelp(document: DocumentHandle, line: UInt64, character: UInt64) {
         _ = core.requestSignatureHelp(document: document, line: line, character: character)
     }
@@ -169,6 +180,30 @@ final class CoreBridge {
 
     func gitStatus(workspace: Workspace) -> GitStatusInfo? {
         try? workspace.gitStatus()
+    }
+
+    func gitBranches(workspace: Workspace) -> [GitBranchInfo] {
+        (try? workspace.gitBranches()) ?? []
+    }
+
+    func gitCheckout(workspace: Workspace, name: String) -> Bool {
+        (try? workspace.gitCheckout(name: name)) != nil
+    }
+
+    func gitCreateBranch(workspace: Workspace, name: String) -> Bool {
+        (try? workspace.gitCreateBranch(name: name)) != nil
+    }
+
+    func gitStage(workspace: Workspace, path: String) -> Bool {
+        (try? workspace.gitStage(path: path)) != nil
+    }
+
+    func gitUnstage(workspace: Workspace, path: String) -> Bool {
+        (try? workspace.gitUnstage(path: path)) != nil
+    }
+
+    func gitCommit(workspace: Workspace, message: String) -> Bool {
+        (try? workspace.gitCommit(message: message)) != nil
     }
 
     func gitDiffLines(workspace: Workspace, path: String, text: String) -> [GitLineChangeInfo] {

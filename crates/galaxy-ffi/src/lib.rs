@@ -25,6 +25,7 @@ use galaxy_core::multicursor;
 use galaxy_core::navigation::{self, Location, NavHistory};
 use galaxy_core::position::Utf16Position;
 use galaxy_core::selection::{Selection, SelectionSet};
+use galaxy_core::snippets;
 use galaxy_core::syntax::{self, SyntaxLanguage, SyntaxService, SyntaxSnapshot};
 use galaxy_core::terminal::TerminalSession;
 use galaxy_core::viewport;
@@ -420,6 +421,10 @@ impl Core {
             language: language.clone(),
             root: PathBuf::from(root),
         };
+        let normalized = language.to_ascii_lowercase();
+        if (normalized == "php" || normalized == "blade") && !key.root.join("artisan").is_file() {
+            return Ok(false);
+        }
         let Some(config) = LspSettings::default().resolve(&language) else {
             return Ok(false);
         };
@@ -1198,6 +1203,59 @@ pub struct CompletionInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SnippetExpansionInfo {
+    pub text: String,
+    pub stops: Vec<SnippetStopInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct SnippetStopInfo {
+    pub index: u32,
+    pub range: Utf16Range,
+}
+
+#[uniffi::export]
+pub fn expand_snippet(
+    body: String,
+    base_indent: String,
+    indent_unit: String,
+    filename: String,
+    selected_text: String,
+    current_year: String,
+) -> SnippetExpansionInfo {
+    let context = snippets::ExpansionContext {
+        filename,
+        selected_text,
+        current_year,
+    };
+    let expansion = snippets::expand_with_context(&body, &base_indent, &indent_unit, &context);
+    let stops = expansion
+        .stops
+        .iter()
+        .map(|stop| {
+            let prefix: String = expansion.text.chars().take(stop.start).collect();
+            let text: String = expansion
+                .text
+                .chars()
+                .skip(stop.start)
+                .take(stop.end.saturating_sub(stop.start))
+                .collect();
+            SnippetStopInfo {
+                index: stop.index,
+                range: Utf16Range {
+                    location: prefix.encode_utf16().count() as u64,
+                    length: text.encode_utf16().count() as u64,
+                },
+            }
+        })
+        .collect();
+    SnippetExpansionInfo {
+        text: expansion.text,
+        stops,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct SignatureInfo {
     pub label: String,
     pub documentation: Option<String>,
@@ -1292,6 +1350,21 @@ pub struct WorkspaceSearchMatch {
 pub struct GitStatusInfo {
     pub branch: Option<String>,
     pub changed_paths: Vec<String>,
+    pub changes: Vec<GitChangeInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GitChangeInfo {
+    pub path: String,
+    pub staged: bool,
+    pub code: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GitBranchInfo {
+    pub name: String,
+    pub current: bool,
+    pub remote: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
@@ -1569,8 +1642,53 @@ impl Workspace {
     pub fn git_status(&self) -> Result<Option<GitStatusInfo>, CoreError> {
         Ok(self.inner.git_status()?.map(|status| GitStatusInfo {
             branch: status.branch,
-            changed_paths: status.files.into_iter().map(|file| file.path).collect(),
+            changed_paths: status.files.iter().map(|file| file.path.clone()).collect(),
+            changes: status
+                .files
+                .into_iter()
+                .map(|file| GitChangeInfo {
+                    path: file.path,
+                    staged: file.staged,
+                    code: file.code,
+                })
+                .collect(),
         }))
+    }
+
+    pub fn git_branches(&self) -> Result<Vec<GitBranchInfo>, CoreError> {
+        Ok(galaxy_core::git::branches(&self.inner.root())?
+            .into_iter()
+            .map(|branch| GitBranchInfo {
+                name: branch.name,
+                current: branch.current,
+                remote: branch.remote,
+            })
+            .collect())
+    }
+
+    pub fn git_checkout(&self, name: String) -> Result<(), CoreError> {
+        galaxy_core::git::checkout(&self.inner.root(), &name)?;
+        Ok(())
+    }
+
+    pub fn git_create_branch(&self, name: String) -> Result<(), CoreError> {
+        galaxy_core::git::create_branch(&self.inner.root(), &name)?;
+        Ok(())
+    }
+
+    pub fn git_stage(&self, path: String) -> Result<(), CoreError> {
+        galaxy_core::git::stage(&self.inner.root(), &path)?;
+        Ok(())
+    }
+
+    pub fn git_unstage(&self, path: String) -> Result<(), CoreError> {
+        galaxy_core::git::unstage(&self.inner.root(), &path)?;
+        Ok(())
+    }
+
+    pub fn git_commit(&self, message: String) -> Result<(), CoreError> {
+        galaxy_core::git::commit(&self.inner.root(), &message)?;
+        Ok(())
     }
 
     pub fn terminal(&self, cols: u16, rows: u16) -> Result<Arc<TerminalHandle>, CoreError> {
@@ -2237,6 +2355,22 @@ impl DocumentHandle {
             .syntax
             .as_ref()
             .map(|syntax| syntax.language.name().to_owned())
+    }
+
+    /// Built-in snippets for this document's file type. The UI filters these
+    /// by the word immediately before the caret and merges them with LSP
+    /// completions.
+    pub fn snippet_completions(&self) -> Vec<CompletionInfo> {
+        let path = self.path();
+        snippets::snippets_for_path(&path)
+            .into_iter()
+            .map(|snippet| CompletionInfo {
+                label: snippet.prefix.to_owned(),
+                detail: Some(format!("Snippet: {}", snippet.description)),
+                insert_text: snippet.body.to_owned(),
+                is_snippet: true,
+            })
+            .collect()
     }
 
     /// Polls the background parser without blocking. `true` means styles for

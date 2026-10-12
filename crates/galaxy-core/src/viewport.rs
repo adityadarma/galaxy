@@ -303,9 +303,14 @@ pub fn snapshot(
     }
 }
 
+/// Guide columns inside the leading whitespace, one per enclosing indent
+/// level. A guide at the column where code starts would be drawn flush
+/// against its first glyph (like a stray `|`), so it is left out; lines
+/// that are only whitespace keep every level so blocks stay connected.
 fn indent_guides(text: &str, tab_size: usize) -> Vec<usize> {
     let mut col = 0;
     let mut guides = Vec::new();
+    let mut has_code = false;
     for c in text.chars() {
         match c {
             ' ' => {
@@ -318,8 +323,14 @@ fn indent_guides(text: &str, tab_size: usize) -> Vec<usize> {
                 col += tab_size - col % tab_size;
                 guides.push(col)
             }
-            _ => break,
+            _ => {
+                has_code = true;
+                break;
+            }
         }
+    }
+    if has_code && guides.last() == Some(&col) {
+        guides.pop();
     }
     guides
 }
@@ -370,8 +381,9 @@ mod tests {
         let caret = doc.text().find('(').unwrap() + 1;
         let sel = SelectionSet::new(vec![Selection::caret(caret)], 0, &doc);
         let snap = snapshot(&doc, &sel, 0, 3);
-        assert_eq!(snap.lines[0].indent_guides, vec![4]);
-        assert_eq!(snap.lines[1].indent_guides, vec![4, 8]);
+        // No guide at the column where the code starts.
+        assert_eq!(snap.lines[0].indent_guides, Vec::<usize>::new());
+        assert_eq!(snap.lines[1].indent_guides, vec![4]);
         let mut decorated = snap.clone();
         add_bracket_match(&doc, &sel, &mut decorated);
         assert_eq!(decorated.lines[0].brackets.len(), 2);

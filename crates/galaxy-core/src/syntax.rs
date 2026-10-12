@@ -41,10 +41,11 @@ pub enum SyntaxLanguage {
     Html,
     Css,
     Bash,
+    Php,
 }
 
 impl SyntaxLanguage {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Rust,
         Self::TypeScript,
         Self::Tsx,
@@ -58,6 +59,7 @@ impl SyntaxLanguage {
         Self::Html,
         Self::Css,
         Self::Bash,
+        Self::Php,
     ];
 
     pub fn name(self) -> &'static str {
@@ -75,6 +77,7 @@ impl SyntaxLanguage {
             Self::Html => "HTML",
             Self::Css => "CSS",
             Self::Bash => "Bash",
+            Self::Php => "PHP",
         }
     }
 
@@ -85,6 +88,7 @@ impl SyntaxLanguage {
             Self::Rust | Self::TypeScript | Self::Tsx | Self::JavaScript | Self::Go => Some("//"),
             Self::Toml | Self::Yaml | Self::Python | Self::Bash => Some("#"),
             Self::Json | Self::Html | Self::Css | Self::Markdown => None,
+            Self::Php => Some("//"),
         }
     }
 
@@ -103,6 +107,7 @@ impl SyntaxLanguage {
             Self::Html => tree_sitter_html::LANGUAGE.into(),
             Self::Css => tree_sitter_css::LANGUAGE.into(),
             Self::Bash => tree_sitter_bash::LANGUAGE.into(),
+            Self::Php => tree_sitter_php::LANGUAGE_PHP.into(),
         }
     }
 
@@ -123,6 +128,7 @@ impl SyntaxLanguage {
             Self::Html => tree_sitter_html::HIGHLIGHTS_QUERY,
             Self::Css => tree_sitter_css::HIGHLIGHTS_QUERY,
             Self::Bash => BASH_HIGHLIGHTS,
+            Self::Php => tree_sitter_php::HIGHLIGHTS_QUERY,
         }
     }
 
@@ -175,6 +181,7 @@ impl SyntaxLanguage {
             "html" | "htm" => Some(Self::Html),
             "css" => Some(Self::Css),
             "sh" | "bash" | "zsh" => Some(Self::Bash),
+            "php" => Some(Self::Php),
             _ => None,
         };
         if by_extension.is_some() {
@@ -467,7 +474,7 @@ pub fn style_runs_for_viewport(
 }
 
 fn cached_highlight_query(language: SyntaxLanguage) -> Option<&'static Query> {
-    static QUERIES: [OnceLock<Option<Query>>; 13] = [const { OnceLock::new() }; 13];
+    static QUERIES: [OnceLock<Option<Query>>; 14] = [const { OnceLock::new() }; 14];
     let slot = &QUERIES[language as usize];
     slot.get_or_init(|| language.compile_highlights().ok())
         .as_ref()
@@ -811,6 +818,10 @@ mod tests {
             (SyntaxLanguage::Html, "<main>Galaxy</main>"),
             (SyntaxLanguage::Css, "main { color: red; }"),
             (SyntaxLanguage::Bash, "#!/usr/bin/env bash\necho Galaxy"),
+            (
+                SyntaxLanguage::Php,
+                "<?php function hello(string $name): string { return $name; }",
+            ),
         ];
         assert_eq!(SyntaxLanguage::ALL.len(), samples.len());
         for (language, source) in samples {
@@ -941,6 +952,14 @@ mod tests {
             Some(SyntaxLanguage::Bash)
         );
         assert_eq!(SyntaxLanguage::detect("notes.txt", "hello"), None);
+        assert_eq!(
+            SyntaxLanguage::detect("app/Console/Kernel.php", "<?php"),
+            Some(SyntaxLanguage::Php)
+        );
+        assert_eq!(
+            SyntaxLanguage::detect("resources/views/welcome.blade.php", "<?php"),
+            Some(SyntaxLanguage::Php)
+        );
     }
 
     #[test]
@@ -994,5 +1013,19 @@ mod tests {
             assert!(run.start < run.end);
             assert!(run.end <= text.encode_utf16().count());
         }
+    }
+
+    #[test]
+    fn php_styles_include_keywords_variables_and_strings() {
+        let doc = Document::from_text(
+            "<?php\nclass User { public function name() { return \"Ada\"; } }\n",
+        );
+        let language = SyntaxLanguage::Php;
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(doc.text(), None).unwrap();
+        let runs = style_runs_for_viewport(&doc, &tree, language, 0, 2);
+        assert!(runs.iter().any(|run| run.scope == HighlightScope::Keyword));
+        assert!(runs.iter().any(|run| run.scope == HighlightScope::String));
     }
 }

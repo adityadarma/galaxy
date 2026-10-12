@@ -24,6 +24,13 @@ final class TwoGenerationCacheTests: XCTestCase {
 
 @MainActor
 final class EditorViewTests: XCTestCase {
+    func testWhitespaceColumnsRenderAllAndBoundaryModes() {
+        XCTAssertEqual(EditorView.whitespaceColumns(in: "a  b\t", mode: .all), [1, 2, 4])
+        XCTAssertEqual(EditorView.whitespaceColumns(in: "a b", mode: .boundary), [])
+        XCTAssertEqual(EditorView.whitespaceColumns(in: "a  b", mode: .boundary), [1, 2])
+        XCTAssertEqual(EditorView.whitespaceColumns(in: "a b", mode: .none), [])
+    }
+
     private func makeDocument(lines: Int) throws -> (DocumentHandle, URL) {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("galaxy-\(UUID().uuidString).txt")
@@ -210,8 +217,10 @@ final class EditorViewTests: XCTestCase {
         let plain = try luminance(rep, view, x: view.textOriginX + 5 * sw, y: y)
         XCTAssertGreaterThan(abs(selected - plain), 0.05, "selected columns must be tinted")
         // Edges: just before the start and just after the end stay plain.
-        let before = try luminance(rep, view, x: view.textOriginX + 0.5 * sw, y: y)
-        let after = try luminance(rep, view, x: view.textOriginX + 3.5 * sw, y: y)
+        let before = try luminance(rep, view, x: view.textOriginX + 0.1 * sw, y: y)
+        // Column 3 contains a whitespace marker; sample the unmarked column 5
+        // instead of treating every space cell as a flat background.
+        let after = try luminance(rep, view, x: view.textOriginX + 3.1 * sw, y: y)
         XCTAssertEqual(before, plain, accuracy: 0.02)
         XCTAssertEqual(after, plain, accuracy: 0.02)
     }

@@ -33,8 +33,10 @@ final class PreferencesWindowController: NSWindowController {
         appearance.addItems(withTitles: ["System", "Light", "Dark"])
         appearance.selectItem(withTitle: UserDefaults.standard.string(forKey: "Appearance") ?? "System")
         appearance.target = self; appearance.action = #selector(saveAppearance(_:))
-        font.addItems(withTitles: ["System Monospaced", "Menlo", "Monaco", "Courier"])
-        font.selectItem(withTitle: UserDefaults.standard.string(forKey: "EditorFontName") ?? "System Monospaced")
+        let installedFonts = Self.installedFontFamilies()
+        font.addItems(withTitles: ["System Monospaced"] + installedFonts)
+        let savedFont = UserDefaults.standard.string(forKey: "EditorFontName") ?? "System Monospaced"
+        font.selectItem(withTitle: installedFonts.contains(savedFont) || savedFont == "System Monospaced" ? savedFont : "System Monospaced")
         font.target = self; font.action = #selector(saveFont(_:))
         let size = UserDefaults.standard.object(forKey: "EditorFontSize") as? Double ?? 13
         fontSize.minValue = 10; fontSize.maxValue = 24; fontSize.increment = 1; fontSize.doubleValue = size
@@ -78,4 +80,10 @@ final class PreferencesWindowController: NSWindowController {
     }
 
     private func updateFontSizeLabel() { fontSizeLabel.stringValue = "\(Int(fontSize.doubleValue)) pt" }
+
+    private static func installedFontFamilies() -> [String] {
+        NSFontManager.shared.availableFontFamilies
+            .filter { $0 != ".AppleSystemUIFont" && $0 != ".SFNSDisplay" && NSFont(name: $0, size: 13) != nil }
+            .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
 }

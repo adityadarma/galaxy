@@ -29,6 +29,12 @@ enum MainMenu {
         fileMenu.addItem(withTitle: "Open File or Folder…", action: #selector(MainWindowController.openDocument(_:)), keyEquivalent: "o")
         let openFolder = fileMenu.addItem(withTitle: "Open Folder…", action: #selector(MainWindowController.openFolder(_:)), keyEquivalent: "o")
         openFolder.keyEquivalentModifierMask = [.command, .shift]
+        let recent = NSMenuItem(title: "Recent Projects", action: nil, keyEquivalent: "")
+        let recentMenu = NSMenu(title: "Recent Projects")
+        recentMenu.identifier = NSUserInterfaceItemIdentifier("recent-projects")
+        populateRecentProjects(recentMenu)
+        recent.submenu = recentMenu
+        fileMenu.addItem(recent)
         fileMenu.addItem(.separator())
         fileMenu.addItem(withTitle: "Save", action: #selector(MainWindowController.saveDocument(_:)), keyEquivalent: "s")
         let saveAs = fileMenu.addItem(withTitle: "Save As…", action: #selector(MainWindowController.saveDocumentAs(_:)), keyEquivalent: "s")
@@ -141,5 +147,38 @@ enum MainMenu {
         main.addItem(goItem)
 
         return main
+    }
+
+    static func refreshRecentProjects() {
+        guard let menu = findRecentProjectsMenu(in: NSApp.mainMenu) else { return }
+        populateRecentProjects(menu)
+    }
+
+    private static func populateRecentProjects(_ menu: NSMenu) {
+        menu.removeAllItems()
+        for path in MainWindowController.recentProjectPaths() {
+            let item = NSMenuItem(title: URL(fileURLWithPath: path).lastPathComponent,
+                                  action: #selector(MainWindowController.openRecentProject(_:)),
+                                  keyEquivalent: "")
+            item.representedObject = path
+            item.toolTip = path
+            menu.addItem(item)
+        }
+        if menu.items.isEmpty {
+            let empty = NSMenuItem(title: "No Recent Projects", action: nil, keyEquivalent: "")
+            empty.isEnabled = false
+            menu.addItem(empty)
+        }
+    }
+
+    private static func findRecentProjectsMenu(in menu: NSMenu?) -> NSMenu? {
+        guard let menu else { return nil }
+        for item in menu.items {
+            if item.submenu?.identifier == NSUserInterfaceItemIdentifier("recent-projects") {
+                return item.submenu
+            }
+            if let found = findRecentProjectsMenu(in: item.submenu) { return found }
+        }
+        return nil
     }
 }
