@@ -1681,8 +1681,18 @@ impl Workspace {
         Ok(())
     }
 
+    pub fn git_stage_all(&self) -> Result<(), CoreError> {
+        galaxy_core::git::stage_all(&self.inner.root())?;
+        Ok(())
+    }
+
     pub fn git_unstage(&self, path: String) -> Result<(), CoreError> {
         galaxy_core::git::unstage(&self.inner.root(), &path)?;
+        Ok(())
+    }
+
+    pub fn git_unstage_all(&self) -> Result<(), CoreError> {
+        galaxy_core::git::unstage_all(&self.inner.root())?;
         Ok(())
     }
 

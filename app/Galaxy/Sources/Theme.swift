@@ -116,3 +116,42 @@ extension NSColor {
                   blue: CGFloat(value & 0xff) / 255, alpha: 1)
     }
 }
+
+/// Git modification status and colors matching VS Code conventions.
+enum GitFileStatus: Equatable {
+    case modified
+    case added
+    case deleted
+    case renamed
+    case untracked
+    case none
+
+    static func from(code: String) -> GitFileStatus {
+        if code.contains("?") { return .untracked }
+        if code.contains("A") { return .added }
+        if code.contains("D") { return .deleted }
+        if code.contains("R") { return .renamed }
+        if code.contains("U") { return .untracked }
+        if code.contains("M") { return .modified }
+        let trimmed = code.trimmingCharacters(in: .whitespaces)
+        if !trimmed.isEmpty { return .modified }
+        return .none
+    }
+
+    var color: NSColor? {
+        switch self {
+        case .modified:
+            // VS Code modified amber/yellow #e2c08d
+            return NSColor(srgbRed: 226/255.0, green: 192/255.0, blue: 141/255.0, alpha: 1.0)
+        case .added, .untracked, .renamed:
+            // VS Code added/new green #73c991
+            return NSColor(srgbRed: 115/255.0, green: 201/255.0, blue: 145/255.0, alpha: 1.0)
+        case .deleted:
+            // VS Code deleted red #c74e39
+            return NSColor(srgbRed: 199/255.0, green: 78/255.0, blue: 57/255.0, alpha: 1.0)
+        case .none:
+            return nil
+        }
+    }
+}
+

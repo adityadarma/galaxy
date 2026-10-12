@@ -59,6 +59,15 @@ final class TabBar: NSView {
         var isPreview: Bool
         var isEdited: Bool
         var isGitChanged: Bool
+        var gitStatus: GitFileStatus
+
+        init(title: String, isPreview: Bool, isEdited: Bool, isGitChanged: Bool, gitStatus: GitFileStatus = .none) {
+            self.title = title
+            self.isPreview = isPreview
+            self.isEdited = isEdited
+            self.isGitChanged = isGitChanged
+            self.gitStatus = gitStatus != .none ? gitStatus : (isGitChanged ? .modified : .none)
+        }
     }
 
     static let minTabWidth: CGFloat = 96
@@ -278,13 +287,17 @@ final class TabItemView: NSView {
         }
         label.font = font
         label.stringValue = item.title
-        label.textColor = isSelected ? .labelColor : .secondaryLabelColor
+        if let gitColor = item.gitStatus.color {
+            label.textColor = gitColor
+        } else {
+            label.textColor = isSelected ? .labelColor : .secondaryLabelColor
+        }
         let glyph = FileGlyph.for(name: item.title)
         icon.image = glyph.image
         icon.contentTintColor = glyph.color
         icon.alphaValue = isSelected ? 1 : 0.8
         editedDot.isHidden = !showsEditedDot
-        gitDot.isHidden = !item.isGitChanged || showsEditedDot
+        gitDot.isHidden = true
         closeButton.isHidden = showsEditedDot || !(isSelected || isHovered)
         closeButton.setAccessibilityLabel("Close \(item.title)")
         toolTip = item.isPreview ? "\(item.title) (preview: double-click the file to keep it open)" : item.title

@@ -8,6 +8,231 @@ final class SourceControlRootView: NSView {
     }
 }
 
+// MARK: - Pill Badge
+
+@MainActor
+final class CountPillView: NSView {
+    let label = NSTextField(labelWithString: "")
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.cornerRadius = 9
+        layer?.masksToBounds = true
+        layer?.backgroundColor = NSColor(white: 1.0, alpha: 0.16).cgColor
+
+        label.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
+        label.textColor = .white
+        label.alignment = .center
+        label.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(label)
+
+        NSLayoutConstraint.activate([
+            heightAnchor.constraint(equalToConstant: 18),
+            label.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 6),
+            label.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func setCount(_ count: Int) {
+        label.stringValue = "\(count)"
+        isHidden = count == 0
+    }
+}
+
+// MARK: - Commit Message Input Container
+
+@MainActor
+final class CommitMessageInputContainer: NSView {
+    let textField = NSTextField()
+    let generateButton = NSButton()
+
+    var onGenerate: (() -> Void)?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.cornerRadius = 4
+        layer?.masksToBounds = true
+        layer?.borderWidth = 1
+        layer?.borderColor = NSColor(white: 0.28, alpha: 1.0).cgColor
+        layer?.backgroundColor = NSColor(white: 0.15, alpha: 1.0).cgColor
+
+        textField.isBordered = false
+        textField.drawsBackground = false
+        textField.focusRingType = .none
+        textField.font = .systemFont(ofSize: 12)
+        textField.textColor = .labelColor
+        textField.placeholderString = "Message (⌘Enter to commit)"
+        textField.maximumNumberOfLines = 1
+        textField.usesSingleLineMode = true
+        textField.cell?.wraps = false
+        textField.cell?.isScrollable = true
+        textField.cell?.usesSingleLineMode = true
+        textField.lineBreakMode = .byClipping
+        textField.translatesAutoresizingMaskIntoConstraints = false
+
+        generateButton.title = "Generate "
+        generateButton.image = NSImage(systemSymbolName: "sparkles", accessibilityDescription: "Generate with AI")?
+            .withSymbolConfiguration(.init(pointSize: 10, weight: .semibold))
+        generateButton.imagePosition = .imageRight
+        generateButton.isBordered = false
+        generateButton.wantsLayer = true
+        generateButton.layer?.cornerRadius = 3
+        generateButton.layer?.masksToBounds = true
+        generateButton.layer?.backgroundColor = NSColor(srgbRed: 0/255.0, green: 120/255.0, blue: 212/255.0, alpha: 1.0).cgColor
+        generateButton.contentTintColor = .white
+        generateButton.font = .systemFont(ofSize: 11, weight: .medium)
+        generateButton.toolTip = "Generate Commit Message"
+        generateButton.target = self
+        generateButton.action = #selector(generateClicked(_:))
+        generateButton.translatesAutoresizingMaskIntoConstraints = false
+
+        addSubview(textField)
+        addSubview(generateButton)
+
+        NSLayoutConstraint.activate([
+            heightAnchor.constraint(equalToConstant: 30),
+
+            textField.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            textField.centerYAnchor.constraint(equalTo: centerYAnchor),
+            textField.heightAnchor.constraint(equalToConstant: 20),
+            textField.trailingAnchor.constraint(equalTo: generateButton.leadingAnchor, constant: -6),
+
+            generateButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -3),
+            generateButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            generateButton.heightAnchor.constraint(equalToConstant: 24),
+            generateButton.widthAnchor.constraint(equalToConstant: 86),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    func setFocused(_ focused: Bool) {
+        layer?.borderColor = focused
+            ? NSColor(srgbRed: 0/255.0, green: 120/255.0, blue: 212/255.0, alpha: 1.0).cgColor
+            : NSColor(white: 0.28, alpha: 1.0).cgColor
+    }
+
+    @objc private func generateClicked(_ sender: Any?) { onGenerate?() }
+}
+
+// MARK: - Non Interactive Stack View for Button Content
+
+@MainActor
+private final class NonInteractiveStackView: NSStackView {
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+}
+
+// MARK: - Commit Split Button
+
+@MainActor
+final class CommitSplitButton: NSView {
+    let mainButton = NSButton()
+    let dropdownButton = NSButton()
+    private let divider = NSView()
+    private let checkIcon = NSImageView()
+    private let commitLabel = NSTextField(labelWithString: "Commit")
+
+    var onCommit: (() -> Void)?
+    var onDropdown: ((NSButton) -> Void)?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.cornerRadius = 4
+        layer?.masksToBounds = true
+        layer?.backgroundColor = NSColor(srgbRed: 0/255.0, green: 120/255.0, blue: 212/255.0, alpha: 1.0).cgColor
+
+        // Main button
+        mainButton.title = ""
+        mainButton.image = nil
+        mainButton.isBordered = false
+        mainButton.target = self
+        mainButton.action = #selector(commitClicked(_:))
+        mainButton.translatesAutoresizingMaskIntoConstraints = false
+
+        checkIcon.image = NSImage(systemSymbolName: "checkmark", accessibilityDescription: "Commit")?
+            .withSymbolConfiguration(.init(pointSize: 11, weight: .bold))
+        checkIcon.contentTintColor = .white
+        checkIcon.translatesAutoresizingMaskIntoConstraints = false
+
+        commitLabel.font = .systemFont(ofSize: 12, weight: .medium)
+        commitLabel.textColor = .white
+        commitLabel.alignment = .center
+        commitLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        let contentStack = NonInteractiveStackView(views: [checkIcon, commitLabel])
+        contentStack.orientation = .horizontal
+        contentStack.spacing = 6
+        contentStack.alignment = .centerY
+        contentStack.translatesAutoresizingMaskIntoConstraints = false
+        mainButton.addSubview(contentStack)
+
+        // Divider
+        divider.wantsLayer = true
+        divider.layer?.backgroundColor = NSColor(white: 1.0, alpha: 0.25).cgColor
+        divider.translatesAutoresizingMaskIntoConstraints = false
+
+        // Dropdown button
+        dropdownButton.title = ""
+        dropdownButton.image = NSImage(systemSymbolName: "chevron.down", accessibilityDescription: "More Commit Actions")?
+            .withSymbolConfiguration(.init(pointSize: 10, weight: .bold))
+        dropdownButton.imagePosition = .imageOnly
+        dropdownButton.isBordered = false
+        dropdownButton.contentTintColor = .white
+        dropdownButton.target = self
+        dropdownButton.action = #selector(dropdownClicked(_:))
+        dropdownButton.translatesAutoresizingMaskIntoConstraints = false
+
+        addSubview(mainButton)
+        addSubview(divider)
+        addSubview(dropdownButton)
+
+        NSLayoutConstraint.activate([
+            heightAnchor.constraint(equalToConstant: 28),
+
+            mainButton.leadingAnchor.constraint(equalTo: leadingAnchor),
+            mainButton.topAnchor.constraint(equalTo: topAnchor),
+            mainButton.bottomAnchor.constraint(equalTo: bottomAnchor),
+            mainButton.trailingAnchor.constraint(equalTo: divider.leadingAnchor),
+
+            contentStack.centerXAnchor.constraint(equalTo: mainButton.centerXAnchor),
+            contentStack.centerYAnchor.constraint(equalTo: mainButton.centerYAnchor),
+            checkIcon.widthAnchor.constraint(equalToConstant: 12),
+            checkIcon.heightAnchor.constraint(equalToConstant: 12),
+
+            divider.topAnchor.constraint(equalTo: topAnchor),
+            divider.bottomAnchor.constraint(equalTo: bottomAnchor),
+            divider.widthAnchor.constraint(equalToConstant: 1),
+            divider.trailingAnchor.constraint(equalTo: dropdownButton.leadingAnchor),
+
+            dropdownButton.trailingAnchor.constraint(equalTo: trailingAnchor),
+            dropdownButton.topAnchor.constraint(equalTo: topAnchor),
+            dropdownButton.bottomAnchor.constraint(equalTo: bottomAnchor),
+            dropdownButton.widthAnchor.constraint(equalToConstant: 28),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError() }
+
+    @objc private func commitClicked(_ sender: Any?) { onCommit?() }
+    @objc private func dropdownClicked(_ sender: Any?) { onDropdown?(dropdownButton) }
+
+    var isEnabled: Bool = true {
+        didSet {
+            mainButton.isEnabled = isEnabled
+            dropdownButton.isEnabled = isEnabled
+            alphaValue = isEnabled ? 1.0 : 0.6
+        }
+    }
+}
+
+// MARK: - Main Source Control Controller
+
 @MainActor
 final class SourceControlController: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
     private enum SectionType {
@@ -22,9 +247,8 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
     }
 
     let view = SourceControlRootView()
-    private let message = NSTextField()
-    private let commitButton = NSButton(title: "Commit", target: nil, action: nil)
-    private let refreshButton = NSButton(image: NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: "Refresh Changes")!, target: nil, action: nil)
+    private let messageContainer = CommitMessageInputContainer()
+    let splitCommitButton = CommitSplitButton()
     private let table = SourceControlTableView()
     private let scroll = NSScrollView()
 
@@ -33,6 +257,7 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
     private var unstagedChanges: [GitChangeInfo] = []
     private var isStagedCollapsed: Bool = false
     private var isChangesCollapsed: Bool = false
+    private var currentBranch: String?
 
     var workspace: Workspace?
     var onOpen: ((String) -> Void)?
@@ -42,22 +267,21 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         super.init()
         view.translatesAutoresizingMaskIntoConstraints = false
 
-        message.placeholderString = "Message (⌘Enter to commit)"
-        message.font = .systemFont(ofSize: 12)
-        message.delegate = self
-        message.translatesAutoresizingMaskIntoConstraints = false
+        messageContainer.textField.delegate = self
+        messageContainer.textField.placeholderString = "Message (⌘Enter to commit)"
+        messageContainer.translatesAutoresizingMaskIntoConstraints = false
+        messageContainer.onGenerate = { [weak self] in
+            self?.generateCommitMessage()
+        }
 
-        commitButton.bezelStyle = .rounded
-        commitButton.target = self
-        commitButton.action = #selector(commit(_:))
-        commitButton.translatesAutoresizingMaskIntoConstraints = false
-        commitButton.isEnabled = false
-
-        refreshButton.isBordered = false
-        refreshButton.target = self
-        refreshButton.action = #selector(refreshClicked(_:))
-        refreshButton.translatesAutoresizingMaskIntoConstraints = false
-        refreshButton.toolTip = "Refresh Changes"
+        splitCommitButton.translatesAutoresizingMaskIntoConstraints = false
+        splitCommitButton.isEnabled = false
+        splitCommitButton.onCommit = { [weak self] in
+            self?.commit(nil)
+        }
+        splitCommitButton.onDropdown = { [weak self] button in
+            self?.showCommitDropdown(from: button)
+        }
 
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("scm-changes"))
         column.resizingMask = .autoresizingMask
@@ -82,40 +306,29 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         scroll.hasVerticalScroller = true
         scroll.translatesAutoresizingMaskIntoConstraints = false
 
-        view.addSubview(message)
-        view.addSubview(commitButton)
-        view.addSubview(refreshButton)
+        view.addSubview(messageContainer)
+        view.addSubview(splitCommitButton)
         view.addSubview(scroll)
 
-        let messageTrailing = message.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -10)
-        messageTrailing.priority = NSLayoutConstraint.Priority(999)
+        let msgTrailing = messageContainer.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -10)
+        msgTrailing.priority = NSLayoutConstraint.Priority(999)
 
-        let commitTrailing = commitButton.trailingAnchor.constraint(equalTo: refreshButton.leadingAnchor, constant: -6)
+        let commitTrailing = splitCommitButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -10)
         commitTrailing.priority = NSLayoutConstraint.Priority(999)
-
-        let refreshTrailing = refreshButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -10)
-        refreshTrailing.priority = NSLayoutConstraint.Priority(999)
 
         let scrollTrailing = scroll.trailingAnchor.constraint(equalTo: view.trailingAnchor)
         scrollTrailing.priority = NSLayoutConstraint.Priority(999)
 
         NSLayoutConstraint.activate([
-            message.topAnchor.constraint(equalTo: view.topAnchor, constant: 10),
-            message.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 10),
-            messageTrailing,
-            message.heightAnchor.constraint(equalToConstant: 28),
+            messageContainer.topAnchor.constraint(equalTo: view.topAnchor, constant: 10),
+            messageContainer.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 10),
+            msgTrailing,
 
-            commitButton.topAnchor.constraint(equalTo: message.bottomAnchor, constant: 8),
-            commitButton.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 10),
+            splitCommitButton.topAnchor.constraint(equalTo: messageContainer.bottomAnchor, constant: 8),
+            splitCommitButton.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 10),
             commitTrailing,
-            commitButton.heightAnchor.constraint(equalToConstant: 28),
 
-            refreshButton.centerYAnchor.constraint(equalTo: commitButton.centerYAnchor),
-            refreshTrailing,
-            refreshButton.widthAnchor.constraint(equalToConstant: 28),
-            refreshButton.heightAnchor.constraint(equalToConstant: 28),
-
-            scroll.topAnchor.constraint(equalTo: commitButton.bottomAnchor, constant: 10),
+            scroll.topAnchor.constraint(equalTo: splitCommitButton.bottomAnchor, constant: 8),
             scroll.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             scrollTrailing,
             scroll.bottomAnchor.constraint(equalTo: view.bottomAnchor),
@@ -125,10 +338,17 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
     @available(*, unavailable) required init?(coder: NSCoder) { fatalError() }
 
     func focusMessageInput() {
-        view.window?.makeFirstResponder(message)
+        view.window?.makeFirstResponder(messageContainer.textField)
     }
 
     func refresh(status: GitStatusInfo?) {
+        currentBranch = status?.branch
+        if let branch = currentBranch, !branch.isEmpty {
+            messageContainer.textField.placeholderString = "Message (⌘Enter to commit on '\(branch)')"
+        } else {
+            messageContainer.textField.placeholderString = "Message (⌘Enter to commit)"
+        }
+
         let changes = status?.changes ?? []
         stagedChanges = changes.filter { isStagedChange($0) }
         unstagedChanges = changes.filter { isUnstagedChange($0) }
@@ -156,13 +376,13 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
     private func rebuildRows() {
         rows = []
         if !stagedChanges.isEmpty {
-            rows.append(.header(type: .staged, title: "STAGED CHANGES", count: stagedChanges.count, isCollapsed: isStagedCollapsed))
+            rows.append(.header(type: .staged, title: "Staged Changes", count: stagedChanges.count, isCollapsed: isStagedCollapsed))
             if !isStagedCollapsed {
                 rows += stagedChanges.map { Row.change($0, isStaged: true) }
             }
         }
         if !unstagedChanges.isEmpty || stagedChanges.isEmpty {
-            rows.append(.header(type: .unstaged, title: "CHANGES", count: unstagedChanges.count, isCollapsed: isChangesCollapsed))
+            rows.append(.header(type: .unstaged, title: "Changes", count: unstagedChanges.count, isCollapsed: isChangesCollapsed))
             if !isChangesCollapsed {
                 if unstagedChanges.isEmpty && stagedChanges.isEmpty {
                     rows.append(.empty("No changes"))
@@ -185,13 +405,20 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
     }
 
     private func updateCommitButtonState() {
-        let hasMsg = !message.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let hasChanges = !stagedChanges.isEmpty || !unstagedChanges.isEmpty
-        commitButton.isEnabled = hasMsg && hasChanges
+        splitCommitButton.isEnabled = hasChanges
     }
 
     func controlTextDidChange(_ obj: Notification) {
         updateCommitButtonState()
+    }
+
+    func controlTextDidBeginEditing(_ obj: Notification) {
+        messageContainer.setFocused(true)
+    }
+
+    func controlTextDidEndEditing(_ obj: Notification) {
+        messageContainer.setFocused(false)
     }
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
@@ -233,6 +460,9 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
                     self?.stageAll()
                 }
             }
+            cell.onDiscardAll = { [weak self] in
+                self?.discardAll()
+            }
             return cell
 
         case .change(let change, let isStaged):
@@ -245,6 +475,9 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
                 } else {
                     self?.stage(change: change)
                 }
+            }
+            cell.onDiscard = { [weak self] in
+                self?.discard(change: change)
             }
             return cell
 
@@ -299,14 +532,58 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         onRefresh?()
     }
 
-    @objc private func refreshClicked(_ sender: Any?) { onRefresh?() }
-
-    @objc private func commit(_ sender: Any?) {
+    func discard(change: GitChangeInfo) {
         guard let workspace else { return }
-        let msg = message.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !msg.isEmpty else { return }
+        let root = workspace.root()
+        let path = change.path
+        if change.code.contains("?") {
+            let fileURL = URL(fileURLWithPath: root).appendingPathComponent(path)
+            try? FileManager.default.removeItem(at: fileURL)
+        } else {
+            _ = runGit(args: ["restore", "--", path])
+        }
+        onRefresh?()
+    }
 
-        // If there are no staged changes, stage all changes first (like VS Code)
+    func discardAll() {
+        guard workspace != nil else { return }
+        _ = runGit(args: ["restore", "."])
+        _ = runGit(args: ["clean", "-fd"])
+        onRefresh?()
+    }
+
+    func generateCommitMessage() {
+        let targets = !stagedChanges.isEmpty ? stagedChanges : unstagedChanges
+        guard !targets.isEmpty else { return }
+
+        let fileNames = targets.map { ($0.path as NSString).lastPathComponent }
+        let generated: String
+        if fileNames.count == 1 {
+            generated = "Update \(fileNames[0])"
+        } else if fileNames.count == 2 {
+            generated = "Update \(fileNames[0]) and \(fileNames[1])"
+        } else {
+            generated = "Update \(fileNames[0]), \(fileNames[1]) and \(fileNames.count - 2) others"
+        }
+
+        messageContainer.textField.stringValue = generated
+        updateCommitButtonState()
+        focusMessageInput()
+    }
+
+    @objc func commit(_ sender: Any?) {
+        guard let workspace else { return }
+        var msg = messageContainer.textField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if msg.isEmpty {
+            // Auto-generate if message was left blank
+            generateCommitMessage()
+            msg = messageContainer.textField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !msg.isEmpty else {
+                focusMessageInput()
+                return
+            }
+        }
+
         if stagedChanges.isEmpty && !unstagedChanges.isEmpty {
             for change in unstagedChanges {
                 _ = try? workspace.gitStage(path: change.path)
@@ -314,10 +591,135 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         }
 
         guard (try? workspace.gitCommit(message: msg)) != nil else { return }
-        message.stringValue = ""
+        messageContainer.textField.stringValue = ""
         updateCommitButtonState()
         onRefresh?()
     }
+
+    func commitAmend() {
+        guard workspace != nil else { return }
+        if stagedChanges.isEmpty && !unstagedChanges.isEmpty {
+            stageAll()
+        }
+        let msg = messageContainer.textField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if msg.isEmpty {
+            _ = runGit(args: ["commit", "--amend", "--no-edit"])
+        } else {
+            _ = runGit(args: ["commit", "--amend", "-m", msg])
+            messageContainer.textField.stringValue = ""
+        }
+        updateCommitButtonState()
+        onRefresh?()
+    }
+
+    func commitAndPush() {
+        commit(nil)
+        _ = runGit(args: ["push"])
+        onRefresh?()
+    }
+
+    func commitAndSync() {
+        commit(nil)
+        _ = runGit(args: ["pull", "--rebase"])
+        _ = runGit(args: ["push"])
+        onRefresh?()
+    }
+
+    func pull() {
+        _ = runGit(args: ["pull"])
+        onRefresh?()
+    }
+
+    func push() {
+        _ = runGit(args: ["push"])
+        onRefresh?()
+    }
+
+    func stash() {
+        _ = runGit(args: ["stash"])
+        onRefresh?()
+    }
+
+    func stashPop() {
+        _ = runGit(args: ["stash", "pop"])
+        onRefresh?()
+    }
+
+    @discardableResult
+    private func runGit(args: [String]) -> (status: Int32, output: String) {
+        guard let root = workspace?.root() else { return (-1, "") }
+        let process = Process()
+        let pipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.currentDirectoryURL = URL(fileURLWithPath: root)
+        process.arguments = args
+        process.standardOutput = pipe
+        process.standardError = pipe
+        do {
+            try process.run()
+            process.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let output = String(data: data, encoding: .utf8) ?? ""
+            return (process.terminationStatus, output)
+        } catch {
+            return (-1, error.localizedDescription)
+        }
+    }
+
+    // MARK: - Dropdown & Menus
+
+    private func showCommitDropdown(from button: NSButton) {
+        let menu = NSMenu()
+
+        let commitItem = menu.addItem(withTitle: "Commit", action: #selector(menuCommit(_:)), keyEquivalent: "")
+        commitItem.target = self
+
+        let amendItem = menu.addItem(withTitle: "Commit (Amend)", action: #selector(menuCommitAmend(_:)), keyEquivalent: "")
+        amendItem.target = self
+
+        menu.addItem(.separator())
+
+        let pushItem = menu.addItem(withTitle: "Commit & Push", action: #selector(menuCommitAndPush(_:)), keyEquivalent: "")
+        pushItem.target = self
+
+        let syncItem = menu.addItem(withTitle: "Commit & Sync", action: #selector(menuCommitAndSync(_:)), keyEquivalent: "")
+        syncItem.target = self
+
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.maxY + 4), in: button)
+    }
+
+    @objc private func menuCommit(_ sender: Any?) { commit(nil) }
+    @objc private func menuCommitAmend(_ sender: Any?) { commitAmend() }
+    @objc private func menuCommitAndPush(_ sender: Any?) { commitAndPush() }
+    @objc private func menuCommitAndSync(_ sender: Any?) { commitAndSync() }
+
+    func moreActionsMenu() -> NSMenu {
+        let menu = NSMenu()
+        let pullItem = menu.addItem(withTitle: "Pull", action: #selector(menuPull(_:)), keyEquivalent: "")
+        pullItem.target = self
+        let pushItem = menu.addItem(withTitle: "Push", action: #selector(menuPush(_:)), keyEquivalent: "")
+        pushItem.target = self
+        let syncItem = menu.addItem(withTitle: "Sync", action: #selector(menuCommitAndSync(_:)), keyEquivalent: "")
+        syncItem.target = self
+
+        menu.addItem(.separator())
+        let stashItem = menu.addItem(withTitle: "Stash All Changes", action: #selector(menuStash(_:)), keyEquivalent: "")
+        stashItem.target = self
+        let popItem = menu.addItem(withTitle: "Pop Latest Stash", action: #selector(menuStashPop(_:)), keyEquivalent: "")
+        popItem.target = self
+
+        menu.addItem(.separator())
+        let discardItem = menu.addItem(withTitle: "Discard All Changes", action: #selector(menuDiscardAll(_:)), keyEquivalent: "")
+        discardItem.target = self
+
+        return menu
+    }
+
+    @objc private func menuPull(_ sender: Any?) { pull() }
+    @objc private func menuPush(_ sender: Any?) { push() }
+    @objc private func menuStash(_ sender: Any?) { stash() }
+    @objc private func menuStashPop(_ sender: Any?) { stashPop() }
+    @objc private func menuDiscardAll(_ sender: Any?) { discardAll() }
 
     // MARK: - Context Menu & Keyboard
 
@@ -333,12 +735,19 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
             } else {
                 let item = menu.addItem(withTitle: "Stage All Changes", action: #selector(contextStageAll(_:)), keyEquivalent: "")
                 item.target = self
+                let discard = menu.addItem(withTitle: "Discard All Changes", action: #selector(menuDiscardAll(_:)), keyEquivalent: "")
+                discard.target = self
             }
         case .change(let change, let isStaged):
             let stageTitle = isStaged ? "Unstage Changes" : "Stage Changes"
             let stageItem = menu.addItem(withTitle: stageTitle, action: #selector(contextToggleStage(_:)), keyEquivalent: "")
             stageItem.target = self
             stageItem.representedObject = change
+
+            let discardItem = menu.addItem(withTitle: "Discard Changes", action: #selector(contextDiscardChange(_:)), keyEquivalent: "")
+            discardItem.target = self
+            discardItem.representedObject = change
+
             menu.addItem(.separator())
             let openItem = menu.addItem(withTitle: "Open File", action: #selector(contextOpenFile(_:)), keyEquivalent: "")
             openItem.target = self
@@ -361,6 +770,10 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         } else {
             stage(change: change)
         }
+    }
+    @objc private func contextDiscardChange(_ sender: NSMenuItem) {
+        guard let change = sender.representedObject as? GitChangeInfo else { return }
+        discard(change: change)
     }
     @objc private func contextOpenFile(_ sender: NSMenuItem) {
         guard let path = sender.representedObject as? String else { return }
@@ -430,11 +843,13 @@ final class SourceControlHeaderCellView: NSTableCellView {
 
     let chevronButton = NSButton()
     let titleLabel = NSTextField(labelWithString: "")
-    let countBadge = NSTextField(labelWithString: "")
+    let countPill = CountPillView()
+    let discardAllButton = NSButton()
     let actionButton = NSButton()
 
     var onToggle: (() -> Void)?
     var onAction: (() -> Void)?
+    var onDiscardAll: (() -> Void)?
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -451,13 +866,20 @@ final class SourceControlHeaderCellView: NSTableCellView {
         chevronButton.translatesAutoresizingMaskIntoConstraints = false
         chevronButton.contentTintColor = .secondaryLabelColor
 
-        titleLabel.font = .systemFont(ofSize: 11, weight: .bold)
-        titleLabel.textColor = .secondaryLabelColor
+        titleLabel.font = .systemFont(ofSize: 11, weight: .semibold)
+        titleLabel.textColor = .labelColor
         titleLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        countBadge.font = .systemFont(ofSize: 10, weight: .medium)
-        countBadge.textColor = .tertiaryLabelColor
-        countBadge.translatesAutoresizingMaskIntoConstraints = false
+        countPill.translatesAutoresizingMaskIntoConstraints = false
+
+        discardAllButton.isBordered = false
+        discardAllButton.target = self
+        discardAllButton.action = #selector(discardAllClicked(_:))
+        discardAllButton.translatesAutoresizingMaskIntoConstraints = false
+        discardAllButton.contentTintColor = .secondaryLabelColor
+        discardAllButton.image = NSImage(systemSymbolName: "arrow.uturn.backward", accessibilityDescription: "Discard All Changes")?
+            .withSymbolConfiguration(.init(pointSize: 10, weight: .semibold))
+        discardAllButton.toolTip = "Discard All Changes"
 
         actionButton.isBordered = false
         actionButton.target = self
@@ -467,7 +889,8 @@ final class SourceControlHeaderCellView: NSTableCellView {
 
         addSubview(chevronButton)
         addSubview(titleLabel)
-        addSubview(countBadge)
+        addSubview(countPill)
+        addSubview(discardAllButton)
         addSubview(actionButton)
 
         NSLayoutConstraint.activate([
@@ -479,13 +902,18 @@ final class SourceControlHeaderCellView: NSTableCellView {
             titleLabel.leadingAnchor.constraint(equalTo: chevronButton.trailingAnchor, constant: 4),
             titleLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
 
-            countBadge.leadingAnchor.constraint(equalTo: titleLabel.trailingAnchor, constant: 6),
-            countBadge.centerYAnchor.constraint(equalTo: centerYAnchor),
+            countPill.leadingAnchor.constraint(equalTo: titleLabel.trailingAnchor, constant: 6),
+            countPill.centerYAnchor.constraint(equalTo: centerYAnchor),
 
-            actionButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            actionButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
             actionButton.centerYAnchor.constraint(equalTo: centerYAnchor),
-            actionButton.widthAnchor.constraint(equalToConstant: 20),
-            actionButton.heightAnchor.constraint(equalToConstant: 20),
+            actionButton.widthAnchor.constraint(equalToConstant: 18),
+            actionButton.heightAnchor.constraint(equalToConstant: 18),
+
+            discardAllButton.trailingAnchor.constraint(equalTo: actionButton.leadingAnchor, constant: -4),
+            discardAllButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            discardAllButton.widthAnchor.constraint(equalToConstant: 18),
+            discardAllButton.heightAnchor.constraint(equalToConstant: 18),
         ])
     }
 
@@ -497,20 +925,23 @@ final class SourceControlHeaderCellView: NSTableCellView {
         chevronButton.image = chevronImage
 
         titleLabel.stringValue = title
-        countBadge.stringValue = "\(count)"
+        countPill.setCount(count)
 
-        let actionImageName = isStaged ? "minus" : "plus"
+        discardAllButton.isHidden = isStaged || count == 0
+
+        let actionSymbol = isStaged ? "minus" : "plus"
         let tooltip = isStaged ? "Unstage All Changes" : "Stage All Changes"
         actionButton.image = NSImage(
-            systemSymbolName: actionImageName,
+            systemSymbolName: actionSymbol,
             accessibilityDescription: tooltip
-        )?.withSymbolConfiguration(.init(pointSize: 11, weight: .bold))
+        )?.withSymbolConfiguration(.init(pointSize: 11, weight: .semibold))
         actionButton.toolTip = tooltip
         actionButton.isHidden = count == 0
     }
 
     @objc private func toggleClicked(_ sender: Any?) { onToggle?() }
     @objc private func actionClicked(_ sender: Any?) { onAction?() }
+    @objc private func discardAllClicked(_ sender: Any?) { onDiscardAll?() }
 }
 
 @MainActor
@@ -521,9 +952,11 @@ final class SourceControlItemCellView: NSTableCellView {
     let nameLabel = NSTextField(labelWithString: "")
     let dirLabel = NSTextField(labelWithString: "")
     let statusBadge = NSTextField(labelWithString: "")
+    let discardButton = NSButton()
     let actionButton = NSButton()
 
     var onAction: (() -> Void)?
+    var onDiscard: (() -> Void)?
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -536,7 +969,6 @@ final class SourceControlItemCellView: NSTableCellView {
     private func setupViews() {
         iconView.translatesAutoresizingMaskIntoConstraints = false
         iconView.imageScaling = .scaleProportionallyDown
-        iconView.contentTintColor = .secondaryLabelColor
 
         nameLabel.font = .systemFont(ofSize: 12, weight: .regular)
         nameLabel.textColor = .labelColor
@@ -545,44 +977,61 @@ final class SourceControlItemCellView: NSTableCellView {
         nameLabel.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
 
         dirLabel.font = .systemFont(ofSize: 11, weight: .regular)
-        dirLabel.textColor = .tertiaryLabelColor
+        dirLabel.textColor = NSColor(white: 0.55, alpha: 1.0)
         dirLabel.lineBreakMode = .byTruncatingMiddle
         dirLabel.translatesAutoresizingMaskIntoConstraints = false
         dirLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        statusBadge.font = .systemFont(ofSize: 11, weight: .bold)
+        statusBadge.font = .systemFont(ofSize: 11, weight: .medium)
         statusBadge.alignment = .right
         statusBadge.translatesAutoresizingMaskIntoConstraints = false
+
+        discardButton.isBordered = false
+        discardButton.target = self
+        discardButton.action = #selector(discardClicked(_:))
+        discardButton.translatesAutoresizingMaskIntoConstraints = false
+        discardButton.contentTintColor = .secondaryLabelColor
+        discardButton.image = NSImage(systemSymbolName: "arrow.uturn.backward", accessibilityDescription: "Discard Changes")?
+            .withSymbolConfiguration(.init(pointSize: 10, weight: .semibold))
+        discardButton.toolTip = "Discard Changes"
+        discardButton.isHidden = true
 
         actionButton.isBordered = false
         actionButton.target = self
         actionButton.action = #selector(actionClicked(_:))
         actionButton.translatesAutoresizingMaskIntoConstraints = false
         actionButton.contentTintColor = .secondaryLabelColor
+        actionButton.isHidden = true
 
         addSubview(iconView)
         addSubview(nameLabel)
         addSubview(dirLabel)
+        addSubview(discardButton)
         addSubview(actionButton)
         addSubview(statusBadge)
 
         NSLayoutConstraint.activate([
-            iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 18),
+            iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 16),
             iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
-            iconView.widthAnchor.constraint(equalToConstant: 14),
-            iconView.heightAnchor.constraint(equalToConstant: 14),
+            iconView.widthAnchor.constraint(equalToConstant: 16),
+            iconView.heightAnchor.constraint(equalToConstant: 16),
 
             nameLabel.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 6),
             nameLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
 
-            dirLabel.leadingAnchor.constraint(equalTo: nameLabel.trailingAnchor, constant: 4),
+            dirLabel.leadingAnchor.constraint(equalTo: nameLabel.trailingAnchor, constant: 6),
             dirLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
-            dirLabel.trailingAnchor.constraint(lessThanOrEqualTo: actionButton.leadingAnchor, constant: -4),
+            dirLabel.trailingAnchor.constraint(lessThanOrEqualTo: discardButton.leadingAnchor, constant: -4),
+
+            discardButton.trailingAnchor.constraint(equalTo: actionButton.leadingAnchor, constant: -2),
+            discardButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            discardButton.widthAnchor.constraint(equalToConstant: 16),
+            discardButton.heightAnchor.constraint(equalToConstant: 16),
 
             actionButton.trailingAnchor.constraint(equalTo: statusBadge.leadingAnchor, constant: -4),
             actionButton.centerYAnchor.constraint(equalTo: centerYAnchor),
-            actionButton.widthAnchor.constraint(equalToConstant: 18),
-            actionButton.heightAnchor.constraint(equalToConstant: 18),
+            actionButton.widthAnchor.constraint(equalToConstant: 16),
+            actionButton.heightAnchor.constraint(equalToConstant: 16),
 
             statusBadge.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             statusBadge.centerYAnchor.constraint(equalTo: centerYAnchor),
@@ -594,8 +1043,11 @@ final class SourceControlItemCellView: NSTableCellView {
         let name = (change.path as NSString).lastPathComponent
         let dir = (change.path as NSString).deletingLastPathComponent
         nameLabel.stringValue = name
-        dirLabel.stringValue = dir.isEmpty ? "" : "\(dir)/"
-        iconView.image = fileIcon(for: change.path)
+        dirLabel.stringValue = dir
+
+        let glyph = FileGlyph.for(name: name)
+        iconView.image = glyph.image
+        iconView.contentTintColor = glyph.color
 
         let badgeInfo = statusBadgeInfo(for: change, isStaged: isStaged)
         statusBadge.stringValue = badgeInfo.letter
@@ -606,59 +1058,62 @@ final class SourceControlItemCellView: NSTableCellView {
         actionButton.image = NSImage(
             systemSymbolName: actionSymbol,
             accessibilityDescription: tooltip
-        )?.withSymbolConfiguration(.init(pointSize: 11, weight: .semibold))
+        )?.withSymbolConfiguration(.init(pointSize: 10, weight: .semibold))
         actionButton.toolTip = tooltip
     }
 
-    private func fileIcon(for path: String) -> NSImage? {
-        let ext = (path as NSString).pathExtension.lowercased()
-        let name: String
-        switch ext {
-        case "rs", "swift", "c", "cpp", "h", "go", "py", "js", "ts", "jsx", "tsx", "php", "rb", "java":
-            name = "chevron.left.forwardslash.chevron.right"
-        case "json", "toml", "yaml", "yml", "xml":
-            name = "curlybraces"
-        case "md", "txt":
-            name = "doc.text"
-        case "png", "jpg", "jpeg", "svg", "gif", "webp", "pdf":
-            name = "photo"
-        default:
-            name = "doc"
-        }
-        return NSImage(systemSymbolName: name, accessibilityDescription: nil)?
-            .withSymbolConfiguration(.init(pointSize: 12, weight: .regular))
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
+                                       owner: self, userInfo: nil))
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        discardButton.isHidden = false
+        actionButton.isHidden = false
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        discardButton.isHidden = true
+        actionButton.isHidden = true
     }
 
     private func statusBadgeInfo(for change: GitChangeInfo, isStaged: Bool) -> (letter: String, color: NSColor) {
+        let orangeColor = NSColor(srgbRed: 226/255.0, green: 192/255.0, blue: 141/255.0, alpha: 1.0) // VS Code Modified amber #e2c08d
+        let greenColor = NSColor(srgbRed: 115/255.0, green: 201/255.0, blue: 145/255.0, alpha: 1.0) // VS Code Green #73c991
+        let redColor = NSColor(srgbRed: 199/255.0, green: 78/255.0, blue: 57/255.0, alpha: 1.0)     // VS Code Red #c74e39
+
         let code = change.code
         if isStaged {
             let first = code.first ?? "M"
             switch first {
-            case "M": return ("M", .systemOrange)
-            case "A": return ("A", .systemGreen)
-            case "D": return ("D", .systemRed)
-            case "R": return ("R", .systemBlue)
-            default: return ("M", .systemOrange)
+            case "M": return ("M", orangeColor)
+            case "A": return ("A", greenColor)
+            case "D": return ("D", redColor)
+            case "R": return ("R", greenColor)
+            default: return ("M", orangeColor)
             }
         } else {
             if code.contains("?") {
-                return ("U", .systemGreen)
+                return ("U", greenColor)
             }
             let second = code.count >= 2 ? code[code.index(after: code.startIndex)] : (code.first ?? "M")
             switch second {
-            case "M": return ("M", .systemOrange)
-            case "D": return ("D", .systemRed)
-            case "A": return ("A", .systemGreen)
-            case "U": return ("U", .systemOrange)
+            case "M": return ("M", orangeColor)
+            case "D": return ("D", redColor)
+            case "A": return ("A", greenColor)
+            case "U": return ("U", greenColor)
             default:
                 let trimmed = code.trimmingCharacters(in: .whitespaces)
                 let letter = trimmed.isEmpty ? "M" : String(trimmed.prefix(1))
-                return (letter, .systemOrange)
+                return (letter, orangeColor)
             }
         }
     }
 
     @objc private func actionClicked(_ sender: Any?) { onAction?() }
+    @objc private func discardClicked(_ sender: Any?) { onDiscard?() }
 }
 
 @MainActor

@@ -247,8 +247,16 @@ pub fn stage(root: &Path, path: &str) -> io::Result<()> {
     git_path_command(root, ["add", "--", path])
 }
 
+pub fn stage_all(root: &Path) -> io::Result<()> {
+    git_path_command(root, ["add", "-A"])
+}
+
 pub fn unstage(root: &Path, path: &str) -> io::Result<()> {
     git_path_command(root, ["restore", "--staged", "--", path])
+}
+
+pub fn unstage_all(root: &Path) -> io::Result<()> {
+    git_path_command(root, ["restore", "--staged", "."])
 }
 
 pub fn commit(root: &Path, message: &str) -> io::Result<()> {

@@ -1148,6 +1148,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         sectionHeader.moreMenu = { [weak self] in self?.explorerMoreMenu() ?? NSMenu() }
         sectionHeader.showsTools = false
 
+        sectionHeader.onScmGenerate = { [weak self] in self?.sourceControl.generateCommitMessage() }
+        sectionHeader.onScmPull = { [weak self] in self?.sourceControl.pull() }
+        sectionHeader.onScmBranch = { [weak self] in self?.showGitBranchPicker() }
+        sectionHeader.onScmCommit = { [weak self] in self?.sourceControl.commit(nil) }
+        sectionHeader.onScmRefresh = { [weak self] in self?.refreshGitStatus() }
+        sectionHeader.onScmHistory = { [weak self] in self?.showGitBranchPicker() }
+        sectionHeader.scmMoreMenu = { [weak self] in self?.sourceControl.moreActionsMenu() ?? NSMenu() }
+
         // Shown until a folder is opened.
         let message = NSTextField(wrappingLabelWithString: "No folder open")
         message.font = .systemFont(ofSize: 12)
@@ -1281,12 +1289,19 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private func refreshGitStatus() {
         guard let workspace, let status = bridge.gitStatus(workspace: workspace) else {
             statusBar.showGit(branch: nil, changedCount: 0)
+            explorer.gitStatusMap = [:]
             explorer.gitChangedPaths = []
             sourceControl.refresh(status: nil)
             refreshTabBar()
             return
         }
         statusBar.showGit(branch: status.branch, changedCount: status.changedPaths.count)
+
+        var map: [String: GitFileStatus] = [:]
+        for change in status.changes {
+            map[change.path] = GitFileStatus.from(code: change.code)
+        }
+        explorer.gitStatusMap = map
         explorer.gitChangedPaths = Set(status.changedPaths)
         sourceControl.refresh(status: status)
         refreshTabBar()
@@ -1309,8 +1324,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             sourceControl.view.isHidden = false
             sourceControl.workspace = workspace
             sourceControl.refresh(status: workspace.flatMap { bridge.gitStatus(workspace: $0) })
+            sectionHeader.mode = .sourceControl
             sectionHeader.title = "SOURCE CONTROL"
-            sectionHeader.showsTools = false
             activityBar.setActive(isSidebarVisible ? .sourceControl : nil)
         case .search:
             break
@@ -1704,10 +1719,22 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func refreshTabBar() {
+        let statusMap = explorer.gitStatusMap
         let gitPaths = explorer.gitChangedPaths
         tabBar.set(items: tabs.map { tab in
-            TabBar.Item(title: tab.displayTitle, isPreview: tab.isPreview, isEdited: tab.isEdited,
-                        isGitChanged: tab.relPath.map(gitPaths.contains) ?? false)
+            let rel = tab.relPath
+            var status = rel.flatMap { statusMap[$0] } ?? .none
+            if status == .none && tab.isDeletedOnDisk {
+                status = .deleted
+            }
+            let isChanged = rel.map(gitPaths.contains) ?? (status != .none)
+            return TabBar.Item(
+                title: tab.displayTitle,
+                isPreview: tab.isPreview,
+                isEdited: tab.isEdited,
+                isGitChanged: isChanged,
+                gitStatus: status
+            )
         },
                    selected: activeIndex)
     }
@@ -3237,9 +3264,21 @@ private extension NSLayoutConstraint {
 /// tab strip, with a rule underneath.
 @MainActor
 final class SidebarSectionHeader: NSView {
+    enum Mode {
+        case explorer
+        case sourceControl
+    }
+
     static var height: CGFloat { Theme.tabHeight }
 
+    var mode: Mode = .explorer {
+        didSet { updateMode() }
+    }
+
+    let scmChevron = NSButton()
     let label = NSTextField(labelWithString: "EXPLORER")
+
+    // Explorer tools
     let newFileButton = SidebarSectionHeader.tool("doc.badge.plus", "New File…")
     let newFolderButton = SidebarSectionHeader.tool("folder.badge.plus", "New Folder…")
     let refreshButton = SidebarSectionHeader.tool("arrow.clockwise", "Refresh Explorer")
@@ -3247,23 +3286,53 @@ final class SidebarSectionHeader: NSView {
     let moreButton = SidebarSectionHeader.tool("ellipsis", "More Actions…")
     var tools: [NSButton] { [newFileButton, newFolderButton, refreshButton, collapseButton, moreButton] }
 
+    // Source Control tools
+    let scmViewModeButton = SidebarSectionHeader.tool("list.bullet", "View as List")
+    let scmGenerateButton = SidebarSectionHeader.tool("sparkles", "Generate Commit Message")
+    let scmPullButton = SidebarSectionHeader.tool("arrow.down.to.line", "Pull")
+    let scmBranchButton = SidebarSectionHeader.tool("arrow.triangle.branch", "Branches")
+    let scmCommitButton = SidebarSectionHeader.tool("checkmark", "Commit")
+    let scmRefreshButton = SidebarSectionHeader.tool("arrow.clockwise", "Refresh")
+    let scmHistoryButton = SidebarSectionHeader.tool("clock.arrow.circlepath", "View History")
+    let scmMoreButton = SidebarSectionHeader.tool("ellipsis", "More Actions…")
+    var scmTools: [NSButton] {
+        [scmViewModeButton, scmGenerateButton, scmPullButton, scmBranchButton,
+         scmCommitButton, scmRefreshButton, scmHistoryButton, scmMoreButton]
+    }
+
     var onNewFile: (() -> Void)?
     var onNewFolder: (() -> Void)?
     var onRefresh: (() -> Void)?
     var onCollapseAll: (() -> Void)?
     var moreMenu: (() -> NSMenu)?
 
+    var onScmToggle: (() -> Void)?
+    var onScmViewMode: (() -> Void)?
+    var onScmGenerate: (() -> Void)?
+    var onScmPull: (() -> Void)?
+    var onScmBranch: (() -> Void)?
+    var onScmCommit: (() -> Void)?
+    var onScmRefresh: (() -> Void)?
+    var onScmHistory: (() -> Void)?
+    var scmMoreMenu: (() -> NSMenu)?
+
     /// Folder name; empty shows EXPLORER.
     var title = "" {
         didSet {
-            label.stringValue = title.isEmpty ? "EXPLORER" : title.uppercased()
+            if mode == .explorer {
+                label.stringValue = title.isEmpty ? "EXPLORER" : title.uppercased()
+            }
             setAccessibilityLabel(title.isEmpty ? "Explorer" : title)
         }
     }
 
     /// The buttons only make sense with a folder open.
     var showsTools = true {
-        didSet { tools.forEach { $0.isHidden = !showsTools } }
+        didSet {
+            if mode == .explorer {
+                tools.forEach { $0.isHidden = !showsTools }
+            }
+        }
     }
 
     override init(frame: NSRect) {
@@ -3273,11 +3342,24 @@ final class SidebarSectionHeader: NSView {
         setAccessibilityLabel("Explorer")
         setAccessibilityIdentifier("folder-title")
 
+        scmChevron.image = NSImage(systemSymbolName: "chevron.down", accessibilityDescription: "Changes")?
+            .withSymbolConfiguration(.init(pointSize: 10, weight: .bold))
+        scmChevron.isBordered = false
+        scmChevron.imagePosition = .imageOnly
+        scmChevron.contentTintColor = .secondaryLabelColor
+        scmChevron.target = self
+        scmChevron.action = #selector(scmToggleAction(_:))
+        scmChevron.translatesAutoresizingMaskIntoConstraints = false
+        scmChevron.widthAnchor.constraint(equalToConstant: 14).isActive = true
+        scmChevron.heightAnchor.constraint(equalToConstant: 14).isActive = true
+        scmChevron.isHidden = true
+
         label.font = .systemFont(ofSize: 12, weight: .medium)
         label.textColor = .labelColor
         label.lineBreakMode = .byTruncatingTail
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         label.setContentHuggingPriority(.init(1), for: .horizontal)
+
         for (button, action) in [(newFileButton, #selector(newFile(_:))), (newFolderButton, #selector(newFolder(_:))),
                                  (refreshButton, #selector(refresh(_:))), (collapseButton, #selector(collapseAll(_:))),
                                  (moreButton, #selector(more(_:)))] {
@@ -3285,21 +3367,51 @@ final class SidebarSectionHeader: NSView {
             button.action = action
         }
 
-        let row = NSStackView(views: [label] + tools)
-        row.spacing = 6
-        row.setCustomSpacing(10, after: label)
+        for (button, action) in [
+            (scmViewModeButton, #selector(scmViewModeAction(_:))),
+            (scmGenerateButton, #selector(scmGenerateAction(_:))),
+            (scmPullButton, #selector(scmPullAction(_:))),
+            (scmBranchButton, #selector(scmBranchAction(_:))),
+            (scmCommitButton, #selector(scmCommitAction(_:))),
+            (scmRefreshButton, #selector(scmRefreshAction(_:))),
+            (scmHistoryButton, #selector(scmHistoryAction(_:))),
+            (scmMoreButton, #selector(scmMoreAction(_:))),
+        ] {
+            button.target = self
+            button.action = action
+            button.isHidden = true
+        }
+
+        let row = NSStackView(views: [scmChevron, label] + tools + scmTools)
+        row.spacing = 3
+        row.setCustomSpacing(6, after: label)
         row.translatesAutoresizingMaskIntoConstraints = false
         addSubview(row)
         NSLayoutConstraint.activate([
             heightAnchor.constraint(equalToConstant: Self.height),
-            row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 20).withPriority(.defaultHigh),
-            row.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10).withPriority(.defaultHigh),
+            row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14).withPriority(.defaultHigh),
+            row.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8).withPriority(.defaultHigh),
             row.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    private func updateMode() {
+        switch mode {
+        case .explorer:
+            scmChevron.isHidden = true
+            scmTools.forEach { $0.isHidden = true }
+            tools.forEach { $0.isHidden = !showsTools }
+            label.stringValue = title.isEmpty ? "EXPLORER" : title.uppercased()
+        case .sourceControl:
+            scmChevron.isHidden = false
+            tools.forEach { $0.isHidden = true }
+            scmTools.forEach { $0.isHidden = false }
+            label.stringValue = "Changes"
+        }
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         NSColor.separatorColor.setFill()
@@ -3309,14 +3421,14 @@ final class SidebarSectionHeader: NSView {
     private static func tool(_ symbol: String, _ title: String) -> NSButton {
         let b = NSButton()
         b.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)?
-            .withSymbolConfiguration(.init(pointSize: 14, weight: .regular))
+            .withSymbolConfiguration(.init(pointSize: 12, weight: .regular))
         b.isBordered = false
         b.imagePosition = .imageOnly
         b.contentTintColor = .secondaryLabelColor
         b.toolTip = title
         b.setAccessibilityLabel(title)
-        b.widthAnchor.constraint(equalToConstant: 24).isActive = true
-        b.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        b.widthAnchor.constraint(equalToConstant: 20).isActive = true
+        b.heightAnchor.constraint(equalToConstant: 20).isActive = true
         return b
     }
 
@@ -3328,6 +3440,20 @@ final class SidebarSectionHeader: NSView {
     @objc private func more(_ sender: Any?) {
         guard let menu = moreMenu?() else { return }
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: moreButton.bounds.maxY + 4), in: moreButton)
+    }
+
+    @objc private func scmToggleAction(_ sender: Any?) { onScmToggle?() }
+    @objc private func scmViewModeAction(_ sender: Any?) { onScmViewMode?() }
+    @objc private func scmGenerateAction(_ sender: Any?) { onScmGenerate?() }
+    @objc private func scmPullAction(_ sender: Any?) { onScmPull?() }
+    @objc private func scmBranchAction(_ sender: Any?) { onScmBranch?() }
+    @objc private func scmCommitAction(_ sender: Any?) { onScmCommit?() }
+    @objc private func scmRefreshAction(_ sender: Any?) { onScmRefresh?() }
+    @objc private func scmHistoryAction(_ sender: Any?) { onScmHistory?() }
+
+    @objc private func scmMoreAction(_ sender: Any?) {
+        guard let menu = scmMoreMenu?() else { return }
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: scmMoreButton.bounds.maxY + 4), in: scmMoreButton)
     }
 }
 

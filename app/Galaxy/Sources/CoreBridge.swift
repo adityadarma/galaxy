@@ -198,8 +198,16 @@ final class CoreBridge {
         (try? workspace.gitStage(path: path)) != nil
     }
 
+    func gitStageAll(workspace: Workspace) -> Bool {
+        (try? workspace.gitStageAll()) != nil
+    }
+
     func gitUnstage(workspace: Workspace, path: String) -> Bool {
         (try? workspace.gitUnstage(path: path)) != nil
+    }
+
+    func gitUnstageAll(workspace: Workspace) -> Bool {
+        (try? workspace.gitUnstageAll()) != nil
     }
 
     func gitCommit(workspace: Workspace, message: String) -> Bool {

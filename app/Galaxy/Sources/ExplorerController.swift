@@ -42,6 +42,12 @@ final class ExplorerController: NSObject {
     var gitChangedPaths: Set<String> = [] {
         didSet { if gitChangedPaths != oldValue { refreshGitMarks() } }
     }
+    var gitStatusMap: [String: GitFileStatus] = [:] {
+        didSet {
+            gitChangedPaths = Set(gitStatusMap.keys)
+            refreshGitMarks()
+        }
+    }
     /// Set while a folder click selects its row, so the selection change
     /// does not toggle the folder a second time.
     private var selectingFromClick = false
@@ -156,9 +162,32 @@ final class ExplorerController: NSObject {
     }
 
     func isGitChanged(_ entry: FileEntry) -> Bool {
-        if !entry.isDir { return gitChangedPaths.contains(entry.relPath) }
+        if !entry.isDir { return gitChangedPaths.contains(entry.relPath) || (gitStatusMap[entry.relPath] != nil) }
         let prefix = entry.relPath.isEmpty ? "" : entry.relPath + "/"
-        return gitChangedPaths.contains { $0.hasPrefix(prefix) }
+        return gitChangedPaths.contains { $0.hasPrefix(prefix) } || gitStatusMap.keys.contains { $0.hasPrefix(prefix) }
+    }
+
+    func gitStatus(for entry: FileEntry) -> GitFileStatus {
+        if !entry.isDir {
+            return gitStatusMap[entry.relPath] ?? (gitChangedPaths.contains(entry.relPath) ? .modified : .none)
+        }
+        let prefix = entry.relPath.isEmpty ? "" : entry.relPath + "/"
+        var hasAdded = false
+        var hasModified = false
+        var hasDeleted = false
+        for (path, status) in gitStatusMap where path.hasPrefix(prefix) {
+            switch status {
+            case .modified: hasModified = true
+            case .added, .untracked, .renamed: hasAdded = true
+            case .deleted: hasDeleted = true
+            case .none: break
+            }
+        }
+        if hasModified { return .modified }
+        if hasAdded { return .added }
+        if hasDeleted { return .deleted }
+        if gitChangedPaths.contains(where: { $0.hasPrefix(prefix) }) { return .modified }
+        return .none
     }
 
     /// Updates the rows on screen; others pick it up when they are made.
@@ -180,7 +209,9 @@ final class ExplorerController: NSObject {
             guard let node = outlineView.item(atRow: row) as? ExplorerNode,
                   let cell = outlineView.view(atColumn: 0, row: row, makeIfNecessary: false) as? ExplorerCell
             else { continue }
-            cell.isGitChanged = isGitChanged(node.entry)
+            let status = gitStatus(for: node.entry)
+            cell.gitStatus = status
+            cell.isGitChanged = status != .none
         }
     }
 
@@ -392,7 +423,9 @@ extension ExplorerController: NSOutlineViewDelegate {
             ?? ExplorerCell()
         cell.show(node.entry, expanded: outlineView.isItemExpanded(node))
         cell.isDirty = isDirty(node.entry)
-        cell.isGitChanged = isGitChanged(node.entry)
+        let status = gitStatus(for: node.entry)
+        cell.gitStatus = status
+        cell.isGitChanged = status != .none
         return cell
     }
 
@@ -488,10 +521,22 @@ final class ExplorerCell: NSTableCellView {
         }
     }
 
+    var gitStatus: GitFileStatus = .none {
+        didSet {
+            if let color = gitStatus.color {
+                label.textColor = color
+            } else {
+                label.textColor = .labelColor
+            }
+        }
+    }
+
     var isGitChanged = false {
         didSet {
-            gitDot.isHidden = !isGitChanged
-            label.textColor = isGitChanged ? .systemYellow : .labelColor
+            gitDot.isHidden = true
+            if !isGitChanged {
+                gitStatus = .none
+            }
         }
     }
 
