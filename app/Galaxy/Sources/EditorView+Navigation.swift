@@ -120,10 +120,10 @@ extension EditorView {
             } else if flags.contains(.option) {
                 document.addCaret(pos: pos)
             } else {
-                let before = document.viewport(firstLine: 0, count: 0).primary
+                let before = document.primaryCursor()
                 document.setCaret(pos: pos)
                 if let onClickMove {
-                    onClickMove(before, document.viewport(firstLine: 0, count: 0).primary)
+                    onClickMove(before, document.primaryCursor())
                 }
             }
         }
@@ -230,28 +230,107 @@ extension EditorView {
         return range
     }
 
-    /// Helpers whose string argument laravel-lsp can resolve to a file.
+    /// Global helpers whose string argument laravel-lsp can resolve to a file.
     static let laravelStringHelpers: Set<String> = [
         "config", "route", "to_route", "view", "env", "trans", "trans_choice", "__", "asset", "mix", "vite",
+        "inertia", "base_path", "resource_path", "config_path", "app_path", "database_path", "lang_path",
+        "public_path", "storage_path",
     ]
 
-    /// Whole string contents (without quotes) when the literal is the first
-    /// argument of a Laravel helper such as `config('app.name')`. Any other
-    /// string, e.g. a log message, is not a link.
-    static func laravelStringRange(in text: String, stringStart: Int, stringEnd: Int) -> Range<Int>? {
+    /// Facade and method names whose string argument laravel-lsp (or
+    /// Galaxy's own resolver, for `Log::channel`) can resolve, e.g.
+    /// `Storage::disk('s3')`, `Config::get('app.name')`, `$lang->get('x')`.
+    /// Other calls such as `Log::info('message')` stay plain text.
+    static let laravelStringMethods: Set<String> = [
+        "get", "getMany", "string", "integer", "boolean", "float", "array", "prepend", "push", "has",
+        "hasForLocale", "choice", "disk", "fake", "persistentFake", "forgetDisk", "make", "view", "render",
+        "modal", "inertia", "asset", "route", "channel",
+    ]
+
+    /// The call a string literal is the first argument of: the function or
+    /// method name, and for `A::m(` the class `A` (last namespace segment).
+    struct StringCall: Equatable {
+        var receiver: String?
+        var isMethod: Bool
+        var name: String
+    }
+
+    static func stringCall(in text: String, stringStart: Int) -> StringCall? {
         let units = Array(text.utf16)
-        guard stringStart >= 0, stringEnd <= units.count, stringEnd - stringStart >= 2 else { return nil }
-        // Walk back over `(` and spaces to the helper name.
+        guard stringStart >= 0, stringStart <= units.count else { return nil }
+        func isWord(_ i: Int) -> Bool {
+            guard i >= 0, i < units.count, let scalar = Unicode.Scalar(units[i]) else { return false }
+            return scalar == "_" || CharacterSet.alphanumerics.contains(scalar)
+        }
+        func word(endingAt end: Int) -> (String, Int) {
+            var i = end
+            while isWord(i) { i -= 1 }
+            return (String(utf16CodeUnits: Array(units[(i + 1)...end]), count: end - i), i)
+        }
+        // Walk back over `(` and spaces to the callee name.
         var i = stringStart - 1
         while i >= 0, units[i] == 0x20 { i -= 1 }
         guard i >= 0, units[i] == UInt16(UInt8(ascii: "(")) else { return nil }
         i -= 1
         while i >= 0, units[i] == 0x20 { i -= 1 }
-        let nameEnd = i + 1
-        while i >= 0, let scalar = Unicode.Scalar(units[i]),
-              scalar == "_" || CharacterSet.alphanumerics.contains(scalar) { i -= 1 }
-        let name = String(utf16CodeUnits: Array(units[(i + 1)..<nameEnd]), count: nameEnd - i - 1)
-        guard laravelStringHelpers.contains(name) else { return nil }
+        guard isWord(i) else { return nil }
+        let (name, before) = word(endingAt: i)
+        i = before
+        while i >= 0, units[i] == 0x20 { i -= 1 }
+        let colon = UInt16(UInt8(ascii: ":")), arrow = UInt16(UInt8(ascii: ">")), dash = UInt16(UInt8(ascii: "-"))
+        if i >= 1, units[i] == colon, units[i - 1] == colon {
+            i -= 2
+            while i >= 0, units[i] == 0x20 { i -= 1 }
+            let receiver = isWord(i) ? word(endingAt: i).0 : nil
+            return StringCall(receiver: receiver, isMethod: true, name: name)
+        }
+        if i >= 1, units[i] == arrow, units[i - 1] == dash {
+            return StringCall(receiver: nil, isMethod: true, name: name)
+        }
+        return StringCall(receiver: nil, isMethod: false, name: name)
+    }
+
+    /// `true` for `Log::channel('x')`, which Galaxy resolves itself.
+    static func isLogChannel(_ call: StringCall?) -> Bool {
+        call?.receiver == "Log" && call?.name == "channel"
+    }
+
+    /// Channel name when `pos` is inside the string of `Log::channel('x')`.
+    func logChannelName(at pos: TextPos) -> String? {
+        guard let document, Self.isPHP(document) else { return nil }
+        let column = Int(pos.colUtf16)
+        // PHP highlights both `string` and its `string_content`; the widest
+        // run is the whole literal, quotes included.
+        let run = document.viewport(firstLine: pos.line, count: 1).styles
+            .filter { $0.line == pos.line && $0.scope == "string" && Int($0.start) <= column && column < Int($0.end) }
+            .max { ($0.end - $0.start) < ($1.end - $1.start) }
+        guard let run else { return nil }
+        return Self.logChannelName(in: document.displayLine(line: pos.line),
+                                   stringStart: Int(run.start), stringEnd: Int(run.end))
+    }
+
+    static func logChannelName(in text: String, stringStart: Int, stringEnd: Int) -> String? {
+        guard isLogChannel(stringCall(in: text, stringStart: stringStart)),
+              let inner = laravelStringRange(in: text, stringStart: stringStart, stringEnd: stringEnd) else { return nil }
+        let units = Array(text.utf16)
+        return String(utf16CodeUnits: Array(units[inner]), count: inner.count)
+    }
+
+    /// Whole string contents (without quotes) when the literal is the first
+    /// argument of a Laravel helper such as `config('app.name')` or of a
+    /// resolvable method such as `Storage::disk('s3')`. Any other string,
+    /// e.g. a log message, is not a link.
+    static func laravelStringRange(in text: String, stringStart: Int, stringEnd: Int) -> Range<Int>? {
+        let units = Array(text.utf16)
+        guard stringStart >= 0, stringEnd <= units.count, stringEnd - stringStart >= 2,
+              let call = stringCall(in: text, stringStart: stringStart) else { return nil }
+        if call.isMethod {
+            guard laravelStringMethods.contains(call.name) else { return nil }
+            // `channel` is only resolvable on the Log facade.
+            if call.name == "channel", !isLogChannel(call) { return nil }
+        } else {
+            guard laravelStringHelpers.contains(call.name) else { return nil }
+        }
         let first = units[stringStart], last = units[stringEnd - 1]
         let quotes: Set<UInt16> = [UInt16(UInt8(ascii: "'")), UInt16(UInt8(ascii: "\""))]
         let inner = quotes.contains(first) && first == last ? (stringStart + 1)..<(stringEnd - 1) : stringStart..<stringEnd
@@ -402,6 +481,6 @@ extension EditorView {
 
     override func accessibilityInsertionPointLineNumber() -> Int {
         guard let document else { return 0 }
-        return Int(document.viewport(firstLine: 0, count: 0).primary.line)
+        return Int(document.primaryCursor().line)
     }
 }

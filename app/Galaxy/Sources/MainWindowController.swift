@@ -982,7 +982,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     private func requestCompletionIfNeeded() {
         guard let document = activeTab?.doc else { return }
-        let position = document.viewport(firstLine: 0, count: 0).primary
+        let position = document.primaryCursor()
         completionPosition = TextPos(line: position.line, colUtf16: position.colUtf16)
         let line = document.displayLine(line: position.line)
         let column = Int(position.colUtf16)
@@ -1011,7 +1011,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private func refreshCompletion() {
         guard let document = activeTab?.doc else { return }
         guard !completionDismissed else { return }
-        let position = document.viewport(firstLine: 0, count: 0).primary
+        let position = document.primaryCursor()
         guard position.line == completionPosition.line,
               position.colUtf16 == completionPosition.colUtf16 else {
             completionPopup.isHidden = true
@@ -1052,6 +1052,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     private func requestDefinition(at position: TextPos) -> Bool {
         guard let document = activeTab?.doc else { return false }
+        // laravel-lsp has no log channel provider; the core resolves it.
+        if let channel = editorView.logChannelName(at: position) {
+            if let found = laravelLogChannelLocation(file: document.path(), channel: channel) {
+                jump(to: found)
+            } else {
+                NSSound.beep()
+            }
+            return true
+        }
         definitionRequest = (document, position)
         bridge.requestDefinition(document: document, line: position.line, character: position.colUtf16)
         return true
@@ -1061,16 +1070,20 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         guard let request = definitionRequest,
               let location = bridge.definitionLocations(document: request.document).first else { return }
         definitionRequest = nil
+        jump(to: location)
+    }
+
+    /// Opens `location` and records the jump for back/forward.
+    private func jump(to location: DefinitionLocation) {
         guard let path = URL(string: location.uri)?.path else { return }
-        let current = activeTab.map(location(of:))
         let target = NavLocation(key: path, line: location.line, col: location.column)
-        if let current { _ = navHistory.recordJump(from: current, to: target) }
+        if let current = activeTab.map(location(of:)) { _ = navHistory.recordJump(from: current, to: target) }
         _ = show(target)
     }
 
     @objc func findReferences(_ sender: Any?) {
         guard let document = activeTab?.doc else { NSSound.beep(); return }
-        let position = document.viewport(firstLine: 0, count: 0).primary
+        let position = document.primaryCursor()
         referencesRequest = document
         bridge.requestReferences(document: document, line: position.line, character: position.colUtf16)
     }
@@ -1088,17 +1101,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func showReference(_ location: DefinitionLocation) {
-        guard let path = URL(string: location.uri)?.path else { return }
+        guard URL(string: location.uri) != nil else { return }
         referencesPanel.removeFromSuperview()
-        let current = activeTab.map(location(of:))
-        let target = NavLocation(key: path, line: location.line, col: location.column)
-        if let current { _ = navHistory.recordJump(from: current, to: target) }
-        _ = show(target)
+        jump(to: location)
     }
 
     @objc func renameSymbol(_ sender: Any?) {
         guard let document = activeTab?.doc else { NSSound.beep(); return }
-        let current = document.viewport(firstLine: 0, count: 0).primary
+        let current = document.primaryCursor()
         let line = document.displayLine(line: current.line)
         let column = min(Int(current.colUtf16), line.utf16.count)
         let prefix = String(line.prefix(column))
@@ -1138,7 +1148,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     @objc func showCodeActions(_ sender: Any?) {
         guard let document = activeTab?.doc else { NSSound.beep(); return }
-        let position = document.viewport(firstLine: 0, count: 0).primary
+        let position = document.primaryCursor()
         codeActionRequest = document
         bridge.requestCodeActions(document: document, line: position.line, character: position.colUtf16)
     }
@@ -1216,20 +1226,20 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     @objc func goToDefinition(_ sender: Any?) {
         guard let document = activeTab?.doc else { NSSound.beep(); return }
-        let position = document.viewport(firstLine: 0, count: 0).primary
+        let position = document.primaryCursor()
         _ = requestDefinition(at: TextPos(line: position.line, colUtf16: position.colUtf16))
     }
 
     @objc func goToTypeDefinition(_ sender: Any?) {
         guard let document = activeTab?.doc else { NSSound.beep(); return }
-        let position = document.viewport(firstLine: 0, count: 0).primary
+        let position = document.primaryCursor()
         definitionRequest = (document, TextPos(line: position.line, colUtf16: position.colUtf16))
         bridge.requestTypeDefinition(document: document, line: position.line, character: position.colUtf16)
     }
 
     @objc func goToImplementation(_ sender: Any?) {
         guard let document = activeTab?.doc else { NSSound.beep(); return }
-        let position = document.viewport(firstLine: 0, count: 0).primary
+        let position = document.primaryCursor()
         definitionRequest = (document, TextPos(line: position.line, colUtf16: position.colUtf16))
         bridge.requestImplementation(document: document, line: position.line, character: position.colUtf16)
     }
@@ -2450,7 +2460,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         closeOverlays()
         editorView.flushPendingUpdates()
         let panel = goToLine
-        panel.reset(lineCount: doc.lineCount(), current: doc.viewport(firstLine: 0, count: 0).primary.line)
+        panel.reset(lineCount: doc.lineCount(), current: doc.primaryCursor().line)
         panel.isHidden = false
         panel.focus()
     }
@@ -2582,7 +2592,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         if let document = activeTab?.doc {
             let symbols = bridge.documentSymbols(document: document)
             documentSymbols = symbols.map { OutlineSymbol(uri: $0.uri, name: $0.name, kind: $0.kind, line: $0.line, column: $0.column) }
-            let line = editorView.document?.viewport(firstLine: 0, count: 0).primary.line ?? 0
+            let line = editorView.document?.primaryCursor().line ?? 0
             breadcrumbBar.show(symbols: documentSymbols, atLine: line)
         } else {
             documentSymbols = []

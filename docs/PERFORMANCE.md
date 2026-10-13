@@ -7,7 +7,7 @@ measurements use Release builds. Physical footprint excludes language servers.
 |---|---:|---:|---|
 | Cold start to first frame | < 200 ms | warm median 204.8 ms; first cold run 939.6 ms | needs follow-up |
 | Idle footprint, no workspace | < 40 MB | median 28 MB | pass |
-| Workspace footprint, 10k files / 5 tabs | < 120 MB | not measured by an automated harness | gap |
+| Workspace footprint, 10k files / 5 tabs | < 120 MB | median 55 MB app (3 runs, 2026-10-13, `scripts/measure-footprint.sh`); 11.6 MB core-only peak RSS; 97 MB core-only with an extra 1 MB + 1.5 MB tab (was 234 MB before incremental reparse) | pass |
 | Open 1 MB file | < 30 ms | no dedicated app harness | gap |
 | Open 100 MB large-file mode | < 500 ms | core load benchmark exists; app open timing missing | gap |
 | Keypress to render | < 8 ms p95 | 1.14-1.52 ms p95 in existing Release runs | pass |

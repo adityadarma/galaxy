@@ -11,7 +11,7 @@
 
 use std::sync::OnceLock;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicU64, Ordering},
     mpsc::{self, Receiver, Sender, TryRecvError},
 };
@@ -19,7 +19,7 @@ use std::thread::{self, JoinHandle};
 
 use ropey::Rope;
 use tree_sitter::{
-    InputEdit, Language, Parser, Point, Query, QueryCursor, StreamingIterator, Tree,
+    InputEdit, Language, Parser, Point, Query, QueryCursor, StreamingIterator, TextProvider, Tree,
 };
 
 use crate::document::Document;
@@ -217,18 +217,15 @@ pub fn outline_symbols(
     tree: &Tree,
     language: SyntaxLanguage,
 ) -> Vec<OutlineSymbol> {
-    let Some(source) = language.tags_query() else {
-        return Vec::new();
-    };
-    let Ok(query) = Query::new(&language.grammar(), source) else {
+    let Some(query) = cached_tags_query(language) else {
         return Vec::new();
     };
     let names = query.capture_names();
     let mut cursor = QueryCursor::new();
     let rope = doc.rope();
-    let source = rope.to_string();
+    let len = rope.len_bytes();
     let mut out = Vec::new();
-    let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+    let mut matches = cursor.matches(query, tree.root_node(), RopeTextProvider(rope));
     while let Some(m) = matches.next() {
         let mut name = None;
         let mut kind = None;
@@ -244,8 +241,9 @@ pub fn outline_symbols(
         let (Some(name), Some(kind)) = (name, kind) else {
             continue;
         };
-        let start = rope.byte_to_char(name.start_byte());
-        let end = rope.byte_to_char(name.end_byte());
+        // Tree may lag the rope by one edit; clamp instead of panicking.
+        let start = rope.byte_to_char(name.start_byte().min(len));
+        let end = rope.byte_to_char(name.end_byte().min(len));
         let pos = doc.char_to_utf16(start);
         out.push(OutlineSymbol {
             name: rope.slice(start..end).to_string(),
@@ -432,17 +430,9 @@ pub fn style_runs_for_viewport(
     let names = query.capture_names();
     let mut cursor = QueryCursor::new();
     cursor.set_byte_range(start_byte..end_byte);
-    let mut text = rope.to_string().into_bytes();
-    // The tree may be one edit behind (drawn while the worker reparses).
-    // Query predicates slice the source by node ranges, so pad to the tree's
-    // extent instead of panicking when text was deleted. Runs are clipped to
-    // `end_byte` below, so padding never reaches the screen.
-    let tree_end = tree.root_node().end_byte();
-    if tree_end > text.len() {
-        text.resize(tree_end, b' ');
-    }
+    // Predicates read node text through Rope chunks; no full-document copy.
     let mut runs = Vec::new();
-    let mut matches = cursor.matches(query, tree.root_node(), text.as_slice());
+    let mut matches = cursor.matches(query, tree.root_node(), RopeTextProvider(rope));
     while let Some(m) = matches.next() {
         for capture in m.captures {
             let Some(scope) = HighlightScope::from_capture(names[capture.index as usize]) else {
@@ -479,6 +469,66 @@ pub fn style_runs_for_viewport(
     }
     runs.sort_by_key(|run| (run.line, run.start, run.end));
     runs
+}
+
+/// Feeds Tree-sitter query predicates straight from Rope chunks, so a query
+/// never copies the whole document. Node ranges past the end of the rope
+/// (the tree may be one edit behind while the worker reparses) are clipped;
+/// affected runs are clipped to the viewport later, so this never reaches
+/// the screen.
+struct RopeTextProvider<'a>(&'a Rope);
+
+impl<'a> TextProvider<&'a [u8]> for RopeTextProvider<'a> {
+    type I = RopeByteChunks<'a>;
+
+    fn text(&mut self, node: tree_sitter::Node) -> Self::I {
+        let len = self.0.len_bytes();
+        let end = node.end_byte().min(len);
+        let start = node.start_byte().min(end);
+        let (chunks, chunk_start, _, _) = self.0.chunks_at_byte(start);
+        RopeByteChunks {
+            chunks,
+            chunk_start,
+            start,
+            end,
+        }
+    }
+}
+
+struct RopeByteChunks<'a> {
+    chunks: ropey::iter::Chunks<'a>,
+    chunk_start: usize,
+    start: usize,
+    end: usize,
+}
+
+impl<'a> Iterator for RopeByteChunks<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        if self.start >= self.end {
+            return None;
+        }
+        let chunk = self.chunks.next()?.as_bytes();
+        let chunk_start = self.chunk_start;
+        let chunk_end = chunk_start + chunk.len();
+        self.chunk_start = chunk_end;
+        let from = self.start.saturating_sub(chunk_start);
+        let to = self.end.min(chunk_end) - chunk_start;
+        self.start = chunk_end;
+        Some(&chunk[from..to])
+    }
+}
+
+fn cached_tags_query(language: SyntaxLanguage) -> Option<&'static Query> {
+    static QUERIES: [OnceLock<Option<Query>>; 14] = [const { OnceLock::new() }; 14];
+    let slot = &QUERIES[language as usize];
+    slot.get_or_init(|| {
+        language
+            .tags_query()
+            .and_then(|source| Query::new(&language.grammar(), source).ok())
+    })
+    .as_ref()
 }
 
 fn cached_highlight_query(language: SyntaxLanguage) -> Option<&'static Query> {
@@ -584,6 +634,11 @@ pub struct SyntaxService {
     results: Receiver<SyntaxSnapshot>,
     latest_requested: Arc<AtomicU64>,
     worker: Option<JoinHandle<()>>,
+    /// Last rope handed to the worker (a shared-node clone). The next
+    /// `submit_document` diffs against it so the worker can reparse
+    /// incrementally; new trees then share unchanged subtrees with the old
+    /// one instead of each being a full copy.
+    last_submitted: Mutex<Option<(u64, Rope)>>,
 }
 
 impl SyntaxService {
@@ -601,13 +656,47 @@ impl SyntaxService {
             results: result_rx,
             latest_requested,
             worker: Some(worker),
+            last_submitted: Mutex::new(None),
         }
     }
 
     /// Queues the document's current rope. Cloning a Rope is O(1): text is
     /// still read by Tree-sitter through rope chunks on the worker.
+    ///
+    /// After the first submit this sends an edit computed by diffing against
+    /// the previous rope, so every edit path (typing, paste, undo, IME,
+    /// reload) gets an incremental reparse without reporting its changes.
     pub fn submit_document(&self, doc: &Document) {
-        self.submit(doc.revision(), doc.rope().clone());
+        let revision = doc.revision();
+        let text = doc.rope().clone();
+        let edit = self
+            .last_submitted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|(base, old)| {
+                let change = crate::rope_diff::changed_bytes(old, &text).unwrap_or(
+                    crate::rope_diff::ByteChange {
+                        start: 0,
+                        old_end: 0,
+                        new_end: 0,
+                    },
+                );
+                (
+                    *base,
+                    SyntaxEdit::from_byte_ranges(
+                        old,
+                        &text,
+                        change.start,
+                        change.old_end,
+                        change.new_end,
+                    ),
+                )
+            });
+        match edit {
+            Some((base, edit)) => self.submit_edit(base, revision, text, edit),
+            None => self.submit(revision, text),
+        }
     }
 
     pub fn submit(&self, revision: u64, text: Rope) {
@@ -633,6 +722,10 @@ impl SyntaxService {
 
     fn send(&self, request: Request) {
         let revision = request.revision;
+        *self
+            .last_submitted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some((revision, request.text.clone()));
         self.latest_requested.store(revision, Ordering::Release);
         // The receiver only disappears while Drop is joining the worker.
         let _ = self
@@ -752,6 +845,41 @@ mod tests {
         assert_eq!(snapshot.revision(), doc.revision());
         assert_eq!(snapshot.tree().root_node().kind(), "document");
         assert!(!snapshot.tree().root_node().has_error());
+    }
+
+    #[test]
+    fn submit_document_diffs_and_reparses_incrementally() {
+        let language: Language = tree_sitter_rust::LANGUAGE.into();
+        let service = SyntaxService::new(language.clone());
+        let mut doc = Document::from_text("fn a() { let x = 1; }\nfn b() {}\n");
+        service.submit_document(&doc);
+        let first = wait_for(&service);
+        assert!(!first.is_incremental());
+
+        // Edits reach the service without any change description, as from
+        // undo or paste.
+        for (at, text) in [(17, "42 + "), (0, "// 😀 note\n"), (5, "")] {
+            let change = crate::change::ChangeSet::new(
+                vec![crate::change::Change::new(
+                    at,
+                    at + usize::from(text.is_empty()),
+                    text,
+                )],
+                doc.len_chars(),
+            );
+            doc.apply(&change);
+            service.submit_document(&doc);
+            let snapshot = wait_for(&service);
+            assert!(snapshot.is_incremental(), "edit at {at} reparsed in full");
+            let mut parser = Parser::new();
+            parser.set_language(&language).unwrap();
+            let full = parser.parse(doc.text(), None).unwrap();
+            assert_eq!(
+                snapshot.tree().root_node().to_sexp(),
+                full.root_node().to_sexp(),
+                "incremental tree differs from a full parse"
+            );
+        }
     }
 
     #[test]

@@ -241,9 +241,9 @@ final class EditorView: NSView {
     /// need scroll-into-view must reuse the returned value rather than make
     /// another FFI request (M1-15).
     @discardableResult
-    func reloadDocument() -> ViewportSnapshot? {
-        let snapshot = document?.viewport(firstLine: 0, count: 0)
-        applyDocumentMetadata(snapshot)
+    func reloadDocument() -> StatusSnapshot? {
+        let snapshot = document?.statusSnapshot()
+        applyDocumentMetadata(lineCount: snapshot?.lineCount)
         metadataNeedsRefresh = false
         pendingCaretScroll = false
         // A moving caret should be solid, like every text field.
@@ -253,8 +253,8 @@ final class EditorView: NSView {
         return snapshot
     }
 
-    private func applyDocumentMetadata(_ snapshot: ViewportSnapshot?) {
-        lineCount = Int(snapshot?.lineCount ?? 0)
+    private func applyDocumentMetadata(lineCount newCount: UInt64?) {
+        lineCount = Int(newCount ?? 0)
         let virtual = CGFloat(lineCount) * metrics.lineHeight
         let visible = enclosingScrollView?.contentSize.height ?? 0
         setFrameSize(NSSize(width: frame.width, height: max(virtual, visible)))
@@ -442,7 +442,7 @@ final class EditorView: NSView {
             count: UInt64(range.count)
         )
         if metadataNeedsRefresh {
-            applyDocumentMetadata(snapshot)
+            applyDocumentMetadata(lineCount: snapshot.lineCount)
             metadataNeedsRefresh = false
             // After this draw: changing a label mid-draw can trigger layout.
             let primary = snapshot.primary, count = snapshot.selectionCount

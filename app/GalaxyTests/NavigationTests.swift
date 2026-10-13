@@ -192,6 +192,43 @@ final class NavigationTests: XCTestCase {
         XCTAssertEqual(configLink?.1, UInt64(app + "app.name".utf16.count))
     }
 
+    func testCommandClickOnLogChannelOpensLoggingConfig() throws {
+        // The Laravel app sits below the opened file's folder tree, as in a
+        // workspace whose root is not the project root.
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-log-\(UUID().uuidString)")
+        let root = dir.appendingPathComponent("backend")
+        let providers = root.appendingPathComponent("app/Providers")
+        try FileManager.default.createDirectory(at: providers, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("config"), withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try "#!/usr/bin/env php\n".write(to: root.appendingPathComponent("artisan"), atomically: true, encoding: .utf8)
+        let logging = root.appendingPathComponent("config/logging.php")
+        try "<?php\n\nreturn [\n    'channels' => [\n        'stack' => ['driver' => 'stack'],\n        'queue' => ['driver' => 'daily'],\n    ],\n];\n"
+            .write(to: logging, atomically: true, encoding: .utf8)
+        let file = providers.appendingPathComponent("AppServiceProvider.php")
+        let line = "        Log::channel('queue')->info('Queue job processing', [])"
+        try "<?php\nclass A {\n    function boot() {\n\(line);\n    }\n}\n".write(to: file, atomically: true, encoding: .utf8)
+
+        let c = MainWindowController(bridge: CoreBridge())
+        c.showWindow(nil)
+        try c.openFile(at: file)
+        let v = c.editorView
+        let deadline = Date().addingTimeInterval(5)
+        while v.document?.viewport(firstLine: 3, count: 1).styles.isEmpty ?? true, Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
+        let column = (line as NSString).range(of: "queue").location + 2
+        XCTAssertEqual(v.logChannelName(at: TextPos(line: 3, colUtf16: UInt64(column))), "queue")
+        XCTAssertNil(v.logChannelName(at: TextPos(line: 3, colUtf16: UInt64((line as NSString).range(of: "Queue job").location + 2))))
+
+        click(v, line: 3, utf16Col: column, flags: .command)
+        let opened = c.activeTab.map { URL(fileURLWithPath: $0.doc.path()).resolvingSymlinksInPath().path }
+        XCTAssertEqual(opened, logging.resolvingSymlinksInPath().path, "Cmd+click opens config/logging.php")
+        let caret = c.activeTab?.doc.primaryCursor()
+        XCTAssertEqual(caret?.line, 5, "caret on the 'queue' key")
+        XCTAssertEqual(caret?.colUtf16, 8)
+    }
+
     func testOnlyLaravelHelperStringsAreLinks() {
         func range(_ text: String, _ literal: String) -> Range<Int>? {
             let r = (text as NSString).range(of: literal)
@@ -202,8 +239,32 @@ final class NavigationTests: XCTestCase {
         XCTAssertEqual(range(config, "'services.sipay.url'"), start..<(start + "services.sipay.url".utf16.count))
         XCTAssertNotNil(range("return view( \"home\" );", "\"home\""))
         XCTAssertNil(range("Log::channel('queue')->info('Queue job processing', [", "'Queue job processing'"))
-        XCTAssertNil(range("Log::channel('queue')", "'queue'"))
         XCTAssertNil(range("'connection' => $event->connectionName,", "'connection'"))
+        XCTAssertNil(range("Log::info('message')", "'message'"))
+        XCTAssertNil(range("$broadcast->channel('orders')", "'orders'"), "channel() is only a link on Log")
+    }
+
+    func testFacadeAndMethodStringsAreLinks() {
+        func range(_ text: String, _ literal: String) -> Range<Int>? {
+            let r = (text as NSString).range(of: literal)
+            return EditorView.laravelStringRange(in: text, stringStart: r.location, stringEnd: r.location + r.length)
+        }
+        XCTAssertNotNil(range("Storage::disk('s3')->put($p, $c);", "'s3'"))
+        XCTAssertNotNil(range("Config::get('app.name')", "'app.name'"))
+        XCTAssertNotNil(range("\\Illuminate\\Support\\Facades\\Log::channel('queue')", "'queue'"))
+        XCTAssertNotNil(range("$path = storage_path('logs/x.log');", "'logs/x.log'"))
+        XCTAssertNotNil(range("$this->lang->get('auth.failed')", "'auth.failed'"))
+    }
+
+    func testLogChannelNameIsExtracted() {
+        func name(_ text: String, _ literal: String) -> String? {
+            let r = (text as NSString).range(of: literal)
+            return EditorView.logChannelName(in: text, stringStart: r.location, stringEnd: r.location + r.length)
+        }
+        XCTAssertEqual(name("Log::channel('queue')->info('x');", "'queue'"), "queue")
+        XCTAssertEqual(name("Log :: channel( \"daily\" )", "\"daily\""), "daily")
+        XCTAssertNil(name("Storage::disk('s3')", "'s3'"))
+        XCTAssertNil(name("Log::channel('queue')->info('x');", "'x'"))
     }
 
     func testClickingPastTheEndsClampsToValidPositions() throws {

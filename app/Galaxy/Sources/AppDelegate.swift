@@ -46,6 +46,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             controller.newDocument(nil)
         }
 
+        // `scripts/measure-footprint.sh`: open extra files as tabs after the
+        // workspace, so the footprint covers a realistic editing session.
+        if let files = ProcessInfo.processInfo.environment["GALAXY_BENCH_OPEN_FILES"] {
+            for path in files.split(separator: ":") where !path.isEmpty {
+                controller.open(url: URL(fileURLWithPath: String(path)))
+            }
+        }
+
         StartupProbe.mark("document_open")
         NSApp.activate()
         Log.app.info("window ready, core \(self.bridge.version, privacy: .public)")

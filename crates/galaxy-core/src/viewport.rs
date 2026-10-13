@@ -95,6 +95,12 @@ pub struct ViewportSnapshot {
 }
 
 impl Editor {
+    /// Primary caret position without building any line snapshot. Use this
+    /// instead of `viewport(0, 0)` when only the cursor is needed.
+    pub fn primary_cursor(&self) -> CursorInfo {
+        primary_cursor(&self.doc, &self.sel)
+    }
+
     /// Snapshot of `count` lines starting at `first_line` (clamped).
     pub fn viewport(&self, first_line: usize, count: usize) -> ViewportSnapshot {
         let mut snap = snapshot(&self.doc, &self.sel, first_line, count);
@@ -287,19 +293,23 @@ pub fn snapshot(
         });
     }
 
-    let head = sel.primary().head;
-    let pos = doc.char_to_position(head);
     ViewportSnapshot {
         revision: doc.revision(),
         line_count,
         lines,
-        primary: CursorInfo {
-            line: pos.line,
-            col: pos.col,
-            col_utf16: doc.char_to_utf16(head).col,
-        },
+        primary: primary_cursor(doc, sel),
         selection_count: sel.len(),
         styles: Vec::new(),
+    }
+}
+
+fn primary_cursor(doc: &Document, sel: &SelectionSet) -> CursorInfo {
+    let head = sel.primary().head;
+    let pos = doc.char_to_position(head);
+    CursorInfo {
+        line: pos.line,
+        col: pos.col,
+        col_utf16: doc.char_to_utf16(head).col,
     }
 }
 

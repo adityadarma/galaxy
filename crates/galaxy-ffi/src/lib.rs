@@ -82,6 +82,19 @@ pub fn core_version() -> String {
     galaxy_core::version().to_string()
 }
 
+/// Definition of a `Log::channel('name')` channel for the Laravel project
+/// containing `file` (`config/logging.php`). laravel-lsp has no provider
+/// for log channels.
+#[uniffi::export]
+pub fn laravel_log_channel_location(file: String, channel: String) -> Option<DefinitionLocation> {
+    let location = galaxy_core::laravel::log_channel_location(Path::new(&file), &channel)?;
+    Some(DefinitionLocation {
+        uri: file_uri(&location.path),
+        line: location.line as u64,
+        column: location.column_utf16 as u64,
+    })
+}
+
 /// Initializes file logging in `dir`. Returns `false` if already initialized.
 #[uniffi::export]
 pub fn init_logging(dir: String, level: String) -> Result<bool, CoreError> {
@@ -447,8 +460,8 @@ impl Core {
         let companion = companion_server(&language, Some(&key.root), &config);
         let mut lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
         lsp.ensure_server(key.clone(), &config)?;
-        let text = document.text();
-        let doc = Document::from_text(&text);
+        // Document clone is a rope handle; no full-text String round trip.
+        let doc = document.lock().editor.doc.clone();
         if let Some(companion) = companion {
             let companion_key = LspKey {
                 language: LARAVEL_COMPANION.to_owned(),
@@ -1147,10 +1160,12 @@ impl Core {
             return;
         }
         let uri = file_uri(Path::new(&path));
+        // A Document clone shares rope nodes; no full-text String.
+        let doc = document.lock().editor.doc.clone();
         self.lsp
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .note_full_text(&uri, document.text(), Instant::now());
+            .note_document(&uri, &doc, Instant::now());
     }
 
     pub fn save_lsp_document(&self, document: Arc<DocumentHandle>) {
@@ -2193,6 +2208,23 @@ pub struct CursorInfo {
     pub col_utf16: u64,
 }
 
+fn cursor_info(c: viewport::CursorInfo) -> CursorInfo {
+    CursorInfo {
+        line: c.line as u64,
+        col: c.col as u64,
+        col_utf16: c.col_utf16 as u64,
+    }
+}
+
+/// Cursor and document metadata without any line content.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct StatusSnapshot {
+    pub revision: u64,
+    pub line_count: u64,
+    pub primary: CursorInfo,
+    pub selection_count: u64,
+}
+
 /// One semantic syntax style range on a document line. Columns are UTF-16,
 /// matching `ViewportLine.text`; `scope` is a stable theme key (M3-04).
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -2265,11 +2297,7 @@ impl From<viewport::ViewportSnapshot> for ViewportSnapshot {
                         .collect(),
                 })
                 .collect(),
-            primary: CursorInfo {
-                line: s.primary.line as u64,
-                col: s.primary.col as u64,
-                col_utf16: s.primary.col_utf16 as u64,
-            },
+            primary: cursor_info(s.primary),
             selection_count: s.selection_count as u64,
             styles: s
                 .styles
@@ -2523,6 +2551,24 @@ impl DocumentHandle {
             .editor
             .doc
             .lines(clamp_usize(first), clamp_usize(count))
+    }
+
+    /// Primary caret only. Cheap: no lines, styles or diagnostics are built,
+    /// so use this instead of `viewport(0, 0)` when only the cursor matters.
+    pub fn primary_cursor(&self) -> CursorInfo {
+        cursor_info(self.lock().editor.primary_cursor())
+    }
+
+    /// Cursor plus document metadata for the status bar and scroll geometry,
+    /// without building a viewport snapshot.
+    pub fn status_snapshot(&self) -> StatusSnapshot {
+        let st = self.lock();
+        StatusSnapshot {
+            revision: st.editor.doc.revision(),
+            line_count: st.editor.doc.line_count() as u64,
+            primary: cursor_info(st.editor.primary_cursor()),
+            selection_count: st.editor.sel.len() as u64,
+        }
     }
 
     /// One snapshot per frame: visible lines, selections, carets, cursor.

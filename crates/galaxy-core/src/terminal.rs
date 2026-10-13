@@ -21,6 +21,10 @@ use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, StdSyncHandler
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
+/// Scrollback lines kept per terminal. alacritty_terminal defaults to 10k;
+/// each cell is ~24 bytes, so a 200-column grid costs ~48 MB at 10k lines.
+/// 5k keeps a useful history at half that worst case.
+pub const SCROLLBACK_LINES: usize = 5_000;
 
 type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
@@ -302,7 +306,10 @@ impl TerminalSession {
         ));
         let output = Arc::new(Mutex::new(Vec::new()));
         let grid = Arc::new(Mutex::new(Term::new(
-            Config::default(),
+            Config {
+                scrolling_history: SCROLLBACK_LINES,
+                ..Config::default()
+            },
             &TerminalSize {
                 cols: cols as usize,
                 rows: rows as usize,

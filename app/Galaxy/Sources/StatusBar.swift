@@ -191,7 +191,7 @@ final class StatusBar: NSView {
     }
 
     func showCursor(of doc: DocumentHandle) {
-        let snap = doc.viewport(firstLine: 0, count: 0)
+        let snap = doc.statusSnapshot()
         showCursor(primary: snap.primary, count: snap.selectionCount)
     }
 

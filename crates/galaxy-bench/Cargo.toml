@@ -39,6 +39,11 @@ name = "memory-profile"
 path = "src/bin/memory_profile.rs"
 bench = false
 
+[[bin]]
+name = "workspace-footprint"
+path = "src/bin/workspace_footprint.rs"
+bench = false
+
 [[bench]]
 name = "document"
 harness = false

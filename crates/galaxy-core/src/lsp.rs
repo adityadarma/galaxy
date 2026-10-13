@@ -9,14 +9,15 @@ use std::env;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command as StdCommand, Stdio};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, OnceLock, mpsc};
 use std::time::Duration;
 use std::time::Instant;
 
+use ropey::Rope;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
-use tokio::runtime::Runtime;
+use tokio::runtime::{Builder, Runtime};
 
 use crate::change::ChangeSet;
 use crate::document::Document;
@@ -249,15 +250,37 @@ fn parse_diagnostic(uri: &str, value: &Value) -> Result<Diagnostic, String> {
     })
 }
 
-/// One pending `textDocument/didChange` batch. Contiguous edits retain a
-/// UTF-16 range; a burst/multi-cursor batch falls back to full text safely.
+/// One incremental `contentChanges` entry: replace `range` (UTF-16, in the
+/// old text) with `text`. Covers everything between the first and last
+/// differing byte, so a burst or multi-cursor batch still sends one span.
 #[derive(Debug, Clone, PartialEq)]
-pub struct PendingChange {
-    pub version: u64,
+pub struct IncrementalChange {
+    pub range: Range,
+    pub range_length: u64,
     pub text: String,
-    pub range: Option<Range>,
-    pub range_length: Option<u64>,
-    due_at: Instant,
+}
+
+/// Diffs two ropes (see [`crate::rope_diff`]) and converts the span to LSP
+/// UTF-16 coordinates in the old text. `None` when the texts are equal.
+pub fn incremental_change(old: &Rope, new: &Rope) -> Option<IncrementalChange> {
+    let change = crate::rope_diff::changed_bytes(old, new)?;
+    let old_start = old.byte_to_char(change.start);
+    let old_end = old.byte_to_char(change.old_end);
+    Some(IncrementalChange {
+        range: Range {
+            start_line: old.char_to_line(old_start) as u64,
+            start_character: utf16_column(old, old_start) as u64,
+            end_line: old.char_to_line(old_end) as u64,
+            end_character: utf16_column(old, old_end) as u64,
+        },
+        range_length: (old.char_to_utf16_cu(old_end) - old.char_to_utf16_cu(old_start)) as u64,
+        text: new.byte_slice(change.start..change.new_end).to_string(),
+    })
+}
+
+fn utf16_column(rope: &Rope, char_idx: usize) -> usize {
+    let line_start = rope.line_to_char(rope.char_to_line(char_idx));
+    rope.char_to_utf16_cu(char_idx) - rope.char_to_utf16_cu(line_start)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,115 +292,99 @@ pub struct Range {
 }
 
 /// Tracks LSP document versions and debounces outgoing changes.
+///
+/// `shadow` is the text the server currently has. It is a `Rope` clone, so
+/// it shares nodes with the editor's document instead of holding a second
+/// full copy; only nodes edited since the last sync are duplicated. Each
+/// flush diffs `shadow` against the newest text and sends just the changed
+/// span, so no full-document `String` lives past `didOpen` serialization.
 #[derive(Debug)]
 pub struct DocumentSync {
     uri: String,
     language_id: String,
     version: u64,
-    initial_text: String,
-    pending: Option<PendingChange>,
+    shadow: Rope,
+    pending: Option<PendingSync>,
+}
+
+#[derive(Debug)]
+struct PendingSync {
+    target: Rope,
+    due_at: Instant,
 }
 
 impl DocumentSync {
-    pub fn new(uri: String, language_id: String, initial_text: String) -> Self {
+    pub fn new(uri: String, language_id: String, text: Rope) -> Self {
         Self {
             uri,
             language_id,
             version: 1,
-            initial_text,
+            shadow: text,
             pending: None,
         }
     }
 
+    /// Serializes the full text only for this one message. Also used to
+    /// replay `didOpen` after a server (re)initializes.
     pub fn did_open(&self) -> Value {
-        serde_json::json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":self.uri,"languageId":self.language_id,"version":self.version,"text":self.initial_text}}})
+        let text = self.pending.as_ref().map_or(&self.shadow, |p| &p.target);
+        serde_json::json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":self.uri,"languageId":self.language_id,"version":self.version,"text":text.to_string()}}})
     }
 
-    pub fn note_full_text(&mut self, text: String, now: Instant) {
-        self.version += 1;
-        self.pending = Some(PendingChange {
-            version: self.version,
-            text,
-            range: None,
-            range_length: None,
+    /// Starts tracking `doc` as opened at its current text.
+    pub fn for_document(uri: String, language_id: String, doc: &Document) -> Self {
+        Self::new(uri, language_id, doc.rope().clone())
+    }
+
+    /// Queues `doc`'s current text (a shared rope handle, not a copy).
+    pub fn note_document(&mut self, doc: &Document, now: Instant) {
+        self.note_text(doc.rope(), now);
+    }
+
+    /// `didOpen` carries the newest text, so nothing remains to send.
+    fn mark_opened(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            self.shadow = pending.target;
+        }
+    }
+
+    /// Queues the document's current text. Cheap: clones a rope handle.
+    pub fn note_text(&mut self, text: &Rope, now: Instant) {
+        self.pending = Some(PendingSync {
+            target: text.clone(),
             due_at: now + DOCUMENT_SYNC_DEBOUNCE,
         });
     }
 
-    /// Records a change made to `before`; `after` must be the resulting doc.
-    /// More than one change uses full text to avoid transformed offset bugs.
+    pub fn note_full_text(&mut self, text: String, now: Instant) {
+        self.note_text(&Rope::from_str(&text), now);
+    }
+
+    /// Records a change; only `after` matters because each flush diffs the
+    /// server's text against the newest one.
     pub fn note_change(
         &mut self,
-        before: &Document,
+        _before: &Document,
         after: &Document,
-        changes: &ChangeSet,
+        _changes: &ChangeSet,
         now: Instant,
     ) {
-        self.version += 1;
-        let range = (changes.len() == 1)
-            .then(|| changes.iter().next())
-            .flatten()
-            .map(|change| {
-                let start = before.char_to_utf16(change.start());
-                let end = before.char_to_utf16(change.end());
-                Range {
-                    start_line: start.line as u64,
-                    start_character: start.col as u64,
-                    end_line: end.line as u64,
-                    end_character: end.col as u64,
-                }
-            });
-        let range_length = (changes.len() == 1)
-            .then(|| changes.iter().next())
-            .flatten()
-            .map(|change| {
-                let start = before.rope().char_to_utf16_cu(change.start());
-                let end = before.rope().char_to_utf16_cu(change.end());
-                (end - start) as u64
-            });
-        let text = if let Some(change) = changes.iter().next().filter(|_| changes.len() == 1) {
-            change.text().to_owned()
-        } else {
-            after.text()
-        };
-        let incremental = range.is_some();
-        match &mut self.pending {
-            Some(pending) => {
-                // A second edit invalidates a former range against the server's
-                // version, so collapse this debounce batch to full text.
-                pending.version = self.version;
-                pending.text = after.text();
-                pending.range = None;
-                pending.range_length = None;
-                pending.due_at = now + DOCUMENT_SYNC_DEBOUNCE;
-            }
-            None => {
-                self.pending = Some(PendingChange {
-                    version: self.version,
-                    text,
-                    range: incremental.then_some(range.unwrap()),
-                    range_length: incremental.then_some(range_length.unwrap()),
-                    due_at: now + DOCUMENT_SYNC_DEBOUNCE,
-                })
-            }
-        }
+        self.note_text(after.rope(), now);
     }
 
     pub fn flush(&mut self, now: Instant) -> Option<Value> {
-        let pending = self
-            .pending
-            .as_ref()
-            .filter(|pending| now >= pending.due_at)?;
-        let content = match pending.range {
-            Some(range) => {
-                serde_json::json!({"range":{"start":{"line":range.start_line,"character":range.start_character},"end":{"line":range.end_line,"character":range.end_character}},"rangeLength":pending.range_length,"text":pending.text})
-            }
-            None => serde_json::json!({"text":pending.text}),
-        };
-        let version = pending.version;
-        self.pending = None;
+        if self.pending.as_ref().is_none_or(|p| now < p.due_at) {
+            return None;
+        }
+        let target = self.pending.take()?.target;
+        let change = incremental_change(&self.shadow, &target);
+        self.shadow = target;
+        let change = change?;
+        self.version += 1;
+        let range = change.range;
+        let content = serde_json::json!({"range":{"start":{"line":range.start_line,"character":range.start_character},"end":{"line":range.end_line,"character":range.end_character}},"rangeLength":change.range_length,"text":change.text});
         Some(
-            serde_json::json!({"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":self.uri,"version":version},"contentChanges":[content]}}),
+            serde_json::json!({"jsonrpc":"2.0","method":"textDocument/didChange","params":{"textDocument":{"uri":self.uri,"version":self.version},"contentChanges":[content]}}),
         )
     }
 
@@ -1142,7 +1149,7 @@ impl LspManager {
         language_id: String,
         doc: &Document,
     ) -> io::Result<()> {
-        let sync = DocumentSync::new(uri.clone(), language_id, doc.text());
+        let sync = DocumentSync::new(uri.clone(), language_id, doc.rope().clone());
         if self
             .servers
             .get(&key)
@@ -1556,7 +1563,7 @@ impl LspManager {
         language_id: String,
         doc: &Document,
     ) -> io::Result<()> {
-        let sync = DocumentSync::new(uri.clone(), language_id, doc.text());
+        let sync = DocumentSync::new(uri.clone(), language_id, doc.rope().clone());
         if self
             .servers
             .get(&key)
@@ -1587,19 +1594,35 @@ impl LspManager {
     }
 
     pub fn note_full_text(&mut self, uri: &str, text: String, now: Instant) {
+        self.note_text(uri, &Rope::from_str(&text), now);
+    }
+
+    /// Queues `doc`'s current text; see [`Self::note_text`].
+    pub fn note_document(&mut self, uri: &str, doc: &Document, now: Instant) {
+        self.note_text(uri, doc.rope(), now);
+    }
+
+    /// Queues the document's current text for the primary server and every
+    /// companion. Each gets a rope handle (shared nodes), not a `String`
+    /// copy; the flush sends only the span that differs.
+    pub fn note_text(&mut self, uri: &str, text: &Rope, now: Instant) {
         for (_, sync) in self.companions.get_mut(uri).into_iter().flatten() {
-            sync.note_full_text(text.clone(), now);
+            sync.note_text(text, now);
         }
         if let Some((_, sync)) = self.documents.get_mut(uri) {
-            sync.note_full_text(text, now);
+            sync.note_text(text, now);
         }
     }
 
     pub fn flush_changes(&mut self, now: Instant) -> Vec<io::Error> {
+        let servers = &self.servers;
         let ready: Vec<_> = self
             .documents
             .values_mut()
             .chain(self.companions.values_mut().flatten())
+            // Until `initialized`, keep changes queued: the replayed didOpen
+            // carries them, and `shadow` must match what the server has.
+            .filter(|(key, _)| servers.get(key).is_some_and(|server| server.initialized))
             .filter_map(|(key, sync)| sync.flush(now).map(|message| (key.clone(), message)))
             .collect();
         ready
@@ -1638,16 +1661,26 @@ impl LspManager {
         for (key, server) in &mut self.servers {
             loop {
                 match server.transport.try_recv() {
-                    Ok(Incoming::Message(message)) if !server.initialized && message.get("id") == Some(&Value::from(0)) && message.get("method").is_none() => {
+                    Ok(Incoming::Message(message))
+                        if !server.initialized
+                            && message.get("id") == Some(&Value::from(0))
+                            && message.get("method").is_none() =>
+                    {
                         match server.transport.send(&serde_json::json!({"jsonrpc": "2.0", "method": "initialized", "params": {}})) {
                             Ok(()) => {
                                 server.initialized = true;
+                                // didOpen carries the newest text, so it also settles
+                                // any change queued while the server was starting.
                                 let opens: Vec<_> = self
                                     .documents
-                                    .values()
-                                    .chain(self.companions.values().flatten())
+                                    .values_mut()
+                                    .chain(self.companions.values_mut().flatten())
                                     .filter(|(document_key, _)| document_key == key)
-                                    .map(|(_, sync)| sync.did_open())
+                                    .map(|(_, sync)| {
+                                        let open = sync.did_open();
+                                        sync.mark_opened();
+                                        open
+                                    })
                                     .collect();
                                 for open in opens {
                                     if let Err(error) = server.transport.send(&open) {
@@ -1662,7 +1695,9 @@ impl LspManager {
                     // Server-to-client requests carry an id too; their ids
                     // can collide with ours, so answer them instead of
                     // treating them as responses.
-                    Ok(Incoming::Message(message)) if message.get("id").is_some() && message.get("method").is_some() => {
+                    Ok(Incoming::Message(message))
+                        if message.get("id").is_some() && message.get("method").is_some() =>
+                    {
                         let result = if message["method"] == "workspace/configuration" {
                             let items = message["params"]["items"].as_array().map_or(0, Vec::len);
                             Value::Array(vec![Value::Null; items])
@@ -1674,7 +1709,9 @@ impl LspManager {
                             events.push(LspEvent::Error(key.clone(), error.to_string()));
                         }
                     }
-                    Ok(Incoming::Message(message)) if message.get("id").and_then(Value::as_u64).is_some() => {
+                    Ok(Incoming::Message(message))
+                        if message.get("id").and_then(Value::as_u64).is_some() =>
+                    {
                         let id = message["id"].as_u64().expect("checked above");
                         if let Some(uri) = self.hover_requests.remove(&(key.clone(), id))
                             && let Some(value) = message.get("result").and_then(parse_hover)
@@ -1683,54 +1720,109 @@ impl LspManager {
                         }
                         if let Some(uri) = self.completion_requests.remove(&(key.clone(), id))
                             && let Some(result) = message.get("result").and_then(parse_completion)
-                        { self.completion.insert(uri, result); }
+                        {
+                            self.completion.insert(uri, result);
+                        }
                         if let Some(uri) = self.signature_requests.remove(&(key.clone(), id))
                             && let Some(result) = message.get("result").and_then(parse_signature)
-                        { self.signatures.insert(uri, result); }
+                        {
+                            self.signatures.insert(uri, result);
+                        }
                         // Several servers may answer one lookup; keep every location.
                         if let Some(uri) = self.definition_requests.remove(&(key.clone(), id))
-                            && let Some(result) = message.get("result").and_then(parse_definition_locations)
-                        { self.definition_locations.entry(uri).or_default().extend(result); }
+                            && let Some(result) =
+                                message.get("result").and_then(parse_definition_locations)
+                        {
+                            self.definition_locations
+                                .entry(uri)
+                                .or_default()
+                                .extend(result);
+                        }
                         if let Some(uri) = self.reference_requests.remove(&(key.clone(), id))
-                            && let Some(result) = message.get("result").and_then(parse_definition_locations)
-                        { self.references.insert(uri, result); }
+                            && let Some(result) =
+                                message.get("result").and_then(parse_definition_locations)
+                        {
+                            self.references.insert(uri, result);
+                        }
                         if let Some(uri) = self.rename_requests.remove(&(key.clone(), id))
-                            && let Some(result) = message.get("result").and_then(parse_workspace_edit)
-                        { self.rename_edits.insert(uri, result); }
+                            && let Some(result) =
+                                message.get("result").and_then(parse_workspace_edit)
+                        {
+                            self.rename_edits.insert(uri, result);
+                        }
                         if let Some(uri) = self.code_action_requests.remove(&(key.clone(), id))
                             && let Some(result) = message.get("result").and_then(parse_code_actions)
-                        { self.code_actions.insert(uri, result); }
+                        {
+                            self.code_actions.insert(uri, result);
+                        }
                         if let Some(uri) = self.formatting_requests.remove(&(key.clone(), id))
-                            && let Some(result) = message.get("result").and_then(|value| parse_text_edit_array(&uri, value))
-                        { self.formatting_edits.insert(uri, result); }
+                            && let Some(result) = message
+                                .get("result")
+                                .and_then(|value| parse_text_edit_array(&uri, value))
+                        {
+                            self.formatting_edits.insert(uri, result);
+                        }
                         if let Some(uri) = self.range_formatting_requests.remove(&(key.clone(), id))
-                            && let Some(result) = message.get("result").and_then(|value| parse_text_edit_array(&uri, value))
-                        { self.formatting_edits.insert(uri, result); }
-                        if let Some(uri) = self.on_type_formatting_requests.remove(&(key.clone(), id))
-                            && let Some(result) = message.get("result").and_then(|value| parse_text_edit_array(&uri, value))
-                        { self.formatting_edits.insert(uri, result); }
+                            && let Some(result) = message
+                                .get("result")
+                                .and_then(|value| parse_text_edit_array(&uri, value))
+                        {
+                            self.formatting_edits.insert(uri, result);
+                        }
+                        if let Some(uri) =
+                            self.on_type_formatting_requests.remove(&(key.clone(), id))
+                            && let Some(result) = message
+                                .get("result")
+                                .and_then(|value| parse_text_edit_array(&uri, value))
+                        {
+                            self.formatting_edits.insert(uri, result);
+                        }
                         if let Some(uri) = self.document_symbol_requests.remove(&(key.clone(), id))
-                            && let Some(result) = message.get("result").and_then(parse_document_symbols)
-                        { self.document_symbols.insert(uri, result); }
-                        if let Some(root) = self.workspace_symbol_requests.remove(&(key.clone(), id))
-                            && let Some(result) = message.get("result").and_then(parse_workspace_symbols)
-                        { self.workspace_symbols.insert(root, result); }
+                            && let Some(result) =
+                                message.get("result").and_then(parse_document_symbols)
+                        {
+                            self.document_symbols.insert(uri, result);
+                        }
+                        if let Some(root) =
+                            self.workspace_symbol_requests.remove(&(key.clone(), id))
+                            && let Some(result) =
+                                message.get("result").and_then(parse_workspace_symbols)
+                        {
+                            self.workspace_symbols.insert(root, result);
+                        }
                         if let Some(uri) = self.semantic_token_requests.remove(&(key.clone(), id))
-                            && let Some(result) = message.get("result").and_then(parse_semantic_tokens)
-                        { self.semantic_tokens.insert(uri, result); }
+                            && let Some(result) =
+                                message.get("result").and_then(parse_semantic_tokens)
+                        {
+                            self.semantic_tokens.insert(uri, result);
+                        }
                         if let Some(uri) = self.inlay_hint_requests.remove(&(key.clone(), id))
                             && let Some(result) = message.get("result").and_then(parse_inlay_hints)
-                        { self.inlay_hints.insert(uri, result); }
+                        {
+                            self.inlay_hints.insert(uri, result);
+                        }
                         if self.requests.remove(&(key.clone(), id)).is_some() {
                             events.push(LspEvent::Response {
-                                key: key.clone(), id,
-                                result: message.get("result").cloned(), error: message.get("error").cloned(),
+                                key: key.clone(),
+                                id,
+                                result: message.get("result").cloned(),
+                                error: message.get("error").cloned(),
                             });
                         }
                     }
-                    Ok(Incoming::Message(message)) => events.push(LspEvent::Message(key.clone(), message)),
-                    Ok(Incoming::Error(error)) => { self.server_errors.push(error.clone()); events.push(LspEvent::Error(key.clone(), error)); }
-                    Ok(Incoming::Closed) => { self.server_errors.push(format!("LSP server closed: {}", key.language)); events.push(LspEvent::Closed(key.clone())); break; }
+                    Ok(Incoming::Message(message)) => {
+                        events.push(LspEvent::Message(key.clone(), message))
+                    }
+                    Ok(Incoming::Error(error)) => {
+                        self.server_errors.push(error.clone());
+                        events.push(LspEvent::Error(key.clone(), error));
+                    }
+                    Ok(Incoming::Closed) => {
+                        self.server_errors
+                            .push(format!("LSP server closed: {}", key.language));
+                        events.push(LspEvent::Closed(key.clone()));
+                        break;
+                    }
                     Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => break,
                 }
             }
@@ -2190,9 +2282,33 @@ pub enum Incoming {
     Closed,
 }
 
+/// Worker threads for the runtime every language server shares. Work per
+/// server is one reader task plus pipe writes, so two threads are plenty.
+/// Before this, each server built a default multi-thread runtime with one
+/// worker per CPU core.
+pub const LSP_RUNTIME_THREADS: usize = 2;
+
+/// One small Tokio runtime shared by every language-server transport. It
+/// lives for the process; it is never dropped, so dropping a transport from
+/// any context is safe.
+fn shared_runtime() -> io::Result<&'static Runtime> {
+    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+    if let Some(runtime) = RUNTIME.get() {
+        return Ok(runtime);
+    }
+    let runtime = Builder::new_multi_thread()
+        .worker_threads(LSP_RUNTIME_THREADS)
+        .thread_name("galaxy-lsp")
+        .enable_all()
+        .build()?;
+    // A racing caller may win; the loser's unused runtime is dropped here,
+    // outside any async context.
+    Ok(RUNTIME.get_or_init(|| runtime))
+}
+
 /// Stdio JSON-RPC transport for one language-server process.
 pub struct LspTransport {
-    runtime: Runtime,
+    runtime: &'static Runtime,
     child: Child,
     stdin: Arc<tokio::sync::Mutex<ChildStdin>>,
     incoming: mpsc::Receiver<Incoming>,
@@ -2209,7 +2325,7 @@ impl LspTransport {
         log_traffic: bool,
         root: &Path,
     ) -> io::Result<Self> {
-        let runtime = Runtime::new()?;
+        let runtime = shared_runtime()?;
         let mut command = Command::new(program);
         command.args(args).env("PATH", server_path_env(program));
         if root.is_dir() {
@@ -2392,6 +2508,143 @@ async fn read_frame<R: AsyncRead + Unpin>(
 mod tests {
     use super::*;
     use std::fs;
+
+    /// End-to-end check that incremental `didChange` keeps a real server's
+    /// copy identical to ours. Diverged text shows up as wrong symbols or
+    /// stray syntax diagnostics. Needs `gopls` on PATH:
+    /// `cargo test -p galaxy-core --lib gopls -- --ignored`.
+    #[test]
+    #[ignore = "requires gopls on PATH"]
+    fn gopls_stays_in_sync_through_incremental_edits() {
+        let Some(gopls) = find_in_path("gopls") else {
+            panic!("gopls not found on PATH");
+        };
+        let root = std::env::temp_dir().join(format!("galaxy-gopls-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("go.mod"), "module example.com/sync\n\ngo 1.21\n").unwrap();
+        let path = root.join("main.go");
+        let original = "package main\n\n// 😀 中文 comment\nfunc alpha() int {\n\treturn 1\n}\n\nfunc main() {\n\t_ = alpha()\n}\n";
+        fs::write(&path, original).unwrap();
+        let uri = format!("file://{}", path.display());
+
+        let key = LspKey {
+            language: "go".into(),
+            root: root.clone(),
+        };
+        let config = ServerConfig {
+            program: gopls.to_string_lossy().into_owned(),
+            args: Vec::new(),
+            log_traffic: false,
+            initialization_options: Value::Null,
+            restart_backoff: [Duration::ZERO; 3],
+        };
+        let mut manager = LspManager::default();
+        manager.ensure_server(key.clone(), &config).unwrap();
+        let mut doc = Document::from_text(original);
+        manager
+            .open_document(key.clone(), uri.clone(), "go".into(), &doc)
+            .unwrap();
+        // Edit only after `initialized`; otherwise the changes ride along in
+        // the replayed didOpen and the incremental path is never exercised.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !manager.poll().contains(&LspEvent::Initialized(key.clone())) {
+            assert!(Instant::now() < deadline, "gopls did not initialize");
+            thread::sleep(Duration::from_millis(20));
+        }
+        // Diffing the shadow against `doc` must produce a range change, not
+        // full text, for this to test anything.
+        {
+            let (_, sync) = manager.documents.get(&uri).unwrap();
+            assert_eq!(sync.shadow.to_string(), original);
+        }
+
+        let wait = |manager: &mut LspManager, what: &str, done: &dyn Fn(&LspManager) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                manager.flush_changes(Instant::now() + DOCUMENT_SYNC_DEBOUNCE);
+                manager.poll();
+                if done(manager) {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let edit = |manager: &mut LspManager, doc: &mut Document, find: &str, replace: &str| {
+            let text = doc.text();
+            let byte = text
+                .find(find)
+                .unwrap_or_else(|| panic!("{find:?} not in text"));
+            let start = text[..byte].chars().count();
+            let end = start + find.chars().count();
+            let change = ChangeSet::new(
+                vec![crate::change::Change::new(start, end, replace)],
+                doc.len_chars(),
+            );
+            let before = doc.clone();
+            doc.apply(&change);
+            manager.note_document_change(&uri, &before, doc, &change, Instant::now());
+        };
+
+        // Several edits inside one debounce window, after a non-ASCII line,
+        // collapse into one incremental span. The result references an
+        // undefined name, so gopls must report it.
+        edit(&mut manager, &mut doc, "return 1", "return missing + 1");
+        edit(
+            &mut manager,
+            &mut doc,
+            "func main",
+            "func beta() string {\n\treturn \"β\"\n}\n\nfunc main",
+        );
+        edit(
+            &mut manager,
+            &mut doc,
+            "_ = alpha()",
+            "_ = alpha()\n\t_ = beta()",
+        );
+        wait(&mut manager, "undefined-name diagnostic", &|m| {
+            m.diagnostics(&uri)
+                .iter()
+                .any(|d| d.message.contains("missing"))
+        });
+
+        // Fix it with a deletion; a clean file proves the server's text
+        // matches ours byte for byte.
+        edit(&mut manager, &mut doc, "missing + ", "");
+        wait(&mut manager, "diagnostics to clear", &|m| {
+            m.diagnostics(&uri).is_empty()
+        });
+
+        manager
+            .request_document_symbols(&uri, Instant::now())
+            .unwrap();
+        wait(&mut manager, "document symbols", &|m| {
+            !m.document_symbols(&uri).is_empty()
+        });
+        let mut names: Vec<_> = manager
+            .document_symbols(&uri)
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["alpha", "beta", "main"]);
+        // `beta` starts on the line our text has it on.
+        let beta_line = doc
+            .text()
+            .lines()
+            .position(|l| l.starts_with("func beta"))
+            .unwrap();
+        let beta = manager
+            .document_symbols(&uri)
+            .iter()
+            .find(|s| s.name == "beta")
+            .unwrap();
+        assert_eq!(beta.range.start_line as usize, beta_line);
+
+        manager.shutdown_all();
+        let _ = fs::remove_dir_all(&root);
+    }
     use std::process::Command as StdCommand;
     use std::thread;
     use std::time::Instant;
@@ -3297,7 +3550,11 @@ mod tests {
         );
         after.apply(&change);
         let now = Instant::now();
-        let mut sync = DocumentSync::new("file:///test.rs".into(), "rust".into(), before.text());
+        let mut sync = DocumentSync::new(
+            "file:///test.rs".into(),
+            "rust".into(),
+            before.rope().clone(),
+        );
         assert_eq!(sync.did_open()["params"]["textDocument"]["text"], "a😀中b");
         sync.note_change(&before, &after, &change, now);
         assert!(sync.flush(now).is_none());
@@ -3324,10 +3581,104 @@ mod tests {
             ),
             now + DOCUMENT_SYNC_DEBOUNCE + Duration::from_millis(1),
         );
+        // A burst stays incremental: one span diffed against the server's text.
         let burst = sync.flush(now + DOCUMENT_SYNC_DEBOUNCE * 3).unwrap();
-        assert!(burst["params"]["contentChanges"][0].get("range").is_none());
+        let content = &burst["params"]["contentChanges"][0];
+        assert_eq!(content["range"]["start"]["character"], 1);
+        assert_eq!(content["range"]["end"]["character"], 1);
+        assert_eq!(content["rangeLength"], 0);
+        assert_eq!(content["text"], "!");
+        assert_eq!(burst["params"]["textDocument"]["version"], 3);
         assert_eq!(sync.did_save()["method"], "textDocument/didSave");
         assert_eq!(sync.did_close()["method"], "textDocument/didClose");
+    }
+
+    /// Applies an LSP incremental change to `old` the way a server would.
+    fn apply_incremental(old: &str, change: &IncrementalChange) -> String {
+        let utf16: Vec<u16> = old.encode_utf16().collect();
+        let line_offset = |line: u64| -> usize {
+            let mut seen = 0;
+            let mut offset = 0;
+            for (i, unit) in utf16.iter().enumerate() {
+                if seen == line {
+                    break;
+                }
+                if *unit == u16::from(b'\n') {
+                    seen += 1;
+                }
+                offset = i + 1;
+            }
+            if line == 0 { 0 } else { offset }
+        };
+        let start = line_offset(change.range.start_line) + change.range.start_character as usize;
+        let end = line_offset(change.range.end_line) + change.range.end_character as usize;
+        assert_eq!((end - start) as u64, change.range_length);
+        let mut out = String::from_utf16(&utf16[..start]).unwrap();
+        out.push_str(&change.text);
+        out.push_str(&String::from_utf16(&utf16[end..]).unwrap());
+        out
+    }
+
+    #[test]
+    fn incremental_change_round_trips_edits() {
+        let cases = [
+            ("", "abc"),
+            ("abc", ""),
+            ("abc", "abc"),
+            ("hello world", "hello brave world"),
+            ("aaaa", "aaaaa"),
+            ("line1\nline2\nline3\n", "line1\nLINE2\nline3\n"),
+            ("a😀b", "a😁b"),
+            ("中文\n😀x", "中文\n😀yx"),
+            ("first\nsecond", "first\nsecond\nthird"),
+            ("x\ny\nz", "z"),
+        ];
+        for (old, new) in cases {
+            let change = incremental_change(&Rope::from_str(old), &Rope::from_str(new));
+            match change {
+                None => assert_eq!(old, new),
+                Some(change) => {
+                    assert_eq!(apply_incremental(old, &change), new, "{old:?} -> {new:?}")
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_change_spans_large_ropes_without_full_text() {
+        let base = "fn value() -> u32 { 42 }\n".repeat(20_000);
+        let old = Rope::from_str(&base);
+        let mut new = old.clone();
+        let at = new.len_chars() / 2;
+        new.insert(at, "// edited\n");
+        let change = incremental_change(&old, &new).unwrap();
+        assert_eq!(change.text, "// edited\n");
+        assert_eq!(change.range_length, 0);
+        assert_eq!(apply_incremental(&base, &change), new.to_string());
+    }
+
+    #[test]
+    fn changes_wait_for_initialized_and_did_open_settles_them() {
+        let doc = Document::from_text("abc");
+        let mut sync = DocumentSync::new("file:///t.rs".into(), "rust".into(), doc.rope().clone());
+        let mut after = doc.clone();
+        after.apply(&ChangeSet::new(
+            vec![crate::change::Change::insert(3, "d")],
+            3,
+        ));
+        let now = Instant::now();
+        sync.note_document(&after, now);
+        // Replay at initialize sends the newest text and clears the queue.
+        assert_eq!(sync.did_open()["params"]["textDocument"]["text"], "abcd");
+        sync.mark_opened();
+        assert!(sync.flush(now + DOCUMENT_SYNC_DEBOUNCE).is_none());
+    }
+
+    #[test]
+    fn shared_runtime_is_reused() {
+        let a = shared_runtime().unwrap() as *const Runtime;
+        let b = shared_runtime().unwrap() as *const Runtime;
+        assert_eq!(a, b);
     }
 
     #[test]
