@@ -399,6 +399,24 @@ const BUILTIN: &[(&str, &str, &str, &[&str])] = &[
         &["panel", "bottom", "hide", "show", "console"],
     ),
     (
+        "workbench.action.terminal.moveToEditor",
+        "Terminal",
+        "Move Terminal into Editor Area",
+        &["tab", "editor", "shell"],
+    ),
+    (
+        "workbench.action.terminal.moveToTerminalPanel",
+        "Terminal",
+        "Move Terminal into Panel",
+        &["tab", "panel", "bottom", "shell"],
+    ),
+    (
+        "workbench.action.createTerminalEditor",
+        "Terminal",
+        "Create New Terminal in Editor Area",
+        &["tab", "editor", "shell", "new"],
+    ),
+    (
         "workbench.view.explorer",
         "View",
         "Show Explorer",

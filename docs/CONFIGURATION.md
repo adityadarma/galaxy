@@ -37,9 +37,22 @@ composer global require laravel/lsp
 ```
 
 Pastikan executable `laravel-lsp` tersedia di `PATH` atau di salah satu lokasi
-Composer global yang umum. Galaxy hanya memulai Laravel LSP untuk workspace
-yang memiliki file `artisan`. Konfigurasi custom dapat ditempatkan di settings
-workspace:
+Composer global yang umum. Server utama untuk PHP dan Blade adalah yang pertama
+ditemukan dari `intelephense --stdio` lalu `phpactor language-server`.
+Server ini menangani class, method, dan function.
+
+Di workspace dengan file `artisan`, `laravel-lsp` berjalan bersama server
+utama untuk navigasi string Laravel (`config()`, `route()`, `view()`). Hasil
+Go to Definition dan diagnostics dari keduanya digabung. Jika hanya
+`laravel-lsp` yang terpasang, server itu menjadi server utama. PHP dan Blade
+berbagi proses per workspace. File `.blade.php` dikirim dengan `languageId` `blade`, file PHP
+lain dengan `php`. Install fallback dengan `npm i -g intelephense` atau
+`composer global require phpactor/phpactor`.
+
+Konfigurasi custom dibaca dari settings global dan `.galaxy/settings.json`
+workspace (workspace menang per bahasa). Entry `php` juga berlaku untuk Blade
+kecuali ada entry `blade` tersendiri. Perubahan berlaku saat server start atau
+restart:
 
 ```json
 {
@@ -64,9 +77,10 @@ project/
 ```
 
 TypeScript LSP akan memakai workspace parent sebagai root dan menemukan
-`tsconfig.json` atau `package.json` dari folder frontend. Laravel LSP tetap
-harus diaktifkan secara manual melalui konfigurasi PHP agar tidak berjalan
-otomatis pada setiap file PHP.
+`tsconfig.json` atau `package.json` dari folder frontend. Karena `artisan`
+dicari di root workspace, `laravel-lsp` tidak otomatis dipakai pada layout ini;
+Galaxy memakai `intelephense`/`phpactor` bila tersedia, atau server dari entry
+`lsp.servers.php`.
 
 Syntax highlighting saat ini juga mencakup PHP (`.php`) dan file Blade
 (`.blade.php`, memakai grammar PHP untuk bagian PHP). Snippet mendukung
@@ -108,14 +122,16 @@ Language server dikonfigurasi melalui resolver built-in berdasarkan bahasa:
 | TypeScript/JavaScript | `typescript-language-server --stdio` |
 | Python | `pyright-langserver --stdio` |
 | Go | `gopls` |
-| PHP/Blade (Laravel) | `laravel-lsp` |
+| PHP/Blade (Laravel, ada `artisan`) | `intelephense --stdio` atau `phpactor language-server`, ditambah `laravel-lsp` |
+| PHP/Blade (non-Laravel) | `intelephense --stdio`, fallback `phpactor language-server` |
 
 Executable harus tersedia di `PATH` atau lokasi fallback platform. Galaxy
 membagi satu server per kombinasi bahasa dan workspace bila lifecycle server
 mendukungnya. Document `didOpen` dan request fitur baru dikirim setelah server
 menyelesaikan handshake `initialize`/`initialized`.
 
-Override server dapat ditaruh dalam settings JSON melalui `servers`. Nilai
+Override server dapat ditaruh dalam settings JSON melalui `lsp.servers`
+(`servers` di top level masih diterima). Nilai
 `restartBackoffMs` berisi tepat tiga delay retry dalam milidetik; defaultnya
 `[0, 1000, 2000]` dan maksimum tetap tiga restart per lima menit.
 

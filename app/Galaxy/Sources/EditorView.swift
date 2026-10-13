@@ -52,12 +52,16 @@ final class EditorView: NSView {
     var gitLineChanges: [UInt64: GitLineChangeKind] = [:] {
         didSet { if gitLineChanges != oldValue { needsDisplay = true } }
     }
-    var semanticTokens: [SemanticTokenInfo] = [] { didSet { needsDisplay = true } }
+    var semanticTokens: [SemanticTokenInfo] = [] {
+        didSet { if semanticTokens != oldValue { needsDisplay = true } }
+    }
     /// `editor.renderWhitespace`; dots everywhere unless settings say otherwise.
     var renderWhitespace: WhitespaceRendering = .all {
         didSet { if renderWhitespace != oldValue { needsDisplay = true } }
     }
-    var inlayHints: [InlayHintInfo] = [] { didSet { needsDisplay = true } }
+    var inlayHints: [InlayHintInfo] = [] {
+        didSet { if inlayHints != oldValue { needsDisplay = true } }
+    }
 
     /// Drops derived Core Text/LSP decorations while retaining the document.
     func releaseNonEssentialCaches() {
@@ -98,6 +102,24 @@ final class EditorView: NSView {
     var onTextInput: ((String) -> Void)?
     var onSnippetInvalidated: (() -> Void)?
     var onDefinitionClick: ((TextPos) -> Bool)?
+    /// Word under the mouse while Cmd is held: drawn as a link so the user
+    /// sees what Cmd+click will open. UTF-16 columns on one line.
+    var definitionLink: (line: UInt64, start: UInt64, end: UInt64)? {
+        didSet {
+            guard definitionLink?.line != oldValue?.line
+                || definitionLink?.start != oldValue?.start
+                || definitionLink?.end != oldValue?.end else { return }
+            for link in [oldValue, definitionLink].compactMap({ $0 }) {
+                setNeedsDisplay(NSRect(x: 0, y: CGFloat(link.line) * metrics.lineHeight,
+                                       width: bounds.width, height: metrics.lineHeight))
+            }
+            // Cursor rects would reset a bare `set()` on the next move.
+            window?.invalidateCursorRects(for: self)
+            (definitionLink == nil ? NSCursor.iBeam : NSCursor.pointingHand).set()
+        }
+    }
+    /// Last mouse location in view coordinates, for Cmd presses without movement.
+    var lastMousePoint: NSPoint?
     /// A change is waiting for the next frame.
     private(set) var hasPendingChange = false
     /// How many times pending work was flushed (tests check coalescing).
@@ -145,13 +167,33 @@ final class EditorView: NSView {
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         trackingAreas.forEach(removeTrackingArea)
-        let area = NSTrackingArea(rect: bounds, options: [.activeInKeyWindow, .mouseMoved, .inVisibleRect], owner: self)
+        let area = NSTrackingArea(rect: bounds, options: [.activeInKeyWindow, .mouseMoved, .mouseEnteredAndExited, .inVisibleRect], owner: self)
         addTrackingArea(area)
     }
 
     override func mouseMoved(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
+        lastMousePoint = point
+        updateDefinitionLink(commandHeld: event.modifierFlags.contains(.command))
         onHover?(textPosition(at: point), point)
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        lastMousePoint = nil
+        definitionLink = nil
+    }
+
+    override func flagsChanged(with event: NSEvent) {
+        super.flagsChanged(with: event)
+        updateDefinitionLink(commandHeld: event.modifierFlags.contains(.command))
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        super.scrollWheel(with: event)
+        // The text moved under a still mouse; re-hit-test the link.
+        guard let window else { return }
+        lastMousePoint = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        updateDefinitionLink(commandHeld: event.modifierFlags.contains(.command))
     }
 
     override var acceptsFirstResponder: Bool { true }
@@ -512,6 +554,13 @@ final class EditorView: NSView {
                 let x1 = originX + xOffset(in: line.text, column: token.start + token.length)
                 semanticColor(token.tokenType).setFill()
                 context.fill(CGRect(x: x0, y: top + lineHeight - 1, width: max(1, x1 - x0), height: 1))
+            }
+            // Cmd hover: underline the identifier Cmd+click would open.
+            if let link = definitionLink, link.line == line.line {
+                let x0 = originX + xOffset(in: line.text, column: link.start)
+                let x1 = originX + xOffset(in: line.text, column: link.end)
+                context.setFillColor(NSColor.linkColor.cgColor)
+                context.fill(CGRect(x: x0, y: top + metrics.ascent + 2, width: max(1, x1 - x0), height: 1))
             }
             for span in line.diagnostics {
                 let x0 = originX + xOffset(in: line.text, column: span.start)

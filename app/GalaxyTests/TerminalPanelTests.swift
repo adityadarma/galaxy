@@ -95,4 +95,126 @@ final class TerminalPanelTests: XCTestCase {
         XCTAssertFalse(c.isBottomPanelVisible)
         XCTAssertEqual(c.titleBar.panelButton.state, .off)
     }
+
+    func testProblemBadgeIsARoundPillThatGrowsWithTheCount() {
+        let badge = CountBadge()
+        badge.count = 7
+        XCTAssertEqual(badge.intrinsicContentSize, NSSize(width: CountBadge.height, height: CountBadge.height), "one digit: a circle")
+        badge.count = 128
+        XCTAssertGreaterThan(badge.intrinsicContentSize.width, CountBadge.height, "more digits: a wider pill")
+        badge.count = 5000
+        XCTAssertEqual(badge.text, "999+")
+    }
+
+    func testBlockAndBoxCharactersFillTheirCell() throws {
+        let cell = NSRect(x: 10, y: 20, width: 8, height: 16)
+        func union(_ scalar: Unicode.Scalar) throws -> NSRect {
+            try XCTUnwrap(TerminalView.customGlyph(scalar, cell: cell)).map(\.rect).reduce(NSRect.null) { $0.union($1) }
+        }
+        XCTAssertEqual(try union("\u{2588}"), cell, "full block")
+        XCTAssertEqual(try union("\u{2580}"), NSRect(x: 10, y: 20, width: 8, height: 8), "upper half")
+        XCTAssertEqual(try union("\u{2584}"), NSRect(x: 10, y: 28, width: 8, height: 8), "lower half")
+        XCTAssertEqual(try union("\u{258C}"), NSRect(x: 10, y: 20, width: 4, height: 16), "left half")
+        XCTAssertEqual(try union("\u{2590}"), NSRect(x: 14, y: 20, width: 4, height: 16), "right half")
+        XCTAssertEqual(try union("\u{259B}"), cell, "three quadrants span the cell")
+        // Vertical lines run top to bottom, so stacked rows join up.
+        let bar = try union("\u{2502}")
+        XCTAssertEqual(bar.minY, cell.minY)
+        XCTAssertEqual(bar.maxY, cell.maxY)
+        let dash = try union("\u{2500}")
+        XCTAssertEqual(dash.minX, cell.minX)
+        XCTAssertEqual(dash.maxX, cell.maxX)
+        XCTAssertNil(TerminalView.customGlyph("a", cell: cell))
+    }
+
+    func testPanelTopEdgeDragsTheHeight() throws {
+        let c = MainWindowController(bridge: CoreBridge())
+        c.window?.setContentSize(NSSize(width: 1000, height: 800))
+        c.showWindow(nil)
+        defer { c.window?.orderOut(nil); UserDefaults.standard.removeObject(forKey: "BottomPanelHeight") }
+        c.toggleTerminal(nil)
+        c.window?.layoutIfNeeded()
+        let header = c.bottomPanelHeaderForTesting
+        let before = c.bottomPanelContentHeight
+        // The top strip of the header is the drag handle.
+        let sash = header.superview!.convert(NSPoint(x: header.bounds.midX, y: 2), from: header)
+        XCTAssertTrue(header.hitTest(sash) === header)
+        header.onResize?(true, 0)
+        header.onResize?(false, 100)
+        XCTAssertEqual(c.bottomPanelContentHeight, before + 100, accuracy: 0.5)
+        header.onResize?(true, 0)
+        header.onResize?(false, -10_000)
+        XCTAssertEqual(c.bottomPanelContentHeight, MainWindowController.minBottomPanelHeight, "never below the minimum")
+        header.onResize?(true, 0)
+        header.onResize?(false, 10_000)
+        c.window?.layoutIfNeeded()
+        let editorTop = c.tabBar.convert(c.tabBar.bounds, to: nil).minY
+        let headerTop = header.convert(header.bounds, to: nil).maxY
+        XCTAssertGreaterThanOrEqual(editorTop - headerTop, 39, "the editor keeps some room")
+        XCTAssertEqual(UserDefaults.standard.double(forKey: "BottomPanelHeight"), Double(c.bottomPanelContentHeight), accuracy: 0.5)
+    }
+
+    func testTerminalMovesIntoEditorAreaAndBack() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-term-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try "hello".write(to: root.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let c = MainWindowController(bridge: CoreBridge())
+        c.askSaveChoice = { _ in XCTFail("terminal tabs never ask to save"); return .cancel }
+        c.showWindow(nil)
+        defer { c.window?.orderOut(nil) }
+        try c.openWorkspace(at: root)
+        try c.openFile(at: root.appendingPathComponent("a.txt"))
+
+        // Panel terminal → editor tab, same shell.
+        c.toggleTerminal(nil)
+        XCTAssertTrue(c.isBottomPanelVisible)
+        c.moveTerminalToEditor(nil)
+        let tab = try XCTUnwrap(c.activeTab)
+        let handle = try XCTUnwrap(tab.terminal)
+        XCTAssertTrue(handle.isRunning())
+        XCTAssertEqual(c.terminalTabs.count, 1)
+        XCTAssertTrue(c.tabBar.items.last?.isTerminal == true)
+        XCTAssertEqual(c.tabBar.items.last?.title, handle.shellName())
+        XCTAssertFalse(c.editorTerminalView.isHidden)
+        XCTAssertTrue(c.window?.firstResponder === c.editorTerminalView)
+        c.window?.layoutIfNeeded()
+        let terminalFrame = c.editorTerminalView.convert(c.editorTerminalView.bounds, to: nil)
+        let tabFrame = c.tabBar.convert(c.tabBar.bounds, to: nil)
+        // The layer-backed terminal must not be composited over the tab bar:
+        // their parent needs a layer too.
+        XCTAssertTrue(c.tabBar.superview?.wantsLayer == true)
+        XCTAssertFalse(c.tabBar.isHidden)
+        XCTAssertEqual(c.tabBar.items.count, 2, "the file tab stays")
+        XCTAssertLessThanOrEqual(terminalFrame.maxY, tabFrame.minY + 0.5, "the terminal sits below the tab bar")
+        XCTAssertFalse(c.isBottomPanelVisible, "the panel closes with its last terminal")
+
+        // Switching to the file hides the terminal; back shows it again.
+        c.selectTab(0)
+        XCTAssertTrue(c.editorTerminalView.isHidden)
+        XCTAssertTrue(c.window?.firstResponder === c.editorView)
+        c.selectTab(1)
+        XCTAssertFalse(c.editorTerminalView.isHidden)
+
+        // Session and unsaved prompts skip the terminal tab.
+        XCTAssertEqual(c.currentSession().tabs.count, 1)
+        XCTAssertTrue(c.confirmDiscardChanges())
+
+        // Back into the panel, still the same running shell.
+        c.moveTerminalToPanel(nil)
+        XCTAssertTrue(c.terminalTabs.isEmpty)
+        XCTAssertTrue(c.isBottomPanelVisible)
+        XCTAssertTrue(handle.isRunning())
+        XCTAssertTrue(c.editorTerminalView.isHidden)
+
+        // A new editor terminal is killed when its tab closes.
+        c.createTerminalEditor(nil)
+        let other = try XCTUnwrap(c.activeTab?.terminal)
+        XCTAssertTrue(c.closeTab(at: try XCTUnwrap(c.activeIndex)))
+        let deadline = Date().addingTimeInterval(3)
+        while other.isRunning() && Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.05)) }
+        XCTAssertFalse(other.isRunning())
+        XCTAssertTrue(c.terminalTabs.isEmpty)
+        handle.kill()
+    }
 }

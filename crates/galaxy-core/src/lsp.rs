@@ -131,10 +131,18 @@ pub struct ProgressInfo {
 #[derive(Debug, Default)]
 pub struct DiagnosticStore {
     by_uri: HashMap<String, Vec<Diagnostic>>,
+    /// Per-server lists when several servers serve one document (PHP:
+    /// intelephense plus laravel-lsp). `by_uri` is their concatenation, so
+    /// one server publishing never wipes the other's diagnostics.
+    by_server: HashMap<String, HashMap<String, Vec<Diagnostic>>>,
 }
 
 impl DiagnosticStore {
     pub fn publish(&mut self, message: &Value) -> Result<bool, String> {
+        self.publish_from("", message)
+    }
+
+    pub fn publish_from(&mut self, server: &str, message: &Value) -> Result<bool, String> {
         if message.get("method").and_then(Value::as_str) != Some("textDocument/publishDiagnostics")
         {
             return Ok(false);
@@ -155,7 +163,15 @@ impl DiagnosticStore {
             .iter()
             .map(|value| parse_diagnostic(&uri, value))
             .collect::<Result<Vec<_>, _>>()?;
-        self.by_uri.insert(uri, diagnostics);
+        let servers = self.by_server.entry(uri.clone()).or_default();
+        servers.insert(server.to_owned(), diagnostics);
+        let mut names: Vec<_> = servers.keys().cloned().collect();
+        names.sort();
+        let merged = names
+            .iter()
+            .flat_map(|name| servers[name].iter().cloned())
+            .collect();
+        self.by_uri.insert(uri, merged);
         Ok(true)
     }
 
@@ -477,23 +493,130 @@ impl LspSettings {
     /// Resolves a server override first, otherwise the built-in language
     /// default. Relative or bare commands are found in `PATH` at launch time.
     pub fn resolve(&self, language: &str) -> Option<ServerConfig> {
-        self.servers
-            .get(&language.to_ascii_lowercase())
-            .cloned()
-            .or_else(|| default_server(language))
+        self.resolve_for_root(language, None)
+    }
+
+    /// Like [`Self::resolve`], but lets root-sensitive defaults inspect the
+    /// workspace. PHP uses `laravel-lsp` only when `<root>/artisan` exists.
+    pub fn resolve_for_root(&self, language: &str, root: Option<&Path>) -> Option<ServerConfig> {
+        self.override_for(language)
+            .or_else(|| default_server(language, root, &find_in_path))
+    }
+
+    /// Overrides match the exact language first (`blade`), then the shared
+    /// server kind (`php`), so one PHP entry also covers Blade views.
+    fn override_for(&self, language: &str) -> Option<ServerConfig> {
+        let lower = language.to_ascii_lowercase();
+        self.servers.get(&lower).cloned().or_else(|| {
+            default_server_kind(language).and_then(|kind| self.servers.get(kind).cloned())
+        })
+    }
+
+    /// Loads global then workspace settings; workspace entries win per
+    /// language. Missing files are fine; unreadable or invalid ones are
+    /// returned as errors next to whatever did load.
+    pub fn load(global: Option<&Path>, workspace_root: Option<&Path>) -> (Self, Vec<String>) {
+        let mut out = Self::default();
+        let mut errors = Vec::new();
+        let workspace = workspace_root.map(|root| root.join(".galaxy/settings.json"));
+        for path in [global.map(Path::to_path_buf), workspace]
+            .into_iter()
+            .flatten()
+        {
+            match Self::load_file(&path) {
+                Ok(Some(settings)) => out.servers.extend(settings.servers),
+                Ok(None) => {}
+                Err(error) => errors.push(format!("{}: {error}", path.display())),
+            }
+        }
+        (out, errors)
+    }
+
+    /// Default global settings file used by the macOS app.
+    pub fn global_settings_path() -> Option<PathBuf> {
+        env::var_os("HOME").map(|home| {
+            PathBuf::from(home).join("Library/Application Support/Galaxy/settings.json")
+        })
+    }
+
+    fn load_file(path: &Path) -> Result<Option<Self>, String> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.to_string()),
+        };
+        let value: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        // Documented shape is `{ "lsp": { "servers": … } }`; a top-level
+        // `servers` key is still accepted for older files.
+        let section = value.get("lsp").unwrap_or(&value);
+        Self::from_json(section).map(Some)
     }
 }
 
-fn default_server(language: &str) -> Option<ServerConfig> {
-    let (program, args) = match default_server_kind(language)? {
-        "rust" => ("rust-analyzer", &[][..]),
-        "typescript" => ("typescript-language-server", &["--stdio"] as &[&str]),
-        "python" => ("pyright-langserver", &["--stdio"] as &[&str]),
-        "go" => ("gopls", &[] as &[&str]),
-        "php" => ("laravel-lsp", &[] as &[&str]),
+/// Maps editor display names (`"PHP"`, `"TypeScript React"`) to the
+/// `languageId` values LSP servers expect. Blade views are detected from the
+/// `.blade.php` suffix because they share the PHP grammar.
+pub fn lsp_language_id(language: &str, path: &str) -> String {
+    if path.to_ascii_lowercase().ends_with(".blade.php") {
+        return "blade".to_owned();
+    }
+    let normalized = language.to_ascii_lowercase().replace([' ', '-'], "");
+    match normalized.as_str() {
+        "typescriptreact" | "tsx" => "typescriptreact",
+        "javascriptreact" | "jsx" => "javascriptreact",
+        "js" => "javascript",
+        "shellscript" | "bash" => "shellscript",
+        _ => return normalized,
+    }
+    .to_owned()
+}
+
+/// Server identity used for [`LspKey::language`]. Languages served by the
+/// same server (PHP and Blade, TS and JS) share one process per root.
+pub fn lsp_server_language(language: &str) -> String {
+    default_server_kind(language)
+        .map(str::to_owned)
+        .unwrap_or_else(|| language.to_ascii_lowercase())
+}
+
+fn default_server(
+    language: &str,
+    root: Option<&Path>,
+    find: &dyn Fn(&str) -> Option<PathBuf>,
+) -> Option<ServerConfig> {
+    let candidates: &[(&str, &[&str])] = match default_server_kind(language)? {
+        "rust" => &[("rust-analyzer", &[])],
+        "typescript" => &[("typescript-language-server", &["--stdio"])],
+        "python" => &[("pyright-langserver", &["--stdio"])],
+        "go" => &[("gopls", &[])],
+        // A general PHP server comes first: laravel-lsp only resolves Laravel
+        // strings (config/route/view), not classes or methods. In Laravel
+        // projects it runs next to the primary, see `companion_server`.
+        "php" if is_laravel_root(root) => &[
+            ("intelephense", &["--stdio"]),
+            ("phpactor", &["language-server"]),
+            ("laravel-lsp", &[]),
+        ],
+        // Plain PHP projects: laravel-lsp is Laravel-specific, skip it.
+        "php" => &[
+            ("intelephense", &["--stdio"]),
+            ("phpactor", &["language-server"]),
+        ],
         _ => return None,
     };
-    find_in_path(program).map(|program| ServerConfig {
+    candidates.iter().find_map(|(program, args)| {
+        find(program).map(|path| {
+            if *program == "laravel-lsp" {
+                laravel_config(&path, find)
+            } else {
+                default_config(&path, args)
+            }
+        })
+    })
+}
+
+fn default_config(program: &Path, args: &[&str]) -> ServerConfig {
+    ServerConfig {
         program: program.to_string_lossy().into_owned(),
         args: args.iter().map(|arg| (*arg).to_owned()).collect(),
         log_traffic: false,
@@ -503,7 +626,53 @@ fn default_server(language: &str) -> Option<ServerConfig> {
             Duration::from_secs(1),
             Duration::from_secs(2),
         ],
-    })
+    }
+}
+
+fn is_laravel_root(root: Option<&Path>) -> bool {
+    root.is_some_and(|root| root.join("artisan").is_file())
+}
+
+/// `LspKey::language` of the Laravel companion; distinct from `"php"` so it
+/// gets its own process next to the primary PHP server.
+pub const LARAVEL_COMPANION: &str = "php-laravel";
+
+/// Second server to attach next to `primary` for this language and root.
+/// Laravel projects get `laravel-lsp` for config/route/view navigation
+/// unless it already is the primary server.
+pub fn companion_server(
+    language: &str,
+    root: Option<&Path>,
+    primary: &ServerConfig,
+) -> Option<ServerConfig> {
+    companion_server_with(language, root, primary, &find_in_path)
+}
+
+fn companion_server_with(
+    language: &str,
+    root: Option<&Path>,
+    primary: &ServerConfig,
+    find: &dyn Fn(&str) -> Option<PathBuf>,
+) -> Option<ServerConfig> {
+    if default_server_kind(language) != Some("php") || !is_laravel_root(root) {
+        return None;
+    }
+    let laravel = find("laravel-lsp")?;
+    let is_primary = Path::new(&primary.program).file_name() == laravel.file_name();
+    (!is_primary).then(|| laravel_config(&laravel, find))
+}
+
+/// laravel-lsp reads routes/config/views by running PHP inside the project.
+/// Its `auto` detection picks Sail whenever `vendor/bin/sail` exists, even
+/// with the container stopped, and then every lookup comes back empty. Pin
+/// the local PHP binary when there is one.
+fn laravel_config(program: &Path, find: &dyn Fn(&str) -> Option<PathBuf>) -> ServerConfig {
+    let mut config = default_config(program, &[]);
+    if let Some(php) = find("php") {
+        config.initialization_options =
+            serde_json::json!({ "phpCommand": [php.to_string_lossy()] });
+    }
+    config
 }
 
 fn default_server_kind(language: &str) -> Option<&'static str> {
@@ -527,6 +696,16 @@ pub fn find_in_path(program: &str) -> Option<PathBuf> {
     if path.components().count() > 1 {
         return is_executable(path).then(|| path.to_path_buf());
     }
+    search_directories()
+        .into_iter()
+        .map(|dir| dir.join(program))
+        .find(|candidate| is_executable(candidate))
+}
+
+/// `PATH` plus common install locations. GUI apps on macOS start with a
+/// minimal `PATH`, so script servers (`#!/usr/bin/env php`, `node`) also need
+/// these directories in the child environment, see [`server_path_env`].
+fn search_directories() -> Vec<PathBuf> {
     let mut directories = env::var_os("PATH")
         .into_iter()
         .flat_map(|value| {
@@ -539,7 +718,13 @@ pub fn find_in_path(program: &str) -> Option<PathBuf> {
         .collect::<Vec<_>>();
     if let Some(home) = env::var_os("HOME") {
         let home = PathBuf::from(home);
-        directories.extend([home.join(".composer/vendor/bin"), home.join(".local/bin")]);
+        directories.extend([
+            home.join(".composer/vendor/bin"),
+            home.join(".config/composer/vendor/bin"),
+            home.join(".local/bin"),
+            // Laravel Herd ships its own php binary.
+            home.join("Library/Application Support/Herd/bin"),
+        ]);
         let nvm_bin = home.join(".nvm/versions/node");
         if let Ok(entries) = std::fs::read_dir(nvm_bin) {
             for entry in entries.flatten() {
@@ -550,11 +735,27 @@ pub fn find_in_path(program: &str) -> Option<PathBuf> {
     directories.extend([
         PathBuf::from("/opt/homebrew/bin"),
         PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/usr/bin"),
+        PathBuf::from("/bin"),
     ]);
+    let mut seen = HashSet::new();
+    directories.retain(|dir| !dir.as_os_str().is_empty() && seen.insert(dir.clone()));
     directories
-        .into_iter()
-        .map(|dir| dir.join(program))
-        .find(|candidate| is_executable(candidate))
+}
+
+/// `PATH` for a server child: the server's own directory first, then the
+/// search directories, so `#!/usr/bin/env php` resolves when Galaxy is
+/// launched from Finder with launchd's minimal `PATH`.
+fn server_path_env(program: &str) -> std::ffi::OsString {
+    let mut directories = Vec::new();
+    if let Some(parent) = Path::new(program)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+    {
+        directories.push(parent.to_path_buf());
+    }
+    directories.extend(search_directories());
+    env::join_paths(directories).unwrap_or_else(|_| env::var_os("PATH").unwrap_or_default())
 }
 
 fn is_executable(path: &Path) -> bool {
@@ -613,6 +814,11 @@ pub struct LspManager {
     pending_restarts: HashMap<LspKey, Instant>,
     stopped: HashSet<LspKey>,
     documents: HashMap<String, (LspKey, DocumentSync)>,
+    /// Extra servers attached to a document next to its primary one, e.g.
+    /// laravel-lsp beside intelephense. They get the full document
+    /// lifecycle; feature requests fan out only where results merge cleanly
+    /// (definitions, diagnostics).
+    companions: HashMap<String, Vec<(LspKey, DocumentSync)>>,
     requests: HashMap<(LspKey, u64), PendingRequest>,
     next_request_id: u64,
     diagnostics: DiagnosticStore,
@@ -877,21 +1083,77 @@ impl LspManager {
         method: &str,
         now: Instant,
     ) -> io::Result<Option<u64>> {
-        let Some(key) = self.documents.get(uri).map(|(key, _)| key.clone()) else {
+        let keys: Vec<LspKey> = self
+            .documents
+            .get(uri)
+            .map(|(key, _)| key.clone())
+            .into_iter()
+            .chain(self.companion_keys(uri))
+            .collect();
+        if keys.is_empty() {
             return Ok(None);
-        };
+        }
         self.definition_locations.remove(uri);
-        let id = self.request(
-            &key,
-            method.into(),
-            serde_json::json!({
-                "textDocument": { "uri": uri }, "position": { "line": line, "character": character }
-            }),
-            Duration::from_millis(1000),
-            now,
-        )?;
-        self.definition_requests.insert((key, id), uri.to_owned());
-        Ok(Some(id))
+        // Late answers to an older lookup must not leak into this one.
+        self.definition_requests.retain(|_, pending| pending != uri);
+        let params = serde_json::json!({
+            "textDocument": { "uri": uri }, "position": { "line": line, "character": character }
+        });
+        let mut first = None;
+        let mut last_error = None;
+        for key in keys {
+            match self.request(
+                &key,
+                method.into(),
+                params.clone(),
+                // laravel-lsp builds its project index (by running PHP) on
+                // the first lookup, which takes a few seconds.
+                Duration::from_secs(5),
+                now,
+            ) {
+                Ok(id) => {
+                    self.definition_requests.insert((key, id), uri.to_owned());
+                    first.get_or_insert(id);
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        match (first, last_error) {
+            (Some(id), _) => Ok(Some(id)),
+            (None, Some(error)) => Err(error),
+            (None, None) => Ok(None),
+        }
+    }
+
+    /// Keys of the companion servers attached to `uri`.
+    pub fn companion_keys(&self, uri: &str) -> Vec<LspKey> {
+        self.companions
+            .get(uri)
+            .map(|entries| entries.iter().map(|(key, _)| key.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// Attaches an extra server to an already open document and sends
+    /// `didOpen` to it (now, or once it finishes initializing).
+    pub fn open_companion(
+        &mut self,
+        key: LspKey,
+        uri: String,
+        language_id: String,
+        doc: &Document,
+    ) -> io::Result<()> {
+        let sync = DocumentSync::new(uri.clone(), language_id, doc.text());
+        if self
+            .servers
+            .get(&key)
+            .is_some_and(|server| server.initialized)
+        {
+            self.send(&key, &sync.did_open())?;
+        }
+        let entries = self.companions.entry(uri).or_default();
+        entries.retain(|(existing, _)| existing != &key);
+        entries.push((key, sync));
+        Ok(())
     }
 
     pub fn definition_locations(&self, uri: &str) -> &[DefinitionLocation] {
@@ -1319,9 +1581,15 @@ impl LspManager {
         if let Some((_, sync)) = self.documents.get_mut(uri) {
             sync.note_change(before, after, changes, now);
         }
+        for (_, sync) in self.companions.get_mut(uri).into_iter().flatten() {
+            sync.note_change(before, after, changes, now);
+        }
     }
 
     pub fn note_full_text(&mut self, uri: &str, text: String, now: Instant) {
+        for (_, sync) in self.companions.get_mut(uri).into_iter().flatten() {
+            sync.note_full_text(text.clone(), now);
+        }
         if let Some((_, sync)) = self.documents.get_mut(uri) {
             sync.note_full_text(text, now);
         }
@@ -1331,6 +1599,7 @@ impl LspManager {
         let ready: Vec<_> = self
             .documents
             .values_mut()
+            .chain(self.companions.values_mut().flatten())
             .filter_map(|(key, sync)| sync.flush(now).map(|message| (key.clone(), message)))
             .collect();
         ready
@@ -1344,10 +1613,16 @@ impl LspManager {
             .documents
             .get(uri)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "LSP document is not open"))?;
+        for (companion, companion_sync) in self.companions.get(uri).into_iter().flatten() {
+            let _ = self.send(companion, &companion_sync.did_save());
+        }
         self.send(key, &sync.did_save())
     }
 
     pub fn close_document(&mut self, uri: &str) -> io::Result<()> {
+        for (companion, sync) in self.companions.remove(uri).into_iter().flatten() {
+            let _ = self.send(&companion, &sync.did_close());
+        }
         let (key, sync) = self
             .documents
             .remove(uri)
@@ -1363,13 +1638,14 @@ impl LspManager {
         for (key, server) in &mut self.servers {
             loop {
                 match server.transport.try_recv() {
-                    Ok(Incoming::Message(message)) if !server.initialized && message.get("id") == Some(&Value::from(0)) => {
+                    Ok(Incoming::Message(message)) if !server.initialized && message.get("id") == Some(&Value::from(0)) && message.get("method").is_none() => {
                         match server.transport.send(&serde_json::json!({"jsonrpc": "2.0", "method": "initialized", "params": {}})) {
                             Ok(()) => {
                                 server.initialized = true;
                                 let opens: Vec<_> = self
                                     .documents
                                     .values()
+                                    .chain(self.companions.values().flatten())
                                     .filter(|(document_key, _)| document_key == key)
                                     .map(|(_, sync)| sync.did_open())
                                     .collect();
@@ -1381,6 +1657,21 @@ impl LspManager {
                                 events.push(LspEvent::Initialized(key.clone()));
                             }
                             Err(error) => events.push(LspEvent::Error(key.clone(), error.to_string())),
+                        }
+                    }
+                    // Server-to-client requests carry an id too; their ids
+                    // can collide with ours, so answer them instead of
+                    // treating them as responses.
+                    Ok(Incoming::Message(message)) if message.get("id").is_some() && message.get("method").is_some() => {
+                        let result = if message["method"] == "workspace/configuration" {
+                            let items = message["params"]["items"].as_array().map_or(0, Vec::len);
+                            Value::Array(vec![Value::Null; items])
+                        } else {
+                            Value::Null
+                        };
+                        let reply = serde_json::json!({"jsonrpc": "2.0", "id": message["id"], "result": result});
+                        if let Err(error) = server.transport.send(&reply) {
+                            events.push(LspEvent::Error(key.clone(), error.to_string()));
                         }
                     }
                     Ok(Incoming::Message(message)) if message.get("id").and_then(Value::as_u64).is_some() => {
@@ -1396,9 +1687,10 @@ impl LspManager {
                         if let Some(uri) = self.signature_requests.remove(&(key.clone(), id))
                             && let Some(result) = message.get("result").and_then(parse_signature)
                         { self.signatures.insert(uri, result); }
+                        // Several servers may answer one lookup; keep every location.
                         if let Some(uri) = self.definition_requests.remove(&(key.clone(), id))
                             && let Some(result) = message.get("result").and_then(parse_definition_locations)
-                        { self.definition_locations.insert(uri, result); }
+                        { self.definition_locations.entry(uri).or_default().extend(result); }
                         if let Some(uri) = self.reference_requests.remove(&(key.clone(), id))
                             && let Some(result) = message.get("result").and_then(parse_definition_locations)
                         { self.references.insert(uri, result); }
@@ -1444,8 +1736,9 @@ impl LspManager {
             }
         }
         for event in &events {
-            if let LspEvent::Message(_, message) = event
-                && let Err(error) = self.publish_diagnostics(message)
+            // Tagged per server so a companion never clears the primary's list.
+            if let LspEvent::Message(key, message) = event
+                && let Err(error) = self.diagnostics.publish_from(&key.language, message)
             {
                 tracing::warn!(%error, "discarded invalid LSP diagnostics notification");
             }
@@ -1538,6 +1831,7 @@ impl LspManager {
         }
         self.servers.clear();
         self.documents.clear();
+        self.companions.clear();
     }
 }
 
@@ -1917,7 +2211,7 @@ impl LspTransport {
     ) -> io::Result<Self> {
         let runtime = Runtime::new()?;
         let mut command = Command::new(program);
-        command.args(args);
+        command.args(args).env("PATH", server_path_env(program));
         if root.is_dir() {
             command.current_dir(root);
         }
@@ -2324,6 +2618,224 @@ mod tests {
         );
     }
 
+    fn fake_find(available: &'static [&'static str]) -> impl Fn(&str) -> Option<PathBuf> {
+        move |program| {
+            available
+                .contains(&program)
+                .then(|| PathBuf::from(format!("/fake/bin/{program}")))
+        }
+    }
+
+    #[test]
+    fn server_path_env_includes_program_dir_and_fallbacks() {
+        let path = server_path_env("/custom/tools/bin/laravel-lsp");
+        let dirs: Vec<PathBuf> = env::split_paths(&path).collect();
+        assert_eq!(dirs[0], PathBuf::from("/custom/tools/bin"));
+        assert!(dirs.contains(&PathBuf::from("/opt/homebrew/bin")));
+        assert!(dirs.contains(&PathBuf::from("/usr/bin")));
+        let unique: HashSet<_> = dirs[1..].iter().collect();
+        assert_eq!(unique.len(), dirs.len() - 1);
+    }
+
+    #[test]
+    fn script_server_runs_with_minimal_parent_path() {
+        // `#!/usr/bin/env` interpreters must resolve through the child PATH.
+        let dir = tempfile::tempdir().unwrap();
+        let interpreter = dir.path().join("fake-interp");
+        std::fs::write(&interpreter, "#!/bin/sh\nexec /bin/cat\n").unwrap();
+        let server = dir.path().join("fake-server");
+        std::fs::write(&server, "#!/usr/bin/env fake-interp\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        for file in [&interpreter, &server] {
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let transport =
+            LspTransport::spawn(server.to_str().unwrap(), &[], false, dir.path()).unwrap();
+        let ping = serde_json::json!({"jsonrpc": "2.0", "method": "ping"});
+        transport.send(&ping).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(Incoming::Message(message)) = transport.try_recv() {
+                assert_eq!(message["method"], "ping");
+                break;
+            }
+            assert!(Instant::now() < deadline, "script server did not echo");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn php_prefers_laravel_lsp_only_in_laravel_projects() {
+        let laravel = tempfile::tempdir().unwrap();
+        std::fs::write(laravel.path().join("artisan"), "<?php").unwrap();
+        let plain = tempfile::tempdir().unwrap();
+        let all = fake_find(&["laravel-lsp", "intelephense", "phpactor"]);
+
+        // Laravel: a general PHP server is primary, laravel-lsp the companion.
+        let primary = default_server("PHP", Some(laravel.path()), &all).unwrap();
+        assert_eq!(primary.program, "/fake/bin/intelephense");
+        let companion =
+            companion_server_with("Blade", Some(laravel.path()), &primary, &all).unwrap();
+        assert_eq!(companion.program, "/fake/bin/laravel-lsp");
+
+        // Plain PHP: no laravel-lsp at all.
+        let config = default_server("PHP", Some(plain.path()), &all).unwrap();
+        assert_eq!(config.program, "/fake/bin/intelephense");
+        assert_eq!(config.args, ["--stdio"]);
+        assert!(companion_server_with("PHP", Some(plain.path()), &config, &all).is_none());
+        assert!(default_server("PHP", Some(plain.path()), &fake_find(&["laravel-lsp"])).is_none());
+    }
+
+    #[test]
+    fn laravel_lsp_gets_the_local_php_binary() {
+        let laravel = tempfile::tempdir().unwrap();
+        std::fs::write(laravel.path().join("artisan"), "<?php").unwrap();
+        let all = fake_find(&["intelephense", "laravel-lsp", "php"]);
+        let primary = default_server("php", Some(laravel.path()), &all).unwrap();
+        let companion = companion_server_with("php", Some(laravel.path()), &primary, &all).unwrap();
+        assert_eq!(
+            companion.initialization_options["phpCommand"],
+            serde_json::json!(["/fake/bin/php"])
+        );
+        // Without a local php, leave laravel-lsp's own detection alone.
+        let no_php = fake_find(&["intelephense", "laravel-lsp"]);
+        let companion =
+            companion_server_with("php", Some(laravel.path()), &primary, &no_php).unwrap();
+        assert!(companion.initialization_options.is_null());
+    }
+
+    #[test]
+    fn laravel_lsp_alone_is_primary_without_a_duplicate_companion() {
+        let laravel = tempfile::tempdir().unwrap();
+        std::fs::write(laravel.path().join("artisan"), "<?php").unwrap();
+        let only = fake_find(&["laravel-lsp"]);
+        let primary = default_server("php", Some(laravel.path()), &only).unwrap();
+        assert_eq!(primary.program, "/fake/bin/laravel-lsp");
+        assert!(companion_server_with("php", Some(laravel.path()), &primary, &only).is_none());
+        assert!(companion_server_with("rust", Some(laravel.path()), &primary, &only).is_none());
+    }
+
+    #[test]
+    fn diagnostics_from_two_servers_are_kept_side_by_side() {
+        let mut store = DiagnosticStore::default();
+        let publish = |message: &str| {
+            serde_json::json!({"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{
+                "uri":"file:///a.php","diagnostics":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"severity":1,"message":message}]
+            }})
+        };
+        store
+            .publish_from("php", &publish("from intelephense"))
+            .unwrap();
+        store
+            .publish_from("php-laravel", &publish("from laravel"))
+            .unwrap();
+        assert_eq!(store.for_uri("file:///a.php").len(), 2);
+        let cleared = serde_json::json!({"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file:///a.php","diagnostics":[]}});
+        store.publish_from("php-laravel", &cleared).unwrap();
+        let left = store.for_uri("file:///a.php");
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].message, "from intelephense");
+    }
+
+    #[test]
+    fn php_falls_back_to_intelephense_then_phpactor() {
+        let laravel = tempfile::tempdir().unwrap();
+        std::fs::write(laravel.path().join("artisan"), "<?php").unwrap();
+        let config =
+            default_server("php", Some(laravel.path()), &fake_find(&["intelephense"])).unwrap();
+        assert_eq!(config.program, "/fake/bin/intelephense");
+        let config = default_server("php", None, &fake_find(&["phpactor"])).unwrap();
+        assert_eq!(config.program, "/fake/bin/phpactor");
+        assert_eq!(config.args, ["language-server"]);
+        assert!(default_server("php", None, &fake_find(&[])).is_none());
+    }
+
+    #[test]
+    fn php_override_covers_blade_and_exact_entry_wins() {
+        let settings = LspSettings::from_json(&serde_json::json!({
+            "servers": {
+                "php": { "command": "/bin/php-server" },
+                "go": { "command": "/bin/go-server" }
+            }
+        }))
+        .unwrap();
+        assert_eq!(settings.resolve("PHP").unwrap().program, "/bin/php-server");
+        assert_eq!(
+            settings.resolve("Blade").unwrap().program,
+            "/bin/php-server"
+        );
+        let settings = LspSettings::from_json(&serde_json::json!({
+            "servers": {
+                "php": { "command": "/bin/php-server" },
+                "blade": { "command": "/bin/blade-server" }
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            settings.resolve("blade").unwrap().program,
+            "/bin/blade-server"
+        );
+    }
+
+    #[test]
+    fn settings_load_merges_global_and_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global.json");
+        std::fs::write(
+            &global,
+            r#"{ "lsp": { "servers": {
+                "php": { "command": "/global/php" },
+                "go": { "command": "/global/go" }
+            } } }"#,
+        )
+        .unwrap();
+        let root = dir.path().join("ws");
+        std::fs::create_dir_all(root.join(".galaxy")).unwrap();
+        std::fs::write(
+            root.join(".galaxy/settings.json"),
+            r#"{ "editor": { "tabSize": 2 },
+                "lsp": { "servers": { "php": {
+                    "command": "/ws/php",
+                    "initializationOptions": { "storagePath": "/tmp/x" }
+                } } } }"#,
+        )
+        .unwrap();
+        let (settings, errors) = LspSettings::load(Some(&global), Some(&root));
+        assert!(errors.is_empty(), "{errors:?}");
+        let php = settings.resolve("php").unwrap();
+        assert_eq!(php.program, "/ws/php");
+        assert_eq!(php.initialization_options["storagePath"], "/tmp/x");
+        assert_eq!(settings.resolve("go").unwrap().program, "/global/go");
+
+        let missing = dir.path().join("missing.json");
+        let (settings, errors) = LspSettings::load(Some(&missing), None);
+        assert!(errors.is_empty());
+        assert!(settings.servers.is_empty());
+
+        std::fs::write(&global, "{ not json").unwrap();
+        let (_, errors) = LspSettings::load(Some(&global), None);
+        assert_eq!(errors.len(), 1);
+    }
+
+    #[test]
+    fn language_ids_follow_lsp_spec() {
+        assert_eq!(lsp_language_id("PHP", "/app/Models/User.php"), "php");
+        assert_eq!(
+            lsp_language_id("PHP", "/resources/views/welcome.blade.php"),
+            "blade"
+        );
+        assert_eq!(lsp_language_id("Rust", "/src/main.rs"), "rust");
+        assert_eq!(lsp_language_id("TSX", "/a.tsx"), "typescriptreact");
+        assert_eq!(
+            lsp_language_id("TypeScript React", "/a.tsx"),
+            "typescriptreact"
+        );
+        assert_eq!(lsp_language_id("JavaScript", "/a.js"), "javascript");
+        assert_eq!(lsp_server_language("Blade"), "php");
+        assert_eq!(lsp_server_language("PHP"), "php");
+        assert_eq!(lsp_server_language("TSX"), "typescript");
+    }
+
     #[test]
     fn display_language_names_resolve_to_typescript_server_kind() {
         for language in [
@@ -2492,6 +3004,271 @@ mod tests {
         manager
             .open_document(key, uri, "rust".into(), &document)
             .unwrap();
+        manager.shutdown_all();
+    }
+
+    /// Opt-in: `GALAXY_LARAVEL_PATH=/path/to/laravel-app` with intelephense
+    /// and laravel-lsp installed. Checks class definitions (intelephense)
+    /// and config strings (laravel-lsp) through one manager.
+    #[test]
+    fn laravel_definitions_merge_both_servers_when_configured() {
+        let Ok(root) = std::env::var("GALAXY_LARAVEL_PATH") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let source_path = root.join("bootstrap/app.php");
+        let (Some(primary), true) = (
+            default_server("php", Some(&root), &find_in_path),
+            source_path.is_file(),
+        ) else {
+            return;
+        };
+        let Some(companion) = companion_server("php", Some(&root), &primary) else {
+            return;
+        };
+        let source = std::fs::read_to_string(&source_path).unwrap();
+        let key = LspKey {
+            language: "php".into(),
+            root: root.clone(),
+        };
+        let companion_key = LspKey {
+            language: LARAVEL_COMPANION.into(),
+            root,
+        };
+        let mut manager = LspManager::default();
+        manager.ensure_server(key.clone(), &primary).unwrap();
+        manager
+            .ensure_server(companion_key.clone(), &companion)
+            .unwrap();
+        let uri = format!("file://{}", source_path.to_string_lossy());
+        let document = Document::from_text(&source);
+        manager
+            .open_companion(companion_key.clone(), uri.clone(), "php".into(), &document)
+            .unwrap();
+        manager
+            .open_document(key.clone(), uri.clone(), "php".into(), &document)
+            .unwrap();
+        let mut ready = HashSet::new();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while ready.len() < 2 {
+            for event in manager.poll() {
+                if let LspEvent::Initialized(key) = event {
+                    ready.insert(key);
+                }
+            }
+            assert!(Instant::now() < deadline, "PHP servers did not initialize");
+            thread::sleep(Duration::from_millis(20));
+        }
+        // Indexing takes a while on a real project; retry until it resolves.
+        let (line, column) = source
+            .lines()
+            .enumerate()
+            .find_map(|(i, text)| text.find("Application::").map(|c| (i, c + 1)))
+            .expect("bootstrap/app.php mentions Application::");
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            manager
+                .request_definition(&uri, line as u64, column as u64, Instant::now())
+                .unwrap();
+            let asked = Instant::now();
+            while Instant::now() < asked + Duration::from_secs(2)
+                && manager.definition_locations(&uri).is_empty()
+            {
+                manager.poll();
+                thread::sleep(Duration::from_millis(20));
+            }
+            if manager
+                .definition_locations(&uri)
+                .iter()
+                .any(|location| location.uri.ends_with("Foundation/Application.php"))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no class definition for Application"
+            );
+        }
+        manager.shutdown_all();
+    }
+
+    /// Opt-in: `config('services.sipay.username')` in possipay must resolve
+    /// through the laravel-lsp companion to `config/services.php`.
+    #[test]
+    fn laravel_config_string_definition_when_configured() {
+        let Ok(root) = std::env::var("GALAXY_LARAVEL_PATH") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let source_path = root.join("app/Libraries/SiPay.php");
+        let (Some(primary), true) = (
+            default_server("php", Some(&root), &find_in_path),
+            source_path.is_file(),
+        ) else {
+            return;
+        };
+        let Some(companion) = companion_server("php", Some(&root), &primary) else {
+            return;
+        };
+        let source = std::fs::read_to_string(&source_path).unwrap();
+        let key = LspKey {
+            language: "php".into(),
+            root: root.clone(),
+        };
+        let companion_key = LspKey {
+            language: LARAVEL_COMPANION.into(),
+            root,
+        };
+        let mut manager = LspManager::default();
+        manager.ensure_server(key.clone(), &primary).unwrap();
+        manager
+            .ensure_server(companion_key.clone(), &companion)
+            .unwrap();
+        let uri = format!("file://{}", source_path.to_string_lossy());
+        let document = Document::from_text(&source);
+        manager
+            .open_companion(companion_key, uri.clone(), "php".into(), &document)
+            .unwrap();
+        manager
+            .open_document(key, uri.clone(), "php".into(), &document)
+            .unwrap();
+        let mut ready = 0;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while ready < 2 {
+            ready += manager
+                .poll()
+                .iter()
+                .filter(|event| matches!(event, LspEvent::Initialized(_)))
+                .count();
+            assert!(Instant::now() < deadline, "PHP servers did not initialize");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let (line, column) = source
+            .lines()
+            .enumerate()
+            .find_map(|(i, text)| text.find("services.sipay.username").map(|c| (i, c + 3)))
+            .expect("SiPay.php uses services.sipay.username");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut log = Vec::new();
+        loop {
+            let asked = Instant::now();
+            manager
+                .request_definition(&uri, line as u64, column as u64, asked)
+                .unwrap();
+            while Instant::now() < asked + Duration::from_secs(5)
+                && manager.definition_locations(&uri).is_empty()
+            {
+                for event in manager.poll() {
+                    if let LspEvent::Response {
+                        key, id, result, ..
+                    } = event
+                    {
+                        log.push(format!(
+                            "{}ms {} id={id} {}",
+                            asked.elapsed().as_millis(),
+                            key.language,
+                            result
+                                .map(|value| value.to_string())
+                                .unwrap_or_default()
+                                .chars()
+                                .take(200)
+                                .collect::<String>()
+                        ));
+                    }
+                }
+                for event in manager.expire_requests(Instant::now()) {
+                    if let LspEvent::TimedOut { key, method, .. } = event {
+                        log.push(format!(
+                            "{}ms TIMEOUT {} {method}",
+                            asked.elapsed().as_millis(),
+                            key.language
+                        ));
+                    }
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            if manager
+                .definition_locations(&uri)
+                .iter()
+                .any(|location| location.uri.ends_with("config/services.php"))
+            {
+                eprintln!(
+                    "CONFIG ok after {}ms: {log:#?}",
+                    asked.elapsed().as_millis()
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline, "no config definition: {log:#?}");
+        }
+        manager.shutdown_all();
+    }
+
+    /// Opt-in like the definition test: hover on a class name in a real
+    /// Laravel project must produce hover contents.
+    #[test]
+    fn laravel_hover_returns_contents_when_configured() {
+        let Ok(root) = std::env::var("GALAXY_LARAVEL_PATH") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let source_path = root.join("bootstrap/providers.php");
+        let (Some(primary), true) = (
+            default_server("php", Some(&root), &find_in_path),
+            source_path.is_file(),
+        ) else {
+            return;
+        };
+        let source = std::fs::read_to_string(&source_path).unwrap();
+        let key = LspKey {
+            language: "php".into(),
+            root,
+        };
+        let mut manager = LspManager::default();
+        manager.ensure_server(key.clone(), &primary).unwrap();
+        let uri = format!("file://{}", source_path.to_string_lossy());
+        manager
+            .open_document(
+                key.clone(),
+                uri.clone(),
+                "php".into(),
+                &Document::from_text(&source),
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !manager.poll().contains(&LspEvent::Initialized(key.clone())) {
+            assert!(Instant::now() < deadline, "intelephense did not initialize");
+            thread::sleep(Duration::from_millis(20));
+        }
+        let (line, column) = source
+            .lines()
+            .enumerate()
+            .find_map(|(i, text)| text.find("AppServiceProvider").map(|c| (i, c + 3)))
+            .expect("providers.php mentions AppServiceProvider");
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut raw = Vec::new();
+        loop {
+            manager
+                .request_hover(&uri, line as u64, column as u64, Instant::now())
+                .unwrap();
+            let asked = Instant::now();
+            while Instant::now() < asked + Duration::from_secs(3) && manager.hover(&uri).is_none() {
+                for event in manager.poll() {
+                    if let LspEvent::Message(_, message) = event
+                        && message.get("id").is_some()
+                    {
+                        raw.push(message.to_string().chars().take(300).collect::<String>());
+                    }
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            if manager.hover(&uri).is_some() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no hover; responses seen: {raw:#?}"
+            );
+        }
         manager.shutdown_all();
     }
 

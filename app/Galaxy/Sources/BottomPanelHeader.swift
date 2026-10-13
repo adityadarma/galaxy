@@ -31,6 +31,37 @@ final class BottomPanelHeader: NSView {
     var onKillTerminal: (() -> Void)?
     var onToggleMaximize: (() -> Void)?
     var onClose: (() -> Void)?
+    /// Dragging the top edge (VS Code's sash): called with the drag start
+    /// (`true`) and then the vertical distance moved, up positive.
+    var onResize: ((_ began: Bool, _ deltaY: CGFloat) -> Void)?
+
+    /// Height of the grab strip along the top edge.
+    static let sashHeight: CGFloat = 5
+
+    private func inSash(_ point: NSPoint) -> Bool { point.y < Self.sashHeight }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        guard !isHidden, let local = superview.map({ convert(point, from: $0) }),
+              bounds.contains(local), inSash(local) else { return super.hitTest(point) }
+        return self
+    }
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(NSRect(x: 0, y: 0, width: bounds.width, height: Self.sashHeight), cursor: .resizeUpDown)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard inSash(convert(event.locationInWindow, from: nil)), let window else {
+            return super.mouseDown(with: event)
+        }
+        let startY = event.locationInWindow.y
+        onResize?(true, 0)
+        while let next = window.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
+            onResize?(false, next.locationInWindow.y - startY)
+            if next.type == .leftMouseUp { break }
+        }
+    }
 
     private(set) var selectedTab: Tab = .terminal
     private var tabViews: [Tab: PanelTabView] = [:]
@@ -189,15 +220,15 @@ final class PanelTabView: NSView {
     }
     var badge = 0 {
         didSet {
-            badgeLabel.stringValue = "\(badge)"
-            badgeLabel.isHidden = badge == 0
+            badgeView.count = badge
+            badgeView.isHidden = badge == 0
             setAccessibilityLabel(badge > 0 ? "\(title), \(badge)" : title)
         }
     }
 
     private let title: String
     private let label: NSTextField
-    private let badgeLabel = NSTextField(labelWithString: "")
+    let badgeView = CountBadge()
 
     init(title: String) {
         self.title = title
@@ -212,18 +243,12 @@ final class PanelTabView: NSView {
         label.textColor = .secondaryLabelColor
         label.translatesAutoresizingMaskIntoConstraints = false
 
-        badgeLabel.font = .monospacedDigitSystemFont(ofSize: 9, weight: .semibold)
-        badgeLabel.textColor = .white
-        badgeLabel.alignment = .center
-        badgeLabel.wantsLayer = true
-        badgeLabel.layer?.backgroundColor = Theme.accent.cgColor
-        badgeLabel.layer?.cornerRadius = 8
-        badgeLabel.isHidden = true
-        badgeLabel.translatesAutoresizingMaskIntoConstraints = false
+        badgeView.isHidden = true
+        badgeView.translatesAutoresizingMaskIntoConstraints = false
 
-        let stack = NSStackView(views: [label, badgeLabel])
+        let stack = NSStackView(views: [label, badgeView])
         stack.orientation = .horizontal
-        stack.spacing = 5
+        stack.spacing = 6
         stack.alignment = .centerY
         stack.translatesAutoresizingMaskIntoConstraints = false
         addSubview(stack)
@@ -232,8 +257,6 @@ final class PanelTabView: NSView {
             stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
             stack.centerYAnchor.constraint(equalTo: centerYAnchor),
             heightAnchor.constraint(equalToConstant: BottomPanelHeader.height),
-            badgeLabel.heightAnchor.constraint(equalToConstant: 16),
-            badgeLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 16),
         ])
     }
 
@@ -241,29 +264,85 @@ final class PanelTabView: NSView {
 
     override var isFlipped: Bool { true }
 
-    override func updateLayer() {
-        super.updateLayer()
-        badgeLabel.layer?.backgroundColor = Theme.accent.cgColor
-    }
-
-    override func viewDidChangeEffectiveAppearance() {
-        super.viewDidChangeEffectiveAppearance()
-        badgeLabel.layer?.backgroundColor = Theme.accent.resolved(for: effectiveAppearance).cgColor
-    }
-
+    /// VS Code's active panel tab: a 1pt rule a few points under the title,
+    /// as wide as the title and badge.
     override func draw(_ dirtyRect: NSRect) {
         guard isSelected else { return }
         NSColor.labelColor.setFill()
         let inset: CGFloat = 6
-        NSRect(x: inset, y: bounds.height - 6, width: bounds.width - inset * 2, height: 1)
+        let y = round(bounds.midY + 11)
+        NSRect(x: inset, y: y, width: bounds.width - inset * 2, height: 1)
             .intersection(dirtyRect).fill()
     }
+
+    private var isHovered = false {
+        didSet { label.textColor = isSelected || isHovered ? .labelColor : .secondaryLabelColor }
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+                                       owner: self, userInfo: nil))
+    }
+
+    override func mouseEntered(with event: NSEvent) { isHovered = true }
+    override func mouseExited(with event: NSEvent) { isHovered = false }
 
     override func mouseDown(with event: NSEvent) { onClick?() }
 
     override func accessibilityPerformPress() -> Bool {
         onClick?()
         return true
+    }
+}
+
+/// Count pill like VS Code's panel badge: 18pt tall, fully rounded, the
+/// number centered both ways (an `NSTextField` sat it high in the pill).
+@MainActor
+final class CountBadge: NSView {
+    static let height: CGFloat = 18
+    var count = 0 {
+        didSet {
+            guard count != oldValue else { return }
+            invalidateIntrinsicContentSize()
+            needsDisplay = true
+        }
+    }
+
+    var text: String { count > 999 ? "999+" : "\(count)" }
+
+    private var attributes: [NSAttributedString.Key: Any] {
+        [.font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold), .foregroundColor: NSColor.white]
+    }
+
+    override var intrinsicContentSize: NSSize {
+        // 5pt each side: one digit stays a circle, more digits widen it.
+        let width = ceil((text as NSString).size(withAttributes: attributes).width) + 10
+        return NSSize(width: max(Self.height, width), height: Self.height)
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setContentHuggingPriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.required, for: .horizontal)
+        setAccessibilityElement(false)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override func draw(_ dirtyRect: NSRect) {
+        Theme.accent.resolved(for: effectiveAppearance).setFill()
+        NSBezierPath(roundedRect: bounds, xRadius: bounds.height / 2, yRadius: bounds.height / 2).fill()
+        let string = NSAttributedString(string: text, attributes: attributes)
+        let size = string.size()
+        // Center the digits (cap height) rather than the whole line box.
+        // Not flipped: `draw(at:)` takes the line's bottom, a descender
+        // below the baseline.
+        let font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
+        let baseline = (bounds.height - font.capHeight) / 2
+        string.draw(at: NSPoint(x: ((bounds.width - size.width) / 2).rounded(),
+                                y: (baseline + font.descender).rounded()))
     }
 }
 

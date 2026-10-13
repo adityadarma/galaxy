@@ -19,7 +19,10 @@ use galaxy_core::file_finder::FileFinder as CoreFileFinder;
 use galaxy_core::find::{FindError, FindOptions, Finder};
 use galaxy_core::history::{EditKind, Editor};
 use galaxy_core::keymap::{self, Keymap};
-use galaxy_core::lsp::{LspKey, LspManager, LspSettings};
+use galaxy_core::lsp::{
+    LARAVEL_COMPANION, LspKey, LspManager, LspSettings, companion_server, lsp_language_id,
+    lsp_server_language,
+};
 use galaxy_core::movement::{self, Motion};
 use galaxy_core::multicursor;
 use galaxy_core::navigation::{self, Location, NavHistory};
@@ -418,16 +421,20 @@ impl Core {
             return Ok(false);
         }
         let key = LspKey {
-            language: language.clone(),
+            language: lsp_server_language(&language),
             root: PathBuf::from(root),
         };
-        let normalized = language.to_ascii_lowercase();
-        if (normalized == "php" || normalized == "blade") && !key.root.join("artisan").is_file() {
-            return Ok(false);
+        let (settings, errors) = LspSettings::load(
+            LspSettings::global_settings_path().as_deref(),
+            Some(&key.root),
+        );
+        for error in errors {
+            tracing::warn!(%error, "ignoring invalid LSP settings");
         }
-        let Some(config) = LspSettings::default().resolve(&language) else {
+        let Some(config) = settings.resolve_for_root(&language, Some(&key.root)) else {
             return Ok(false);
         };
+        let language_id = lsp_language_id(&language, &path);
         let uri = file_uri(Path::new(&path));
         if self
             .lsp_documents
@@ -437,11 +444,29 @@ impl Core {
         {
             return Ok(true);
         }
+        let companion = companion_server(&language, Some(&key.root), &config);
         let mut lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
         lsp.ensure_server(key.clone(), &config)?;
         let text = document.text();
         let doc = Document::from_text(&text);
-        lsp.open_document(key, uri.clone(), language, &doc)?;
+        if let Some(companion) = companion {
+            let companion_key = LspKey {
+                language: LARAVEL_COMPANION.to_owned(),
+                root: key.root.clone(),
+            };
+            // Optional extra: a failing laravel-lsp must not block the primary.
+            match lsp.ensure_server(companion_key.clone(), &companion) {
+                Ok(_) => {
+                    if let Err(error) =
+                        lsp.open_companion(companion_key, uri.clone(), language_id.clone(), &doc)
+                    {
+                        tracing::warn!(%error, "could not open document in laravel-lsp");
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "could not start laravel-lsp"),
+            }
+        }
+        lsp.open_document(key, uri.clone(), language_id, &doc)?;
         self.lsp_documents
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -535,6 +560,9 @@ impl Core {
         let Some((key, _)) = lsp.document_key(&uri) else {
             return false;
         };
+        for companion in lsp.companion_keys(&uri) {
+            lsp.stop_server(&companion);
+        }
         let stopped = lsp.stop_server(&key);
         documents.retain(|_, value| value.path() != path);
         stopped
@@ -551,14 +579,20 @@ impl Core {
             return Ok(false);
         }
         let key = LspKey {
-            language: language.clone(),
+            language: lsp_server_language(&language),
             root: PathBuf::from(root),
         };
-        let restarted = self
-            .lsp
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .restart_server(&key)?;
+        let restarted = {
+            let mut lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
+            let companion = LspKey {
+                language: LARAVEL_COMPANION.to_owned(),
+                root: key.root.clone(),
+            };
+            if let Err(error) = lsp.restart_server(&companion) {
+                tracing::warn!(%error, "could not restart laravel-lsp");
+            }
+            lsp.restart_server(&key)?
+        };
         if restarted {
             return Ok(true);
         }
@@ -2268,12 +2302,15 @@ struct State {
     find_error: Option<String>,
     syntax: Option<SyntaxState>,
     diagnostics: Vec<DiagnosticInfo>,
+    diagnostics_revision: u64,
 }
 
 struct SyntaxState {
     language: SyntaxLanguage,
     service: SyntaxService,
     snapshot: Option<SyntaxSnapshot>,
+    /// Last document revision handed to the worker.
+    submitted: u64,
 }
 
 impl SyntaxState {
@@ -2284,20 +2321,46 @@ impl SyntaxState {
             language,
             service,
             snapshot: None,
+            submitted: doc.revision(),
         }
     }
 
-    fn submit(&self, doc: &Document) {
+    fn submit(&mut self, doc: &Document) {
         self.service.submit_document(doc);
+        self.submitted = doc.revision();
     }
 
-    fn poll(&mut self, revision: u64) -> Option<&SyntaxSnapshot> {
+    /// Submits the document if any edit path (undo, paste, IME, ...) changed
+    /// it without telling the worker. Cheap: Rope clones are O(1).
+    fn ensure_submitted(&mut self, doc: &Document) {
+        if self.submitted != doc.revision() {
+            self.submit(doc);
+        }
+    }
+
+    fn drain(&mut self) {
         if let Some(snapshot) = self.service.poll() {
             self.snapshot = Some(snapshot);
         }
+    }
+
+    /// Tree for exactly `doc`'s revision.
+    fn poll(&mut self, doc: &Document) -> Option<&SyntaxSnapshot> {
+        self.ensure_submitted(doc);
+        self.drain();
+        let revision = doc.revision();
         self.snapshot
             .as_ref()
             .filter(|snapshot| snapshot.revision() == revision)
+    }
+
+    /// Newest tree, possibly one edit behind. Drawing with it keeps colors
+    /// on screen while the worker reparses, instead of a plain-text frame
+    /// on every keystroke.
+    fn latest(&mut self, doc: &Document) -> Option<&SyntaxSnapshot> {
+        self.ensure_submitted(doc);
+        self.drain();
+        self.snapshot.as_ref()
     }
 }
 
@@ -2386,11 +2449,10 @@ impl DocumentHandle {
     /// Polls the background parser without blocking. `true` means styles for
     /// the current document revision are ready for the next viewport draw.
     pub fn poll_syntax(&self) -> bool {
-        let mut st = self.lock();
-        let revision = st.editor.doc.revision();
+        let st = &mut *self.lock();
         st.syntax
             .as_mut()
-            .and_then(|syntax| syntax.poll(revision))
+            .and_then(|syntax| syntax.poll(&st.editor.doc))
             .is_some()
     }
 
@@ -2415,20 +2477,30 @@ impl DocumentHandle {
         self.lock().syntax.is_some()
     }
 
+    /// Called for every document on each LSP poll; bumps
+    /// [`Self::diagnostics_revision`] only when the list actually changed.
     pub fn set_diagnostics(&self, diagnostics: Vec<DiagnosticInfo>) {
-        self.lock().diagnostics = diagnostics;
+        let mut st = self.lock();
+        if st.diagnostics != diagnostics {
+            st.diagnostics = diagnostics;
+            st.diagnostics_revision += 1;
+        }
+    }
+
+    /// Changes whenever diagnostics change, so the UI can skip redraws.
+    pub fn diagnostics_revision(&self) -> u64 {
+        self.lock().diagnostics_revision
     }
 
     /// Definitions from the current completed syntax tree. Parsing stays on
     /// the syntax worker; callers receive an empty list while it catches up.
     pub fn outline(&self) -> Vec<OutlineSymbol> {
-        let mut st = self.lock();
-        let revision = st.editor.doc.revision();
+        let st = &mut *self.lock();
         let (tree, language) = {
             let Some(syntax) = st.syntax.as_mut() else {
                 return Vec::new();
             };
-            let Some(snapshot) = syntax.poll(revision) else {
+            let Some(snapshot) = syntax.poll(&st.editor.doc) else {
                 return Vec::new();
             };
             (snapshot.tree().clone(), syntax.language)
@@ -2455,14 +2527,15 @@ impl DocumentHandle {
 
     /// One snapshot per frame: visible lines, selections, carets, cursor.
     pub fn viewport(&self, first_line: u64, count: u64) -> ViewportSnapshot {
-        let mut st = self.lock();
+        let st = &mut *self.lock();
         let first_line = clamp_usize(first_line);
         let count = clamp_usize(count);
-        let revision = st.editor.doc.revision();
+        // A tree one edit behind is fine for colors: offsets are clipped to
+        // the current text and the fresh tree arrives a frame or two later.
         let syntax = st.syntax.as_mut().and_then(|syntax| {
             let language = syntax.language;
             syntax
-                .poll(revision)
+                .latest(&st.editor.doc)
                 .map(|snapshot| (language, snapshot.tree().clone()))
         });
         let mut snap: ViewportSnapshot = if let Some((language, tree)) = syntax {
@@ -2695,7 +2768,8 @@ impl DocumentHandle {
             };
             ed.apply(tx, kind, Instant::now());
         }
-        if let Some(syntax) = &st.syntax {
+        let st = &mut *st;
+        if let Some(syntax) = st.syntax.as_mut() {
             syntax.submit(&st.editor.doc);
         }
     }
@@ -3071,7 +3145,8 @@ impl DocumentHandle {
         let transaction = galaxy_core::edit::from_changes(tx, doc);
         st.editor
             .apply(transaction, EditKind::Other, Instant::now());
-        if let Some(syntax) = &st.syntax {
+        let st = &mut *st;
+        if let Some(syntax) = st.syntax.as_mut() {
             syntax.submit(&st.editor.doc);
         }
         true
@@ -3193,6 +3268,7 @@ impl DocumentHandle {
                 find_error: None,
                 syntax,
                 diagnostics: Vec::new(),
+                diagnostics_revision: 0,
             }),
         }
     }
@@ -3288,6 +3364,23 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(1));
         }
+        // Edits keep the previous colors until the reparse lands, instead of
+        // drawing one plain frame per keystroke.
+        doc.edit(EditCommand::InsertText { text: "x".into() });
+        assert!(!doc.viewport(0, 2).styles.is_empty());
+        // Undo must resubmit too; colors come back for the undone text.
+        assert!(doc.undo());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !doc.poll_syntax() {
+            assert!(Instant::now() < deadline, "undo was not reparsed");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            doc.viewport(0, 2)
+                .styles
+                .iter()
+                .any(|run| run.scope == "keyword")
+        );
         let plain = dir.path().join("notes.txt");
         std::fs::write(&plain, "plain text").unwrap();
         let plain = Core::new()

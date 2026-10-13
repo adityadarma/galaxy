@@ -432,9 +432,17 @@ pub fn style_runs_for_viewport(
     let names = query.capture_names();
     let mut cursor = QueryCursor::new();
     cursor.set_byte_range(start_byte..end_byte);
-    let text = rope.to_string();
+    let mut text = rope.to_string().into_bytes();
+    // The tree may be one edit behind (drawn while the worker reparses).
+    // Query predicates slice the source by node ranges, so pad to the tree's
+    // extent instead of panicking when text was deleted. Runs are clipped to
+    // `end_byte` below, so padding never reaches the screen.
+    let tree_end = tree.root_node().end_byte();
+    if tree_end > text.len() {
+        text.resize(tree_end, b' ');
+    }
     let mut runs = Vec::new();
-    let mut matches = cursor.matches(query, tree.root_node(), text.as_bytes());
+    let mut matches = cursor.matches(query, tree.root_node(), text.as_slice());
     while let Some(m) = matches.next() {
         for capture in m.captures {
             let Some(scope) = HighlightScope::from_capture(names[capture.index as usize]) else {
@@ -1027,5 +1035,22 @@ mod tests {
         let runs = style_runs_for_viewport(&doc, &tree, language, 0, 2);
         assert!(runs.iter().any(|run| run.scope == HighlightScope::Keyword));
         assert!(runs.iter().any(|run| run.scope == HighlightScope::String));
+    }
+
+    #[test]
+    fn stale_tree_after_deletion_styles_shorter_text_without_panicking() {
+        // The UI draws with the previous tree while the worker reparses.
+        let before = Document::from_text("<?php\n$name = \"Ada\";\n$age = 36;\n");
+        let language = SyntaxLanguage::Php;
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(before.text(), None).unwrap();
+        let after = Document::from_text("<?php\n$n");
+        let runs = style_runs_for_viewport(&after, &tree, language, 0, 10);
+        for run in runs {
+            let text = crate::viewport::display_text(&after, run.line);
+            assert!(run.line < after.line_count());
+            assert!(run.end <= text.encode_utf16().count());
+        }
     }
 }

@@ -13,13 +13,14 @@ import os
 /// in its place.
 @MainActor
 final class MainWindowController: NSWindowController, NSWindowDelegate {
-    private let bridge: CoreBridge
+    let bridge: CoreBridge
     let statusBar = StatusBar()
     let pathBar = PathBar()
     private let breadcrumbBar = BreadcrumbBar()
     private let stickyScopeView = StickyScopeView()
     private var documentSymbols: [OutlineSymbol] = []
     private var lastSemanticRequest = Date.distantPast
+    private var lastDiagnosticsRevision: UInt64?
     let titleBar = TitleBar()
     let activityBar = ActivityBar()
     private let sourceControl = SourceControlController()
@@ -38,6 +39,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private let problemsPanel = ProblemsPanel()
     private let referencesPanel = ReferencesPanel()
     private let terminalView = TerminalView()
+    /// Shows the active tab's terminal when that tab is a terminal (VS Code
+    /// "Move Terminal into Editor Area"). Covers the path bar and editor.
+    let editorTerminalView = TerminalView()
     private let outputPanel = OutputPanel()
     private let portsPanel = PortsPanel()
     private let bottomPanelHeader = BottomPanelHeader()
@@ -52,7 +56,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private let bottomPanelPlaceholder = NSTextField(labelWithString: "Debug console is not connected")
     private var terminalHandles: [TerminalHandle] = []
     private var activeTerminalIndex = 0
-    private let hoverPopover = HoverPopover()
+    let hoverPopover = HoverPopover()
     private let completionPopup = CompletionPopup()
     private let signaturePopup = SignaturePopup()
     private let codeActionPopup = CodeActionPopup()
@@ -67,6 +71,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private var hoverPoint = NSPoint.zero
     private var hoverDocument: DocumentHandle?
     private var hoverRequestPosition: TextPos?
+    private var hoverRequestTime = Date.distantPast
+    /// Word the visible card describes (server range, single line).
+    private var hoverShownRange: (line: UInt64, start: UInt64, end: UInt64)?
+    private var hoverShownContents: String?
+    private var hoverShownPosition: TextPos?
     private let splitView = NSSplitView()
     private let detailView = NSView()
     /// Holds the find bar's place in the layout. The bar itself is built on
@@ -263,6 +272,33 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         return max(bottomPanelOpenHeight, available)
     }
 
+    private var resizeStartHeight: CGFloat = 0
+    var bottomPanelHeaderForTesting: BottomPanelHeader { bottomPanelHeader }
+    var bottomPanelContentHeight: CGFloat { bottomPanelHeight.constant }
+
+    /// Drag on the panel's top edge. The size is kept for next time.
+    private func resizeBottomPanel(began: Bool, deltaY: CGFloat) {
+        if began { resizeStartHeight = bottomPanelHeight.constant; return }
+        setBottomPanelHeight(resizeStartHeight + deltaY)
+    }
+
+    /// Sets the open panel's content height, leaving the editor some room.
+    func setBottomPanelHeight(_ height: CGFloat) {
+        let maximum = max(Self.minBottomPanelHeight,
+                          detailView.bounds.height - Theme.tabHeight - BottomPanelHeader.height - 40)
+        let clamped = min(max(height, Self.minBottomPanelHeight), maximum)
+        isBottomPanelMaximized = false
+        bottomPanelHeader.setMaximized(false)
+        bottomPanelOpenHeight = clamped
+        UserDefaults.standard.set(Double(clamped), forKey: "BottomPanelHeight")
+        if isBottomPanelVisible { bottomPanelHeight.constant = clamped }
+        detailView.needsLayout = true
+    }
+
+    /// Panel children are laid out at least this tall; a shorter panel
+    /// would cut off the terminal's bottom rows.
+    static let minBottomPanelHeight: CGFloat = BottomPanelContentView.minimumChildHeight
+
     private func toggleBottomPanelMaximized() {
         isBottomPanelMaximized.toggle()
         bottomPanelHeader.setMaximized(isBottomPanelMaximized)
@@ -338,6 +374,90 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         } else {
             ensureTerminal()
         }
+    }
+
+    // MARK: Terminals in the editor area
+
+    /// Terminal tabs, in tab order.
+    var terminalTabs: [EditorTab] { tabs.filter { $0.terminal != nil } }
+
+    /// Moves the panel's active terminal into a new editor tab, keeping the
+    /// shell running. With no panel terminal, starts a new one there.
+    @objc func moveTerminalToEditor(_ sender: Any?) {
+        guard let workspace else { return NSSound.beep() }
+        if terminalHandles.indices.contains(activeTerminalIndex) {
+            let handle = terminalHandles.remove(at: activeTerminalIndex)
+            removedTerminal()
+            openTerminalTab(handle)
+        } else if let handle = bridge.terminal(workspace: workspace, cols: 100, rows: 24) {
+            openTerminalTab(handle)
+        } else {
+            NSSound.beep()
+        }
+    }
+
+    /// Opens a new terminal as an editor tab.
+    @objc func createTerminalEditor(_ sender: Any?) {
+        guard let workspace, let handle = bridge.terminal(workspace: workspace, cols: 100, rows: 24) else {
+            return NSSound.beep()
+        }
+        openTerminalTab(handle)
+    }
+
+    /// Moves a terminal tab (the clicked one from the tab menu, else the
+    /// active one) back into the bottom panel.
+    @objc func moveTerminalToPanel(_ sender: Any?) {
+        let target = ((sender as? NSMenuItem)?.representedObject as? EditorTab) ?? activeTab
+        guard let tab = target, let handle = tab.terminal,
+              let index = tabs.firstIndex(where: { $0 === tab }) else { return NSSound.beep() }
+        closeTab(at: index, keepTerminal: true)
+        terminalHandles.append(handle)
+        activeTerminalIndex = terminalHandles.count - 1
+        if !isBottomPanelVisible { setBottomPanelOpen(true) }
+        showBottomPanel(tab: .terminal)
+    }
+
+    private func openTerminalTab(_ handle: TerminalHandle) {
+        let name = handle.shellName()
+        let tab = EditorTab(doc: bridge.newDocument(), title: name, pathComponents: [name], windowTitle: name,
+                            isPreview: false, status: "Terminal: \(name)", terminal: handle)
+        add(tab, replacing: nil)
+    }
+
+    /// Shows or hides the editor-area terminal for the active tab.
+    private func showEditorTerminal(for tab: EditorTab?) {
+        if let handle = tab?.terminal {
+            editorTerminalView.isHidden = false
+            editorTerminalView.start(handle: handle)
+        } else if !editorTerminalView.isHidden {
+            if window?.firstResponder === editorTerminalView { window?.makeFirstResponder(editorView) }
+            editorTerminalView.stop()
+            editorTerminalView.isHidden = true
+        }
+    }
+
+    /// The shell in the active terminal tab exited: close the tab.
+    private func editorTerminalExited() {
+        guard let index = activeIndex, let handle = tabs[index].terminal, !handle.isRunning() else { return }
+        closeTab(at: index, keepTerminal: true)
+    }
+
+    private func menu(forTab index: Int) -> NSMenu? {
+        guard tabs.indices.contains(index), tabs[index].terminal != nil else { return nil }
+        let menu = NSMenu()
+        let move = menu.addItem(withTitle: "Move Terminal into Panel", action: #selector(moveTerminalToPanel(_:)), keyEquivalent: "")
+        move.target = self
+        move.representedObject = tabs[index]
+        return menu
+    }
+
+    private func panelTerminalMenu() -> NSMenu {
+        let menu = NSMenu()
+        menu.addItem(withTitle: "Move Terminal into Editor Area", action: #selector(moveTerminalToEditor(_:)), keyEquivalent: "")
+            .target = self
+        menu.addItem(withTitle: "New Terminal in Editor Area", action: #selector(createTerminalEditor(_:)), keyEquivalent: "")
+            .target = self
+        return menu
     }
 
     init(bridge: CoreBridge) {
@@ -578,8 +698,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                     let markers = problems.filter { $0.uri == "file://\(document.path())" }
                         .map { ($0.line, $0.severity) }
                     self?.scrollView.diagnosticScroller.update(markers: markers, lineCount: document.lineCount())
+                    // Redraw only when diagnostics change, not every 100 ms.
+                    let revision = document.diagnosticsRevision()
+                    if revision != self?.lastDiagnosticsRevision {
+                        self?.lastDiagnosticsRevision = revision
+                        self?.editorView.needsDisplay = true
+                    }
                 }
-                self?.editorView.needsDisplay = true
             }
         }
         tabBar.titleBar = titleBar
@@ -607,7 +732,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         bottomPanelHeader.isHidden = true
         referencesPanel.translatesAutoresizingMaskIntoConstraints = true
         referencesPanel.autoresizingMask = [.width]
-        hoverPopover.translatesAutoresizingMaskIntoConstraints = false
+        // Positioned by frame in `hoverFrame`; without constraints Auto Layout
+        // would collapse it to zero size.
+        hoverPopover.translatesAutoresizingMaskIntoConstraints = true
         completionPopup.translatesAutoresizingMaskIntoConstraints = false
         signaturePopup.translatesAutoresizingMaskIntoConstraints = false
         findBarSlot.isHidden = true
@@ -618,6 +745,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         detailView.addSubview(findBarSlot)
         detailView.addSubview(editorSplitView)
         detailView.addSubview(stickyScopeView)
+        editorTerminalView.translatesAutoresizingMaskIntoConstraints = false
+        editorTerminalView.isHidden = true
+        detailView.addSubview(editorTerminalView)
+        // `TerminalView` is layer-backed. Without a layer here, it was
+        // composited above every non-layer sibling and blanked the tab bar
+        // and path bar while a terminal tab was active.
+        detailView.wantsLayer = true
         detailView.addSubview(bottomPanelHeader)
         detailView.addSubview(bottomPanelContent)
         // Every panel is added once and switched with `isHidden`; see
@@ -655,6 +789,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
              stickyScopeView.trailingAnchor.constraint(equalTo: editorSplitView.trailingAnchor),
              // VS Code order: editor, panel title row, panel content.
              editorSplitView.bottomAnchor.constraint(equalTo: bottomPanelHeader.topAnchor),
+             // A terminal tab covers the path bar, breadcrumbs and editor.
+             editorTerminalView.topAnchor.constraint(equalTo: tabBar.bottomAnchor),
+             editorTerminalView.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
+             editorTerminalView.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
+             editorTerminalView.bottomAnchor.constraint(equalTo: bottomPanelHeader.topAnchor),
              bottomPanelHeader.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
              bottomPanelHeader.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
              bottomPanelHeaderHeight,
@@ -680,6 +819,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         bottomPanelHeader.onNewTerminal = { [weak self] in self?.newTerminal() }
         bottomPanelHeader.onKillTerminal = { [weak self] in self?.killActiveTerminal() }
         bottomPanelHeader.onToggleMaximize = { [weak self] in self?.toggleBottomPanelMaximized() }
+        bottomPanelHeader.onResize = { [weak self] began, delta in self?.resizeBottomPanel(began: began, deltaY: delta) }
+        if let saved = UserDefaults.standard.object(forKey: "BottomPanelHeight") as? Double, saved >= Double(Self.minBottomPanelHeight) {
+            bottomPanelOpenHeight = CGFloat(saved)
+        }
         bottomPanelHeader.onClose = { [weak self] in self?.setBottomPanelOpen(false) }
         bottomPanelHeader.onSelectTerminal = { [weak self] index in
             guard let self, self.terminalHandles.indices.contains(index) else { return }
@@ -692,6 +835,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             self?.openTerminalLink(path: path, line: line, col: col)
         }
         terminalView.onExit = { [weak self] in self?.terminalExited() }
+        terminalView.contextMenu = { [weak self] in self?.panelTerminalMenu() }
+        editorTerminalView.onOpenLink = { [weak self] path, line, col in
+            self?.openTerminalLink(path: path, line: line, col: col)
+        }
+        editorTerminalView.onExit = { [weak self] in self?.editorTerminalExited() }
+        tabBar.menuForTab = { [weak self] index in self?.menu(forTab: index) }
         hoverPopover.isHidden = true
         completionPopup.isHidden = true
         signaturePopup.isHidden = true
@@ -770,22 +919,65 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             hoverPopover.isHidden = true
             return
         }
-        if hoverDocument === document, hoverRequestPosition?.line == position.line, hoverRequestPosition?.colUtf16 == position.colUtf16 { return }
+        // Same spot: skip unless the last answer was empty (the server may
+        // still be indexing), then retry at most once a second.
+        if hoverDocument === document, hoverRequestPosition?.line == position.line,
+           hoverRequestPosition?.colUtf16 == position.colUtf16,
+           !hoverPopover.isHidden || Date().timeIntervalSince(hoverRequestTime) < 1 { return }
+        // Leaving the hovered word hides the card; moving within it keeps it.
+        if !hoverPopover.isHidden, !(hoverShownRange.map { range in
+            position.line == range.line && position.colUtf16 >= range.start && position.colUtf16 <= range.end
+        } ?? false) {
+            hoverPopover.isHidden = true
+        }
+        hoverRequestTime = Date()
         hoverDocument = document
         hoverPosition = position
         hoverPoint = point
         hoverRequestPosition = position
-        bridge.requestHover(document: document, line: position.line, character: position.colUtf16)
+        // Only remember the position once a request actually went out, so
+        // hovering the same spot again retries after the server is ready.
+        if !bridge.requestHover(document: document, line: position.line, character: position.colUtf16) {
+            hoverRequestPosition = nil
+        }
     }
 
     private func refreshHover() {
         guard let document = hoverDocument, let position = hoverRequestPosition,
               let hover = bridge.hover(document: document),
               hover.startLine == nil || (position.line >= (hover.startLine ?? 0) && position.line <= (hover.endLine ?? position.line)) else { return }
+        // The poll timer calls this every 100 ms; only re-layout on new content.
+        if !hoverPopover.isHidden, hoverShownContents == hover.contents,
+           hoverShownPosition?.line == position.line, hoverShownPosition?.colUtf16 == position.colUtf16 { return }
+        hoverShownContents = hover.contents
+        hoverShownPosition = position
+        if let line = hover.startLine, hover.endLine == line,
+           let start = hover.startCharacter, let end = hover.endCharacter {
+            hoverShownRange = (line, start, end)
+        } else {
+            hoverShownRange = (position.line, position.colUtf16, position.colUtf16)
+        }
         hoverPopover.show(hover.contents)
+        hoverPopover.frame = hoverFrame(for: hover, at: position)
         hoverPopover.isHidden = false
-        hoverPopover.frame = NSRect(x: hoverPoint.x + 14, y: hoverPoint.y + 18, width: 360, height: 72)
-        hoverPopover.needsDisplay = true
+        hoverPopover.needsLayout = true
+    }
+
+    /// Places the card above the hovered word (VS Code default), or below,
+    /// or on whichever side of the line has more room, clamped to the
+    /// visible editor so it never spills off the window edges.
+    private func hoverFrame(for hover: HoverInfo, at position: TextPos) -> NSRect {
+        let editor = editorView
+        let line = position.line
+        let text = activeTab?.doc.displayLine(line: line) ?? ""
+        let column = hover.startLine == line ? (hover.startCharacter ?? position.colUtf16) : position.colUtf16
+        let wordX = editor.textOriginX + editor.xOffset(in: text, column: column)
+        let lineTop = CGFloat(line) * editor.metrics.lineHeight
+        let wordRect = NSRect(x: wordX, y: lineTop, width: 1, height: editor.metrics.lineHeight)
+        let anchor = detailView.convert(wordRect, from: editor)
+        let visible = detailView.convert(editor.visibleRect, from: editor).insetBy(dx: 8, dy: 4)
+        let size = hoverPopover.fittingSize(maxHeight: min(HoverPopover.maxHeight, max(60, visible.height / 2)))
+        return HoverPopover.placement(size: size, anchor: anchor, in: visible)
     }
 
     private func requestCompletionIfNeeded() {
@@ -1582,7 +1774,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         editorView.document = tab.doc
         secondaryEditorView.document = isEditorSplit ? tab.doc : nil
         let root = workspace?.root() ?? (tab.doc.path() as NSString).deletingLastPathComponent
-        _ = bridge.startLSP(document: tab.doc, language: tab.doc.syntaxLanguage() ?? StatusBar.language(for: tab.doc.path()), root: root)
+        if tab.terminal == nil {
+            _ = bridge.startLSP(document: tab.doc, language: tab.doc.syntaxLanguage() ?? StatusBar.language(for: tab.doc.path()), root: root)
+        }
         if let y = tab.scrollY {
             scrollView.contentView.scroll(to: NSPoint(x: 0, y: y))
             scrollView.reflectScrolledClipView(scrollView.contentView)
@@ -1597,7 +1791,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         if let rel = tab.relPath {
             explorer.reveal(relPath: rel)
         }
-        if isFindVisible {
+        showEditorTerminal(for: tab)
+        if tab.terminal != nil {
+            if isFindVisible { closeFind(nil) }
+            window?.makeFirstResponder(editorTerminalView)
+        } else if isFindVisible {
             applyFind(select: false)
         } else {
             window?.makeFirstResponder(editorView)
@@ -1765,9 +1963,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     /// Closes tab `index`, asking first if it has unsaved changes. `false`
     /// if the user cancelled.
+    /// Closing a terminal tab kills its shell, as in VS Code, unless
+    /// `keepTerminal` (moved back to the panel, or already exited).
     @discardableResult
-    func closeTab(at index: Int) -> Bool {
+    func closeTab(at index: Int, keepTerminal: Bool = false) -> Bool {
         guard tabs.indices.contains(index) else { return false }
+        if let handle = tabs[index].terminal {
+            if activeIndex == index { showEditorTerminal(for: nil) }
+            if !keepTerminal { handle.kill() }
+        }
         editorView.flushPendingUpdates()
         if tabs[index].doc.isModified() {
             if activeIndex != index { selectTab(index) }
@@ -1818,7 +2022,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 isPreview: tab.isPreview,
                 isEdited: tab.isEdited,
                 isGitChanged: isChanged,
-                gitStatus: status
+                gitStatus: status,
+                isTerminal: tab.terminal != nil
             )
         },
                    selected: activeIndex)
@@ -1846,7 +2051,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// over an untouched empty "Untitled" tab, or (nil) a new tab.
     private func slotForOpening(preview: Bool) -> Int? {
         if preview, let i = tabs.firstIndex(where: { $0.isPreview && !$0.isEdited }) { return i }
-        guard let i = activeIndex else { return nil }
+        guard let i = activeIndex, tabs[i].terminal == nil else { return nil }
         let doc = tabs[i].doc
         return doc.path().isEmpty && !doc.isModified() && doc.lenBytes() == 0 ? i : nil
     }
@@ -1865,6 +2070,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private func showNoDocument() {
         activeIndex = nil
         if isFindVisible { closeFind(nil) }
+        showEditorTerminal(for: nil)
         editorView.document = nil
         pathBar.show([])
         statusBar.show(document: nil)
@@ -2997,7 +3203,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// was cancelled.
     @discardableResult
     func save() -> Bool {
-        guard let doc = editorView.document else { return true }
+        guard activeTab?.terminal == nil, let doc = editorView.document else { return true }
         if doc.path().isEmpty { return saveAs() }
         if doc.checkDisk() == .changed, let tab = activeTab {
             tab.hasDiskConflict = false
@@ -3024,7 +3230,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     @discardableResult
     func saveAs() -> Bool {
-        guard let doc = editorView.document, let url = askSaveLocation(documentName) else { return false }
+        guard activeTab?.terminal == nil, let doc = editorView.document, let url = askSaveLocation(documentName) else { return false }
         do {
             try doc.saveAs(path: url.path)
         } catch {
@@ -3647,7 +3853,7 @@ extension MainWindowController: NSMenuItemValidation {
     /// Disables menu items (and palette commands) that cannot do anything
     /// right now.
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
-        let hasDocument = editorView.document != nil
+        let hasDocument = editorView.document != nil && activeTab?.terminal == nil
         switch item.action {
         case #selector(saveDocument(_:)), #selector(saveDocumentAs(_:)),
              #selector(showFind(_:)), #selector(showFindAndReplace(_:)),
@@ -3662,6 +3868,10 @@ extension MainWindowController: NSMenuItemValidation {
             return workspace != nil && explorer.selectedEntry != nil
         case #selector(closeTab(_:)):
             return true
+        case #selector(moveTerminalToEditor(_:)), #selector(createTerminalEditor(_:)):
+            return workspace != nil
+        case #selector(moveTerminalToPanel(_:)):
+            return ((item.representedObject as? EditorTab) ?? activeTab)?.terminal != nil
         case #selector(showNextTab(_:)), #selector(showPreviousTab(_:)), #selector(selectLastUsedTab(_:)):
             return tabs.count > 1
         case #selector(navigateBack(_:)): return navHistory.canGoBack()

@@ -4,6 +4,11 @@ import AppKit
 @MainActor
 final class EditorTab {
     let doc: DocumentHandle
+    /// Set for a terminal moved into the editor area (VS Code "Move
+    /// Terminal into Editor Area"). `doc` is then an empty, never-shown
+    /// buffer: it has no path and is never modified, so saving, the
+    /// session and the unsaved prompts skip the tab.
+    let terminal: TerminalHandle?
     /// File name shown on the tab.
     var title: String
     /// Breadcrumb for the path bar: workspace, folders, file.
@@ -38,8 +43,9 @@ final class EditorTab {
     var navKey: String { fileKey ?? untitledKey }
 
     init(doc: DocumentHandle, title: String, pathComponents: [String], windowTitle: String,
-         isPreview: Bool, status: String) {
+         isPreview: Bool, status: String, terminal: TerminalHandle? = nil) {
         self.doc = doc
+        self.terminal = terminal
         self.title = title
         self.pathComponents = pathComponents
         self.windowTitle = windowTitle
@@ -60,8 +66,12 @@ final class TabBar: NSView {
         var isEdited: Bool
         var isGitChanged: Bool
         var gitStatus: GitFileStatus
+        /// Terminal tab: terminal icon instead of a file glyph.
+        var isTerminal = false
 
-        init(title: String, isPreview: Bool, isEdited: Bool, isGitChanged: Bool, gitStatus: GitFileStatus = .none) {
+        init(title: String, isPreview: Bool, isEdited: Bool, isGitChanged: Bool, gitStatus: GitFileStatus = .none,
+             isTerminal: Bool = false) {
+            self.isTerminal = isTerminal
             self.title = title
             self.isPreview = isPreview
             self.isEdited = isEdited
@@ -81,6 +91,8 @@ final class TabBar: NSView {
     var onClose: ((Int) -> Void)?
     /// `(from, to)`: `to` is the tab's final index.
     var onMove: ((Int, Int) -> Void)?
+    /// Context menu for tab `index`, if any.
+    var menuForTab: ((Int) -> NSMenu?)?
 
     private let stack = NSStackView()
 
@@ -223,7 +235,7 @@ final class TabItemView: NSView {
         setAccessibilityRole(.radioButton)
         setAccessibilityIdentifier("tab")
 
-        icon.imageScaling = .scaleNone
+        icon.imageScaling = .scaleProportionallyDown
         icon.setAccessibilityElement(false)
         icon.translatesAutoresizingMaskIntoConstraints = false
         label.lineBreakMode = .byTruncatingMiddle
@@ -258,6 +270,7 @@ final class TabItemView: NSView {
             icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
             icon.centerYAnchor.constraint(equalTo: centerYAnchor),
             icon.widthAnchor.constraint(equalToConstant: 16),
+            icon.heightAnchor.constraint(equalToConstant: 16),
             label.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 6),
             label.centerYAnchor.constraint(equalTo: centerYAnchor),
             closeButton.leadingAnchor.constraint(equalTo: label.trailingAnchor, constant: 6),
@@ -292,9 +305,15 @@ final class TabItemView: NSView {
         } else {
             label.textColor = isSelected ? .labelColor : .secondaryLabelColor
         }
-        let glyph = FileGlyph.for(name: item.title)
-        icon.image = glyph.image
-        icon.contentTintColor = glyph.color
+        if item.isTerminal {
+            icon.image = NSImage(systemSymbolName: "apple.terminal", accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: 12, weight: .regular))
+            icon.contentTintColor = .secondaryLabelColor
+        } else {
+            let glyph = FileGlyph.for(name: item.title)
+            icon.image = glyph.image
+            icon.contentTintColor = glyph.color
+        }
         icon.alphaValue = isSelected ? 1 : 0.8
         editedDot.isHidden = !showsEditedDot
         gitDot.isHidden = true
@@ -339,6 +358,10 @@ final class TabItemView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         bar?.track(tab: index, from: event)
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        bar?.menuForTab?(index) ?? super.menu(for: event)
     }
 
     override func otherMouseUp(with event: NSEvent) {

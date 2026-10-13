@@ -102,7 +102,14 @@ final class PathBar: NSView {
         let tinted = image.withSymbolConfiguration(.init(paletteColors: [color])) ?? image
         let a = NSTextAttachment()
         a.image = tinted
-        let size = tinted.size
+        // Cap at 14pt so file glyphs sit with 13pt text instead of
+        // stretching the row; SF Symbols (chevrons) are already smaller.
+        var size = tinted.size
+        let maxSide: CGFloat = 14
+        if max(size.width, size.height) > maxSide {
+            let scale = maxSide / max(size.width, size.height)
+            size = NSSize(width: size.width * scale, height: size.height * scale)
+        }
         a.bounds = NSRect(x: 0, y: (font.capHeight - size.height) / 2, width: size.width, height: size.height)
         return NSAttributedString(attachment: a)
     }

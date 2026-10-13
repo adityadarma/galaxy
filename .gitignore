@@ -20,3 +20,8 @@ xcuserdata/
 /fuzz/crashes/
 /fuzz/*.log
 /dhat-heap.json
+
+# Graphify
+.opencode
+AGENTS.md
+graphify-out

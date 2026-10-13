@@ -114,6 +114,98 @@ final class NavigationTests: XCTestCase {
         XCTAssertEqual(v.document?.lines(first: 0, count: 2), ["#hello world", "#second line"])
     }
 
+    func testIdentifierRangeForCommandHoverLink() {
+        let text = "use App\\Providers\\MacroBuilderServiceProvider; $user->name(42);"
+        let start = (text as NSString).range(of: "MacroBuilder").location
+        XCTAssertEqual(EditorView.identifierRange(in: text, at: start + 3),
+                       start..<(start + "MacroBuilderServiceProvider".utf16.count))
+        let variable = (text as NSString).range(of: "$user").location
+        XCTAssertEqual(EditorView.identifierRange(in: text, at: variable + 2), variable..<(variable + 5))
+        let number = (text as NSString).range(of: "42").location
+        XCTAssertNil(EditorView.identifierRange(in: text, at: number))
+        XCTAssertNil(EditorView.identifierRange(in: "a ;; b", at: 3))
+    }
+
+    func testCommandHoverUnderlinesWordAndClearsOnRelease() throws {
+        let c = try makeController(text: "use Foo\\BarService;\nsecond")
+        let v = c.editorView
+        v.onDefinitionClick = { _ in true }
+        let text = "use Foo\\BarService;"
+        let column = (text as NSString).range(of: "BarService").location + 2
+        let x = v.textOriginX + v.xOffset(in: text, column: UInt64(column)) + 0.5
+        v.lastMousePoint = NSPoint(x: x, y: v.metrics.lineHeight / 2)
+
+        v.updateDefinitionLink(commandHeld: true)
+        XCTAssertEqual(v.definitionLink?.line, 0)
+        XCTAssertEqual(v.definitionLink?.start, 8)
+        XCTAssertEqual(v.definitionLink?.end, 18)
+
+        v.updateDefinitionLink(commandHeld: false)
+        XCTAssertNil(v.definitionLink, "releasing Cmd removes the underline")
+
+        // Past the end of the line there is nothing to open.
+        v.lastMousePoint = NSPoint(x: 10_000, y: v.metrics.lineHeight / 2)
+        v.updateDefinitionLink(commandHeld: true)
+        XCTAssertNil(v.definitionLink)
+    }
+
+    func testCommandHoverSkipsKeywordsButKeepsNames() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-link-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let file = dir.appendingPathComponent("a.php")
+        let line = "    public function boot(?string $accessKey = null): void { Log::info('Queue job'); return Foo::bar(config('app.name'), true); }"
+        try "<?php\nclass A {\n\(line)\n}\n".write(to: file, atomically: true, encoding: .utf8)
+        let c = MainWindowController(bridge: CoreBridge())
+        c.showWindow(nil)
+        try c.openFile(at: file)
+        let v = c.editorView
+        v.onDefinitionClick = { _ in true }
+
+        // Syntax parsing is asynchronous; wait until the line has styles.
+        let deadline = Date().addingTimeInterval(5)
+        while v.document?.viewport(firstLine: 2, count: 1).styles.isEmpty ?? true, Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
+        func link(_ word: String) -> (UInt64, UInt64)? {
+            let column = (line as NSString).range(of: word).location + 1
+            v.lastMousePoint = NSPoint(x: v.textOriginX + v.xOffset(in: line, column: UInt64(column)) + 0.5,
+                                       y: 2 * v.metrics.lineHeight + v.metrics.lineHeight / 2)
+            v.updateDefinitionLink(commandHeld: true)
+            return v.definitionLink.map { ($0.start, $0.end) }
+        }
+        XCTAssertNil(link("public"), "keywords are not links")
+        XCTAssertNil(link("function"))
+        XCTAssertNil(link("return"))
+        XCTAssertNotNil(link("boot"), "method names stay links")
+        XCTAssertNotNil(link("Foo"), "class names stay links")
+        XCTAssertNotNil(link("bar"))
+        XCTAssertNil(link("Queue"), "plain strings are not links")
+        XCTAssertNil(link("string"), "built-in types are not links")
+        XCTAssertNil(link("null"), "literals are not links")
+        XCTAssertNil(link("void"))
+        XCTAssertNil(link("true"))
+        XCTAssertNotNil(link("$accessKey"), "variables stay links")
+        let app = (line as NSString).range(of: "app.name").location
+        let configLink = link("app.name")
+        XCTAssertEqual(configLink?.0, UInt64(app), "config() keys link as a whole")
+        XCTAssertEqual(configLink?.1, UInt64(app + "app.name".utf16.count))
+    }
+
+    func testOnlyLaravelHelperStringsAreLinks() {
+        func range(_ text: String, _ literal: String) -> Range<Int>? {
+            let r = (text as NSString).range(of: literal)
+            return EditorView.laravelStringRange(in: text, stringStart: r.location, stringEnd: r.location + r.length)
+        }
+        let config = "$url = config('services.sipay.url');"
+        let start = (config as NSString).range(of: "services").location
+        XCTAssertEqual(range(config, "'services.sipay.url'"), start..<(start + "services.sipay.url".utf16.count))
+        XCTAssertNotNil(range("return view( \"home\" );", "\"home\""))
+        XCTAssertNil(range("Log::channel('queue')->info('Queue job processing', [", "'Queue job processing'"))
+        XCTAssertNil(range("Log::channel('queue')", "'queue'"))
+        XCTAssertNil(range("'connection' => $event->connectionName,", "'connection'"))
+    }
+
     func testClickingPastTheEndsClampsToValidPositions() throws {
         let c = try makeController(text: "ab\ncd")
         let v = c.editorView

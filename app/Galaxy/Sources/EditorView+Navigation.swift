@@ -99,7 +99,9 @@ extension EditorView {
         let local = convert(event.locationInWindow, from: nil)
         let pos = textPosition(at: local)
         let flags = event.modifierFlags
-        if flags.contains(.command), event.clickCount == 1, onDefinitionClick?(pos) == true { return }
+        // ⌘+click on a keyword or comment is a plain click, not a lookup.
+        if flags.contains(.command), event.clickCount == 1, navigableRange(at: pos) != nil,
+           onDefinitionClick?(pos) == true { return }
         columnAnchor = nil
         if flags.contains(.option), flags.contains(.shift) {
             // Opt+Shift+drag: column (box) selection.
@@ -160,7 +162,121 @@ extension EditorView {
     }
 
     override func resetCursorRects() {
-        addCursorRect(visibleRect, cursor: .iBeam)
+        addCursorRect(visibleRect, cursor: definitionLink == nil ? .iBeam : .pointingHand)
+    }
+
+    /// Shows or clears the Cmd-hover link for the word under the mouse.
+    func updateDefinitionLink(commandHeld: Bool) {
+        guard commandHeld, onDefinitionClick != nil, let point = lastMousePoint,
+              point.x >= textOriginX, let document, lineCount > 0 else {
+            definitionLink = nil
+            return
+        }
+        let row = point.y / metrics.lineHeight
+        guard row.isFinite, row >= 0, Int(row) < lineCount else { definitionLink = nil; return }
+        let pos = textPosition(at: point)
+        let text = document.displayLine(line: pos.line)
+        // Hit-testing returns the nearest caret slot; ignore points past the text.
+        guard point.x - textOriginX <= xOffset(in: text, column: UInt64(text.utf16.count)) else {
+            definitionLink = nil
+            return
+        }
+        definitionLink = navigableRange(at: pos, text: text)
+            .map { (line: pos.line, start: UInt64($0.lowerBound), end: UInt64($0.upperBound)) }
+    }
+
+    /// Syntax scopes that never have a definition to jump to. Strings stay
+    /// navigable: laravel-lsp resolves `config('...')`, `route('...')`, etc.
+    static let nonNavigableScopes: Set<String> = ["keyword", "comment", "number", "operator", "punctuation"]
+
+    /// PHP scalar/pseudo types and literal constants: nothing to open.
+    /// `self` and `parent` stay links since they resolve to a class.
+    static let phpBuiltins: Set<String> = [
+        "string", "int", "integer", "float", "double", "bool", "boolean", "array", "object",
+        "mixed", "void", "never", "iterable", "callable", "null", "true", "false",
+    ]
+
+    static func isPHP(_ document: DocumentHandle) -> Bool {
+        let language = document.syntaxLanguage()?.lowercased() ?? ""
+        return language.contains("php") || language.contains("blade")
+            || document.path().lowercased().hasSuffix(".php")
+    }
+
+    /// Identifier under `pos` unless Tree-sitter marks it as a keyword,
+    /// comment, number or operator.
+    func navigableRange(at pos: TextPos, text: String? = nil) -> Range<Int>? {
+        guard let document else { return nil }
+        let text = text ?? document.displayLine(line: pos.line)
+        guard let range = Self.identifierRange(in: text, at: Int(pos.colUtf16)) else { return nil }
+        let styles = document.viewport(firstLine: pos.line, count: 1).styles.filter { $0.line == pos.line }
+        // Look up the scope at the name itself: PHP grammars may style the
+        // `$` of a variable as punctuation.
+        let units = Array(text.utf16)
+        let nameStart = units[range.lowerBound] == UInt16(UInt8(ascii: "$")) ? range.lowerBound + 1 : range.lowerBound
+        guard let run = styles.first(where: { Int($0.start) <= nameStart && nameStart < Int($0.end) }) else {
+            return range
+        }
+        if Self.nonNavigableScopes.contains(run.scope) { return nil }
+        // Built-in types and literals share the `type`/`constant` scopes with
+        // classes and user constants, so filter them by name. PHP is
+        // case-insensitive here (`NULL`, `String`).
+        if Self.isPHP(document),
+           Self.phpBuiltins.contains((text as NSString).substring(with: NSRange(location: range.lowerBound, length: range.count)).lowercased()) {
+            return nil
+        }
+        if run.scope == "string" {
+            return Self.laravelStringRange(in: text, stringStart: Int(run.start), stringEnd: Int(run.end))
+        }
+        return range
+    }
+
+    /// Helpers whose string argument laravel-lsp can resolve to a file.
+    static let laravelStringHelpers: Set<String> = [
+        "config", "route", "to_route", "view", "env", "trans", "trans_choice", "__", "asset", "mix", "vite",
+    ]
+
+    /// Whole string contents (without quotes) when the literal is the first
+    /// argument of a Laravel helper such as `config('app.name')`. Any other
+    /// string, e.g. a log message, is not a link.
+    static func laravelStringRange(in text: String, stringStart: Int, stringEnd: Int) -> Range<Int>? {
+        let units = Array(text.utf16)
+        guard stringStart >= 0, stringEnd <= units.count, stringEnd - stringStart >= 2 else { return nil }
+        // Walk back over `(` and spaces to the helper name.
+        var i = stringStart - 1
+        while i >= 0, units[i] == 0x20 { i -= 1 }
+        guard i >= 0, units[i] == UInt16(UInt8(ascii: "(")) else { return nil }
+        i -= 1
+        while i >= 0, units[i] == 0x20 { i -= 1 }
+        let nameEnd = i + 1
+        while i >= 0, let scalar = Unicode.Scalar(units[i]),
+              scalar == "_" || CharacterSet.alphanumerics.contains(scalar) { i -= 1 }
+        let name = String(utf16CodeUnits: Array(units[(i + 1)..<nameEnd]), count: nameEnd - i - 1)
+        guard laravelStringHelpers.contains(name) else { return nil }
+        let first = units[stringStart], last = units[stringEnd - 1]
+        let quotes: Set<UInt16> = [UInt16(UInt8(ascii: "'")), UInt16(UInt8(ascii: "\""))]
+        let inner = quotes.contains(first) && first == last ? (stringStart + 1)..<(stringEnd - 1) : stringStart..<stringEnd
+        return inner.isEmpty ? nil : inner
+    }
+
+    /// UTF-16 range of the identifier touching `column` (letters, digits,
+    /// `_`, and a leading `$` for PHP variables). `nil` on punctuation.
+    static func identifierRange(in text: String, at column: Int) -> Range<Int>? {
+        let units = Array(text.utf16)
+        func isWord(_ i: Int) -> Bool {
+            guard i >= 0, i < units.count, let scalar = Unicode.Scalar(units[i]) else { return false }
+            return scalar == "_" || CharacterSet.alphanumerics.contains(scalar)
+        }
+        // A caret slot sits between characters; prefer the one to its right.
+        var start = isWord(column) ? column : (isWord(column - 1) ? column - 1 : -1)
+        guard start >= 0 else { return nil }
+        var end = start
+        while isWord(start - 1) { start -= 1 }
+        while isWord(end) { end += 1 }
+        if start > 0, units[start - 1] == UInt16(UInt8(ascii: "$")) { start -= 1 }
+        // Pure numbers are not navigable.
+        let word = units[start..<end].compactMap(Unicode.Scalar.init)
+        guard word.contains(where: { !CharacterSet.decimalDigits.contains($0) }) else { return nil }
+        return start..<end
     }
 
     // MARK: Multi-cursor

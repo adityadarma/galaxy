@@ -64,8 +64,10 @@ final class CoreBridge {
         core.saveLspDocument(document: document)
     }
 
-    func requestHover(document: DocumentHandle, line: UInt64, character: UInt64) {
-        _ = core.requestHover(document: document, line: line, character: character)
+    /// False when no request went out (server missing or still initializing).
+    @discardableResult
+    func requestHover(document: DocumentHandle, line: UInt64, character: UInt64) -> Bool {
+        core.requestHover(document: document, line: line, character: character)
     }
 
     func hover(document: DocumentHandle) -> HoverInfo? {

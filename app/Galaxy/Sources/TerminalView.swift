@@ -12,6 +12,12 @@ final class TerminalView: NSView {
     var onOpenLink: ((String, UInt64, UInt64) -> Void)?
     /// The shell exited; the controller drops the session.
     var onExit: (() -> Void)?
+    /// Right-click menu (Move Terminal into Editor Area, …).
+    var contextMenu: (() -> NSMenu?)?
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        contextMenu?() ?? super.menu(for: event)
+    }
 
     private var handle: TerminalHandle?
     private var timer: Timer?
@@ -38,6 +44,10 @@ final class TerminalView: NSView {
         super.init(frame: frameRect)
         wantsLayer = true
         layerContentsRedrawPolicy = .onSetNeedsDisplay
+        // macOS 14+ no longer clips by default: `draw` may get a dirty rect
+        // beyond the bounds, and the background fill would paint over the
+        // tab bar above an editor-area terminal.
+        clipsToBounds = true
         setAccessibilityElement(true)
         setAccessibilityRole(.textArea)
         setAccessibilityIdentifier("terminal")
@@ -334,7 +344,7 @@ final class TerminalView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         let palette = TerminalPalette(appearance: effectiveAppearance)
         palette.background.setFill()
-        dirtyRect.fill()
+        dirtyRect.intersection(bounds).fill()
         guard let screen, let context = NSGraphicsContext.current?.cgContext else { return }
 
         let firstRow = max(0, Int((dirtyRect.minY - Self.padding.top) / lineHeight))
@@ -367,30 +377,159 @@ final class TerminalView: NSView {
             .foregroundColor: color,
             .ligature: 0,
         ]
-        if run.underline { attributes[.underlineStyle] = NSUnderlineStyle.single.rawValue }
-        if run.strikeout { attributes[.strikethroughStyle] = NSUnderlineStyle.single.rawValue }
         // Place each cell at its grid column, so the shell's layout holds
         // even where the font's glyphs are not exactly one cell wide.
         let baseline = rect.minY + fonts.baselineOffset
         if run.text.unicodeScalars.allSatisfy({ $0.isASCII }) {
             let kern = cellWidth - fonts.asciiAdvance
             if abs(kern) > 0.01 { attributes[.kern] = kern }
-            NSAttributedString(string: run.text, attributes: attributes)
-                .draw(with: NSRect(x: rect.minX, y: baseline - fonts.ascent, width: rect.width + 4, height: lineHeight),
-                      options: [.usesLineFragmentOrigin])
-            return
-        }
-        var column = 0
-        for character in run.text {
-            let cells = character.unicodeScalars.first.map(Self.cellCount) ?? 1
-            if character != " " {
+            Self.drawText(run.text, attributes: attributes, x: rect.minX, baseline: baseline, context: context)
+        } else {
+            var column = 0
+            for character in run.text {
+                let cells = character.unicodeScalars.first.map(Self.cellCount) ?? 1
                 let x = rect.minX + CGFloat(column) * cellWidth
-                NSAttributedString(string: String(character), attributes: attributes)
-                    .draw(with: NSRect(x: x, y: baseline - fonts.ascent, width: CGFloat(cells) * cellWidth + 8, height: lineHeight),
-                          options: [.usesLineFragmentOrigin])
+                let cell = NSRect(x: x, y: rect.minY, width: CGFloat(cells) * cellWidth, height: lineHeight)
+                if let scalar = character.unicodeScalars.first, character.unicodeScalars.count == 1,
+                   let parts = Self.customGlyph(scalar, cell: cell) {
+                    // Block and line characters fill the whole cell, so
+                    // TUIs (opencode, htop) draw seamless bars and boxes.
+                    for part in parts {
+                        color.withAlphaComponent(color.alphaComponent * part.alpha).setFill()
+                        part.rect.fill()
+                    }
+                } else if character != " " {
+                    Self.drawText(String(character), attributes: attributes, x: x, baseline: baseline, context: context)
+                }
+                column += cells
             }
-            column += cells
         }
+        // Drawn by hand: Core Text does not draw underlines.
+        if run.underline {
+            color.setFill()
+            NSRect(x: rect.minX, y: baseline + max(1, round(-fonts.underlinePosition)), width: rect.width, height: 1).fill()
+        }
+        if run.strikeout {
+            color.setFill()
+            NSRect(x: rect.minX, y: round(baseline - fonts.xHeight / 2), width: rect.width, height: 1).fill()
+        }
+    }
+
+    /// Rectangles that draw block elements (U+2580–U+259F) and the common
+    /// box-drawing lines (U+2500–U+257F) edge to edge in `cell`, as VS
+    /// Code's terminal does. Font glyphs for these stop short of the cell
+    /// because lines are taller than the font, which left gaps between
+    /// rows. `nil` for every other character. `cell` is in flipped
+    /// coordinates (y grows down).
+    static func customGlyph(_ scalar: Unicode.Scalar, cell: NSRect) -> [(rect: NSRect, alpha: CGFloat)]? {
+        let v = scalar.value
+        let x = cell.minX, y = cell.minY, w = cell.width, h = cell.height
+        func r(_ fx: CGFloat, _ fy: CGFloat, _ fw: CGFloat, _ fh: CGFloat, _ alpha: CGFloat = 1) -> (rect: NSRect, alpha: CGFloat) {
+            (NSRect(x: x + fx * w, y: y + fy * h, width: fw * w, height: fh * h), alpha)
+        }
+        switch v {
+        case 0x2580: return [r(0, 0, 1, 0.5)]
+        case 0x2581...0x2587:
+            let f = CGFloat(v - 0x2580) / 8
+            return [r(0, 1 - f, 1, f)]
+        case 0x2588: return [r(0, 0, 1, 1)]
+        case 0x2589...0x258F:
+            let f = CGFloat(0x2590 - v) / 8
+            return [r(0, 0, f, 1)]
+        case 0x2590: return [r(0.5, 0, 0.5, 1)]
+        case 0x2591: return [r(0, 0, 1, 1, 0.25)]
+        case 0x2592: return [r(0, 0, 1, 1, 0.5)]
+        case 0x2593: return [r(0, 0, 1, 1, 0.75)]
+        case 0x2594: return [r(0, 0, 1, 1.0 / 8)]
+        case 0x2595: return [r(7.0 / 8, 0, 1.0 / 8, 1)]
+        case 0x2596...0x259F:
+            // Quadrants: upper-left, upper-right, lower-left, lower-right.
+            let masks: [UInt8] = [0b0010, 0b0001, 0b1000, 0b1011, 0b1001, 0b1110, 0b1101, 0b0100, 0b0110, 0b0111]
+            let mask = masks[Int(v - 0x2596)]
+            var parts: [(rect: NSRect, alpha: CGFloat)] = []
+            if mask & 0b1000 != 0 { parts.append(r(0, 0, 0.5, 0.5)) }
+            if mask & 0b0100 != 0 { parts.append(r(0.5, 0, 0.5, 0.5)) }
+            if mask & 0b0010 != 0 { parts.append(r(0, 0.5, 0.5, 0.5)) }
+            if mask & 0b0001 != 0 { parts.append(r(0.5, 0.5, 0.5, 0.5)) }
+            return parts
+        default:
+            break
+        }
+        // Box drawing: weight per arm (up, down, left, right); 1 light, 2 heavy.
+        let arms: (UInt8, UInt8, UInt8, UInt8)
+        switch v {
+        case 0x2500: arms = (0, 0, 1, 1)
+        case 0x2501: arms = (0, 0, 2, 2)
+        case 0x2502: arms = (1, 1, 0, 0)
+        case 0x2503: arms = (2, 2, 0, 0)
+        case 0x250C, 0x256D: arms = (0, 1, 0, 1)
+        case 0x250F: arms = (0, 2, 0, 2)
+        case 0x2510, 0x256E: arms = (0, 1, 1, 0)
+        case 0x2513: arms = (0, 2, 2, 0)
+        case 0x2514, 0x2570: arms = (1, 0, 0, 1)
+        case 0x2517: arms = (2, 0, 0, 2)
+        case 0x2518, 0x256F: arms = (1, 0, 1, 0)
+        case 0x251B: arms = (2, 0, 2, 0)
+        case 0x251C: arms = (1, 1, 0, 1)
+        case 0x2523: arms = (2, 2, 0, 2)
+        case 0x2524: arms = (1, 1, 1, 0)
+        case 0x252B: arms = (2, 2, 2, 0)
+        case 0x252C: arms = (0, 1, 1, 1)
+        case 0x2533: arms = (0, 2, 2, 2)
+        case 0x2534: arms = (1, 0, 1, 1)
+        case 0x253B: arms = (2, 0, 2, 2)
+        case 0x253C: arms = (1, 1, 1, 1)
+        case 0x254B: arms = (2, 2, 2, 2)
+        case 0x2574: arms = (0, 0, 1, 0)
+        case 0x2575: arms = (1, 0, 0, 0)
+        case 0x2576: arms = (0, 0, 0, 1)
+        case 0x2577: arms = (0, 1, 0, 0)
+        case 0x2578: arms = (0, 0, 2, 0)
+        case 0x2579: arms = (2, 0, 0, 0)
+        case 0x257A: arms = (0, 0, 0, 2)
+        case 0x257B: arms = (0, 2, 0, 0)
+        default: return nil
+        }
+        let light = max(1, (w / 8).rounded())
+        let heavy = max(2, (w / 4).rounded())
+        func thickness(_ weight: UInt8) -> CGFloat { weight == 2 ? heavy : light }
+        let cx = (cell.midX * 2).rounded() / 2
+        let cy = (cell.midY * 2).rounded() / 2
+        // Arms meet in the middle, overlapping by the crossing line's width.
+        let vertical = thickness(max(arms.0, arms.1))
+        let horizontal = thickness(max(arms.2, arms.3))
+        var parts: [(rect: NSRect, alpha: CGFloat)] = []
+        if arms.0 > 0 {
+            let t = thickness(arms.0)
+            parts.append((NSRect(x: cx - t / 2, y: y, width: t, height: cy - y + horizontal / 2), 1))
+        }
+        if arms.1 > 0 {
+            let t = thickness(arms.1)
+            parts.append((NSRect(x: cx - t / 2, y: cy - horizontal / 2, width: t, height: cell.maxY - cy + horizontal / 2), 1))
+        }
+        if arms.2 > 0 {
+            let t = thickness(arms.2)
+            parts.append((NSRect(x: x, y: cy - t / 2, width: cx - x + vertical / 2, height: t), 1))
+        }
+        if arms.3 > 0 {
+            let t = thickness(arms.3)
+            parts.append((NSRect(x: cx - vertical / 2, y: cy - t / 2, width: cell.maxX - cx + vertical / 2, height: t), 1))
+        }
+        return parts
+    }
+
+    /// Draws `text` with its baseline exactly at `baseline`. AppKit's
+    /// string drawing adds the font's own line spacing on top, which put
+    /// the glyphs low in their cells, under the prompt's colored blocks.
+    static func drawText(_ text: String, attributes: [NSAttributedString.Key: Any], x: CGFloat, baseline: CGFloat,
+                         context: CGContext) {
+        let line = CTLineCreateWithAttributedString(NSAttributedString(string: text, attributes: attributes))
+        context.saveGState()
+        // The view is flipped; Core Text draws with y up.
+        context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
+        context.textPosition = CGPoint(x: x, y: baseline)
+        CTLineDraw(line, context)
+        context.restoreGState()
     }
 
     private func drawCursor(_ screen: TerminalScreenInfo, _ palette: TerminalPalette) {
@@ -401,13 +540,12 @@ final class TerminalView: NSView {
             guard cursorVisible else { return }
             rect.fill()
             // The character under a block cursor, in the background color.
-            if let character = character(at: cursor, in: screen), character != " " {
-                NSAttributedString(string: String(character), attributes: [
+            if let character = character(at: cursor, in: screen), character != " ",
+               let context = NSGraphicsContext.current?.cgContext {
+                Self.drawText(String(character), attributes: [
                     .font: fonts.font(bold: false, italic: false),
                     .foregroundColor: palette.background,
-                ]).draw(with: NSRect(x: rect.minX, y: rect.minY + fonts.baselineOffset - fonts.ascent,
-                                     width: cellWidth + 4, height: lineHeight),
-                        options: [.usesLineFragmentOrigin])
+                ], x: rect.minX, baseline: rect.minY + fonts.baselineOffset, context: context)
             }
         } else {
             let outline = NSBezierPath(rect: rect.insetBy(dx: 0.5, dy: 0.5))
@@ -465,8 +603,12 @@ private struct FontSet {
     let lineHeight: CGFloat
     let ascent: CGFloat
     let baselineOffset: CGFloat
+    let underlinePosition: CGFloat
+    let xHeight: CGFloat
 
     init(_ font: NSFont) {
+        underlinePosition = font.underlinePosition
+        xHeight = font.xHeight
         let manager = NSFontManager.shared
         regular = font
         bold = manager.convert(font, toHaveTrait: .boldFontMask)
@@ -474,9 +616,11 @@ private struct FontSet {
         boldItalic = manager.convert(bold, toHaveTrait: .italicFontMask)
         asciiAdvance = ("M" as NSString).size(withAttributes: [.font: font]).width
         cellWidth = ceil(asciiAdvance * 2) / 2
-        lineHeight = ceil((font.ascender - font.descender + font.leading) * 1.2)
+        // VS Code's default `terminal.integrated.lineHeight` is 1: rows
+        // as tall as the font, so TUIs stack their rows without gaps.
+        lineHeight = ceil(font.ascender - font.descender + font.leading)
         ascent = font.ascender
-        // Center the glyphs in the taller line.
+        // Center the glyphs (ascender to descender) in the taller line.
         let natural = font.ascender - font.descender
         baselineOffset = round((lineHeight - natural) / 2 + font.ascender)
     }

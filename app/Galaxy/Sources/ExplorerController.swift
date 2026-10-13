@@ -700,6 +700,10 @@ enum ExplorerIcon {
         // Xcode copies resource folders into the bundle's flat Resources root.
         let url = Bundle.main.url(forResource: name, withExtension: "svg")
         let image = url.flatMap(NSImage.init(contentsOf:))
+        // The SVGs only carry a viewBox (24 or 32 units), which NSImage takes
+        // as point size. Pin them to the 16pt glyph size used everywhere;
+        // vector content still renders sharp at that size.
+        image?.size = NSSize(width: 16, height: 16)
         cache[name] = image
         return image
     }
