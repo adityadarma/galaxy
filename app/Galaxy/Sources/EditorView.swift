@@ -58,9 +58,17 @@ final class EditorView: NSView {
     var gitLineChanges: [UInt64: GitLineChangeKind] = [:] {
         didSet { if gitLineChanges != oldValue { needsDisplay = true } }
     }
+    /// LSP names (types, parameters, functions) colored over Tree-sitter's runs.
     var semanticTokens: [SemanticTokenInfo] = [] {
-        didSet { if semanticTokens != oldValue { needsDisplay = true } }
+        didSet {
+            guard semanticTokens != oldValue else { return }
+            semanticStylesByLine = Dictionary(grouping: semanticTokens.map {
+                StyleRun(line: $0.line, start: $0.start, end: $0.start + $0.length, scope: $0.scope)
+            }, by: { $0.line })
+            needsDisplay = true
+        }
     }
+    private(set) var semanticStylesByLine: [UInt64: [StyleRun]] = [:]
     /// `editor.renderWhitespace`; dots everywhere unless settings say otherwise.
     var renderWhitespace: WhitespaceRendering = .all {
         didSet { if renderWhitespace != oldValue { needsDisplay = true } }
@@ -554,17 +562,12 @@ final class EditorView: NSView {
             if !line.text.isEmpty {
                 context.setFillColor(NSColor.textColor.cgColor)
                 context.textPosition = CGPoint(x: originX, y: top + metrics.ascent)
-                let styles = stylesByLine[line.line] ?? []
+                // Semantic runs come last so they win over Tree-sitter's.
+                let styles = (stylesByLine[line.line] ?? []) + (semanticStylesByLine[line.line] ?? [])
                 CTLineDraw(styles.isEmpty ? layout(for: line.text) : syntaxLayout(for: line.text, styles: styles), context)
             }
 
             // LSP diagnostics sit above text decorations but beneath carets.
-            for token in semanticTokens where token.line == line.line {
-                let x0 = originX + xOffset(in: line.text, column: token.start)
-                let x1 = originX + xOffset(in: line.text, column: token.start + token.length)
-                semanticColor(token.tokenType).setFill()
-                context.fill(CGRect(x: x0, y: top + lineHeight - 1, width: max(1, x1 - x0), height: 1))
-            }
             // Cmd hover: underline the identifier Cmd+click would open.
             if let link = definitionLink, link.line == line.line {
                 let x0 = originX + xOffset(in: line.text, column: link.start)
@@ -670,10 +673,6 @@ final class EditorView: NSView {
                 context.fillEllipse(in: CGRect(x: cx - radius, y: midY - radius, width: radius * 2, height: radius * 2))
             }
         }
-    }
-
-    private func semanticColor(_ tokenType: UInt64) -> NSColor {
-        ([NSColor.systemBlue, .systemPurple, .systemTeal, .systemOrange, .systemGreen][Int(tokenType % 5)]).withAlphaComponent(0.65)
     }
 
     /// X offset of a UTF-16 column within a line's text.

@@ -20,6 +20,12 @@ final class PathBar: NSView {
 
         label.font = .systemFont(ofSize: 13)
         label.lineBreakMode = .byTruncatingHead
+        // One line only: a long path truncates at the head instead of
+        // wrapping the file name under the bar (and over the editor).
+        label.maximumNumberOfLines = 1
+        label.cell?.wraps = false
+        label.cell?.isScrollable = false
+        label.cell?.usesSingleLineMode = true
         label.setAccessibilityIdentifier("path-bar")
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
@@ -66,6 +72,14 @@ final class PathBar: NSView {
         self.components = components
         let font = NSFont.systemFont(ofSize: 13)
         let text = NSMutableAttributedString()
+        defer {
+            // An attributed string replaces the label's own line break mode;
+            // without a paragraph style the cell wraps.
+            let style = NSMutableParagraphStyle()
+            style.lineBreakMode = .byTruncatingHead
+            text.addAttribute(.paragraphStyle, value: style, range: NSRange(location: 0, length: text.length))
+            label.attributedStringValue = text
+        }
         for (i, part) in components.enumerated() {
             let last = i == components.count - 1
             if i > 0 {
@@ -86,7 +100,6 @@ final class PathBar: NSView {
                 .font: font,
             ]))
         }
-        label.attributedStringValue = text
         label.setAccessibilityLabel(components.joined(separator: " / "))
     }
 

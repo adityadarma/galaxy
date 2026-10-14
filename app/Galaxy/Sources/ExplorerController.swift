@@ -632,11 +632,38 @@ final class ExplorerCell: NSTableCellView {
 final class ExplorerRowView: NSTableRowView {
     static let reuseID = NSUserInterfaceItemIdentifier("explorer-row")
     var level = 0 { didSet { if level != oldValue { needsDisplay = true } } }
-    private var isHovered = false { didSet { if isHovered != oldValue { needsDisplay = true } } }
+    private(set) var isHovered = false { didSet { if isHovered != oldValue { needsDisplay = true } } }
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         identifier = Self.reuseID
+    }
+
+    /// Row views are recycled while the pointer stays still (restoring the
+    /// session expands folders and scrolls). A view that was hovered then
+    /// moved away never gets `mouseExited`, so it kept its hover tint on
+    /// whatever row it was reused for.
+    override func prepareForReuse() {
+        super.prepareForReuse()
+        isHovered = false
+    }
+
+    /// Hover follows where the pointer really is, not the last event seen.
+    private func syncHoverWithPointer() {
+        guard let window else { isHovered = false; return }
+        let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        isHovered = window.isKeyWindow && NSMouseInRect(point, bounds, isFlipped)
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        syncHoverWithPointer()
+    }
+
+    override func setFrameOrigin(_ newOrigin: NSPoint) {
+        super.setFrameOrigin(newOrigin)
+        // A row that moved under (or away from) a still pointer gets no event.
+        if isHovered || window != nil { syncHoverWithPointer() }
     }
 
     @available(*, unavailable)
@@ -673,6 +700,7 @@ final class ExplorerRowView: NSTableRowView {
         trackingAreas.forEach(removeTrackingArea)
         addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
                                        owner: self, userInfo: nil))
+        syncHoverWithPointer()
     }
 
     override func mouseEntered(with event: NSEvent) { isHovered = true }

@@ -308,4 +308,16 @@ final class TabTests: XCTestCase {
         let long = laidOutTab(title: "ApplicationBuilder.php", width: 400).intrinsicContentSize.width
         XCTAssertGreaterThan(long, short)
     }
+
+    /// A long path wrapped the file name onto a second line that overlapped
+    /// the editor. It stays on one line and truncates at the head.
+    func testLongPathStaysOnOneLine() {
+        let bar = PathBar(frame: NSRect(x: 0, y: 0, width: 320, height: PathBar.height))
+        bar.show(["node_modules", ".pnpm", "@types+node@24.12.0", "node_modules", "@types", "node", "child_process.d.ts"])
+        XCTAssertEqual(bar.label.maximumNumberOfLines, 1)
+        let style = bar.label.attributedStringValue.attribute(.paragraphStyle, at: 0, effectiveRange: nil) as? NSParagraphStyle
+        XCTAssertEqual(style?.lineBreakMode, .byTruncatingHead)
+        let fitted = bar.label.cell?.cellSize(forBounds: NSRect(x: 0, y: 0, width: 280, height: 1000))
+        XCTAssertLessThanOrEqual(fitted?.height ?? .infinity, PathBar.height, "one line fits in the bar")
+    }
 }

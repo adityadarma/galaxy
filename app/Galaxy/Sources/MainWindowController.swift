@@ -1089,6 +1089,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             }
             return true
         }
+        // A relative import is a file on disk: open it without the server.
+        // Packages (`node:fs`, `react`) go to the server below.
+        if let specifier = editorView.importSpecifier(at: position),
+           let target = EditorView.resolveImport(specifier.path, from: document.path()) {
+            jump(to: DefinitionLocation(uri: URL(fileURLWithPath: target).absoluteString, line: 0, column: 0))
+            return true
+        }
         definitionRequest = (document, position)
         bridge.requestDefinition(document: document, line: position.line, character: position.colUtf16)
         return true
@@ -1390,15 +1397,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         sectionHeader.moreMenu = { [weak self] in self?.explorerMoreMenu() ?? NSMenu() }
         sectionHeader.showsTools = false
 
-        sectionHeader.onScmGenerate = { [weak self] in self?.sourceControl.generateCommitMessage() }
-        sourceControl.onGeneratingChanged = { [weak self] generating in
-            self?.sectionHeader.setScmGenerating(generating)
-        }
         sectionHeader.onScmPull = { [weak self] in self?.sourceControl.pull() }
         sectionHeader.onScmBranch = { [weak self] in self?.showGitBranchPicker() }
         sectionHeader.onScmCommit = { [weak self] in self?.sourceControl.commit(nil) }
         sectionHeader.onScmRefresh = { [weak self] in self?.refreshGitStatus() }
-        sectionHeader.onScmHistory = { [weak self] in self?.showGitBranchPicker() }
         sectionHeader.scmMoreMenu = { [weak self] in self?.sourceControl.moreActionsMenu() ?? NSMenu() }
         sectionHeader.onExtensionsRefresh = { [weak self] in self?.refreshExtensions(network: true) }
         sectionHeader.onExtensionsAddRegistry = { [weak self] in self?.addPluginRegistry() }
@@ -2506,7 +2508,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                             guard let self else { return }
                             switch installed {
                             case .success:
-                                self.extensions.clearField()
                                 self.extensions.setStatus("Installed \(preview.name) \(preview.version).")
                                 self.pluginsChanged()
                             case .failure(let error):
@@ -3958,7 +3959,6 @@ final class SidebarSectionHeader: NSView {
         didSet { updateMode() }
     }
 
-    let scmChevron = NSButton()
     let label = NSTextField(labelWithString: "EXPLORER")
 
     // Explorer tools
@@ -3970,17 +3970,13 @@ final class SidebarSectionHeader: NSView {
     var tools: [NSButton] { [newFileButton, newFolderButton, refreshButton, collapseButton, moreButton] }
 
     // Source Control tools
-    let scmViewModeButton = SidebarSectionHeader.tool("list.bullet", "View as List")
-    let scmGenerateButton = SidebarSectionHeader.tool("sparkles", "Generate Commit Message")
     let scmPullButton = SidebarSectionHeader.tool("arrow.down.to.line", "Pull")
     let scmBranchButton = SidebarSectionHeader.tool("arrow.triangle.branch", "Branches")
     let scmCommitButton = SidebarSectionHeader.tool("checkmark", "Commit")
     let scmRefreshButton = SidebarSectionHeader.tool("arrow.clockwise", "Refresh")
-    let scmHistoryButton = SidebarSectionHeader.tool("clock.arrow.circlepath", "View History")
     let scmMoreButton = SidebarSectionHeader.tool("ellipsis", "More Actions…")
     var scmTools: [NSButton] {
-        [scmViewModeButton, scmGenerateButton, scmPullButton, scmBranchButton,
-         scmCommitButton, scmRefreshButton, scmHistoryButton, scmMoreButton]
+        [scmPullButton, scmBranchButton, scmCommitButton, scmRefreshButton, scmMoreButton]
     }
 
     let searchRefreshButton = SidebarSectionHeader.tool("arrow.clockwise", "Refresh Search")
@@ -3999,14 +3995,10 @@ final class SidebarSectionHeader: NSView {
     var onCollapseAll: (() -> Void)?
     var moreMenu: (() -> NSMenu)?
 
-    var onScmToggle: (() -> Void)?
-    var onScmViewMode: (() -> Void)?
-    var onScmGenerate: (() -> Void)?
     var onScmPull: (() -> Void)?
     var onScmBranch: (() -> Void)?
     var onScmCommit: (() -> Void)?
     var onScmRefresh: (() -> Void)?
-    var onScmHistory: (() -> Void)?
     var scmMoreMenu: (() -> NSMenu)?
     var onSearchRefresh: (() -> Void)?
     var onExtensionsRefresh: (() -> Void)?
@@ -4042,18 +4034,6 @@ final class SidebarSectionHeader: NSView {
         setAccessibilityLabel("Explorer")
         setAccessibilityIdentifier("folder-title")
 
-        scmChevron.image = NSImage(systemSymbolName: "chevron.down", accessibilityDescription: "Changes")?
-            .withSymbolConfiguration(.init(pointSize: 10, weight: .bold))
-        scmChevron.isBordered = false
-        scmChevron.imagePosition = .imageOnly
-        scmChevron.contentTintColor = .secondaryLabelColor
-        scmChevron.target = self
-        scmChevron.action = #selector(scmToggleAction(_:))
-        scmChevron.translatesAutoresizingMaskIntoConstraints = false
-        scmChevron.widthAnchor.constraint(equalToConstant: 14).isActive = true
-        scmChevron.heightAnchor.constraint(equalToConstant: 14).isActive = true
-        scmChevron.isHidden = true
-
         label.font = .systemFont(ofSize: 12, weight: .medium)
         label.textColor = .labelColor
         label.lineBreakMode = .byTruncatingTail
@@ -4068,13 +4048,10 @@ final class SidebarSectionHeader: NSView {
         }
 
         for (button, action) in [
-            (scmViewModeButton, #selector(scmViewModeAction(_:))),
-            (scmGenerateButton, #selector(scmGenerateAction(_:))),
             (scmPullButton, #selector(scmPullAction(_:))),
             (scmBranchButton, #selector(scmBranchAction(_:))),
             (scmCommitButton, #selector(scmCommitAction(_:))),
             (scmRefreshButton, #selector(scmRefreshAction(_:))),
-            (scmHistoryButton, #selector(scmHistoryAction(_:))),
             (scmMoreButton, #selector(scmMoreAction(_:))),
         ] {
             button.target = self
@@ -4103,7 +4080,7 @@ final class SidebarSectionHeader: NSView {
             button.isHidden = true
         }
 
-        let row = NSStackView(views: [scmChevron, label] + tools + scmTools + searchTools + extensionsTools)
+        let row = NSStackView(views: [label] + tools + scmTools + searchTools + extensionsTools)
         row.spacing = 3
         row.setCustomSpacing(6, after: label)
         row.translatesAutoresizingMaskIntoConstraints = false
@@ -4122,28 +4099,24 @@ final class SidebarSectionHeader: NSView {
     private func updateMode() {
         switch mode {
         case .explorer:
-            scmChevron.isHidden = true
             scmTools.forEach { $0.isHidden = true }
             searchTools.forEach { $0.isHidden = true }
             tools.forEach { $0.isHidden = !showsTools }
             extensionsTools.forEach { $0.isHidden = true }
             label.stringValue = title.isEmpty ? "EXPLORER" : title.uppercased()
         case .sourceControl:
-            scmChevron.isHidden = false
             tools.forEach { $0.isHidden = true }
             scmTools.forEach { $0.isHidden = false }
             searchTools.forEach { $0.isHidden = true }
             extensionsTools.forEach { $0.isHidden = true }
-            label.stringValue = "Changes"
+            label.stringValue = "SOURCE CONTROL"
         case .search:
-            scmChevron.isHidden = true
             tools.forEach { $0.isHidden = true }
             scmTools.forEach { $0.isHidden = true }
             searchTools.forEach { $0.isHidden = false }
             extensionsTools.forEach { $0.isHidden = true }
             label.stringValue = "SEARCH"
         case .extensions:
-            scmChevron.isHidden = true
             tools.forEach { $0.isHidden = true }
             scmTools.forEach { $0.isHidden = true }
             searchTools.forEach { $0.isHidden = true }
@@ -4155,17 +4128,6 @@ final class SidebarSectionHeader: NSView {
     override func draw(_ dirtyRect: NSRect) {
         NSColor.separatorColor.setFill()
         NSRect(x: 0, y: 0, width: bounds.width, height: 1).intersection(dirtyRect).fill()
-    }
-
-    /// Swaps the header's sparkles button to a stop button while generating.
-    func setScmGenerating(_ generating: Bool) {
-        let title = generating ? "Stop Generating Commit Message" : "Generate Commit Message"
-        let symbol = generating ? "stop.fill" : "sparkles"
-        scmGenerateButton.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)?
-            .withSymbolConfiguration(.init(pointSize: generating ? 10 : 12, weight: .regular))
-        scmGenerateButton.contentTintColor = generating ? Theme.accent : .secondaryLabelColor
-        scmGenerateButton.toolTip = title
-        scmGenerateButton.setAccessibilityLabel(title)
     }
 
     private static func tool(_ symbol: String, _ title: String) -> NSButton {
@@ -4192,14 +4154,10 @@ final class SidebarSectionHeader: NSView {
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: moreButton.bounds.maxY + 4), in: moreButton)
     }
 
-    @objc private func scmToggleAction(_ sender: Any?) { onScmToggle?() }
-    @objc private func scmViewModeAction(_ sender: Any?) { onScmViewMode?() }
-    @objc private func scmGenerateAction(_ sender: Any?) { onScmGenerate?() }
     @objc private func scmPullAction(_ sender: Any?) { onScmPull?() }
     @objc private func scmBranchAction(_ sender: Any?) { onScmBranch?() }
     @objc private func scmCommitAction(_ sender: Any?) { onScmCommit?() }
     @objc private func scmRefreshAction(_ sender: Any?) { onScmRefresh?() }
-    @objc private func scmHistoryAction(_ sender: Any?) { onScmHistory?() }
 
     @objc private func scmMoreAction(_ sender: Any?) {
         guard let menu = scmMoreMenu?() else { return }

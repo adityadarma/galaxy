@@ -87,7 +87,7 @@ final class GenerateCommitIconButton: NSButton {
 
     private func updateIcon() {
         let config = NSImage.SymbolConfiguration(pointSize: isGenerating ? 10 : 12, weight: .medium)
-        let symbolName = isGenerating ? "stop.fill" : "sparkles"
+        let symbolName = isGenerating ? "stop.fill" : "wand.and.sparkles"
         let fallbackName = isGenerating ? "stop" : "wand.and.stars"
         let description = isGenerating ? "Stop Generating Commit Message" : "Generate Commit Message"
 
@@ -131,15 +131,94 @@ final class GenerateCommitIconButton: NSButton {
     }
 }
 
+// MARK: - Commit Message Text View
+
+/// Multi-line message editor. Return inserts a newline (a commit message has
+/// a body); ⌘Return commits.
+@MainActor
+final class CommitMessageTextView: NSTextView {
+    var placeholder = "" { didSet { needsDisplay = true } }
+    var onCommandReturn: (() -> Void)?
+    var onFocusChange: ((Bool) -> Void)?
+    var onTextChange: (() -> Void)?
+
+    override func keyDown(with event: NSEvent) {
+        let isReturn = event.keyCode == 36 || event.keyCode == 76
+        if isReturn, event.modifierFlags.contains(.command) {
+            onCommandReturn?()
+            return
+        }
+        super.keyDown(with: event)
+    }
+
+    override func didChangeText() {
+        super.didChangeText()
+        needsDisplay = true
+        onTextChange?()
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        let accepted = super.becomeFirstResponder()
+        if accepted { onFocusChange?(true) }
+        return accepted
+    }
+
+    override func resignFirstResponder() -> Bool {
+        let resigned = super.resignFirstResponder()
+        if resigned { onFocusChange?(false) }
+        return resigned
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard string.isEmpty, !placeholder.isEmpty else { return }
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: font ?? NSFont.systemFont(ofSize: 13),
+            .foregroundColor: NSColor.placeholderTextColor,
+        ]
+        let padding = textContainer?.lineFragmentPadding ?? 0
+        NSAttributedString(string: placeholder, attributes: attributes)
+            .draw(at: NSPoint(x: textContainerOrigin.x + padding, y: textContainerOrigin.y))
+    }
+}
+
 // MARK: - Commit Message Input Container
 
+/// The commit message box: one line until the text needs more, then grows to `maxLines`
+/// (then scrolls), with the generate button in the top right corner.
 @MainActor
 final class CommitMessageInputContainer: NSView {
-    override var isFlipped: Bool { true }
-    let textField = NSTextField()
+    static let minLines = 1
+    static let maxLines = 8
+    static let padding = NSEdgeInsets(top: 8, left: 10, bottom: 8, right: 32)
+
+    let textView = CommitMessageTextView()
     let generateButton = GenerateCommitIconButton()
+    private let scrollView = NSScrollView()
+    private(set) var heightConstraint: NSLayoutConstraint!
+    private var isFocused = false
+    private var lastWidth: CGFloat = 0
 
     var onGenerate: (() -> Void)?
+    var onTextChange: (() -> Void)?
+    var onCommandReturn: (() -> Void)? {
+        get { textView.onCommandReturn }
+        set { textView.onCommandReturn = newValue }
+    }
+
+    var text: String {
+        get { textView.string }
+        set {
+            textView.string = newValue
+            textView.needsDisplay = true
+            updateHeight()
+        }
+    }
+
+    var placeholder: String {
+        get { textView.placeholder }
+        set { textView.placeholder = newValue }
+    }
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -148,56 +227,111 @@ final class CommitMessageInputContainer: NSView {
         layer?.masksToBounds = true
         layer?.borderWidth = 1
 
-        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        layer?.borderColor = (isDark ? NSColor(white: 0.24, alpha: 1.0) : NSColor.separatorColor.withAlphaComponent(0.6)).cgColor
-        layer?.backgroundColor = isDark
-            ? (NSColor(hex: "#1E2227") ?? NSColor(white: 0.14, alpha: 1.0)).cgColor
-            : NSColor.textBackgroundColor.cgColor
+        textView.drawsBackground = false
+        textView.isRichText = false
+        textView.allowsUndo = true
+        textView.font = .systemFont(ofSize: 13)
+        textView.textColor = .labelColor
+        textView.insertionPointColor = .labelColor
+        textView.textContainerInset = .zero
+        textView.textContainer?.lineFragmentPadding = 0
+        textView.isAutomaticQuoteSubstitutionEnabled = false
+        textView.isAutomaticDashSubstitutionEnabled = false
+        textView.isAutomaticSpellingCorrectionEnabled = false
+        textView.isVerticallyResizable = true
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.widthTracksTextView = true
+        textView.placeholder = "Message (⌘Enter to commit)"
+        textView.setAccessibilityLabel("Commit message")
+        textView.setAccessibilityIdentifier("commit-message")
+        textView.onFocusChange = { [weak self] focused in self?.setFocused(focused) }
+        textView.onTextChange = { [weak self] in
+            self?.updateHeight()
+            self?.onTextChange?()
+        }
 
-        textField.isBordered = false
-        textField.drawsBackground = false
-        textField.focusRingType = .none
-        textField.font = .systemFont(ofSize: 12)
-        textField.textColor = .labelColor
-        textField.placeholderString = "Message (⌘Enter to commit)"
-        textField.maximumNumberOfLines = 1
-        textField.usesSingleLineMode = true
-        textField.cell?.wraps = false
-        textField.cell?.isScrollable = true
-        textField.cell?.usesSingleLineMode = true
-        textField.lineBreakMode = .byTruncatingTail
-        textField.cell?.truncatesLastVisibleLine = true
-        textField.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.documentView = textView
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.scrollerStyle = .overlay
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
 
         generateButton.target = self
         generateButton.action = #selector(generateClicked(_:))
 
-        addSubview(textField)
+        addSubview(scrollView)
         addSubview(generateButton)
 
+        let pad = Self.padding
+        heightConstraint = heightAnchor.constraint(equalToConstant: Self.height(forContent: 0, lineHeight: lineHeight))
         NSLayoutConstraint.activate([
-            heightAnchor.constraint(equalToConstant: 32),
+            heightConstraint,
+            scrollView.topAnchor.constraint(equalTo: topAnchor, constant: pad.top),
+            scrollView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -pad.bottom),
+            scrollView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: pad.left),
+            scrollView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -pad.right),
 
-            textField.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
-            textField.centerYAnchor.constraint(equalTo: centerYAnchor),
-            textField.trailingAnchor.constraint(equalTo: generateButton.leadingAnchor, constant: -6),
-
-            generateButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -5),
-            generateButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            generateButton.topAnchor.constraint(equalTo: topAnchor, constant: 6),
+            generateButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
             generateButton.widthAnchor.constraint(equalToConstant: 22),
             generateButton.heightAnchor.constraint(equalToConstant: 22),
         ])
+        applyColors()
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
-    func setFocused(_ focused: Bool) {
-        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        let accentColor = NSColor(srgbRed: 0/255.0, green: 120/255.0, blue: 212/255.0, alpha: 1.0)
-        let normalBorder = isDark ? NSColor(white: 0.24, alpha: 1.0) : NSColor.separatorColor.withAlphaComponent(0.6)
+    private var lineHeight: CGFloat {
+        textView.layoutManager?.defaultLineHeight(for: textView.font ?? .systemFont(ofSize: 13)) ?? 16
+    }
 
-        layer?.borderColor = focused ? accentColor.cgColor : normalBorder.cgColor
-        layer?.borderWidth = focused ? 1.5 : 1.0
+    /// Box height for text `content` points tall: clamped to the line limits.
+    static func height(forContent content: CGFloat, lineHeight: CGFloat) -> CGFloat {
+        let clamped = min(max(content, lineHeight * CGFloat(minLines)), lineHeight * CGFloat(maxLines))
+        return ceil(clamped) + padding.top + padding.bottom
+    }
+
+    /// Fits the box to its text. Safe to call whenever the text or width changes.
+    func updateHeight() {
+        guard let layout = textView.layoutManager, let container = textView.textContainer else { return }
+        let width = bounds.width - Self.padding.left - Self.padding.right
+        if width > 0 { container.containerSize = NSSize(width: width, height: .greatestFiniteMagnitude) }
+        layout.ensureLayout(for: container)
+        let target = Self.height(forContent: layout.usedRect(for: container).height, lineHeight: lineHeight)
+        if abs(heightConstraint.constant - target) > 0.5 { heightConstraint.constant = target }
+    }
+
+    override func layout() {
+        super.layout()
+        // The text wraps at the width it is laid out with; refit once it changes.
+        guard abs(bounds.width - lastWidth) > 0.5 else { return }
+        lastWidth = bounds.width
+        DispatchQueue.main.async { [weak self] in self?.updateHeight() }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyColors()
+    }
+
+    func setFocused(_ focused: Bool) {
+        isFocused = focused
+        applyColors()
+    }
+
+    private func applyColors() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            let normalBorder = isDark ? NSColor(white: 0.24, alpha: 1.0) : NSColor.separatorColor.withAlphaComponent(0.6)
+            layer?.borderColor = (isFocused ? Theme.accent : normalBorder).cgColor
+            layer?.borderWidth = isFocused ? 1.5 : 1.0
+            layer?.backgroundColor = isDark
+                ? (NSColor(hex: "#1E2227") ?? NSColor(white: 0.14, alpha: 1.0)).cgColor
+                : NSColor.textBackgroundColor.cgColor
+        }
     }
 
     @objc private func generateClicked(_ sender: Any?) { onGenerate?() }
@@ -229,7 +363,7 @@ final class CommitSplitButton: NSView {
         // Same corner radius as the message field above it.
         layer?.cornerRadius = 6
         layer?.masksToBounds = true
-        layer?.backgroundColor = NSColor(srgbRed: 0/255.0, green: 120/255.0, blue: 212/255.0, alpha: 1.0).cgColor
+        applyColor()
 
         // Main button
         mainButton.title = ""
@@ -304,6 +438,18 @@ final class CommitSplitButton: NSView {
 
     required init?(coder: NSCoder) { fatalError() }
 
+    /// Same colour as the focused message box border above it.
+    private func applyColor() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = Theme.accent.cgColor
+        }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyColor()
+    }
+
     @objc private func commitClicked(_ sender: Any?) { onCommit?() }
     @objc private func dropdownClicked(_ sender: Any?) { onDropdown?(dropdownButton) }
 
@@ -319,7 +465,7 @@ final class CommitSplitButton: NSView {
 // MARK: - Main Source Control Controller
 
 @MainActor
-final class SourceControlController: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
+final class SourceControlController: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     private enum SectionType {
         case staged
         case unstaged
@@ -351,18 +497,13 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
     /// (not new or deleted files) use it; the rest go to `onOpen`.
     var onOpenDiff: ((String) -> Void)?
     var onRefresh: (() -> Void)?
-    /// Called when AI commit message generation starts or stops.
-    var onGeneratingChanged: ((Bool) -> Void)?
 
     override init() {
         super.init()
         view.translatesAutoresizingMaskIntoConstraints = false
-        messageContainer.generateButton.onGeneratingChanged = { [weak self] generating in
-            self?.onGeneratingChanged?(generating)
-        }
-
-        messageContainer.textField.delegate = self
-        messageContainer.textField.placeholderString = "Message (⌘Enter to commit)"
+        messageContainer.placeholder = "Message (⌘Enter to commit)"
+        messageContainer.onTextChange = { [weak self] in self?.updateCommitButtonState() }
+        messageContainer.onCommandReturn = { [weak self] in self?.commit(nil) }
         messageContainer.translatesAutoresizingMaskIntoConstraints = false
         messageContainer.onGenerate = { [weak self] in
             self?.generateCommitMessage()
@@ -435,7 +576,7 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
     @available(*, unavailable) required init?(coder: NSCoder) { fatalError() }
 
     func focusMessageInput() {
-        view.window?.makeFirstResponder(messageContainer.textField)
+        view.window?.makeFirstResponder(messageContainer.textView)
     }
 
     func refresh(status: GitStatusInfo?) {
@@ -502,27 +643,6 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         splitCommitButton.isEnabled = hasChanges
     }
 
-    func controlTextDidChange(_ obj: Notification) {
-        updateCommitButtonState()
-    }
-
-    func controlTextDidBeginEditing(_ obj: Notification) {
-        messageContainer.setFocused(true)
-    }
-
-    func controlTextDidEndEditing(_ obj: Notification) {
-        messageContainer.setFocused(false)
-    }
-
-    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
-        if commandSelector == #selector(NSResponder.insertNewline(_:)) {
-            if NSEvent.modifierFlags.contains(.command) {
-                commit(nil)
-                return true
-            }
-        }
-        return false
-    }
 
     // MARK: - NSTableViewDataSource & Delegate
 
@@ -667,11 +787,11 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
 
     private func updatePlaceholderString() {
         // Short placeholder so it fits a narrow sidebar; the branch is in the tooltip.
-        messageContainer.textField.placeholderString = "Message (⌘↩ to commit)"
+        messageContainer.placeholder = "Message (⌘↩ to commit)"
         if let branch = currentBranch, !branch.isEmpty {
-            messageContainer.textField.toolTip = "⌘Enter to commit on '\(branch)'"
+            messageContainer.textView.toolTip = "⌘Enter to commit on '\(branch)'"
         } else {
-            messageContainer.textField.toolTip = "⌘Enter to commit"
+            messageContainer.textView.toolTip = "⌘Enter to commit"
         }
     }
 
@@ -694,7 +814,7 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
 
         // If AI / LLM is not configured, immediately use Option 1
         guard AICommitService.shared.isConfigured else {
-            messageContainer.textField.stringValue = fallback
+            messageContainer.text = fallback
             updateCommitButtonState()
             focusMessageInput()
             return
@@ -707,15 +827,15 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         }
 
         guard !diff.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            messageContainer.textField.stringValue = fallback
+            messageContainer.text = fallback
             updateCommitButtonState()
             focusMessageInput()
             return
         }
 
         // Show generating feedback
-        messageContainer.textField.stringValue = ""
-        messageContainer.textField.placeholderString = "Generating with AI…"
+        messageContainer.text = ""
+        messageContainer.placeholder = "Generating with AI…"
         messageContainer.generateButton.isGenerating = true
         messageContainer.generateButton.isEnabled = true
 
@@ -730,10 +850,10 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
                 self.updatePlaceholderString()
 
                 if let generated, !generated.isEmpty {
-                    self.messageContainer.textField.stringValue = generated
+                    self.messageContainer.text = generated
                 } else {
                     // Graceful fallback to Option 1
-                    self.messageContainer.textField.stringValue = fallback
+                    self.messageContainer.text = fallback
                 }
                 self.updateCommitButtonState()
                 self.focusMessageInput()
@@ -746,11 +866,11 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         generateTask?.cancel()
         generateTask = nil
         messageContainer.generateButton.isGenerating = false
-        var msg = messageContainer.textField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        var msg = messageContainer.text.trimmingCharacters(in: .whitespacesAndNewlines)
         if msg.isEmpty {
             // Auto-generate if message was left blank
             generateCommitMessage()
-            msg = messageContainer.textField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            msg = messageContainer.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !msg.isEmpty else {
                 focusMessageInput()
                 return
@@ -764,7 +884,7 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         }
 
         guard (try? workspace.gitCommit(message: msg)) != nil else { return }
-        messageContainer.textField.stringValue = ""
+        messageContainer.text = ""
         updateCommitButtonState()
         onRefresh?()
     }
@@ -774,12 +894,12 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         if stagedChanges.isEmpty && !unstagedChanges.isEmpty {
             stageAll()
         }
-        let msg = messageContainer.textField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let msg = messageContainer.text.trimmingCharacters(in: .whitespacesAndNewlines)
         if msg.isEmpty {
             _ = runGit(args: ["commit", "--amend", "--no-edit"])
         } else {
             _ = runGit(args: ["commit", "--amend", "-m", msg])
-            messageContainer.textField.stringValue = ""
+            messageContainer.text = ""
         }
         updateCommitButtonState()
         onRefresh?()

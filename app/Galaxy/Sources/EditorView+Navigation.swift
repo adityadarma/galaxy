@@ -196,6 +196,93 @@ extension EditorView {
         "mixed", "void", "never", "iterable", "callable", "null", "true", "false",
     ]
 
+    /// Primitive types and literal constants of the other languages. They
+    /// share the `type`/`constant` scopes with user declarations, but there is
+    /// no declaration to open (the lib `.d.ts` interfaces behind them are noise).
+    static let typeScriptBuiltins: Set<String> = [
+        "string", "number", "boolean", "bigint", "symbol", "object", "any", "unknown", "never", "void",
+        "null", "undefined", "true", "false",
+    ]
+    static let rustBuiltins: Set<String> = [
+        "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize",
+        "f32", "f64", "bool", "char", "str", "true", "false",
+    ]
+    static let goBuiltins: Set<String> = [
+        "string", "bool", "byte", "rune", "int", "int8", "int16", "int32", "int64", "uint", "uint8",
+        "uint16", "uint32", "uint64", "uintptr", "float32", "float64", "complex64", "complex128",
+        "nil", "true", "false", "iota",
+    ]
+    static let pythonBuiltins: Set<String> = ["int", "float", "str", "bool", "bytes", "None", "True", "False"]
+
+    /// Names to leave unlinked for `document`'s language, and whether they
+    /// compare case-insensitively (PHP only).
+    static func builtins(for document: DocumentHandle) -> (names: Set<String>, caseInsensitive: Bool)? {
+        if isPHP(document) { return (phpBuiltins, true) }
+        switch document.syntaxLanguage() {
+        case "TypeScript", "TSX", "JavaScript": return (typeScriptBuiltins, false)
+        case "Rust": return (rustBuiltins, false)
+        case "Go": return (goBuiltins, false)
+        case "Python": return (pythonBuiltins, false)
+        default: return nil
+        }
+    }
+
+    static func isJavaScriptFamily(_ document: DocumentHandle) -> Bool {
+        ["TypeScript", "TSX", "JavaScript"].contains(document.syntaxLanguage() ?? "")
+    }
+
+    /// Module path inside the quotes of `import x from 'p'`, `export * from 'p'`,
+    /// `import 'p'`, `require('p')` and `import('p')`; `nil` for any other string.
+    static func importSpecifierRange(in text: String, stringStart: Int, stringEnd: Int) -> Range<Int>? {
+        let units = Array(text.utf16)
+        guard stringStart >= 0, stringEnd <= units.count, stringEnd - stringStart >= 3 else { return nil }
+        let quotes: Set<UInt16> = [UInt16(UInt8(ascii: "'")), UInt16(UInt8(ascii: "\""))]
+        guard quotes.contains(units[stringStart]), units[stringStart] == units[stringEnd - 1] else { return nil }
+        let before = (text as NSString).substring(to: stringStart)
+        guard before.range(of: #"(?:\bfrom|\bimport|\brequire\s*\(|\bimport\s*\()\s*$"#,
+                           options: .regularExpression) != nil else { return nil }
+        return (stringStart + 1)..<(stringEnd - 1)
+    }
+
+    /// The module path under `pos` when it sits in an import/require string
+    /// of a TypeScript or JavaScript file, quotes excluded.
+    func importSpecifier(at pos: TextPos, text: String? = nil) -> (range: Range<Int>, path: String)? {
+        guard let document, Self.isJavaScriptFamily(document) else { return nil }
+        let text = text ?? document.displayLine(line: pos.line)
+        let column = Int(pos.colUtf16)
+        // The widest string run is the whole literal, quotes included.
+        let run = document.viewport(firstLine: pos.line, count: 1).styles
+            .filter { $0.line == pos.line && $0.scope == "string" && Int($0.start) <= column && column < Int($0.end) }
+            .max { ($0.end - $0.start) < ($1.end - $1.start) }
+        guard let run,
+              let range = Self.importSpecifierRange(in: text, stringStart: Int(run.start), stringEnd: Int(run.end)) else { return nil }
+        let path = (text as NSString).substring(with: NSRange(location: range.lowerBound, length: range.count))
+        return (range, path)
+    }
+
+    /// File a relative import points at, trying the extensions and `index`
+    /// files the module resolvers try. `nil` for packages (`react`,
+    /// `node:fs`), which the language server resolves.
+    static func resolveImport(_ spec: String, from file: String) -> String? {
+        guard spec.hasPrefix("./") || spec.hasPrefix("../") || spec == "." || spec == ".." else { return nil }
+        let dir = (file as NSString).deletingLastPathComponent
+        let base = ((dir as NSString).appendingPathComponent(spec) as NSString).standardizingPath
+        let manager = FileManager.default
+        func isFile(_ path: String) -> Bool {
+            var directory: ObjCBool = false
+            return manager.fileExists(atPath: path, isDirectory: &directory) && !directory.boolValue
+        }
+        var candidates = ["", ".ts", ".tsx", ".d.ts", ".js", ".jsx", ".mjs", ".cjs", ".json"].map { base + $0 }
+        // TypeScript ESM imports name the compiled file (`./x.js` for `x.ts`).
+        for (compiled, sources) in [(".js", [".ts", ".tsx", ".d.ts"]), (".jsx", [".tsx"]), (".mjs", [".mts"]), (".cjs", [".cts"])]
+        where base.hasSuffix(compiled) {
+            candidates += sources.map { String(base.dropLast(compiled.count)) + $0 }
+        }
+        candidates += ["index.ts", "index.tsx", "index.d.ts", "index.js", "index.jsx"]
+            .map { (base as NSString).appendingPathComponent($0) }
+        return candidates.first(where: isFile)
+    }
+
     static func isPHP(_ document: DocumentHandle) -> Bool {
         let language = document.syntaxLanguage()?.lowercased() ?? ""
         return language.contains("php") || language.contains("blade")
@@ -207,7 +294,23 @@ extension EditorView {
     func navigableRange(at pos: TextPos, text: String? = nil) -> Range<Int>? {
         guard let document else { return nil }
         let text = text ?? document.displayLine(line: pos.line)
+        // Module paths in imports are links as a whole, punctuation included.
+        if let specifier = importSpecifier(at: pos, text: text) { return specifier.range }
         guard let range = Self.identifierRange(in: text, at: Int(pos.colUtf16)) else { return nil }
+        // A name that is being declared (a parameter in its signature) would
+        // only jump to itself, so it is not offered as a link.
+        if semanticTokens.contains(where: {
+            $0.isDeclaration && $0.line == pos.line
+                && Int($0.start) < range.upperBound && Int($0.start + $0.length) > range.lowerBound
+        }) { return nil }
+        // Built-in types and literals share the `type`/`constant` scopes with
+        // classes and user constants, so filter them by name. PHP is
+        // case-insensitive here (`NULL`, `String`). Checked before the style
+        // lookup: a name without a style run would otherwise stay a link.
+        if let builtins = Self.builtins(for: document) {
+            let word = (text as NSString).substring(with: NSRange(location: range.lowerBound, length: range.count))
+            if builtins.names.contains(builtins.caseInsensitive ? word.lowercased() : word) { return nil }
+        }
         let styles = document.viewport(firstLine: pos.line, count: 1).styles.filter { $0.line == pos.line }
         // Look up the scope at the name itself: PHP grammars may style the
         // `$` of a variable as punctuation.
@@ -217,13 +320,6 @@ extension EditorView {
             return range
         }
         if Self.nonNavigableScopes.contains(run.scope) { return nil }
-        // Built-in types and literals share the `type`/`constant` scopes with
-        // classes and user constants, so filter them by name. PHP is
-        // case-insensitive here (`NULL`, `String`).
-        if Self.isPHP(document),
-           Self.phpBuiltins.contains((text as NSString).substring(with: NSRange(location: range.lowerBound, length: range.count)).lowercased()) {
-            return nil
-        }
         if run.scope == "string" {
             return Self.laravelStringRange(in: text, stringStart: Int(run.start), stringEnd: Int(run.end))
         }

@@ -149,6 +149,129 @@ final class NavigationTests: XCTestCase {
         XCTAssertNil(v.definitionLink)
     }
 
+    func testImportSpecifierRangeCoversOnlyModulePaths() {
+        func range(_ text: String, _ literal: String) -> String? {
+            let ns = text as NSString
+            let r = ns.range(of: literal)
+            guard let found = EditorView.importSpecifierRange(in: text, stringStart: r.location, stringEnd: r.location + r.length)
+            else { return nil }
+            return ns.substring(with: NSRange(location: found.lowerBound, length: found.count))
+        }
+        XCTAssertEqual(range("import type { A } from '../config/env'", "'../config/env'"), "../config/env")
+        XCTAssertEqual(range("import fs from 'node:fs/promises'", "'node:fs/promises'"), "node:fs/promises")
+        XCTAssertEqual(range("export * from \"./x\"", "\"./x\""), "./x")
+        XCTAssertEqual(range("import './polyfill'", "'./polyfill'"), "./polyfill")
+        XCTAssertEqual(range("const a = require('lodash')", "'lodash'"), "lodash")
+        XCTAssertEqual(range("const a = await import('./lazy')", "'./lazy'"), "./lazy")
+        XCTAssertNil(range("const s = 'hello'", "'hello'"))
+        XCTAssertNil(range("console.log('from')", "'from'"))
+        XCTAssertNil(range("import x from ''", "''"))
+    }
+
+    func testRelativeImportsResolveToFilesOnDisk() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-imp-\(UUID().uuidString)")
+        let manager = FileManager.default
+        try manager.createDirectory(at: dir.appendingPathComponent("config"), withIntermediateDirectories: true)
+        try manager.createDirectory(at: dir.appendingPathComponent("drivers"), withIntermediateDirectories: true)
+        try manager.createDirectory(at: dir.appendingPathComponent("src"), withIntermediateDirectories: true)
+        defer { try? manager.removeItem(at: dir) }
+        for name in ["config/env.ts", "drivers/index.ts", "src/util.ts", "src/data.json", "src/main.ts"] {
+            try "x".write(to: dir.appendingPathComponent(name), atomically: true, encoding: .utf8)
+        }
+        let main = dir.appendingPathComponent("src/main.ts").path
+        func resolve(_ spec: String) -> String? {
+            EditorView.resolveImport(spec, from: main).map { $0.replacingOccurrences(of: dir.standardizedFileURL.path + "/", with: "") }
+        }
+        XCTAssertEqual(resolve("../config/env"), "config/env.ts", "extension is added")
+        XCTAssertEqual(resolve("../drivers"), "drivers/index.ts", "a folder resolves to its index")
+        XCTAssertEqual(resolve("./util.js"), "src/util.ts", "ESM style .js names the .ts source")
+        XCTAssertEqual(resolve("./data.json"), "src/data.json")
+        XCTAssertNil(resolve("./missing"))
+        XCTAssertNil(resolve("node:fs/promises"), "packages are left to the language server")
+        XCTAssertNil(resolve("react"))
+    }
+
+    func testCommandHoverLinksImportPaths() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-impl-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let file = dir.appendingPathComponent("a.ts")
+        let lines = ["import type { AgentEnv } from '../config/env'", "import fs from 'node:fs/promises'", "const s = 'hello'"]
+        try (lines.joined(separator: "\n") + "\n").write(to: file, atomically: true, encoding: .utf8)
+        let c = MainWindowController(bridge: CoreBridge())
+        c.showWindow(nil)
+        defer { c.window?.orderOut(nil) }
+        try c.openFile(at: file)
+        let v = c.editorView
+        v.onDefinitionClick = { _ in true }
+        let deadline = Date().addingTimeInterval(5)
+        while v.document?.viewport(firstLine: 0, count: 3).styles.isEmpty ?? true, Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
+        func link(line: Int, at needle: String) -> (UInt64, UInt64)? {
+            let text = lines[line]
+            let column = (text as NSString).range(of: needle).location
+            v.lastMousePoint = NSPoint(x: v.textOriginX + v.xOffset(in: text, column: UInt64(column)) + 0.5,
+                                       y: CGFloat(line) * v.metrics.lineHeight + v.metrics.lineHeight / 2)
+            v.updateDefinitionLink(commandHeld: true)
+            return v.definitionLink.map { ($0.start, $0.end) }
+        }
+        let first = (lines[0] as NSString).range(of: "../config/env")
+        XCTAssertEqual(link(line: 0, at: "env")?.0, UInt64(first.location), "the whole path is one link")
+        XCTAssertEqual(link(line: 0, at: "env")?.1, UInt64(first.location + first.length))
+        XCTAssertNotNil(link(line: 0, at: "/config"), "slashes are part of the link")
+        XCTAssertNotNil(link(line: 1, at: "node:fs"), "package paths are links too")
+        XCTAssertNil(link(line: 2, at: "hello"), "other strings are not links")
+    }
+
+    func testCommandHoverSkipsPrimitiveTypesOutsidePHPToo() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-prim-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let file = dir.appendingPathComponent("a.ts")
+        let line = "function f(a: string, b: Foo | null, c: number) {}"
+        try (line + "\n").write(to: file, atomically: true, encoding: .utf8)
+        let c = MainWindowController(bridge: CoreBridge())
+        c.showWindow(nil)
+        defer { c.window?.orderOut(nil) }
+        try c.openFile(at: file)
+        let v = c.editorView
+        v.onDefinitionClick = { _ in true }
+        func link(_ word: String) -> Bool {
+            let column = (line as NSString).range(of: word).location + 1
+            v.lastMousePoint = NSPoint(x: v.textOriginX + v.xOffset(in: line, column: UInt64(column)) + 0.5,
+                                       y: v.metrics.lineHeight / 2)
+            v.updateDefinitionLink(commandHeld: true)
+            return v.definitionLink != nil
+        }
+        XCTAssertFalse(link("string"))
+        XCTAssertFalse(link("null"))
+        XCTAssertFalse(link("number"))
+        XCTAssertTrue(link("Foo"), "a user type stays a link")
+        XCTAssertTrue(link("f("), "the function name stays a link")
+    }
+
+    func testCommandHoverSkipsNamesThatAreBeingDeclared() throws {
+        let c = try makeController(text: "function exec(command: string): void {}\nexec(command)")
+        let v = c.editorView
+        v.onDefinitionClick = { _ in true }
+        let text = "function exec(command: string): void {}"
+        let column = (text as NSString).range(of: "command").location
+        v.semanticTokens = [
+            SemanticTokenInfo(line: 0, start: UInt64(column), length: 7, scope: "variable", isDeclaration: true),
+        ]
+        func link(line: Int, column: Int) -> Bool {
+            let source = line == 0 ? text : "exec(command)"
+            v.lastMousePoint = NSPoint(x: v.textOriginX + v.xOffset(in: source, column: UInt64(column)) + 0.5,
+                                       y: CGFloat(line) * v.metrics.lineHeight + v.metrics.lineHeight / 2)
+            v.updateDefinitionLink(commandHeld: true)
+            return v.definitionLink != nil
+        }
+        XCTAssertFalse(link(line: 0, column: column + 2), "a declared parameter would only jump to itself")
+        XCTAssertTrue(link(line: 0, column: 9), "the function name stays a link")
+        XCTAssertTrue(link(line: 1, column: 7), "a use of the parameter stays a link")
+    }
+
     func testCommandHoverSkipsKeywordsButKeepsNames() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-link-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

@@ -524,4 +524,27 @@ final class ExplorerTests: XCTestCase {
         let second = explorer.outlineView.rect(ofRow: 1)
         XCTAssertEqual(second.minY - first.minY, 22, accuracy: 0.5, "rows must be 22 pt apart")
     }
+
+    // MARK: Stale hover
+
+    private func crossing(_ type: NSEvent.EventType) -> NSEvent {
+        NSEvent.enterExitEvent(with: type, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0,
+                               context: nil, eventNumber: 0, trackingNumber: 0, userData: nil)!
+    }
+
+    func testRecycledRowViewDoesNotKeepItsHoverTint() {
+        let row = ExplorerRowView()
+        row.mouseEntered(with: crossing(.mouseEntered))
+        XCTAssertTrue(row.isHovered)
+        // The table recycles the view for another row without a mouseExited.
+        row.prepareForReuse()
+        XCTAssertFalse(row.isHovered, "a recycled row starts without a hover tint")
+    }
+
+    func testRowWithoutAWindowIsNotHovered() {
+        let row = ExplorerRowView()
+        row.mouseEntered(with: crossing(.mouseEntered))
+        row.updateTrackingAreas()
+        XCTAssertFalse(row.isHovered, "no window means no pointer over the row")
+    }
 }

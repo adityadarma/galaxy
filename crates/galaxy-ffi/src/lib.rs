@@ -1350,7 +1350,8 @@ impl Core {
                 line: token.line,
                 start: token.start,
                 length: token.length,
-                token_type: token.token_type,
+                scope: token.scope.clone(),
+                is_declaration: token.is_declaration,
             })
             .collect()
     }
@@ -1461,7 +1462,10 @@ pub struct SemanticTokenInfo {
     pub line: u64,
     pub start: u64,
     pub length: u64,
-    pub token_type: u64,
+    /// Theme scope, as in `StyleRun.scope`.
+    pub scope: String,
+    /// Declares the name (a parameter in its signature) rather than uses it.
+    pub is_declaration: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]

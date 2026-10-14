@@ -109,7 +109,11 @@ pub struct SemanticTokenInfo {
     pub line: u64,
     pub start: u64,
     pub length: u64,
-    pub token_type: u64,
+    /// Theme scope (`type`, `variable`, ...) the token type maps to.
+    pub scope: String,
+    /// The token names the thing it declares (a parameter in its signature),
+    /// so jumping to its definition would only land on itself.
+    pub is_declaration: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -769,6 +773,10 @@ pub enum LspEvent {
 struct ManagedServer {
     transport: LspTransport,
     initialized: bool,
+    /// `semanticTokensProvider.legend.tokenTypes` from the initialize reply.
+    semantic_legend: Vec<String>,
+    /// Bit of the `declaration` modifier in the server's modifier legend.
+    declaration_bit: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -858,6 +866,8 @@ impl LspManager {
             ManagedServer {
                 transport,
                 initialized: false,
+                semantic_legend: Vec::new(),
+                declaration_bit: None,
             },
         );
         self.configs.insert(key, config.clone());
@@ -1647,6 +1657,8 @@ impl LspManager {
                             && message.get("id") == Some(&Value::from(0))
                             && message.get("method").is_none() =>
                     {
+                        server.semantic_legend = parse_semantic_legend(&message);
+                        server.declaration_bit = parse_declaration_bit(&message);
                         match server.transport.send(&serde_json::json!({"jsonrpc": "2.0", "method": "initialized", "params": {}})) {
                             Ok(()) => {
                                 server.initialized = true;
@@ -1772,8 +1784,11 @@ impl LspManager {
                             self.workspace_symbols.insert(root, result);
                         }
                         if let Some(uri) = self.semantic_token_requests.remove(&(key.clone(), id))
-                            && let Some(result) =
-                                message.get("result").and_then(parse_semantic_tokens)
+                            && let Some(result) = message
+                                .get("result")
+                                .and_then(|value| {
+                                    parse_semantic_tokens(value, &server.semantic_legend, server.declaration_bit)
+                                })
                         {
                             self.semantic_tokens.insert(uri, result);
                         }
@@ -2199,7 +2214,50 @@ fn range_to_value(range: &Range) -> Value {
     })
 }
 
-fn parse_semantic_tokens(value: &Value) -> Option<Vec<SemanticTokenInfo>> {
+/// Token type names the server announced in its initialize reply.
+fn parse_semantic_legend(initialize: &Value) -> Vec<String> {
+    initialize
+        .pointer("/result/capabilities/semanticTokensProvider/legend/tokenTypes")
+        .and_then(Value::as_array)
+        .map(|names| {
+            names
+                .iter()
+                .map(|name| name.as_str().unwrap_or_default().to_owned())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Position of `declaration` among the server's token modifiers.
+fn parse_declaration_bit(initialize: &Value) -> Option<u32> {
+    let position = initialize
+        .pointer("/result/capabilities/semanticTokensProvider/legend/tokenModifiers")?
+        .as_array()?
+        .iter()
+        .position(|name| name.as_str() == Some("declaration"))?;
+    u32::try_from(position).ok().filter(|bit| *bit < 64)
+}
+
+/// Theme scope for an LSP semantic token type. Keywords, literals, comments
+/// and operators return `None`: Tree-sitter already colors those, and the
+/// server only adds value on names (types, functions, variables).
+fn semantic_scope(token_type: &str) -> Option<&'static str> {
+    Some(match token_type {
+        "namespace" | "type" | "class" | "enum" | "interface" | "struct" | "typeParameter" => "type",
+        "parameter" | "variable" => "variable",
+        "property" | "event" => "property",
+        "enumMember" => "constant",
+        "function" | "method" | "macro" => "function",
+        "decorator" => "attribute",
+        _ => return None,
+    })
+}
+
+fn parse_semantic_tokens(
+    value: &Value,
+    legend: &[String],
+    declaration_bit: Option<u32>,
+) -> Option<Vec<SemanticTokenInfo>> {
     let data = value.get("data")?.as_array()?;
     let mut line = 0;
     let mut start = 0;
@@ -2213,11 +2271,18 @@ fn parse_semantic_tokens(value: &Value) -> Option<Vec<SemanticTokenInfo>> {
         } else {
             delta_start
         };
+        let length = chunk[2].as_u64()?;
+        let token_type = usize::try_from(chunk[3].as_u64()?).ok()?;
+        let Some(scope) = legend.get(token_type).and_then(|name| semantic_scope(name)) else {
+            continue;
+        };
         output.push(SemanticTokenInfo {
             line,
             start,
-            length: chunk[2].as_u64()?,
-            token_type: chunk[3].as_u64()?,
+            length,
+            scope: scope.to_owned(),
+            is_declaration: declaration_bit
+                .is_some_and(|bit| chunk[4].as_u64().is_some_and(|modifiers| modifiers >> bit & 1 == 1)),
         });
     }
     Some(output)
@@ -2631,28 +2696,68 @@ mod tests {
     use std::time::Instant;
     use tokio::io::AsyncWriteExt;
 
+    fn legend(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
     #[test]
     fn parses_delta_encoded_semantic_tokens() {
-        let value = serde_json::json!({ "data": [1, 2, 3, 4, 0, 0, 5, 2, 1, 0] });
-        let tokens = parse_semantic_tokens(&value).unwrap();
+        let legend = legend(&["keyword", "parameter", "class"]);
+        let value = serde_json::json!({ "data": [1, 2, 3, 2, 0, 0, 5, 2, 1, 0] });
+        let tokens = parse_semantic_tokens(&value, &legend, Some(0)).unwrap();
         assert_eq!(
-            tokens[0],
-            SemanticTokenInfo {
-                line: 1,
-                start: 2,
-                length: 3,
-                token_type: 4
-            }
+            tokens,
+            vec![
+                SemanticTokenInfo { line: 1, start: 2, length: 3, scope: "type".into(), is_declaration: false },
+                SemanticTokenInfo { line: 1, start: 7, length: 2, scope: "variable".into(), is_declaration: false },
+            ]
         );
+    }
+
+    #[test]
+    fn semantic_tokens_map_legend_names_to_theme_scopes() {
+        let legend = legend(&["parameter", "class", "function", "keyword", "string"]);
+        let value = serde_json::json!({ "data": [0, 0, 1, 0, 0, 0, 2, 3, 1, 0, 0, 4, 1, 2, 0, 0, 2, 4, 3, 0, 0, 4, 2, 4, 0] });
+        let scopes: Vec<_> = parse_semantic_tokens(&value, &legend, Some(0))
+            .unwrap()
+            .into_iter()
+            .map(|token| (token.start, token.scope))
+            .collect();
         assert_eq!(
-            tokens[1],
-            SemanticTokenInfo {
-                line: 1,
-                start: 7,
-                length: 2,
-                token_type: 1
-            }
+            scopes,
+            vec![(0, "variable".into()), (2, "type".into()), (6, "function".into())],
+            "keywords and strings are left to Tree-sitter"
         );
+    }
+
+    #[test]
+    fn declaration_modifier_is_read_from_the_modifier_legend() {
+        let reply = serde_json::json!({ "result": { "capabilities": { "semanticTokensProvider": {
+            "legend": { "tokenTypes": ["parameter"], "tokenModifiers": ["readonly", "declaration"] }
+        } } } });
+        let bit = parse_declaration_bit(&reply);
+        assert_eq!(bit, Some(1));
+        let legend = legend(&["parameter"]);
+        // Modifier bitsets: 0b10 declares, 0b01 only readonly.
+        let value = serde_json::json!({ "data": [0, 0, 3, 0, 2, 0, 5, 3, 0, 1] });
+        let tokens = parse_semantic_tokens(&value, &legend, bit).unwrap();
+        assert_eq!(tokens.iter().map(|t| t.is_declaration).collect::<Vec<_>>(), vec![true, false]);
+        assert_eq!(parse_declaration_bit(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn semantic_tokens_without_a_legend_are_dropped() {
+        let value = serde_json::json!({ "data": [0, 0, 1, 0, 0] });
+        assert!(parse_semantic_tokens(&value, &[], None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn reads_the_legend_from_the_initialize_reply() {
+        let reply = serde_json::json!({ "id": 0, "result": { "capabilities": {
+            "semanticTokensProvider": { "legend": { "tokenTypes": ["class", "parameter"], "tokenModifiers": [] } }
+        } } });
+        assert_eq!(parse_semantic_legend(&reply), legend(&["class", "parameter"]));
+        assert!(parse_semantic_legend(&serde_json::json!({ "result": { "capabilities": {} } })).is_empty());
     }
 
     #[test]

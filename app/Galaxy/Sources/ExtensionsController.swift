@@ -4,7 +4,7 @@ import AppKit
 /// plus what the configured registries offer. All work happens in the
 /// window controller; this view only reports what the user asked for.
 @MainActor
-final class ExtensionsController: NSObject, NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate {
+final class ExtensionsController: NSObject, NSTableViewDataSource, NSTableViewDelegate {
     enum Row: Equatable {
         case header(String)
         case plugin(PluginInfo)
@@ -13,8 +13,6 @@ final class ExtensionsController: NSObject, NSTableViewDataSource, NSTableViewDe
     }
 
     let view = NSView()
-    private let urlField = NSTextField()
-    private let installButton = NSButton(title: "Install", target: nil, action: nil)
     private let table = NSTableView()
     private let scroll = NSScrollView()
     private let statusLabel = NSTextField(labelWithString: "")
@@ -27,7 +25,7 @@ final class ExtensionsController: NSObject, NSTableViewDataSource, NSTableViewDe
     /// Plugin id -> newest upstream commit.
     private var updates: [String: String] = [:]
 
-    /// `URL`, `URL#REF` or `URL#REF:SUBDIR`.
+    /// `URL`, `URL#REF` or `URL#REF:SUBDIR`, or `builtin:ID`.
     var onInstallSpec: ((_ spec: String, _ sha256: String?) -> Void)?
     var onUninstall: ((String) -> Void)?
     var onSetEnabled: ((_ id: String, _ enabled: Bool) -> Void)?
@@ -37,20 +35,6 @@ final class ExtensionsController: NSObject, NSTableViewDataSource, NSTableViewDe
         super.init()
         view.translatesAutoresizingMaskIntoConstraints = false
         view.setAccessibilityIdentifier("extensions-sidebar")
-
-        urlField.placeholderString = "Git URL, e.g. https://host/repo.git#v1.0:plugins/php"
-        urlField.font = .systemFont(ofSize: 12)
-        urlField.lineBreakMode = .byTruncatingMiddle
-        urlField.delegate = self
-        urlField.setAccessibilityIdentifier("extensions-url")
-        urlField.translatesAutoresizingMaskIntoConstraints = false
-
-        installButton.bezelStyle = .rounded
-        installButton.controlSize = .small
-        installButton.target = self
-        installButton.action = #selector(installFromField(_:))
-        installButton.setAccessibilityIdentifier("extensions-install")
-        installButton.translatesAutoresizingMaskIntoConstraints = false
 
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("extensions"))
         column.resizingMask = .autoresizingMask
@@ -74,17 +58,10 @@ final class ExtensionsController: NSObject, NSTableViewDataSource, NSTableViewDe
         statusLabel.lineBreakMode = .byTruncatingTail
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        view.addSubview(urlField)
-        view.addSubview(installButton)
         view.addSubview(statusLabel)
         view.addSubview(scroll)
         NSLayoutConstraint.activate([
-            urlField.topAnchor.constraint(equalTo: view.topAnchor, constant: 10),
-            urlField.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 10),
-            installButton.leadingAnchor.constraint(equalTo: urlField.trailingAnchor, constant: 6),
-            installButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -10),
-            installButton.centerYAnchor.constraint(equalTo: urlField.centerYAnchor),
-            statusLabel.topAnchor.constraint(equalTo: urlField.bottomAnchor, constant: 6),
+            statusLabel.topAnchor.constraint(equalTo: view.topAnchor, constant: 8),
             statusLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 12),
             statusLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -10),
             scroll.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 6),
@@ -113,17 +90,13 @@ final class ExtensionsController: NSObject, NSTableViewDataSource, NSTableViewDe
 
     var statusText: String { statusLabel.stringValue }
 
-    func clearField() {
-        urlField.stringValue = ""
-    }
-
     private func rebuild() {
         var rows: [Row] = []
         let installed = plugins.filter { !$0.builtin }
         let builtin = plugins.filter(\.builtin)
         rows.append(.header("INSTALLED"))
         if installed.isEmpty {
-            rows.append(.message("Nothing installed. Paste a git URL above."))
+            rows.append(.message("Nothing installed. Use Install on a built-in or available plugin."))
         } else {
             rows += installed.map(Row.plugin)
         }
@@ -232,18 +205,6 @@ final class ExtensionsController: NSObject, NSTableViewDataSource, NSTableViewDe
     }
 
     // MARK: Actions
-
-    @objc private func installFromField(_ sender: Any?) {
-        let spec = urlField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !spec.isEmpty else { NSSound.beep(); return }
-        onInstallSpec?(spec, nil)
-    }
-
-    func control(_ control: NSControl, textView: NSTextView, doCommandBy selector: Selector) -> Bool {
-        guard selector == #selector(NSResponder.insertNewline(_:)) else { return false }
-        installFromField(nil)
-        return true
-    }
 
     @objc private func installAvailableClicked(_ sender: NSButton) {
         guard rows.indices.contains(sender.tag), case .available(let entry) = rows[sender.tag] else { return }

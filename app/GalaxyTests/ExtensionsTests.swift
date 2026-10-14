@@ -44,7 +44,8 @@ final class ExtensionsTests: XCTestCase {
         let messages = controller.rows.compactMap { row -> String? in
             if case .message(let text) = row { text } else { nil }
         }
-        XCTAssertTrue(messages.contains { $0.contains("paste a git URL") || $0.contains("Paste a git URL") })
+        XCTAssertTrue(messages.contains { $0.contains("Nothing installed") })
+        XCTAssertFalse(messages.contains { $0.lowercased().contains("paste a git url") }, "there is no URL field to paste into")
         XCTAssertTrue(messages.contains { $0.contains("No registry") })
     }
 
@@ -172,5 +173,14 @@ final class ExtensionsTests: XCTestCase {
         }
         addTeardownBlock { try? FileManager.default.removeItem(at: repo) }
         return repo
+    }
+
+    func testSidebarHasNoGitURLFieldOrInstallButton() {
+        let controller = ExtensionsController()
+        func allViews(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(allViews) }
+        let views = allViews(controller.view)
+        XCTAssertFalse(views.contains { $0.accessibilityIdentifier() == "extensions-url" })
+        XCTAssertFalse(views.contains { $0.accessibilityIdentifier() == "extensions-install" })
+        XCTAssertFalse(views.contains { ($0 as? NSTextField)?.isEditable == true }, "nothing to type into here")
     }
 }
