@@ -25,6 +25,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     let activityBar = ActivityBar()
     private let sourceControl = SourceControlController()
     private let searchSidebar = SearchSidebarController()
+    let extensions = ExtensionsController()
+    private var extensionsGeneration = 0
     private(set) var activeSidebarTab: ActivityBar.Item = .explorer
     let tabBar = TabBar()
     /// Open documents, in tab order (M2-06).
@@ -609,6 +611,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 } else {
                     self.showSearchTab()
                 }
+            case .extensions:
+                self.showExtensionsAction(nil)
             }
         }
         titleBar.onToggleSidebar = { [weak self] in self?.toggleSidebarVisibility(nil) }
@@ -620,6 +624,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             self.openWorkspaceFile(workspace, FileEntry(name: (relPath as NSString).lastPathComponent, relPath: relPath, isDir: false), preview: false)
         }
         sourceControl.onRefresh = { [weak self] in self?.refreshGitStatus() }
+        extensions.onInstallSpec = { [weak self] spec, sha in self?.installPlugin(spec: spec, sha256: sha) }
+        extensions.onUpdate = { [weak self] plugin in
+            guard let source = plugin.source else { return }
+            self?.installPlugin(spec: source, sha256: nil)
+        }
+        extensions.onUninstall = { [weak self] id in self?.uninstallPlugin(id: id) }
+        extensions.onSetEnabled = { [weak self] id, enabled in self?.setPluginEnabled(id: id, enabled: enabled) }
         searchSidebar.onSearch = { [weak self] query, options in self?.searchSidebarWorkspace(query, options: options) }
         searchSidebar.onOpen = { [weak self] match in self?.openSearchSidebarMatch(match) }
         searchSidebar.onReplaceAll = { [weak self] query, replacement, options in
@@ -1372,6 +1383,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         sectionHeader.onScmRefresh = { [weak self] in self?.refreshGitStatus() }
         sectionHeader.onScmHistory = { [weak self] in self?.showGitBranchPicker() }
         sectionHeader.scmMoreMenu = { [weak self] in self?.sourceControl.moreActionsMenu() ?? NSMenu() }
+        sectionHeader.onExtensionsRefresh = { [weak self] in self?.refreshExtensions(network: true) }
+        sectionHeader.onExtensionsAddRegistry = { [weak self] in self?.addPluginRegistry() }
         sectionHeader.onSearchRefresh = { [weak self] in self?.searchSidebar.refresh() }
         sectionHeader.onSearchClear = { [weak self] in self?.searchSidebar.clearQuery() }
         sectionHeader.onSearchToggleReplace = { [weak self] in self?.searchSidebar.toggleReplace() }
@@ -1408,6 +1421,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         sidebar.addSubview(explorer.scrollView)
         sidebar.addSubview(sourceControl.view)
         sidebar.addSubview(searchSidebar.view)
+        sidebar.addSubview(extensions.view)
         sidebar.addSubview(emptyState)
         NSLayoutConstraint.activate([
             sectionHeader.topAnchor.constraint(equalTo: sidebar.topAnchor),
@@ -1425,6 +1439,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             searchSidebar.view.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor),
             searchSidebar.view.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor),
             searchSidebar.view.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor),
+            extensions.view.topAnchor.constraint(equalTo: sectionHeader.bottomAnchor),
+            extensions.view.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor),
+            extensions.view.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor),
+            extensions.view.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor),
             emptyState.centerXAnchor.constraint(equalTo: sidebar.centerXAnchor).withPriority(.defaultHigh),
             emptyState.centerYAnchor.constraint(equalTo: sidebar.centerYAnchor, constant: -20),
             emptyState.leadingAnchor.constraint(greaterThanOrEqualTo: sidebar.leadingAnchor, constant: 16).withPriority(.defaultLow),
@@ -1432,6 +1450,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         ])
         sourceControl.view.isHidden = true
         searchSidebar.view.isHidden = true
+        extensions.view.isHidden = true
     }
 
     // MARK: Sidebar
@@ -1543,6 +1562,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         case .explorer:
             sourceControl.view.isHidden = true
             searchSidebar.view.isHidden = true
+            extensions.view.isHidden = true
             let hasWorkspace = workspace != nil
             explorer.scrollView.isHidden = !hasWorkspace
             emptyState.isHidden = hasWorkspace
@@ -1554,6 +1574,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             explorer.scrollView.isHidden = true
             emptyState.isHidden = true
             searchSidebar.view.isHidden = true
+            extensions.view.isHidden = true
             sourceControl.view.isHidden = false
             sourceControl.workspace = workspace
             sourceControl.refresh(status: workspace.flatMap { bridge.gitStatus(workspace: $0) })
@@ -1565,9 +1586,19 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             sourceControl.view.isHidden = true
             emptyState.isHidden = true
             searchSidebar.view.isHidden = false
+            extensions.view.isHidden = true
             sectionHeader.mode = .search
             sectionHeader.title = "SEARCH"
             activityBar.setActive(isSidebarVisible ? .search : nil)
+        case .extensions:
+            explorer.scrollView.isHidden = true
+            sourceControl.view.isHidden = true
+            emptyState.isHidden = true
+            searchSidebar.view.isHidden = true
+            extensions.view.isHidden = false
+            sectionHeader.mode = .extensions
+            sectionHeader.title = "EXTENSIONS"
+            activityBar.setActive(isSidebarVisible ? .extensions : nil)
         }
     }
 
@@ -1583,6 +1614,21 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         updateSidebarContent()
         setSidebarVisible(true)
         sourceControl.focusMessageInput()
+    }
+
+    @objc func showExtensionsAction(_ sender: Any?) {
+        if isSidebarVisible && activeSidebarTab == .extensions {
+            setSidebarVisible(false)
+        } else {
+            showExtensionsTab()
+        }
+    }
+
+    func showExtensionsTab() {
+        activeSidebarTab = .extensions
+        updateSidebarContent()
+        setSidebarVisible(true)
+        refreshExtensions(network: false)
     }
 
     func showSearchTab() {
@@ -2217,6 +2263,164 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         alert.addButton(withTitle: "Cancel")
         alert.window.initialFirstResponder = field
         return alert.runModal() == .alertFirstButtonReturn ? field.stringValue : nil
+    }
+
+    // MARK: Extensions (language server plugins)
+
+    /// Shows what an install will run and asks before anything executes.
+    /// Tests replace it.
+    var askConfirmPluginInstall: (_ preview: PluginPreview) -> Bool = { preview in
+        let alert = NSAlert()
+        let verb = preview.previousCommit == nil ? "Install" : "Update"
+        alert.messageText = "\(verb) \"\(preview.name)\" \(preview.version)?"
+        var lines = [
+            "Source: \(preview.source)",
+            "Commit: \(preview.commit.prefix(12))" + (preview.verified ? " (checksum verified)" : ""),
+            "Server: \(preview.server)",
+            "",
+        ]
+        if preview.commands.isEmpty {
+            lines.append("No install commands.")
+        } else {
+            lines.append("These commands run with your permissions:")
+            lines += preview.commands.map { "  \($0)" }
+        }
+        lines += ["", "Only continue if you trust this source."]
+        alert.informativeText = lines.joined(separator: "\n")
+        alert.addButton(withTitle: verb)
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    var askConfirmPluginUninstall: (_ id: String) -> Bool = { id in
+        let alert = NSAlert()
+        alert.messageText = "Uninstall \"\(id)\"?"
+        alert.informativeText = "Its folder is deleted. Built-in plugins are not affected."
+        alert.addButton(withTitle: "Uninstall")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    var askRegistryURL: () -> String? = {
+        let alert = NSAlert()
+        alert.messageText = "Add Plugin Registry"
+        alert.informativeText = "A git URL (URL#REF to pin a branch or tag) or an absolute folder containing index.json."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        field.placeholderString = "https://host/plugins.git#main"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Add")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        return alert.runModal() == .alertFirstButtonReturn ? field.stringValue : nil
+    }
+
+    /// Reloads the list from disk; with `network`, also reads registries and
+    /// checks installed plugins for newer commits.
+    func refreshExtensions(network: Bool) {
+        extensions.show(plugins: pluginList(), hasRegistries: !pluginRegistries().isEmpty)
+        guard network else { return }
+        extensionsGeneration += 1
+        let generation = extensionsGeneration
+        extensions.setStatus("Checking registries and updates…")
+        Task.detached(priority: .utility) { [weak self] in
+            let listing = pluginRegistryEntries()
+            var updates: [String: String] = [:]
+            for plugin in pluginList() where !plugin.builtin {
+                if let latest = try? pluginCheckUpdate(id: plugin.id) { updates[plugin.id] = latest }
+            }
+            await MainActor.run {
+                guard let self, self.extensionsGeneration == generation else { return }
+                self.extensions.show(plugins: pluginList(), available: listing.entries,
+                                     registryErrors: listing.errors, hasRegistries: !pluginRegistries().isEmpty,
+                                     updates: updates)
+                self.extensions.setStatus(updates.isEmpty ? "Up to date." : "\(updates.count) update(s) available.")
+            }
+        }
+    }
+
+    func installPlugin(spec: String, sha256: String?) {
+        extensions.setStatus("Fetching \(spec)…")
+        Task.detached(priority: .userInitiated) { [weak self] in
+            let result = Result { try pluginFetch(spec: spec, sha256: sha256) }
+            await MainActor.run {
+                guard let self else { return }
+                switch result {
+                case .failure(let error):
+                    self.extensions.setStatus("Could not fetch: \(Self.describe(error))")
+                case .success(let preview):
+                    guard self.askConfirmPluginInstall(preview) else {
+                        Task.detached { try? pluginDiscard(token: preview.token) }
+                        self.extensions.setStatus("Cancelled.")
+                        return
+                    }
+                    self.extensions.setStatus("Installing \(preview.name)…")
+                    Task.detached(priority: .userInitiated) { [weak self] in
+                        let installed = Result { try pluginInstall(token: preview.token) }
+                        await MainActor.run {
+                            guard let self else { return }
+                            switch installed {
+                            case .success:
+                                self.extensions.clearField()
+                                self.extensions.setStatus("Installed \(preview.name) \(preview.version).")
+                                self.pluginsChanged()
+                            case .failure(let error):
+                                self.extensions.setStatus("Install failed: \(Self.describe(error))")
+                                if let window = self.window {
+                                    let alert = NSAlert()
+                                    alert.messageText = "Could not install \(preview.name)"
+                                    alert.informativeText = Self.describe(error)
+                                    alert.beginSheetModal(for: window)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    func uninstallPlugin(id: String) {
+        guard askConfirmPluginUninstall(id) else { return }
+        do {
+            try pluginUninstall(id: id)
+            extensions.setStatus("Uninstalled \(id).")
+            pluginsChanged()
+        } catch {
+            extensions.setStatus("Uninstall failed: \(Self.describe(error))")
+        }
+    }
+
+    func setPluginEnabled(id: String, enabled: Bool) {
+        do {
+            try pluginSetEnabled(id: id, enabled: enabled)
+            extensions.setStatus("\(enabled ? "Enabled" : "Disabled") \(id).")
+            pluginsChanged()
+        } catch {
+            extensions.setStatus("Could not change \(id): \(Self.describe(error))")
+        }
+    }
+
+    func addPluginRegistry() {
+        guard let url = askRegistryURL()?.trimmingCharacters(in: .whitespacesAndNewlines), !url.isEmpty else { return }
+        do {
+            try pluginAddRegistry(url: url)
+            refreshExtensions(network: true)
+        } catch {
+            extensions.setStatus("Could not add registry: \(Self.describe(error))")
+        }
+    }
+
+    /// Refreshes the list and restarts the active document's server so it
+    /// runs the plugin set that is now installed.
+    private func pluginsChanged() {
+        refreshExtensions(network: false)
+        guard activeTab != nil, workspace != nil else { return }
+        restartLanguageServer(nil)
+    }
+
+    private static func describe(_ error: Error) -> String {
+        if case CoreError.Io(let message) = error { return message }
+        return String(describing: error)
     }
 
     @objc func explorerNewFile(_ sender: Any?) { createExplorerItem(folder: false) }
@@ -3599,6 +3803,7 @@ final class SidebarSectionHeader: NSView {
         case explorer
         case sourceControl
         case search
+        case extensions
     }
 
     static var height: CGFloat { Theme.tabHeight }
@@ -3637,6 +3842,9 @@ final class SidebarSectionHeader: NSView {
     let searchReplaceButton = SidebarSectionHeader.tool("doc.badge.plus", "Toggle Replace")
     let searchFilterButton = SidebarSectionHeader.tool("line.3.horizontal.decrease", "Search Filters")
     let searchMoreButton = SidebarSectionHeader.tool("ellipsis", "More Search Actions…")
+    let extensionsAddRegistryButton = SidebarSectionHeader.tool("plus", "Add Registry…")
+    let extensionsRefreshButton = SidebarSectionHeader.tool("arrow.clockwise", "Refresh and Check for Updates")
+    var extensionsTools: [NSButton] { [extensionsAddRegistryButton, extensionsRefreshButton] }
     var searchTools: [NSButton] { [searchRefreshButton, searchClearButton, searchReplaceButton, searchFilterButton, searchMoreButton] }
 
     var onNewFile: (() -> Void)?
@@ -3655,6 +3863,8 @@ final class SidebarSectionHeader: NSView {
     var onScmHistory: (() -> Void)?
     var scmMoreMenu: (() -> NSMenu)?
     var onSearchRefresh: (() -> Void)?
+    var onExtensionsRefresh: (() -> Void)?
+    var onExtensionsAddRegistry: (() -> Void)?
     var onSearchClear: (() -> Void)?
     var onSearchToggleReplace: (() -> Void)?
     var onSearchToggleDetails: (() -> Void)?
@@ -3738,7 +3948,16 @@ final class SidebarSectionHeader: NSView {
             button.isHidden = true
         }
 
-        let row = NSStackView(views: [scmChevron, label] + tools + scmTools + searchTools)
+        for (button, action) in [
+            (extensionsAddRegistryButton, #selector(extensionsAddRegistryAction(_:))),
+            (extensionsRefreshButton, #selector(extensionsRefreshAction(_:))),
+        ] {
+            button.target = self
+            button.action = action
+            button.isHidden = true
+        }
+
+        let row = NSStackView(views: [scmChevron, label] + tools + scmTools + searchTools + extensionsTools)
         row.spacing = 3
         row.setCustomSpacing(6, after: label)
         row.translatesAutoresizingMaskIntoConstraints = false
@@ -3761,19 +3980,29 @@ final class SidebarSectionHeader: NSView {
             scmTools.forEach { $0.isHidden = true }
             searchTools.forEach { $0.isHidden = true }
             tools.forEach { $0.isHidden = !showsTools }
+            extensionsTools.forEach { $0.isHidden = true }
             label.stringValue = title.isEmpty ? "EXPLORER" : title.uppercased()
         case .sourceControl:
             scmChevron.isHidden = false
             tools.forEach { $0.isHidden = true }
             scmTools.forEach { $0.isHidden = false }
             searchTools.forEach { $0.isHidden = true }
+            extensionsTools.forEach { $0.isHidden = true }
             label.stringValue = "Changes"
         case .search:
             scmChevron.isHidden = true
             tools.forEach { $0.isHidden = true }
             scmTools.forEach { $0.isHidden = true }
             searchTools.forEach { $0.isHidden = false }
+            extensionsTools.forEach { $0.isHidden = true }
             label.stringValue = "SEARCH"
+        case .extensions:
+            scmChevron.isHidden = true
+            tools.forEach { $0.isHidden = true }
+            scmTools.forEach { $0.isHidden = true }
+            searchTools.forEach { $0.isHidden = true }
+            extensionsTools.forEach { $0.isHidden = false }
+            label.stringValue = "EXTENSIONS"
         }
     }
 
@@ -3831,6 +4060,8 @@ final class SidebarSectionHeader: NSView {
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: scmMoreButton.bounds.maxY + 4), in: scmMoreButton)
     }
     @objc private func searchRefreshAction(_ sender: Any?) { onSearchRefresh?() }
+    @objc private func extensionsRefreshAction(_ sender: Any?) { onExtensionsRefresh?() }
+    @objc private func extensionsAddRegistryAction(_ sender: Any?) { onExtensionsAddRegistry?() }
     @objc private func searchClearAction(_ sender: Any?) { onSearchClear?() }
     @objc private func searchReplaceAction(_ sender: Any?) { onSearchToggleReplace?() }
     @objc private func searchFilterAction(_ sender: Any?) { onSearchToggleDetails?() }

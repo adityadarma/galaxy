@@ -1,0 +1,17 @@
+{
+  "id": "intelephense",
+  "name": "Intelephense",
+  "version": "1.18.5",
+  "description": "PHP language server. Installs into the plugin folder with npm, or uses intelephense from PATH.",
+  "languages": ["php", "blade"],
+  "priority": 10,
+  "server": {
+    "command": ["${pluginDir}/node_modules/.bin/intelephense", "intelephense"],
+    "args": ["--stdio"]
+  },
+  "install": {
+    "steps": [
+      ["npm", "install", "--prefix", "${pluginDir}", "--no-audit", "--no-fund", "--loglevel=error", "intelephense@1.18.5"]
+    ]
+  }
+}

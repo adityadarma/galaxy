@@ -1,0 +1,8 @@
+{
+  "id": "rust-analyzer",
+  "name": "rust-analyzer",
+  "version": "1.0.0",
+  "description": "Rust language server. Uses rust-analyzer from PATH.",
+  "languages": ["rust"],
+  "server": { "command": ["rust-analyzer"] }
+}

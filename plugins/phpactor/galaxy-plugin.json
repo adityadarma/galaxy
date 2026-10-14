@@ -1,0 +1,19 @@
+{
+  "id": "phpactor",
+  "name": "Phpactor",
+  "version": "2026.10.07.0",
+  "description": "PHP language server. Installs into the plugin folder with composer, or uses phpactor from PATH.",
+  "languages": ["php", "blade"],
+  "priority": 20,
+  "server": {
+    "command": ["${pluginDir}/vendor/bin/phpactor", "phpactor"],
+    "args": ["language-server"]
+  },
+  "install": {
+    "steps": [
+      ["composer", "init", "--no-interaction", "--working-dir=${pluginDir}", "--name=galaxy/phpactor", "--stability=dev"],
+      ["composer", "config", "--working-dir=${pluginDir}", "prefer-stable", "true"],
+      ["composer", "require", "--working-dir=${pluginDir}", "--no-interaction", "--no-progress", "phpactor/phpactor:2026.10.07.0"]
+    ]
+  }
+}

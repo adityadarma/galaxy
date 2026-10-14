@@ -20,12 +20,15 @@ use galaxy_core::find::{FindError, FindOptions, Finder};
 use galaxy_core::history::{EditKind, Editor};
 use galaxy_core::keymap::{self, Keymap};
 use galaxy_core::lsp::{
-    LARAVEL_COMPANION, LspKey, LspManager, LspSettings, companion_server, lsp_language_id,
+    LspKey, LspManager, LspSettings, companion_servers, find_in_path, lsp_language_id,
     lsp_server_language,
 };
 use galaxy_core::movement::{self, Motion};
 use galaxy_core::multicursor;
 use galaxy_core::navigation::{self, Location, NavHistory};
+use galaxy_core::plugins::{
+    self, Catalog, install as plugin_install_mod, registry as plugin_registry_mod,
+};
 use galaxy_core::position::Utf16Position;
 use galaxy_core::selection::{Selection, SelectionSet};
 use galaxy_core::snippets;
@@ -74,6 +77,217 @@ pub enum CoreEvent {
 #[uniffi::export(with_foreign)]
 pub trait CoreListener: Send + Sync {
     fn on_event(&self, event: CoreEvent);
+}
+
+fn plugin_error(message: String) -> CoreError {
+    CoreError::Io { message }
+}
+
+fn plugins_dir() -> Result<PathBuf, CoreError> {
+    plugin_install_mod::default_dir().ok_or_else(|| plugin_error("HOME is not set".into()))
+}
+
+/// Built-in plugins plus those installed; problems are logged, not fatal.
+fn load_catalog() -> Catalog {
+    let Some(dir) = plugin_install_mod::default_dir() else {
+        return Catalog::builtin();
+    };
+    let (catalog, errors) = Catalog::load(&dir);
+    for error in errors {
+        tracing::warn!(%error, "ignoring invalid plugin");
+    }
+    catalog
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct PluginInfo {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub languages: Vec<String>,
+    pub builtin: bool,
+    pub enabled: bool,
+    /// The server command resolves on this machine.
+    pub available: bool,
+    /// A built-in with install steps whose server is not on this machine.
+    pub installable: bool,
+    pub source: Option<String>,
+    pub commit: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct PluginPreview {
+    pub token: String,
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub source: String,
+    pub commit: String,
+    pub previous_commit: Option<String>,
+    /// Everything the install will run or download, in order.
+    pub commands: Vec<String>,
+    /// Server the plugin will launch.
+    pub server: String,
+    /// The files matched a checksum pinned by a registry.
+    pub verified: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct RegistryEntryInfo {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub version: String,
+    pub languages: Vec<String>,
+    pub source: String,
+    pub sha256: Option<String>,
+    pub registry: String,
+}
+
+#[derive(Debug, Clone, PartialEq, uniffi::Record)]
+pub struct RegistryListing {
+    pub entries: Vec<RegistryEntryInfo>,
+    pub errors: Vec<String>,
+}
+
+/// Built-in and installed plugins with their state.
+#[uniffi::export]
+pub fn plugin_list() -> Vec<PluginInfo> {
+    let dir = plugin_install_mod::default_dir();
+    let state = dir
+        .as_deref()
+        .and_then(|dir| plugin_install_mod::State::load(dir).ok())
+        .unwrap_or_default();
+    load_catalog()
+        .plugins
+        .iter()
+        .map(|plugin| {
+            let installed = state.installed.get(&plugin.manifest.id);
+            PluginInfo {
+                id: plugin.manifest.id.clone(),
+                name: plugin.manifest.name.clone(),
+                version: plugin.manifest.version.clone(),
+                description: plugin.manifest.description.clone(),
+                languages: plugin.manifest.languages.clone(),
+                builtin: plugin.builtin,
+                enabled: plugin.enabled,
+                available: plugin.server_config(&find_in_path).is_some(),
+                installable: plugin.installable(&find_in_path),
+                source: installed.map(|item| item.source.to_spec()),
+                commit: installed.map(|item| item.commit.clone()),
+            }
+        })
+        .collect()
+}
+
+/// Clones `spec` (`URL`, `URL#REF` or `URL#REF:SUBDIR`) into staging and
+/// reads its manifest. Runs no plugin code; blocks on the network.
+#[uniffi::export]
+pub fn plugin_fetch(spec: String, sha256: Option<String>) -> Result<PluginPreview, CoreError> {
+    let dir = plugins_dir()?;
+    // `builtin:ID` installs a bundled plugin locally. Nothing is downloaded
+    // or run until the user confirms the install steps.
+    let pending = if let Some(id) = spec.strip_prefix("builtin:") {
+        plugin_install_mod::fetch_builtin(&dir, id)
+    } else {
+        plugin_install_mod::Source::parse(&spec)
+            .and_then(|source| plugin_install_mod::fetch(&dir, &source, sha256.as_deref()))
+    }
+    .map_err(plugin_error)?;
+    let source = pending.source.clone();
+    let manifest = &pending.manifest;
+    Ok(PluginPreview {
+        token: pending.token.clone(),
+        id: manifest.id.clone(),
+        name: manifest.name.clone(),
+        version: manifest.version.clone(),
+        description: manifest.description.clone(),
+        source: source.to_spec(),
+        commit: pending.commit.clone(),
+        previous_commit: pending.previous_commit.clone(),
+        commands: manifest.install_summary(&plugins::platform()),
+        server: manifest.command.first().cloned().unwrap_or_default(),
+        verified: sha256.is_some(),
+    })
+}
+
+/// Runs the install for a fetched plugin. Returns the plugin id.
+#[uniffi::export]
+pub fn plugin_install(token: String) -> Result<String, CoreError> {
+    plugin_install_mod::install(&plugins_dir()?, &token)
+        .map(|manifest| manifest.id)
+        .map_err(plugin_error)
+}
+
+#[uniffi::export]
+pub fn plugin_discard(token: String) -> Result<(), CoreError> {
+    plugin_install_mod::discard(&plugins_dir()?, &token).map_err(plugin_error)
+}
+
+#[uniffi::export]
+pub fn plugin_uninstall(id: String) -> Result<(), CoreError> {
+    plugin_install_mod::uninstall(&plugins_dir()?, &id).map_err(plugin_error)
+}
+
+#[uniffi::export]
+pub fn plugin_set_enabled(id: String, enabled: bool) -> Result<(), CoreError> {
+    plugin_install_mod::set_enabled(&plugins_dir()?, &id, enabled).map_err(plugin_error)
+}
+
+/// Newest upstream commit when the installed plugin is behind. Blocks on the
+/// network.
+#[uniffi::export]
+pub fn plugin_check_update(id: String) -> Result<Option<String>, CoreError> {
+    plugin_install_mod::check_update(&plugins_dir()?, &id).map_err(plugin_error)
+}
+
+#[uniffi::export]
+pub fn plugin_registries() -> Vec<String> {
+    plugin_install_mod::default_dir()
+        .and_then(|dir| plugin_install_mod::State::load(&dir).ok())
+        .map(|state| state.registries)
+        .unwrap_or_default()
+}
+
+#[uniffi::export]
+pub fn plugin_add_registry(url: String) -> Result<(), CoreError> {
+    plugin_install_mod::add_registry(&plugins_dir()?, &url).map_err(plugin_error)
+}
+
+#[uniffi::export]
+pub fn plugin_remove_registry(url: String) -> Result<(), CoreError> {
+    plugin_install_mod::remove_registry(&plugins_dir()?, &url).map_err(plugin_error)
+}
+
+/// Plugins offered by every configured registry. Blocks on the network.
+#[uniffi::export]
+pub fn plugin_registry_entries() -> RegistryListing {
+    let mut listing = RegistryListing {
+        entries: Vec::new(),
+        errors: Vec::new(),
+    };
+    for registry in plugin_registries() {
+        match plugin_registry_mod::fetch_entries(&registry) {
+            Ok(entries) => {
+                listing
+                    .entries
+                    .extend(entries.into_iter().map(|entry| RegistryEntryInfo {
+                        id: entry.id,
+                        name: entry.name,
+                        description: entry.description,
+                        version: entry.version,
+                        languages: entry.languages,
+                        source: entry.source.to_spec(),
+                        sha256: entry.sha256,
+                        registry: entry.registry,
+                    }))
+            }
+            Err(error) => listing.errors.push(format!("{registry}: {error}")),
+        }
+    }
+    listing
 }
 
 /// Returns the core version.
@@ -444,7 +658,8 @@ impl Core {
         for error in errors {
             tracing::warn!(%error, "ignoring invalid LSP settings");
         }
-        let Some(config) = settings.resolve_for_root(&language, Some(&key.root)) else {
+        let catalog = load_catalog();
+        let Some(config) = settings.resolve_in(&language, Some(&key.root), &catalog) else {
             return Ok(false);
         };
         let language_id = lsp_language_id(&language, &path);
@@ -457,26 +672,31 @@ impl Core {
         {
             return Ok(true);
         }
-        let companion = companion_server(&language, Some(&key.root), &config);
+        let companions = companion_servers(&catalog, &language, Some(&key.root), &config);
         let mut lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
         lsp.ensure_server(key.clone(), &config)?;
         // Document clone is a rope handle; no full-text String round trip.
         let doc = document.lock().editor.doc.clone();
-        if let Some(companion) = companion {
+        for (companion_language, companion) in companions {
             let companion_key = LspKey {
-                language: LARAVEL_COMPANION.to_owned(),
+                language: companion_language,
                 root: key.root.clone(),
             };
-            // Optional extra: a failing laravel-lsp must not block the primary.
+            // Optional extra: a failing companion must not block the primary.
             match lsp.ensure_server(companion_key.clone(), &companion) {
                 Ok(_) => {
-                    if let Err(error) =
-                        lsp.open_companion(companion_key, uri.clone(), language_id.clone(), &doc)
-                    {
-                        tracing::warn!(%error, "could not open document in laravel-lsp");
+                    if let Err(error) = lsp.open_companion(
+                        companion_key.clone(),
+                        uri.clone(),
+                        language_id.clone(),
+                        &doc,
+                    ) {
+                        tracing::warn!(%error, server = %companion_key.language, "could not open document in companion server");
                     }
                 }
-                Err(error) => tracing::warn!(%error, "could not start laravel-lsp"),
+                Err(error) => {
+                    tracing::warn!(%error, server = %companion_key.language, "could not start companion server");
+                }
             }
         }
         lsp.open_document(key, uri.clone(), language_id, &doc)?;
@@ -596,13 +816,30 @@ impl Core {
             root: PathBuf::from(root),
         };
         let restarted = {
+            let (settings, _) = LspSettings::load(
+                LspSettings::global_settings_path().as_deref(),
+                Some(&key.root),
+            );
+            let catalog = load_catalog();
+            let fresh = settings.resolve_in(&language, Some(&key.root), &catalog);
+            let uri = file_uri(Path::new(&path));
             let mut lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
-            let companion = LspKey {
-                language: LARAVEL_COMPANION.to_owned(),
-                root: key.root.clone(),
-            };
-            if let Err(error) = lsp.restart_server(&companion) {
-                tracing::warn!(%error, "could not restart laravel-lsp");
+            // Pick up plugin changes: restart with freshly resolved commands.
+            if let Some(config) = &fresh {
+                let companions = companion_servers(&catalog, &language, Some(&key.root), config);
+                for (companion_language, companion) in companions {
+                    let companion_key = LspKey {
+                        language: companion_language,
+                        root: key.root.clone(),
+                    };
+                    lsp.set_config(&companion_key, companion);
+                }
+                lsp.set_config(&key, config.clone());
+            }
+            for companion in lsp.companion_keys(&uri) {
+                if let Err(error) = lsp.restart_server(&companion) {
+                    tracing::warn!(%error, server = %companion.language, "could not restart companion server");
+                }
             }
             lsp.restart_server(&key)?
         };

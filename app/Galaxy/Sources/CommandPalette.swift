@@ -62,6 +62,7 @@ final class CommandPaletteView: NSView, NSTextFieldDelegate, NSTableViewDataSour
          "galaxy.stopLanguageServer": #selector(MainWindowController.stopLanguageServer(_:)),
         "workbench.view.explorer": #selector(MainWindowController.showExplorer(_:)),
         "workbench.view.scm": #selector(MainWindowController.showSourceControlAction(_:)),
+        "workbench.view.extensions": #selector(MainWindowController.showExtensionsAction(_:)),
         "workbench.action.nextEditor": #selector(MainWindowController.showNextTab(_:)),
         "workbench.action.previousEditor": #selector(MainWindowController.showPreviousTab(_:)),
         "workbench.action.openPreviousRecentlyUsedEditor": #selector(MainWindowController.selectLastUsedTab(_:)),

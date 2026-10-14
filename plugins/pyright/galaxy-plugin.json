@@ -1,0 +1,16 @@
+{
+  "id": "pyright",
+  "name": "Pyright",
+  "version": "1.1.414",
+  "description": "Python language server. Installs into the plugin folder with npm, or uses pyright-langserver from PATH.",
+  "languages": ["python"],
+  "server": {
+    "command": ["${pluginDir}/node_modules/.bin/pyright-langserver", "pyright-langserver"],
+    "args": ["--stdio"]
+  },
+  "install": {
+    "steps": [
+      ["npm", "install", "--prefix", "${pluginDir}", "--no-audit", "--no-fund", "--loglevel=error", "pyright@1.1.414"]
+    ]
+  }
+}

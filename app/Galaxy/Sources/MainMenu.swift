@@ -119,6 +119,8 @@ enum MainMenu {
         explorer.keyEquivalentModifierMask = [.command, .shift]
         let scm = viewMenu.addItem(withTitle: "Show Source Control", action: #selector(MainWindowController.showSourceControlAction(_:)), keyEquivalent: "g")
         scm.keyEquivalentModifierMask = [.control, .shift]
+        let extensionsItem = viewMenu.addItem(withTitle: "Show Extensions", action: #selector(MainWindowController.showExtensionsAction(_:)), keyEquivalent: "x")
+        extensionsItem.keyEquivalentModifierMask = [.command, .shift]
         viewMenu.addItem(.separator())
         let nextTab = viewMenu.addItem(withTitle: "Show Next Tab", action: #selector(MainWindowController.showNextTab(_:)), keyEquivalent: "]")
         nextTab.keyEquivalentModifierMask = [.command, .shift]

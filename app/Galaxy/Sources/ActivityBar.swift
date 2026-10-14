@@ -5,13 +5,14 @@ import AppKit
 @MainActor
 final class ActivityBar: NSView {
     enum Item: CaseIterable {
-        case explorer, search, sourceControl
+        case explorer, search, sourceControl, extensions
 
         var symbol: String {
             switch self {
             case .explorer: "folder"
             case .search: "magnifyingglass"
             case .sourceControl: "arrow.triangle.branch"
+            case .extensions: "puzzlepiece.extension"
             }
         }
 
@@ -20,6 +21,7 @@ final class ActivityBar: NSView {
             case .explorer: "Explorer"
             case .search: "Search"
             case .sourceControl: "Source Control"
+            case .extensions: "Extensions"
             }
         }
 
@@ -34,6 +36,7 @@ final class ActivityBar: NSView {
             case .explorer: "Explorer (⇧⌘E)"
             case .search: "Search in Workspace (⇧⌘F)"
             case .sourceControl: "Source Control (⌃⇧G)"
+            case .extensions: "Extensions (⇧⌘X)"
             }
         }
     }

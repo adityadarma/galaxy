@@ -21,6 +21,7 @@ use tokio::runtime::{Builder, Runtime};
 
 use crate::change::ChangeSet;
 use crate::document::Document;
+use crate::plugins::{Catalog, companion_language};
 
 pub const DOCUMENT_SYNC_DEBOUNCE: Duration = Duration::from_millis(50);
 
@@ -503,11 +504,25 @@ impl LspSettings {
         self.resolve_for_root(language, None)
     }
 
-    /// Like [`Self::resolve`], but lets root-sensitive defaults inspect the
-    /// workspace. PHP uses `laravel-lsp` only when `<root>/artisan` exists.
+    /// Like [`Self::resolve`], but lets root-sensitive plugins inspect the
+    /// workspace. Uses the built-in plugins only; see [`Self::resolve_in`].
     pub fn resolve_for_root(&self, language: &str, root: Option<&Path>) -> Option<ServerConfig> {
-        self.override_for(language)
-            .or_else(|| default_server(language, root, &find_in_path))
+        self.resolve_in(language, root, &Catalog::builtin())
+    }
+
+    /// A settings override first, otherwise the best enabled plugin in
+    /// `catalog` whose command resolves.
+    pub fn resolve_in(
+        &self,
+        language: &str,
+        root: Option<&Path>,
+        catalog: &Catalog,
+    ) -> Option<ServerConfig> {
+        self.override_for(language).or_else(|| {
+            catalog
+                .primary(language, root, &find_in_path)
+                .map(|(_, config)| config)
+        })
     }
 
     /// Overrides match the exact language first (`blade`), then the shared
@@ -586,68 +601,50 @@ pub fn lsp_server_language(language: &str) -> String {
         .unwrap_or_else(|| language.to_ascii_lowercase())
 }
 
+#[cfg(test)]
 fn default_server(
     language: &str,
     root: Option<&Path>,
     find: &dyn Fn(&str) -> Option<PathBuf>,
 ) -> Option<ServerConfig> {
-    let candidates: &[(&str, &[&str])] = match default_server_kind(language)? {
-        "rust" => &[("rust-analyzer", &[])],
-        "typescript" => &[("typescript-language-server", &["--stdio"])],
-        "python" => &[("pyright-langserver", &["--stdio"])],
-        "go" => &[("gopls", &[])],
-        // A general PHP server comes first: laravel-lsp only resolves Laravel
-        // strings (config/route/view), not classes or methods. In Laravel
-        // projects it runs next to the primary, see `companion_server`.
-        "php" if is_laravel_root(root) => &[
-            ("intelephense", &["--stdio"]),
-            ("phpactor", &["language-server"]),
-            ("laravel-lsp", &[]),
-        ],
-        // Plain PHP projects: laravel-lsp is Laravel-specific, skip it.
-        "php" => &[
-            ("intelephense", &["--stdio"]),
-            ("phpactor", &["language-server"]),
-        ],
-        _ => return None,
-    };
-    candidates.iter().find_map(|(program, args)| {
-        find(program).map(|path| {
-            if *program == "laravel-lsp" {
-                laravel_config(&path, find)
-            } else {
-                default_config(&path, args)
-            }
-        })
-    })
+    Catalog::builtin()
+        .primary(language, root, find)
+        .map(|(_, config)| config)
 }
 
-fn default_config(program: &Path, args: &[&str]) -> ServerConfig {
-    ServerConfig {
-        program: program.to_string_lossy().into_owned(),
-        args: args.iter().map(|arg| (*arg).to_owned()).collect(),
-        log_traffic: false,
-        initialization_options: Value::Null,
-        restart_backoff: [
-            Duration::ZERO,
-            Duration::from_secs(1),
-            Duration::from_secs(2),
-        ],
-    }
+/// Servers to attach next to `primary` for this language and root, each with
+/// the `LspKey::language` it runs under. Laravel projects get `laravel-lsp`
+/// for config/route/view navigation unless it already is the primary server.
+pub fn companion_servers(
+    catalog: &Catalog,
+    language: &str,
+    root: Option<&Path>,
+    primary: &ServerConfig,
+) -> Vec<(String, ServerConfig)> {
+    let kind = lsp_server_language(language);
+    catalog
+        .companions(language, root, &primary.program, &find_in_path)
+        .into_iter()
+        .map(|(plugin, config)| (companion_language(&kind, &plugin.manifest.id), config))
+        .collect()
 }
 
-fn is_laravel_root(root: Option<&Path>) -> bool {
-    root.is_some_and(|root| root.join("artisan").is_file())
+#[cfg(test)]
+fn companion_server_with(
+    language: &str,
+    root: Option<&Path>,
+    primary: &ServerConfig,
+    find: &dyn Fn(&str) -> Option<PathBuf>,
+) -> Option<ServerConfig> {
+    Catalog::builtin()
+        .companions(language, root, &primary.program, find)
+        .into_iter()
+        .next()
+        .map(|(_, config)| config)
 }
 
-/// `LspKey::language` of the Laravel companion; distinct from `"php"` so it
-/// gets its own process next to the primary PHP server.
-pub const LARAVEL_COMPANION: &str = "php-laravel";
-
-/// Second server to attach next to `primary` for this language and root.
-/// Laravel projects get `laravel-lsp` for config/route/view navigation
-/// unless it already is the primary server.
-pub fn companion_server(
+#[cfg(test)]
+fn companion_server(
     language: &str,
     root: Option<&Path>,
     primary: &ServerConfig,
@@ -655,34 +652,7 @@ pub fn companion_server(
     companion_server_with(language, root, primary, &find_in_path)
 }
 
-fn companion_server_with(
-    language: &str,
-    root: Option<&Path>,
-    primary: &ServerConfig,
-    find: &dyn Fn(&str) -> Option<PathBuf>,
-) -> Option<ServerConfig> {
-    if default_server_kind(language) != Some("php") || !is_laravel_root(root) {
-        return None;
-    }
-    let laravel = find("laravel-lsp")?;
-    let is_primary = Path::new(&primary.program).file_name() == laravel.file_name();
-    (!is_primary).then(|| laravel_config(&laravel, find))
-}
-
-/// laravel-lsp reads routes/config/views by running PHP inside the project.
-/// Its `auto` detection picks Sail whenever `vendor/bin/sail` exists, even
-/// with the container stopped, and then every lookup comes back empty. Pin
-/// the local PHP binary when there is one.
-fn laravel_config(program: &Path, find: &dyn Fn(&str) -> Option<PathBuf>) -> ServerConfig {
-    let mut config = default_config(program, &[]);
-    if let Some(php) = find("php") {
-        config.initialization_options =
-            serde_json::json!({ "phpCommand": [php.to_string_lossy()] });
-    }
-    config
-}
-
-fn default_server_kind(language: &str) -> Option<&'static str> {
+pub(crate) fn default_server_kind(language: &str) -> Option<&'static str> {
     let normalized = language.to_ascii_lowercase().replace([' ', '-'], "");
     match normalized.as_str() {
         "rust" => Some("rust"),
@@ -729,6 +699,9 @@ fn search_directories() -> Vec<PathBuf> {
             home.join(".composer/vendor/bin"),
             home.join(".config/composer/vendor/bin"),
             home.join(".local/bin"),
+            // `cargo install` (rust-analyzer) and `go install` (gopls).
+            home.join(".cargo/bin"),
+            home.join("go/bin"),
             // Laravel Herd ships its own php binary.
             home.join("Library/Application Support/Herd/bin"),
         ]);
@@ -753,7 +726,7 @@ fn search_directories() -> Vec<PathBuf> {
 /// `PATH` for a server child: the server's own directory first, then the
 /// search directories, so `#!/usr/bin/env php` resolves when Galaxy is
 /// launched from Finder with launchd's minimal `PATH`.
-fn server_path_env(program: &str) -> std::ffi::OsString {
+pub(crate) fn server_path_env(program: &str) -> std::ffi::OsString {
     let mut directories = Vec::new();
     if let Some(parent) = Path::new(program)
         .parent()
@@ -897,6 +870,14 @@ impl LspManager {
         self.requests
             .retain(|(request_key, _), _| request_key != key);
         self.servers.remove(key).is_some()
+    }
+
+    /// Replaces the launch details used by the next [`Self::restart_server`],
+    /// e.g. after a plugin was installed. No-op for unknown keys.
+    pub fn set_config(&mut self, key: &LspKey, config: ServerConfig) {
+        if let Some(existing) = self.configs.get_mut(key) {
+            *existing = config;
+        }
     }
 
     pub fn restart_server(&mut self, key: &LspKey) -> io::Result<bool> {
@@ -3285,7 +3266,7 @@ mod tests {
             root: root.clone(),
         };
         let companion_key = LspKey {
-            language: LARAVEL_COMPANION.into(),
+            language: companion_language("php", "laravel"),
             root,
         };
         let mut manager = LspManager::default();
@@ -3369,7 +3350,7 @@ mod tests {
             root: root.clone(),
         };
         let companion_key = LspKey {
-            language: LARAVEL_COMPANION.into(),
+            language: companion_language("php", "laravel"),
             root,
         };
         let mut manager = LspManager::default();

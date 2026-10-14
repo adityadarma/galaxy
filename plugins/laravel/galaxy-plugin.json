@@ -1,0 +1,20 @@
+{
+  "id": "laravel",
+  "name": "Laravel",
+  "version": "0.0.32",
+  "description": "laravel/lsp: config, route and view navigation. Runs next to the PHP server in projects with an artisan file.",
+  "languages": ["php", "blade"],
+  "role": "companion",
+  "primaryFallback": true,
+  "priority": 100,
+  "activation": { "rootMarkers": ["artisan"] },
+  "server": {
+    "command": ["${pluginDir}/vendor/bin/laravel-lsp", "laravel-lsp"],
+    "initializationOptions": { "phpCommand": ["${which:php}"] }
+  },
+  "install": {
+    "steps": [
+      ["composer", "require", "--working-dir=${pluginDir}", "--no-interaction", "--no-progress", "laravel/lsp:0.0.32"]
+    ]
+  }
+}

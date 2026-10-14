@@ -1,0 +1,13 @@
+{
+  "id": "gopls",
+  "name": "gopls",
+  "version": "0.22.0",
+  "description": "Go language server. Builds into the plugin folder with go install, or uses gopls from PATH.",
+  "languages": ["go"],
+  "server": { "command": ["${pluginDir}/bin/gopls", "gopls"] },
+  "install": {
+    "steps": [
+      ["env", "GOBIN=${pluginDir}/bin", "go", "install", "golang.org/x/tools/gopls@v0.22.0"]
+    ]
+  }
+}
