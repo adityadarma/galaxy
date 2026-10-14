@@ -412,14 +412,14 @@ extension EditorView {
     }
 
     @objc func cut(_ sender: Any?) {
-        guard let document else { return }
+        guard !isReadOnly, let document else { return }
         write(document.cut())
         onSnippetInvalidated?()
         didChangeDocument()
     }
 
     @objc func paste(_ sender: Any?) {
-        guard let document, let text = pasteboard.string(forType: .string) else { return }
+        guard !isReadOnly, let document, let text = pasteboard.string(forType: .string) else { return }
         // The flag only counts if the text is still what we copied.
         let linewise = pasteboard.string(forType: Self.linewiseType) == text
         document.pasteClipboard(text: text, linewise: linewise)

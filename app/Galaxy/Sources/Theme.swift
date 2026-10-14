@@ -47,6 +47,9 @@ enum Theme {
             ? NSColor(srgbRed: 0.42, green: 0.70, blue: 1, alpha: 0.08)
             : NSColor(srgbRed: 0.00, green: 0.38, blue: 0.78, alpha: 0.08)
     }
+    /// Diff tab: lines added or changed (right), removed or replaced (left).
+    static let diffAdded = NSColor.systemGreen.withAlphaComponent(0.16)
+    static let diffRemoved = NSColor.systemRed.withAlphaComponent(0.16)
     /// Line numbers: quieter than body text; the caret line uses `accent`.
     static let gutterText = NSColor.secondaryLabelColor
     static let indentGuide = NSColor.separatorColor.withAlphaComponent(0.55)

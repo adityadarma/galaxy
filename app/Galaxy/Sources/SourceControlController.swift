@@ -347,6 +347,9 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
 
     var workspace: Workspace?
     var onOpen: ((String) -> Void)?
+    /// Opens the file beside its committed version. Only changes that have one
+    /// (not new or deleted files) use it; the rest go to `onOpen`.
+    var onOpenDiff: ((String) -> Void)?
     var onRefresh: (() -> Void)?
     /// Called when AI commit message generation starts or stops.
     var onGeneratingChanged: ((Bool) -> Void)?
@@ -590,10 +593,17 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         case .header(let type, _, _, _):
             toggleSection(type)
         case .change(let change, _):
-            onOpen?(change.path)
+            open(change)
         case .empty:
             break
         }
+    }
+
+    /// Changes with a committed version open as a diff; new, untracked and
+    /// deleted files have nothing to compare against and open normally.
+    private func open(_ change: GitChangeInfo) {
+        let hasCommittedVersion = !change.code.contains("?") && !change.code.contains("A") && !change.code.contains("D")
+        if hasCommittedVersion, let onOpenDiff { onOpenDiff(change.path) } else { onOpen?(change.path) }
     }
 
     func stage(change: GitChangeInfo) {
@@ -963,7 +973,7 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
             guard let self else { return }
             let row = self.table.selectedRow
             guard row >= 0, row < self.rows.count, case .change(let change, _) = self.rows[row] else { return }
-            self.onOpen?(change.path)
+            self.open(change)
         }
     }
 }

@@ -163,8 +163,16 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// Tabs in the order they were last shown, most recent first (⌃Tab).
     private var tabOrderByUse: [ObjectIdentifier] = []
     let editorView = EditorView(frame: .zero)
-    private let secondaryEditorView = EditorView(frame: .zero)
+    let secondaryEditorView = EditorView(frame: .zero)
     private var isEditorSplit = false
+    /// Orientation of the user's own split, restored after a diff tab.
+    private var userSplitVertical = true
+    /// The left pane shows the committed file of a diff tab.
+    private(set) var isDiffPaneShown = false
+    private(set) var diffMap = DiffLineMap()
+    /// Scroll to the first change once the diff has been computed.
+    private var diffRevealPending = false
+    private var isSyncingDiffScroll = false
 
     enum SaveChoice { case save, discard, cancel }
 
@@ -224,6 +232,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     @objc func splitEditorDown(_ sender: Any?) { setEditorSplit(vertical: false) }
     @objc func closeEditorSplit(_ sender: Any?) {
         isEditorSplit = false
+        guard !isDiffPaneShown else { return }
         secondaryScrollView.removeFromSuperview()
         editorSplitView.isVertical = true
         editorSplitView.adjustSubviews()
@@ -231,7 +240,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func setEditorSplit(vertical: Bool) {
+        // The left pane belongs to the diff while a diff tab is shown.
+        guard !isDiffPaneShown else { return NSSound.beep() }
         isEditorSplit = true
+        userSplitVertical = vertical
         editorSplitView.isVertical = vertical
         if secondaryScrollView.superview == nil {
             editorSplitView.addSubview(secondaryScrollView)
@@ -623,6 +635,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             guard let self, let workspace = self.workspace else { return }
             self.openWorkspaceFile(workspace, FileEntry(name: (relPath as NSString).lastPathComponent, relPath: relPath, isDir: false), preview: false)
         }
+        sourceControl.onOpenDiff = { [weak self] relPath in
+            guard let self, let workspace = self.workspace else { return }
+            self.openWorkspaceDiff(workspace, relPath: relPath)
+        }
         sourceControl.onRefresh = { [weak self] in self?.refreshGitStatus() }
         extensions.onInstallSpec = { [weak self] spec, sha in self?.installPlugin(spec: spec, sha256: sha) }
         extensions.onUpdate = { [weak self] plugin in
@@ -663,6 +679,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         secondaryScrollView.autoresizingMask = [.width, .height]
         secondaryEditorView.autoresizingMask = [.width]
         secondaryScrollView.documentView = secondaryEditorView
+        installDiffScrollSync()
         editorSplitView.isVertical = true
         editorSplitView.dividerStyle = .thin
         editorSplitView.translatesAutoresizingMaskIntoConstraints = false
@@ -1748,14 +1765,141 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             return
         }
         let text = tab.doc.text()
+        let wantsHunks = tab.diffBase != nil
         DispatchQueue.global(qos: .utility).async { [weak self, workspace, path, text] in
             let changes = (try? workspace.gitDiffLines(relPath: path, text: text)) ?? []
             let mapped = Self.gitLineMarkers(changes)
+            let map = wantsHunks ? DiffLineMap((try? workspace.gitDiffHunks(relPath: path, text: text)) ?? []) : nil
             Task { @MainActor [weak self] in
                 guard let self, self.activeTab?.relPath == path else { return }
                 self.editorView.gitLineChanges = mapped
+                if let map, self.isDiffPaneShown { self.applyDiff(map) }
             }
         }
+    }
+
+    // MARK: Diff tab
+
+    /// Opens `relPath` beside its committed version (left, read-only) and the
+    /// working copy (right, editable). A file with no committed version opens
+    /// as a normal tab. A tab already open for the file turns into the diff.
+    func openWorkspaceDiff(_ workspace: Workspace, relPath: String) {
+        let name = (relPath as NSString).lastPathComponent
+        guard let base = (try? workspace.gitBaseDocument(relPath: relPath)) ?? nil else {
+            return openWorkspaceFile(workspace, FileEntry(name: name, relPath: relPath, isDir: false), preview: false)
+        }
+        diffRevealPending = true
+        let path = URL(fileURLWithPath: workspace.root()).appendingPathComponent(relPath).path
+        if let i = tabIndex(forPath: path) {
+            tabs[i].isPreview = false
+            tabs[i].diffBase = base
+            if activeIndex == i {
+                applyDiffPane(for: tabs[i])
+                refreshGitDiff()
+                refreshTabBar()
+            } else {
+                selectTab(i)
+            }
+            window?.makeFirstResponder(editorView)
+            return
+        }
+        do {
+            let doc = try workspace.openFile(relPath: relPath)
+            let tab = EditorTab(
+                doc: doc, title: name,
+                pathComponents: relPath.split(separator: "/").map(String.init),
+                windowTitle: "\(name) — \(workspace.name())", isPreview: false, status: "")
+            tab.fileKey = Self.fileKey(doc.path())
+            tab.relPath = relPath
+            tab.diffBase = base
+            add(tab, replacing: slotForOpening(preview: false))
+            window?.makeFirstResponder(editorView)
+        } catch {
+            report(error, while: "open \(relPath)")
+        }
+    }
+
+    /// Shows the committed text on the left for a diff tab; restores the
+    /// plain editor (or the user's own split) for any other tab.
+    private func applyDiffPane(for tab: EditorTab) {
+        editorView.lineTints = [:]
+        secondaryEditorView.lineTints = [:]
+        guard let base = tab.diffBase else {
+            if isDiffPaneShown { leaveDiffPane() }
+            secondaryEditorView.document = isEditorSplit ? tab.doc : nil
+            return
+        }
+        if !isDiffPaneShown {
+            isDiffPaneShown = true
+            secondaryScrollView.removeFromSuperview()
+            editorSplitView.isVertical = true
+            editorSplitView.addSubview(secondaryScrollView, positioned: .below, relativeTo: scrollView)
+        }
+        secondaryEditorView.isReadOnly = true
+        secondaryEditorView.document = base
+        editorSplitView.layoutSubtreeIfNeeded()
+        // A pane added to a split view starts with no width; give each side half.
+        if secondaryScrollView.frame.width < 1 {
+            editorSplitView.setPosition(editorSplitView.bounds.width / 2, ofDividerAt: 0)
+        }
+        editorSplitView.adjustSubviews()
+        secondaryEditorView.requestDocumentRefresh(scrollCaret: false)
+    }
+
+    private func leaveDiffPane() {
+        isDiffPaneShown = false
+        diffMap = DiffLineMap()
+        secondaryEditorView.isReadOnly = false
+        secondaryEditorView.lineTints = [:]
+        editorView.lineTints = [:]
+        secondaryScrollView.removeFromSuperview()
+        editorSplitView.isVertical = isEditorSplit ? userSplitVertical : true
+        if isEditorSplit { editorSplitView.addSubview(secondaryScrollView) }
+        editorSplitView.adjustSubviews()
+    }
+
+    /// Tints the changed lines of both panes and, the first time, scrolls to
+    /// the first change.
+    private func applyDiff(_ map: DiffLineMap) {
+        diffMap = map
+        editorView.lineTints = Dictionary(map.newChangedLines.map { ($0, Theme.diffAdded) }, uniquingKeysWith: { a, _ in a })
+        secondaryEditorView.lineTints = Dictionary(map.oldChangedLines.map { ($0, Theme.diffRemoved) }, uniquingKeysWith: { a, _ in a })
+        guard diffRevealPending else { return }
+        diffRevealPending = false
+        let lineHeight = editorView.metrics.lineHeight
+        let first = max(0, (map.hunks.first?.newStart ?? 0) - 3)
+        scrollView.contentView.scroll(to: NSPoint(x: 0, y: CGFloat(first) * lineHeight - scrollView.contentInsets.top))
+        scrollView.reflectScrolledClipView(scrollView.contentView)
+        syncDiffScroll(fromPrimary: true)
+    }
+
+    /// Keeps both panes on the same lines while either one scrolls.
+    private func installDiffScrollSync() {
+        for (view, isPrimary) in [(scrollView, true), (secondaryScrollView, false)] {
+            view.contentView.postsBoundsChangedNotifications = true
+            NotificationCenter.default.addObserver(
+                forName: NSView.boundsDidChangeNotification, object: view.contentView, queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.syncDiffScroll(fromPrimary: isPrimary) }
+            }
+        }
+    }
+
+    private func syncDiffScroll(fromPrimary: Bool) {
+        guard isDiffPaneShown, !isSyncingDiffScroll else { return }
+        let source = fromPrimary ? scrollView : secondaryScrollView
+        let target = fromPrimary ? secondaryScrollView : scrollView
+        let lineHeight = editorView.metrics.lineHeight
+        guard lineHeight > 0 else { return }
+        let inset = scrollView.contentInsets.top
+        let y = max(0, source.contentView.bounds.origin.y + inset)
+        let line = Int(y / lineHeight)
+        let fraction = y - CGFloat(line) * lineHeight
+        let mapped = fromPrimary ? diffMap.oldLine(forNew: line) : diffMap.newLine(forOld: line)
+        isSyncingDiffScroll = true
+        defer { isSyncingDiffScroll = false }
+        target.contentView.scroll(to: NSPoint(x: 0, y: CGFloat(mapped) * lineHeight + fraction - inset))
+        target.reflectScrolledClipView(target.contentView)
     }
 
     /// Pure helper called from the utility queue in `refreshGitDiff()`, so it
@@ -1828,7 +1972,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         tabOrderByUse.insert(id, at: 0)
         pathBar.show(tab.pathComponents)
         editorView.document = tab.doc
-        secondaryEditorView.document = isEditorSplit ? tab.doc : nil
+        applyDiffPane(for: tab)
         let root = workspace?.root() ?? (tab.doc.path() as NSString).deletingLastPathComponent
         if tab.terminal == nil {
             _ = bridge.startLSP(document: tab.doc, language: tab.doc.syntaxLanguage() ?? StatusBar.language(for: tab.doc.path()), root: root)
@@ -2079,7 +2223,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 isEdited: tab.isEdited,
                 isGitChanged: isChanged,
                 gitStatus: status,
-                isTerminal: tab.terminal != nil
+                isTerminal: tab.terminal != nil,
+                glyphName: tab.diffBase == nil ? nil : tab.title
             )
         },
                    selected: activeIndex)
@@ -2127,6 +2272,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         activeIndex = nil
         if isFindVisible { closeFind(nil) }
         showEditorTerminal(for: nil)
+        if isDiffPaneShown { leaveDiffPane() }
         editorView.document = nil
         pathBar.show([])
         statusBar.show(document: nil)

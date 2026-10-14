@@ -1666,6 +1666,16 @@ pub struct GitLineChangeInfo {
     pub kind: GitLineChangeKind,
 }
 
+/// A changed region between the committed and the current text, in 0-based
+/// lines of each side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct GitDiffHunkInfo {
+    pub old_start: u64,
+    pub old_len: u64,
+    pub new_start: u64,
+    pub new_len: u64,
+}
+
 #[derive(uniffi::Object)]
 pub struct TerminalHandle {
     session: TerminalSession,
@@ -1991,6 +2001,41 @@ impl Workspace {
         Ok(Arc::new(TerminalHandle {
             session: TerminalSession::spawn(self.inner.root(), cols, rows)?,
         }))
+    }
+
+    /// The file as committed at `HEAD`, as a document for the left side of a
+    /// diff. `None` when HEAD has no such file. Its path is the real one so
+    /// the language (and so the highlighting) matches; nothing saves it.
+    pub fn git_base_document(
+        &self,
+        rel_path: String,
+    ) -> Result<Option<Arc<DocumentHandle>>, CoreError> {
+        let Some(bytes) = galaxy_core::git::head_blob(self.inner.root(), &rel_path)? else {
+            return Ok(None);
+        };
+        let doc = Document::from_bytes(&bytes)?;
+        let path = self.inner.root().join(&rel_path);
+        Ok(Some(Arc::new(DocumentHandle::new(doc, path))))
+    }
+
+    /// Changed regions between `HEAD` and `text` for `rel_path`. A file that
+    /// is not in HEAD is one inserted region.
+    pub fn git_diff_hunks(
+        &self,
+        rel_path: String,
+        text: String,
+    ) -> Result<Vec<GitDiffHunkInfo>, CoreError> {
+        let base = galaxy_core::git::head_blob(self.inner.root(), &rel_path)?.unwrap_or_default();
+        let base = String::from_utf8_lossy(&base);
+        Ok(galaxy_core::git::diff_hunks(&base, &text)
+            .into_iter()
+            .map(|h| GitDiffHunkInfo {
+                old_start: h.old_start as u64,
+                old_len: h.old_len as u64,
+                new_start: h.new_start as u64,
+                new_len: h.new_len as u64,
+            })
+            .collect())
     }
 
     pub fn git_diff_lines(

@@ -275,4 +275,37 @@ final class TabTests: XCTestCase {
         XCTAssertEqual(view.item(withTitle: "Show Next Tab")?.keyEquivalent, "]")
         XCTAssertEqual(view.item(withTitle: "Show Previous Tab")?.keyEquivalent, "[")
     }
+
+    // MARK: Crowded tab bar
+
+    private func laidOutTab(title: String, width: CGFloat, selected: Bool = true) -> TabItemView {
+        let tab = TabItemView(item: TabBar.Item(title: title, isPreview: false, isEdited: false, isGitChanged: false))
+        tab.isSelected = selected
+        let host = NSView(frame: NSRect(x: 0, y: 0, width: width, height: Theme.tabHeight))
+        host.addSubview(tab)
+        tab.frame = host.bounds
+        host.layoutSubtreeIfNeeded()
+        tab.layoutSubtreeIfNeeded()
+        return tab
+    }
+
+    func testNarrowTabKeepsTheTitleAndShowsCloseOnlyOnHover() {
+        let tab = laidOutTab(title: "AppServiceProvider.php", width: TabBar.minTabWidth)
+        XCTAssertTrue(tab.closeButton.isHidden, "no room: the title wins over the X")
+        XCTAssertGreaterThanOrEqual(tab.label.frame.width, 40, "title is not squeezed by the button")
+        XCTAssertGreaterThan(tab.label.frame.maxX, tab.closeButton.frame.minX, "button overlays the title when hovered")
+    }
+
+    func testRoomyTabShowsCloseNextToTheFullTitle() {
+        let tab = laidOutTab(title: "app.php", width: 200)
+        XCTAssertFalse(tab.closeButton.isHidden)
+        XCTAssertLessThanOrEqual(tab.label.frame.maxX, tab.closeButton.frame.minX, "X sits after the title, never over it")
+        XCTAssertEqual(tab.label.stringValue, "app.php")
+    }
+
+    func testTabWantsEnoughWidthForTheWholeTitle() {
+        let short = laidOutTab(title: "a.php", width: 200).intrinsicContentSize.width
+        let long = laidOutTab(title: "ApplicationBuilder.php", width: 400).intrinsicContentSize.width
+        XCTAssertGreaterThan(long, short)
+    }
 }

@@ -49,6 +49,12 @@ final class EditorView: NSView {
     private(set) var layoutsCreated = 0
     /// Lines drawn by the most recent `draw(_:)`, for tests and diagnostics.
     private(set) var lastDrawnLines: Range<Int> = 0..<0
+    /// The committed side of a diff: it shows and navigates, but never edits.
+    var isReadOnly = false
+    /// Background per 0-based line, for the changed lines of a diff.
+    var lineTints: [UInt64: NSColor] = [:] {
+        didSet { if lineTints != oldValue { needsDisplay = true } }
+    }
     var gitLineChanges: [UInt64: GitLineChangeKind] = [:] {
         didSet { if gitLineChanges != oldValue { needsDisplay = true } }
     }
@@ -474,6 +480,10 @@ final class EditorView: NSView {
         for line in snapshot.lines {
             let top = CGFloat(line.line) * lineHeight
             let hasCaret = !line.carets.isEmpty
+            if let tint = lineTints[line.line] {
+                context.setFillColor(tint.cgColor)
+                context.fill(CGRect(x: 0, y: top, width: bounds.width, height: lineHeight))
+            }
             for hint in inlayHints where hint.line == line.line {
                 let x = originX + xOffset(in: line.text, column: hint.character)
                 NSColor.secondaryLabelColor.withAlphaComponent(0.7).setFill()

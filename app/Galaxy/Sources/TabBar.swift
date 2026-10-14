@@ -35,8 +35,14 @@ final class EditorTab {
     var hasDiskConflict = false
     /// Last time this tab was active, used to release background syntax state.
     var lastActiveAt = Date.now
+    /// The file as committed at HEAD, shown read-only beside the working copy
+    /// (opened from Source Control). `nil` is the plain single-pane view.
+    var diffBase: DocumentHandle?
     /// Title with the file's state on disk.
-    var displayTitle: String { isDeletedOnDisk ? "\(title) (deleted)" : title }
+    var displayTitle: String {
+        if isDeletedOnDisk { return "\(title) (deleted)" }
+        return diffBase == nil ? title : "\(title) (Working Tree)"
+    }
     /// Identifies an Untitled buffer in the back/forward history.
     private let untitledKey = "untitled:" + UUID().uuidString
     /// Document key for the back/forward history (M2-08).
@@ -68,10 +74,13 @@ final class TabBar: NSView {
         var gitStatus: GitFileStatus
         /// Terminal tab: terminal icon instead of a file glyph.
         var isTerminal = false
+        /// File name the glyph is chosen from, when the title has a suffix.
+        var glyphName: String?
 
         init(title: String, isPreview: Bool, isEdited: Bool, isGitChanged: Bool, gitStatus: GitFileStatus = .none,
-             isTerminal: Bool = false) {
+             isTerminal: Bool = false, glyphName: String? = nil) {
             self.isTerminal = isTerminal
+            self.glyphName = glyphName
             self.title = title
             self.isPreview = isPreview
             self.isEdited = isEdited
@@ -228,6 +237,14 @@ final class TabItemView: NSView {
     let gitDot = NSTextField(labelWithString: "●")
     private var isHovered = false { didSet { if isHovered != oldValue { refresh() } } }
 
+    private static let leadingInset: CGFloat = 12 + 16 + 6 // margin, icon, gap
+    private static let trailingInset: CGFloat = 6 + 16 + 10 // gap, close button, margin
+    /// The title ends before the close button. Flipped off when the tab is too
+    /// narrow for both: the title keeps the room and the button overlays it.
+    private var closeIsInline = true { didSet { if closeIsInline != oldValue { applyCloseLayout() } } }
+    private var titleEndsAtButton: NSLayoutConstraint!
+    private var titleEndsAtEdge: NSLayoutConstraint!
+
     init(item: TabBar.Item) {
         self.item = item
         super.init(frame: .zero)
@@ -263,7 +280,14 @@ final class TabItemView: NSView {
         gitDot.translatesAutoresizingMaskIntoConstraints = false
 
         for view in [icon, label, closeButton, editedDot, gitDot] { addSubview(view) }
+        titleEndsAtButton = label.trailingAnchor.constraint(lessThanOrEqualTo: closeButton.leadingAnchor, constant: -6)
+        titleEndsAtEdge = label.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -10)
+        closeButton.wantsLayer = true
+        closeButton.layer?.cornerRadius = 3
+        editedDot.wantsLayer = true
+        editedDot.layer?.cornerRadius = 3
         NSLayoutConstraint.activate([
+            titleEndsAtButton,
             widthAnchor.constraint(greaterThanOrEqualToConstant: TabBar.minTabWidth),
             widthAnchor.constraint(lessThanOrEqualToConstant: TabBar.maxTabWidth),
             heightAnchor.constraint(equalToConstant: Theme.tabHeight),
@@ -273,7 +297,6 @@ final class TabItemView: NSView {
             icon.heightAnchor.constraint(equalToConstant: 16),
             label.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 6),
             label.centerYAnchor.constraint(equalTo: centerYAnchor),
-            closeButton.leadingAnchor.constraint(equalTo: label.trailingAnchor, constant: 6),
             closeButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             closeButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             closeButton.widthAnchor.constraint(equalToConstant: 16),
@@ -291,6 +314,29 @@ final class TabItemView: NSView {
 
     /// The dot replaces the close button on unsaved tabs, except on hover.
     var showsEditedDot: Bool { item.isEdited && !isHovered }
+
+    /// Width the tab wants: the whole title plus room for the close button.
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: Self.leadingInset + ceil(label.intrinsicContentSize.width) + Self.trailingInset,
+               height: NSView.noIntrinsicMetric)
+    }
+
+    override func layout() {
+        super.layout()
+        let needed = Self.leadingInset + ceil(label.intrinsicContentSize.width) + Self.trailingInset
+        closeIsInline = bounds.width >= needed
+    }
+
+    private func applyCloseLayout() {
+        titleEndsAtButton.isActive = closeIsInline
+        titleEndsAtEdge.isActive = !closeIsInline
+        refresh()
+    }
+
+    private var backgroundColorBehind: NSColor {
+        if isSelected { return .textBackgroundColor }
+        return isHovered ? Theme.chrome.blended(withFraction: 0.04, of: .labelColor) ?? Theme.chrome : Theme.chrome
+    }
 
     private func refresh() {
         let size: CGFloat = 13
@@ -310,14 +356,22 @@ final class TabItemView: NSView {
                 .withSymbolConfiguration(.init(pointSize: 12, weight: .regular))
             icon.contentTintColor = .secondaryLabelColor
         } else {
-            let glyph = FileGlyph.for(name: item.title)
+            let glyph = FileGlyph.for(name: item.glyphName ?? item.title)
             icon.image = glyph.image
             icon.contentTintColor = glyph.color
         }
         icon.alphaValue = isSelected ? 1 : 0.8
         editedDot.isHidden = !showsEditedDot
         gitDot.isHidden = true
-        closeButton.isHidden = showsEditedDot || !(isSelected || isHovered)
+        // Without room, the button only appears on hover so the title is not cut for it.
+        closeButton.isHidden = showsEditedDot || !(isHovered || (isSelected && closeIsInline))
+        // Over the title, the button and dot carry the tab's own background.
+        let behind = closeIsInline ? NSColor.clear : backgroundColorBehind
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            closeButton.layer?.backgroundColor = behind.cgColor
+            editedDot.layer?.backgroundColor = behind.cgColor
+        }
+        invalidateIntrinsicContentSize()
         closeButton.setAccessibilityLabel("Close \(item.title)")
         toolTip = item.isPreview ? "\(item.title) (preview: double-click the file to keep it open)" : item.title
 

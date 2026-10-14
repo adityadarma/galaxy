@@ -36,6 +36,10 @@ extension EditorView: @preconcurrency NSTextInputClient {
 
     override func doCommand(by selector: Selector) {
         guard let document else { return }
+        if isReadOnly {
+            guard performNavigation(selector) else { return }
+            return didChangeSelection()
+        }
         switch selector {
         case #selector(NSResponder.insertNewline(_:)): document.edit(command: .newline)
         case #selector(NSResponder.insertTab(_:)): document.edit(command: .indent)
@@ -52,19 +56,19 @@ extension EditorView: @preconcurrency NSTextInputClient {
     }
 
     @objc func undoEdit(_ sender: Any?) {
-        guard let document, document.undo() else { return }
+        guard !isReadOnly, let document, document.undo() else { return }
         onSnippetInvalidated?()
         didChangeDocument()
     }
 
     @objc func redoEdit(_ sender: Any?) {
-        guard let document, document.redo() else { return }
+        guard !isReadOnly, let document, document.redo() else { return }
         onSnippetInvalidated?()
         didChangeDocument()
     }
 
     @objc func toggleComment(_ sender: Any?) {
-        guard let document else { return }
+        guard !isReadOnly, let document else { return }
         document.edit(command: .toggleComment)
         didChangeDocument()
     }
@@ -93,7 +97,7 @@ extension EditorView: @preconcurrency NSTextInputClient {
     // MARK: NSTextInputClient
 
     func insertText(_ string: Any, replacementRange: NSRange) {
-        guard let document else { return }
+        guard !isReadOnly, let document else { return }
         let text = Self.plainText(string)
         if document.hasMarkedText() || replacementRange.location != NSNotFound {
             // Composed text or a replaced range: one undo step.
@@ -106,7 +110,7 @@ extension EditorView: @preconcurrency NSTextInputClient {
     }
 
     func setMarkedText(_ string: Any, selectedRange: NSRange, replacementRange: NSRange) {
-        guard let document else { return }
+        guard !isReadOnly, let document else { return }
         document.setMarkedText(
             text: Self.plainText(string),
             selected: Utf16Range(location: UInt64(max(0, selectedRange.location == NSNotFound ? 0 : selectedRange.location)),
@@ -117,6 +121,7 @@ extension EditorView: @preconcurrency NSTextInputClient {
     }
 
     func unmarkText() {
+        guard !isReadOnly else { return }
         document?.unmarkText()
         didChangeDocument()
     }

@@ -110,6 +110,109 @@ pub struct GitLineChange {
     pub kind: GitLineChangeKind,
 }
 
+/// One changed region between two texts, in 0-based line numbers. A pure
+/// insertion has `old_len == 0`, a pure deletion `new_len == 0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiffHunk {
+    pub old_start: usize,
+    pub old_len: usize,
+    pub new_start: usize,
+    pub new_len: usize,
+}
+
+/// Longest middle section (old lines x new lines) compared line by line.
+/// Beyond it the whole middle is reported as one replaced hunk.
+const MAX_DIFF_CELLS: usize = 4_000_000;
+
+/// Changed regions turning `old` into `new`. Common leading and trailing
+/// lines are skipped first, so the quadratic part only sees what changed.
+pub fn diff_hunks(old: &str, new: &str) -> Vec<DiffHunk> {
+    let old: Vec<&str> = old.lines().collect();
+    let new: Vec<&str> = new.lines().collect();
+    let prefix = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+    let suffix = old[prefix..]
+        .iter()
+        .rev()
+        .zip(new[prefix..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let a = &old[prefix..old.len() - suffix];
+    let b = &new[prefix..new.len() - suffix];
+    if a.is_empty() && b.is_empty() {
+        return Vec::new();
+    }
+    let whole = DiffHunk {
+        old_start: prefix,
+        old_len: a.len(),
+        new_start: prefix,
+        new_len: b.len(),
+    };
+    if a.is_empty() || b.is_empty() || a.len().saturating_mul(b.len()) > MAX_DIFF_CELLS {
+        return vec![whole];
+    }
+
+    let width = b.len() + 1;
+    let mut lcs = vec![0u16; (a.len() + 1) * width];
+    for i in (0..a.len()).rev() {
+        for j in (0..b.len()).rev() {
+            lcs[i * width + j] = if a[i] == b[j] {
+                lcs[(i + 1) * width + j + 1] + 1
+            } else {
+                lcs[(i + 1) * width + j].max(lcs[i * width + j + 1])
+            };
+        }
+    }
+
+    let mut hunks = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    let mut open: Option<(usize, usize)> = None;
+    let close = |hunks: &mut Vec<DiffHunk>, (os, ns): (usize, usize), i: usize, j: usize| {
+        hunks.push(DiffHunk {
+            old_start: prefix + os,
+            old_len: i - os,
+            new_start: prefix + ns,
+            new_len: j - ns,
+        });
+    };
+    while i < a.len() || j < b.len() {
+        if i < a.len() && j < b.len() && a[i] == b[j] {
+            if let Some(start) = open.take() {
+                close(&mut hunks, start, i, j);
+            }
+            i += 1;
+            j += 1;
+        } else {
+            open.get_or_insert((i, j));
+            let take_new =
+                j < b.len() && (i == a.len() || lcs[i * width + j + 1] >= lcs[(i + 1) * width + j]);
+            if take_new {
+                j += 1;
+            } else {
+                i += 1;
+            }
+        }
+    }
+    if let Some(start) = open.take() {
+        close(&mut hunks, start, i, j);
+    }
+    hunks
+}
+
+/// The file's content at `HEAD`, or `None` when HEAD has no such file (new,
+/// untracked, or an unborn branch).
+pub fn head_blob(root: &Path, rel_path: &str) -> io::Result<Option<Vec<u8>>> {
+    let repo = gix::discover(root).map_err(io::Error::other)?;
+    let Ok(head) = repo.head_tree() else {
+        return Ok(None);
+    };
+    Ok(head
+        .lookup_entry_by_path(rel_path)
+        .map_err(io::Error::other)?
+        .and_then(|entry| entry.object().ok())
+        .and_then(|object| object.try_into_blob().ok())
+        .map(|mut blob| blob.take_data()))
+}
+
 pub fn diff_lines(
     root: &Path,
     rel_path: &str,
@@ -322,6 +425,71 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["new.txt", "tracked.txt"]
         );
+    }
+
+    fn hunks(old: &str, new: &str) -> Vec<(usize, usize, usize, usize)> {
+        diff_hunks(old, new)
+            .iter()
+            .map(|h| (h.old_start, h.old_len, h.new_start, h.new_len))
+            .collect()
+    }
+
+    #[test]
+    fn diff_hunks_reports_each_changed_region() {
+        assert!(hunks("a\nb\n", "a\nb\n").is_empty());
+        assert!(hunks("", "").is_empty());
+        // Replacement in the middle.
+        assert_eq!(hunks("a\nb\nc\n", "a\nX\nc\n"), [(1, 1, 1, 1)]);
+        // Pure insertion and pure deletion.
+        assert_eq!(hunks("a\nc\n", "a\nb\nc\n"), [(1, 0, 1, 1)]);
+        assert_eq!(hunks("a\nb\nc\n", "a\nc\n"), [(1, 1, 1, 0)]);
+        // Two separate regions keep their own offsets on both sides.
+        assert_eq!(
+            hunks("a\nb\nc\nd\ne\n", "a\nB\nc\nd\nE\nF\n"),
+            [(1, 1, 1, 1), (4, 1, 4, 2)]
+        );
+        // New file and emptied file.
+        assert_eq!(hunks("", "a\nb\n"), [(0, 0, 0, 2)]);
+        assert_eq!(hunks("a\nb\n", ""), [(0, 2, 0, 0)]);
+    }
+
+    #[test]
+    fn diff_hunks_gives_up_on_huge_middles_with_one_hunk() {
+        let old: String = (0..3000).map(|i| format!("old {i}\n")).collect();
+        let new: String = (0..3000).map(|i| format!("new {i}\n")).collect();
+        assert_eq!(hunks(&old, &new), [(0, 3000, 0, 3000)]);
+    }
+
+    #[test]
+    fn head_blob_reads_committed_content_only() {
+        let dir = tempfile::tempdir().unwrap();
+        run(dir.path(), ["init", "-b", "main"]);
+        assert_eq!(
+            head_blob(dir.path(), "tracked.txt").unwrap(),
+            None,
+            "unborn branch"
+        );
+        fs::write(dir.path().join("tracked.txt"), "one\n").unwrap();
+        run(dir.path(), ["add", "tracked.txt"]);
+        run(
+            dir.path(),
+            [
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        );
+        fs::write(dir.path().join("tracked.txt"), "two\n").unwrap();
+        fs::write(dir.path().join("new.txt"), "new\n").unwrap();
+        assert_eq!(
+            head_blob(dir.path(), "tracked.txt").unwrap(),
+            Some(b"one\n".to_vec())
+        );
+        assert_eq!(head_blob(dir.path(), "new.txt").unwrap(), None, "untracked");
     }
 
     #[test]
