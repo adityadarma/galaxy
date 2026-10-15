@@ -58,6 +58,7 @@ final class CommandPaletteView: NSView, NSTextFieldDelegate, NSTableViewDataSour
          "workbench.action.createTerminalEditor": #selector(MainWindowController.createTerminalEditor(_:)),
          "workbench.action.splitEditorRight": #selector(MainWindowController.splitEditorRight(_:)),
          "workbench.action.splitEditorDown": #selector(MainWindowController.splitEditorDown(_:)),
+         "markdown.showPreviewToSide": #selector(MainWindowController.toggleMarkdownPreview(_:)),
          "workbench.action.closeEditorSplit": #selector(MainWindowController.closeEditorSplit(_:)),
          "galaxy.restartLanguageServer": #selector(MainWindowController.restartLanguageServer(_:)),
          "galaxy.stopLanguageServer": #selector(MainWindowController.stopLanguageServer(_:)),

@@ -37,6 +37,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     var statusLabel: NSTextField { statusBar.message }
     private let scrollView = DiagnosticScrollView()
     private let secondaryScrollView = DiagnosticScrollView()
+    private let markdownPreview = MarkdownPreviewView()
+    /// User asked for the Markdown preview; it shows whenever the active tab is Markdown.
+    private(set) var isMarkdownPreviewOn = false
+    var isMarkdownPreviewShown: Bool { markdownPreview.superview != nil }
     private let editorSplitView = NSSplitView()
     private let problemsPanel = ProblemsPanel()
     private let referencesPanel = ReferencesPanel()
@@ -177,6 +181,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// Scroll to the first change once the diff has been computed.
     private var diffRevealPending = false
     private var isSyncingDiffScroll = false
+    /// Set while the preview drives the editor, so that does not echo back.
+    private var isSyncingPreviewScroll = false
 
     enum SaveChoice { case save, discard, cancel }
 
@@ -246,6 +252,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private func setEditorSplit(vertical: Bool) {
         // The left pane belongs to the diff while a diff tab is shown.
         guard !isDiffPaneShown else { return NSSound.beep() }
+        if isMarkdownPreviewShown {
+            isMarkdownPreviewOn = false
+            updateMarkdownPreview()
+        }
         isEditorSplit = true
         userSplitVertical = vertical
         editorSplitView.isVertical = vertical
@@ -256,6 +266,50 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         editorSplitView.layoutSubtreeIfNeeded()
         editorSplitView.adjustSubviews()
         secondaryEditorView.requestDocumentRefresh(scrollCaret: false)
+    }
+
+    /// Shows or hides the rendered Markdown beside the editor (VS Code
+    /// "Open Preview to the Side"). Only Markdown files can be previewed.
+    @objc func toggleMarkdownPreview(_ sender: Any?) {
+        guard isMarkdownPreviewOn || canPreviewMarkdown else { return NSSound.beep() }
+        isMarkdownPreviewOn.toggle()
+        updateMarkdownPreview()
+    }
+
+    private var canPreviewMarkdown: Bool {
+        guard let tab = activeTab, tab.terminal == nil else { return false }
+        return MarkdownPreviewView.isMarkdown(path: tab.doc.path())
+    }
+
+    /// Brings the preview pane in line with the active tab: shown for a
+    /// Markdown file while the preview is on, hidden otherwise. Takes the
+    /// secondary pane's place, and gives it back when it closes.
+    private func updateMarkdownPreview() {
+        defer { tabBar.setPreviewButton(visible: canPreviewMarkdown, active: isMarkdownPreviewShown) }
+        let wanted = isMarkdownPreviewOn && !isDiffPaneShown && canPreviewMarkdown
+        if wanted, let tab = activeTab {
+            if !isMarkdownPreviewShown {
+                secondaryScrollView.removeFromSuperview()
+                editorSplitView.isVertical = true
+                editorSplitView.addSubview(markdownPreview)
+                editorSplitView.layoutSubtreeIfNeeded()
+                if markdownPreview.frame.width < 1 {
+                    editorSplitView.setPosition(editorSplitView.bounds.width / 2, ofDividerAt: 0)
+                }
+                editorSplitView.adjustSubviews()
+            }
+            markdownPreview.show(markdown: tab.doc.text())
+            syncPreviewToEditor()
+        } else if isMarkdownPreviewShown {
+            markdownPreview.removeFromSuperview()
+            if isDiffPaneShown {
+                editorSplitView.isVertical = true
+            } else {
+                editorSplitView.isVertical = isEditorSplit ? userSplitVertical : true
+                if isEditorSplit { editorSplitView.addSubview(secondaryScrollView) }
+            }
+            editorSplitView.adjustSubviews()
+        }
     }
 
     /// Shows the Git Graph tab in the bottom panel, or hides the panel when
@@ -531,6 +585,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             self?.bridge.pollLSP()
             self?.requestCompletionIfNeeded()
             self?.refreshGitDiff()
+            if self?.isMarkdownPreviewShown == true { self?.updateMarkdownPreview() }
         }
         editorView.onSnippetInvalidated = { [weak self] in
             self?.snippetSession = nil
@@ -708,6 +763,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         secondaryEditorView.autoresizingMask = [.width]
         secondaryScrollView.documentView = secondaryEditorView
         installDiffScrollSync()
+        markdownPreview.onUserScroll = { [weak self] line in self?.syncEditorToPreview(line: line) }
         editorSplitView.isVertical = true
         editorSplitView.dividerStyle = .thin
         editorSplitView.translatesAutoresizingMaskIntoConstraints = false
@@ -719,6 +775,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         tabBar.onSelect = { [weak self] i in self?.selectTab(i, fromTabBar: true) }
         tabBar.onClose = { [weak self] i in self?.closeTab(at: i) }
         tabBar.onMove = { [weak self] from, to in self?.moveTab(from: from, to: to) }
+        tabBar.onTogglePreview = { [weak self] in self?.toggleMarkdownPreview(nil) }
         syntaxEvictionTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             self?.evictInactiveSyntax(now: .now)
         }
@@ -1865,6 +1922,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
         if !isDiffPaneShown {
             isDiffPaneShown = true
+            markdownPreview.removeFromSuperview()
             secondaryScrollView.removeFromSuperview()
             editorSplitView.isVertical = true
             editorSplitView.addSubview(secondaryScrollView, positioned: .below, relativeTo: scrollView)
@@ -1914,7 +1972,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             NotificationCenter.default.addObserver(
                 forName: NSView.boundsDidChangeNotification, object: view.contentView, queue: .main
             ) { [weak self] _ in
-                MainActor.assumeIsolated { self?.syncDiffScroll(fromPrimary: isPrimary) }
+                MainActor.assumeIsolated {
+                    self?.syncDiffScroll(fromPrimary: isPrimary)
+                    if isPrimary { self?.syncPreviewToEditor() }
+                }
             }
         }
     }
@@ -1934,6 +1995,28 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         defer { isSyncingDiffScroll = false }
         target.contentView.scroll(to: NSPoint(x: 0, y: CGFloat(mapped) * lineHeight + fraction - inset))
         target.reflectScrolledClipView(target.contentView)
+    }
+
+    /// Moves the Markdown preview to the source line at the top of the editor.
+    private func syncPreviewToEditor() {
+        guard isMarkdownPreviewShown, !isSyncingPreviewScroll else { return }
+        let lineHeight = editorView.metrics.lineHeight
+        guard lineHeight > 0 else { return }
+        let y = max(0, scrollView.contentView.bounds.origin.y + scrollView.contentInsets.top)
+        markdownPreview.scroll(toSourceLine: Double(y / lineHeight))
+    }
+
+    /// Moves the editor to `line`, the source line at the top of the preview.
+    private func syncEditorToPreview(line: Double) {
+        let lineHeight = editorView.metrics.lineHeight
+        guard isMarkdownPreviewShown, lineHeight > 0 else { return }
+        let clip = scrollView.contentView
+        let wanted = NSPoint(x: clip.bounds.origin.x, y: CGFloat(line) * lineHeight - scrollView.contentInsets.top)
+        let target = clip.constrainBoundsRect(NSRect(origin: wanted, size: clip.bounds.size)).origin
+        isSyncingPreviewScroll = true
+        defer { isSyncingPreviewScroll = false }
+        clip.scroll(to: target)
+        scrollView.reflectScrolledClipView(clip)
     }
 
     /// Pure helper called from the utility queue in `refreshGitDiff()`, so it
@@ -2007,6 +2090,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         pathBar.show(tab.pathComponents)
         editorView.document = tab.doc
         applyDiffPane(for: tab)
+        updateMarkdownPreview()
         let root = workspace?.root() ?? (tab.doc.path() as NSString).deletingLastPathComponent
         if tab.terminal == nil {
             _ = bridge.startLSP(document: tab.doc, language: tab.doc.syntaxLanguage() ?? StatusBar.language(for: tab.doc.path()), root: root)
@@ -2242,6 +2326,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func refreshTabBar() {
+        tabBar.setPreviewButton(visible: canPreviewMarkdown, active: isMarkdownPreviewShown)
         let statusMap = explorer.gitStatusMap
         let gitPaths = explorer.gitChangedPaths
         tabBar.set(items: tabs.map { tab in
@@ -2313,6 +2398,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         showEditorTerminal(for: nil)
         if isDiffPaneShown { leaveDiffPane() }
         editorView.document = nil
+        updateMarkdownPreview()
         pathBar.show([])
         statusBar.show(document: nil)
         statusLabel.stringValue = "No open files. ⌘N for a new one, ⌘O to open a file or folder."
@@ -4256,6 +4342,7 @@ extension MainWindowController: NSMenuItemValidation {
             return ((item.representedObject as? EditorTab) ?? activeTab)?.terminal != nil
         case #selector(showNextTab(_:)), #selector(showPreviousTab(_:)), #selector(selectLastUsedTab(_:)):
             return tabs.count > 1
+        case #selector(toggleMarkdownPreview(_:)): return isMarkdownPreviewOn || canPreviewMarkdown
         case #selector(navigateBack(_:)): return navHistory.canGoBack()
         case #selector(navigateForward(_:)): return navHistory.canGoForward()
         default: return true

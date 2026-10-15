@@ -399,6 +399,12 @@ const BUILTIN: &[(&str, &str, &str, &[&str])] = &[
         &["git", "history", "log", "commits", "branches"],
     ),
     (
+        "markdown.showPreviewToSide",
+        "View",
+        "Toggle Markdown Preview",
+        &["markdown", "preview", "md", "render"],
+    ),
+    (
         "workbench.action.togglePanel",
         "View",
         "Toggle Terminal",

@@ -153,6 +153,12 @@ pub struct RegistryListing {
 }
 
 /// Built-in and installed plugins with their state.
+/// Renders Markdown to an HTML fragment for the preview pane.
+#[uniffi::export]
+pub fn markdown_to_html(source: String) -> String {
+    galaxy_core::markdown::to_html(&source)
+}
+
 #[uniffi::export]
 pub fn plugin_list() -> Vec<PluginInfo> {
     let dir = plugin_install_mod::default_dir();

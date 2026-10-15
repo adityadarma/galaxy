@@ -43,6 +43,8 @@ tree-sitter-html.workspace = true
 tree-sitter-css.workspace = true
 tree-sitter-bash.workspace = true
 tree-sitter-php.workspace = true
+# Markdown preview.
+pulldown-cmark.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
 portable-pty.workspace = true

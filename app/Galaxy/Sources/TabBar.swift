@@ -125,6 +125,12 @@ final class TabBar: NSView {
     var onMove: ((Int, Int) -> Void)?
     /// Context menu for tab `index`, if any.
     var menuForTab: ((Int) -> NSMenu?)?
+    /// The preview button (shown for Markdown files) was clicked.
+    var onTogglePreview: (() -> Void)?
+
+    /// Toggle at the right end of the bar, like VS Code's "Open Preview to the Side".
+    let previewButton = NSButton()
+    static let previewButtonWidth: CGFloat = 36
 
     let scrollView = TabScrollView()
     /// Document view of `scrollView`: as wide as all the tabs together.
@@ -161,12 +167,31 @@ final class TabBar: NSView {
         scrollView.contentView.copiesOnScroll = false
         addSubview(scrollView)
 
+        previewButton.setButtonType(.momentaryChange)
+        previewButton.isBordered = false
+        previewButton.imagePosition = .imageOnly
+        previewButton.image = NSImage(systemSymbolName: "eye", accessibilityDescription: "Toggle Markdown Preview")?
+            .withSymbolConfiguration(.init(pointSize: 14, weight: .regular))
+        previewButton.contentTintColor = .secondaryLabelColor
+        previewButton.toolTip = "Toggle Markdown Preview (⇧⌘V)"
+        previewButton.setAccessibilityLabel("Toggle Markdown Preview")
+        previewButton.setAccessibilityIdentifier("markdown-preview-button")
+        previewButton.target = self
+        previewButton.action = #selector(previewButtonClicked(_:))
+        previewButton.isHidden = true
+        previewButton.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(previewButton)
+
         let rule = NSBox()
         rule.boxType = .separator
         rule.translatesAutoresizingMaskIntoConstraints = false
         addSubview(rule, positioned: .below, relativeTo: scrollView)
 
         NSLayoutConstraint.activate([
+            previewButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
+            previewButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            previewButton.widthAnchor.constraint(equalToConstant: 26),
+            previewButton.heightAnchor.constraint(equalToConstant: 24),
             heightAnchor.constraint(equalToConstant: Theme.tabHeight),
             widthAnchor.constraint(greaterThanOrEqualToConstant: 0),
             stack.leadingAnchor.constraint(equalTo: strip.leadingAnchor),
@@ -190,7 +215,8 @@ final class TabBar: NSView {
         strip.setFrameSize(NSSize(width: max(contentWidth, 1), height: bounds.height))
         // The scroll view only covers the tabs, so the empty strip after them
         // stays a title bar to drag the window by.
-        scrollView.frame = NSRect(x: 0, y: 0, width: min(contentWidth, bounds.width), height: bounds.height)
+        let reserved = previewButton.isHidden ? 0 : Self.previewButtonWidth
+        scrollView.frame = NSRect(x: 0, y: 0, width: min(contentWidth, max(0, bounds.width - reserved)), height: bounds.height)
         guard bounds.width > 0 else { return }
         // Keep the offset valid after the bar grows or tabs close.
         scrollView.scroll(toX: scrollView.contentView.bounds.origin.x)
@@ -226,6 +252,17 @@ final class TabBar: NSView {
     override func mouseUp(with event: NSEvent) {
         if let titleBar { titleBar.mouseUp(with: event) } else { super.mouseUp(with: event) }
     }
+
+    /// Shows the preview button for a Markdown tab; `active` while the preview is open.
+    func setPreviewButton(visible: Bool, active: Bool) {
+        let changed = previewButton.isHidden == visible
+        previewButton.isHidden = !visible
+        previewButton.contentTintColor = active ? Theme.accent : .secondaryLabelColor
+        previewButton.setAccessibilityValue(active ? "on" : "off")
+        if changed { needsLayout = true }
+    }
+
+    @objc private func previewButtonClicked(_ sender: Any?) { onTogglePreview?() }
 
     /// Replaces all tabs. Cheap enough: tab counts are small, and per-key
     /// updates go through `setEdited` instead.

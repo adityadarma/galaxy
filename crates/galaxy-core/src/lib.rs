@@ -20,6 +20,7 @@ pub mod jsonc;
 pub mod keymap;
 pub mod laravel;
 pub mod logging;
+pub mod markdown;
 pub mod lsp;
 pub mod movement;
 pub mod multicursor;
