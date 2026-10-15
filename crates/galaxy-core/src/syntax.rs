@@ -211,6 +211,22 @@ pub struct OutlineSymbol {
     pub column_utf16: usize,
 }
 
+/// Whether char offset `pos` lies in plain text between tags (JSX text,
+/// HTML text, or PHP's inline HTML) rather than in code. Such words have no
+/// definition, so Cmd+click must not offer them as links.
+pub fn is_markup_text(doc: &Document, tree: &Tree, language: SyntaxLanguage, pos: usize) -> bool {
+    let kind = match language {
+        SyntaxLanguage::Tsx | SyntaxLanguage::JavaScript => "jsx_text",
+        SyntaxLanguage::Html | SyntaxLanguage::Php => "text",
+        _ => return false,
+    };
+    let rope = doc.rope();
+    let byte = rope.char_to_byte(pos.min(rope.len_chars()));
+    tree.root_node()
+        .descendant_for_byte_range(byte, byte)
+        .is_some_and(|node| node.kind() == kind)
+}
+
 /// Extracts definitions from a completed tree. This never parses or blocks.
 pub fn outline_symbols(
     doc: &Document,
@@ -833,6 +849,74 @@ mod tests {
             assert!(Instant::now() < deadline, "syntax worker did not finish");
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    /// Parses `text` as `language` and reports `is_markup_text` at the first
+    /// char of each of `words`.
+    fn markup_flags(language: SyntaxLanguage, text: &str, words: &[&str]) -> Vec<bool> {
+        let service = SyntaxService::new(language.grammar());
+        let doc = Document::from_text(text);
+        service.submit_document(&doc);
+        let snapshot = wait_for(&service);
+        words
+            .iter()
+            .map(|word| {
+                let byte = text
+                    .find(word)
+                    .unwrap_or_else(|| panic!("{word} not in text"));
+                let pos = text[..byte].chars().count();
+                is_markup_text(&doc, snapshot.tree(), language, pos)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn words_between_jsx_tags_are_markup_text_but_code_is_not() {
+        let text =
+            "const total = 1;\nconst view = <p className=\"cls\">Recorded admin {total}</p>;\n";
+        assert_eq!(
+            markup_flags(
+                SyntaxLanguage::Tsx,
+                text,
+                &[
+                    "Recorded",
+                    "admin",
+                    "className",
+                    "total}",
+                    "view",
+                    "const view"
+                ],
+            ),
+            [true, true, false, false, false, false],
+        );
+    }
+
+    #[test]
+    fn html_text_is_markup_and_plain_languages_never_are() {
+        assert_eq!(
+            markup_flags(
+                SyntaxLanguage::Html,
+                "<p class=\"a\">Hello world</p>",
+                &["Hello", "class"]
+            ),
+            [true, false]
+        );
+        assert_eq!(
+            markup_flags(
+                SyntaxLanguage::Rust,
+                "fn main() { let word = 1; }",
+                &["word", "main"]
+            ),
+            [false, false]
+        );
+        assert_eq!(
+            markup_flags(
+                SyntaxLanguage::Php,
+                "<?php $a = 1; ?>\n<p>Plain words</p>",
+                &["Plain", "$a"]
+            ),
+            [true, false]
+        );
     }
 
     #[test]

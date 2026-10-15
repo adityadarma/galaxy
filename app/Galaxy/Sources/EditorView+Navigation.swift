@@ -297,6 +297,8 @@ extension EditorView {
         // Module paths in imports are links as a whole, punctuation included.
         if let specifier = importSpecifier(at: pos, text: text) { return specifier.range }
         guard let range = Self.identifierRange(in: text, at: Int(pos.colUtf16)) else { return nil }
+        // Words between tags (`<p>Recorded admin</p>`) are text, not names.
+        if document.isMarkupText(line: pos.line, colUtf16: UInt64(range.lowerBound)) { return nil }
         // A name that is being declared (a parameter in its signature) would
         // only jump to itself, so it is not offered as a link.
         if semanticTokens.contains(where: {

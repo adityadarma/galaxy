@@ -3041,6 +3041,23 @@ impl DocumentHandle {
             .collect()
     }
 
+    /// Whether the position is plain text between tags (JSX, HTML or PHP
+    /// inline HTML) instead of code, using the newest completed syntax tree.
+    /// `false` while no tree exists yet.
+    pub fn is_markup_text(&self, line: u64, col_utf16: u64) -> bool {
+        let st = &mut *self.lock();
+        let pos = to_char(&st.editor.doc, TextPos { line, col_utf16 });
+        let Some(syntax) = st.syntax.as_mut() else {
+            return false;
+        };
+        let language = syntax.language;
+        let Some(snapshot) = syntax.latest(&st.editor.doc) else {
+            return false;
+        };
+        let tree = snapshot.tree().clone();
+        syntax::is_markup_text(&st.editor.doc, &tree, language, pos)
+    }
+
     /// Plain lines without selection info.
     pub fn lines(&self, first: u64, count: u64) -> Vec<String> {
         self.lock()

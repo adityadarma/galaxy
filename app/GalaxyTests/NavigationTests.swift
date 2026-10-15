@@ -315,6 +315,38 @@ final class NavigationTests: XCTestCase {
         XCTAssertEqual(configLink?.1, UInt64(app + "app.name".utf16.count))
     }
 
+    func testCommandHoverSkipsWordsBetweenJSXTagsButKeepsCode() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-jsx-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let file = dir.appendingPathComponent("a.tsx")
+        let line = "const view = <p className=\"cls\">Recorded admin {total}</p>;"
+        try "const total = 1;\n\(line)\n".write(to: file, atomically: true, encoding: .utf8)
+        let c = MainWindowController(bridge: CoreBridge())
+        c.showWindow(nil)
+        defer { c.window?.orderOut(nil) }
+        try c.openFile(at: file)
+        let v = c.editorView
+        v.onDefinitionClick = { _ in true }
+
+        // Syntax parsing is asynchronous; wait until the line has styles.
+        let deadline = Date().addingTimeInterval(5)
+        while v.document?.viewport(firstLine: 1, count: 1).styles.isEmpty ?? true, Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
+        func link(_ word: String) -> (UInt64, UInt64)? {
+            let column = (line as NSString).range(of: word).location + 1
+            v.lastMousePoint = NSPoint(x: v.textOriginX + v.xOffset(in: line, column: UInt64(column)) + 0.5,
+                                       y: 1 * v.metrics.lineHeight + v.metrics.lineHeight / 2)
+            v.updateDefinitionLink(commandHeld: true)
+            return v.definitionLink.map { ($0.start, $0.end) }
+        }
+        XCTAssertNil(link("Recorded"), "text between tags is not a name")
+        XCTAssertNil(link("admin"))
+        XCTAssertNotNil(link("total"), "an expression inside {} is code")
+        XCTAssertNotNil(link("view"))
+    }
+
     func testCommandClickOnLogChannelOpensLoggingConfig() throws {
         // The Laravel app sits below the opened file's folder tree, as in a
         // workspace whose root is not the project root.
