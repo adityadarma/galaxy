@@ -30,6 +30,7 @@ pub mod rope_diff;
 pub mod selection;
 pub mod snippets;
 pub mod syntax;
+pub mod tags;
 pub mod terminal;
 pub mod viewport;
 pub mod watcher;

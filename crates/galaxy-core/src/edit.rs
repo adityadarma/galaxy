@@ -21,6 +21,7 @@ use std::collections::BTreeSet;
 use crate::change::{Assoc, Change, ChangeSet};
 use crate::document::Document;
 use crate::selection::{Selection, SelectionSet};
+use crate::tags::{self, Flavor};
 
 /// Indentation settings (VSCode: `editor.insertSpaces`, `editor.tabSize`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +156,140 @@ pub fn skip_closing(doc: &Document, sel: &SelectionSet, close: char) -> Option<T
         })
         .collect();
     Some(finish_with_carets(doc, sel, items))
+}
+
+/// Typing `>` at the end of an unfinished tag also adds its closing tag,
+/// with the caret between: `<div|` + `>` gives `<div>|</div>`. `None` when no
+/// caret is at such a tag (the `>` is then typed normally).
+pub fn close_tag_gt(doc: &Document, sel: &SelectionSet, flavor: Flavor) -> Option<Transaction> {
+    close_tag_with(doc, sel, ">", |caret| {
+        tags::closing_after_gt(doc, caret, flavor).map(|closing| (format!(">{closing}"), 1))
+    })
+}
+
+/// Typing `/` right after `<` completes the nearest unclosed tag:
+/// `<div>text<|` + `/` gives `<div>text</div>|`.
+pub fn close_tag_slash(doc: &Document, sel: &SelectionSet, flavor: Flavor) -> Option<Transaction> {
+    close_tag_with(doc, sel, "/", |caret| {
+        tags::closing_after_slash(doc, caret, flavor).map(|rest| {
+            let chars = rest.chars().count();
+            (rest, chars)
+        })
+    })
+}
+
+/// Shared by the two above: every caret gets its own completion, or plain
+/// `typed` when it has none. `None` when no caret has one, or any selection
+/// is non-empty.
+fn close_tag_with(
+    doc: &Document,
+    sel: &SelectionSet,
+    typed: &str,
+    completion: impl Fn(usize) -> Option<(String, usize)>,
+) -> Option<Transaction> {
+    if sel.iter().any(|s| !s.is_empty()) || sel.len() > MAX_TAG_CARETS {
+        return None;
+    }
+    let mut any = false;
+    let items = sel
+        .iter()
+        .map(|s| match completion(s.head) {
+            Some((text, caret)) => {
+                any = true;
+                let mut item = Item::new(s.head, s.head, text);
+                item.caret = caret;
+                item
+            }
+            None => Item::new(s.head, s.head, typed.to_string()),
+        })
+        .collect();
+    any.then(|| finish_with_carets(doc, sel, items))
+}
+
+const MAX_TAG_CARETS: usize = 8;
+
+/// Adds to `tx` the rename of each tag name's partner: when an edit changes
+/// `<div>`'s name, `</div>` follows in the same transaction, so one undo
+/// reverts both. Carets and the rest of `tx` are unchanged. Edits that
+/// split a name, empty it, or touch the partner itself are left alone.
+pub fn with_linked_rename(
+    doc: &Document,
+    sel: &SelectionSet,
+    tx: Transaction,
+    flavor: Flavor,
+) -> Transaction {
+    if tx.is_noop() || sel.len() > MAX_TAG_CARETS {
+        return tx;
+    }
+    let mut extra: Vec<Change> = Vec::new();
+    let mut after: Option<Document> = None;
+    for s in sel.iter() {
+        let Some((own, partner)) = tags::linked_names(doc, s.head, flavor) else {
+            continue;
+        };
+        if s.start() < own.0 || s.end() > own.1 {
+            continue;
+        }
+        let touches = |c: &Change| c.start() <= partner.1 && c.end() >= partner.0;
+        if tx.changes.iter().any(touches) || extra.iter().any(touches) {
+            continue;
+        }
+        let start = tx.changes.map(own.0, Assoc::Before);
+        let end = tx.changes.map(own.1, Assoc::After);
+        let edited = after.get_or_insert_with(|| {
+            let (mut d, mut selections) = (doc.clone(), sel.clone());
+            tx.clone().apply(&mut d, &mut selections);
+            d
+        });
+        let rope = edited.rope();
+        let mut stop = start;
+        while stop < edited.len_chars() && tags::is_name_char(rope.char(stop)) {
+            stop += 1;
+        }
+        if stop != end || stop == start || !rope.char(start).is_alphabetic() {
+            continue;
+        }
+        let renamed: String = rope.slice(start..stop).chars().collect();
+        let old = |r: (usize, usize)| doc.rope().slice(r.0..r.1).chars().collect::<String>();
+        if renamed == old(own) || renamed == old(partner) {
+            continue;
+        }
+        extra.push(Change::new(partner.0, partner.1, renamed));
+    }
+    if extra.is_empty() {
+        return tx;
+    }
+
+    let mut all: Vec<Change> = tx.changes.iter().cloned().collect();
+    all.extend(extra.iter().cloned());
+    let combined = ChangeSet::new(all, doc.len_chars());
+    // The partner edits expressed after `tx`, to shift the carets past them.
+    let shifted = extra
+        .iter()
+        .map(|c| {
+            Change::new(
+                tx.changes.map(c.start(), Assoc::Before),
+                tx.changes.map(c.end(), Assoc::After),
+                c.text(),
+            )
+        })
+        .collect();
+    let follow = ChangeSet::new(shifted, tx.changes.len_after(doc.len_chars()));
+    let selections = tx
+        .selections
+        .iter()
+        .map(|s| {
+            Selection::new(
+                follow.map(s.anchor, Assoc::After),
+                follow.map(s.head, Assoc::After),
+            )
+        })
+        .collect();
+    Transaction {
+        changes: combined,
+        selections,
+        primary: tx.primary,
+    }
 }
 
 pub fn pair_for(open: char) -> Option<char> {
@@ -649,6 +784,156 @@ mod tests {
         insert_pair(&doc, &sel, '\'').apply(&mut doc, &mut sel);
         assert_eq!(doc.text(), "don't");
         assert_eq!(sel.primary().head, 4);
+    }
+
+    // --- Tags ---
+
+    const HTML: Flavor = Flavor::HTML;
+
+    fn type_gt(marked: &str, flavor: Flavor) -> Option<String> {
+        let (mut doc, mut sel) = setup(marked);
+        let tx = close_tag_gt(&doc, &sel, flavor)?;
+        tx.apply(&mut doc, &mut sel);
+        Some(show(&doc, &sel))
+    }
+
+    fn type_slash(marked: &str, flavor: Flavor) -> Option<String> {
+        let (mut doc, mut sel) = setup(marked);
+        let tx = close_tag_slash(&doc, &sel, flavor)?;
+        tx.apply(&mut doc, &mut sel);
+        Some(show(&doc, &sel))
+    }
+
+    /// The document with `|` at every caret.
+    fn show(doc: &Document, sel: &SelectionSet) -> String {
+        let mut text: Vec<char> = doc.text().chars().collect();
+        let mut carets: Vec<usize> = sel.iter().map(|s| s.head).collect();
+        carets.sort_unstable_by(|a, b| b.cmp(a));
+        for c in carets {
+            text.insert(c, '|');
+        }
+        text.into_iter().collect()
+    }
+
+    #[test]
+    fn typing_gt_adds_the_closing_tag_between_the_carets() {
+        assert_eq!(type_gt("<div|", HTML).as_deref(), Some("<div>|</div>"));
+        assert_eq!(type_gt("<ul><li|", HTML).as_deref(), Some("<ul><li>|</li>"));
+        assert_eq!(type_gt("<br|", HTML), None);
+        assert_eq!(type_gt("a |", HTML), None);
+        assert_eq!(
+            type_gt("<[di]v", HTML),
+            None,
+            "a selection is replaced, not completed"
+        );
+    }
+
+    #[test]
+    fn typing_gt_with_several_carets_completes_each_and_types_the_rest() {
+        assert_eq!(
+            type_gt("x |\n<a|\n<b|", HTML).as_deref(),
+            Some("x >|\n<a>|</a>\n<b>|</b>")
+        );
+    }
+
+    #[test]
+    fn typing_slash_completes_the_nearest_open_tag() {
+        assert_eq!(
+            type_slash("<div>hi<|", HTML).as_deref(),
+            Some("<div>hi</div>|")
+        );
+        assert_eq!(type_slash("<p>a</p><|", HTML), None);
+    }
+
+    /// Replaces the document with `typed` at the caret(s) the way typing
+    /// does, then renames linked tags; returns the document with carets.
+    fn edit_then_rename(
+        marked: &str,
+        flavor: Flavor,
+        edit: impl Fn(&Document, &SelectionSet) -> Transaction,
+    ) -> String {
+        let (mut doc, mut sel) = setup(marked);
+        let tx = with_linked_rename(&doc, &sel, edit(&doc, &sel), flavor);
+        tx.apply(&mut doc, &mut sel);
+        show(&doc, &sel)
+    }
+
+    #[test]
+    fn renaming_an_opening_tag_renames_the_closing_one() {
+        let typed = |t: &'static str| move |d: &Document, s: &SelectionSet| insert_text(d, s, t);
+        assert_eq!(
+            edit_then_rename("<div|>x</div>", HTML, typed("s")),
+            "<divs|>x</divs>"
+        );
+        assert_eq!(
+            edit_then_rename("<|div>x</div>", HTML, typed("a")),
+            "<a|div>x</adiv>"
+        );
+        // Typing inside the closing name renames the opening one too.
+        assert_eq!(
+            edit_then_rename("<div>x</di|v>", HTML, typed("s")),
+            "<disv>x</dis|v>"
+        );
+    }
+
+    #[test]
+    fn deleting_name_characters_renames_the_partner_and_keeps_the_caret() {
+        let back = |d: &Document, s: &SelectionSet| backspace(d, s, &IndentConfig::default());
+        assert_eq!(
+            edit_then_rename("<span|>x</span>", HTML, back),
+            "<spa|>x</spa>"
+        );
+        let fwd = |d: &Document, s: &SelectionSet| delete_forward(d, s);
+        assert_eq!(
+            edit_then_rename("<|span>x</span>", HTML, fwd),
+            "<|pan>x</pan>"
+        );
+    }
+
+    #[test]
+    fn rename_is_one_undo_step_and_skips_unsafe_edits() {
+        let (mut doc, mut sel) = setup("<div|>x</div>");
+        let tx = with_linked_rename(&doc, &sel, insert_text(&doc, &sel, "s"), HTML);
+        let inverse = tx.apply(&mut doc, &mut sel);
+        assert_eq!(doc.text(), "<divs>x</divs>");
+        doc.apply(&inverse);
+        assert_eq!(doc.text(), "<div>x</div>", "both names restored together");
+
+        let typed = |t: &'static str| move |d: &Document, s: &SelectionSet| insert_text(d, s, t);
+        // A space ends the name: the partner must not become `di`.
+        assert_eq!(
+            edit_then_rename("<di| v>x</div>", HTML, typed(" ")),
+            "<di | v>x</div>"
+        );
+        // Typing `>` or deleting the whole name leaves the partner alone.
+        assert_eq!(
+            edit_then_rename("<div|>x</div>", HTML, typed("a")),
+            "<diva|>x</diva>"
+        );
+        let back = |d: &Document, s: &SelectionSet| backspace(d, s, &IndentConfig::default());
+        assert_eq!(edit_then_rename("<a|>x</a>", HTML, back), "<|>x</a>");
+        // Text, attributes and void tags are not tag names.
+        assert_eq!(
+            edit_then_rename("<p>te|xt</p>", HTML, typed("!")),
+            "<p>te!|xt</p>"
+        );
+        assert_eq!(
+            edit_then_rename("<div cl|ass>x</div>", HTML, typed("!")),
+            "<div cl!|ass>x</div>"
+        );
+    }
+
+    #[test]
+    fn rename_follows_nesting_and_every_caret() {
+        let typed = |d: &Document, s: &SelectionSet| insert_text(d, s, "x");
+        assert_eq!(
+            edit_then_rename("<div|><div>a</div></div>", HTML, typed),
+            "<divx|><div>a</div></divx>"
+        );
+        assert_eq!(
+            edit_then_rename("<a|>1</a><b|>2</b>", HTML, typed),
+            "<ax|>1</ax><bx|>2</bx>"
+        );
     }
 
     #[test]

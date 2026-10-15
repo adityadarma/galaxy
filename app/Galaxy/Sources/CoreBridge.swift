@@ -141,6 +141,10 @@ final class CoreBridge {
         try document.save()
     }
 
+    func setTagEditing(document: DocumentHandle, autoClose: Bool, autoRename: Bool) {
+        document.setTagEditing(autoClose: autoClose, autoRename: autoRename)
+    }
+
     func setIndent(document: DocumentHandle, useTabs: Bool, tabSize: UInt32) {
         document.setIndent(useTabs: useTabs, tabSize: tabSize)
     }

@@ -8,6 +8,10 @@ struct GalaxySettings: Equatable {
     var autoSave: AutoSaveMode?
     var autoSaveDelay: TimeInterval?
     var renderWhitespace: WhitespaceRendering? = nil
+    /// Add the closing tag when `>` or `</` is typed in HTML, PHP and JSX.
+    var autoClosingTags: Bool? = nil
+    /// Rename a tag's partner when its name is edited.
+    var linkedEditing: Bool? = nil
 
     static let empty = GalaxySettings(insertSpaces: nil, tabSize: nil, autoSave: nil, autoSaveDelay: nil)
 
@@ -17,11 +21,15 @@ struct GalaxySettings: Equatable {
             tabSize: override.tabSize ?? tabSize,
             autoSave: override.autoSave ?? autoSave,
             autoSaveDelay: override.autoSaveDelay ?? autoSaveDelay,
-            renderWhitespace: override.renderWhitespace ?? renderWhitespace
+            renderWhitespace: override.renderWhitespace ?? renderWhitespace,
+            autoClosingTags: override.autoClosingTags ?? autoClosingTags,
+            linkedEditing: override.linkedEditing ?? linkedEditing
         )
     }
 
     var effectiveRenderWhitespace: WhitespaceRendering { renderWhitespace ?? .all }
+    var effectiveAutoClosingTags: Bool { autoClosingTags ?? true }
+    var effectiveLinkedEditing: Bool { linkedEditing ?? true }
 
     var useTabs: Bool { !(insertSpaces ?? true) }
     var effectiveTabSize: UInt32 { max(tabSize ?? 4, 1) }
@@ -59,7 +67,9 @@ struct GalaxySettings: Equatable {
         }
         return GalaxySettings(insertSpaces: insertSpaces, tabSize: tabSize,
                               autoSave: autoSave, autoSaveDelay: autoSaveDelay,
-                              renderWhitespace: renderWhitespace)
+                              renderWhitespace: renderWhitespace,
+                              autoClosingTags: editor["autoClosingTags"] as? Bool,
+                              linkedEditing: editor["linkedEditing"] as? Bool)
     }
 
     static func completionItems() -> [CompletionInfo] {
@@ -68,6 +78,8 @@ struct GalaxySettings: Equatable {
             CompletionInfo(label: "insertSpaces", detail: "boolean", insertText: "insertSpaces", isSnippet: false),
             CompletionInfo(label: "tabSize", detail: "number", insertText: "tabSize", isSnippet: false),
             CompletionInfo(label: "renderWhitespace", detail: "none | boundary | all", insertText: "renderWhitespace", isSnippet: false),
+            CompletionInfo(label: "autoClosingTags", detail: "boolean: add </tag> after > (HTML, PHP, JSX)", insertText: "autoClosingTags", isSnippet: false),
+            CompletionInfo(label: "linkedEditing", detail: "boolean: rename the matching tag", insertText: "linkedEditing", isSnippet: false),
             CompletionInfo(label: "files.autoSave", detail: "off | afterDelay | onFocusChange", insertText: "files.autoSave", isSnippet: false),
             CompletionInfo(label: "files.autoSaveDelay", detail: "milliseconds", insertText: "files.autoSaveDelay", isSnippet: false),
         ]

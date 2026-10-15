@@ -2013,39 +2013,43 @@ impl Workspace {
 
     pub fn git_log_graph(&self, limit: u32) -> Result<Vec<GitCommitInfo>, CoreError> {
         use galaxy_core::git::GitRefKind;
-        Ok(galaxy_core::git::log_graph(self.inner.root(), limit as usize)?
-            .into_iter()
-            .map(|commit| GitCommitInfo {
-                hash: commit.hash,
-                author: commit.author,
-                timestamp: commit.timestamp,
-                subject: commit.subject,
-                refs: commit
-                    .refs
-                    .into_iter()
-                    .map(|r| GitRefInfo {
-                        name: r.name,
-                        kind: match r.kind {
-                            GitRefKind::Head => GitRefKindInfo::Head,
-                            GitRefKind::Branch => GitRefKindInfo::Branch,
-                            GitRefKind::Remote => GitRefKindInfo::Remote,
-                            GitRefKind::Tag => GitRefKindInfo::Tag,
-                        },
-                    })
-                    .collect(),
-                lane: commit.lane,
-                passing: commit.passing,
-                incoming: commit.incoming,
-                outgoing: commit.outgoing,
-            })
-            .collect())
+        Ok(
+            galaxy_core::git::log_graph(self.inner.root(), limit as usize)?
+                .into_iter()
+                .map(|commit| GitCommitInfo {
+                    hash: commit.hash,
+                    author: commit.author,
+                    timestamp: commit.timestamp,
+                    subject: commit.subject,
+                    refs: commit
+                        .refs
+                        .into_iter()
+                        .map(|r| GitRefInfo {
+                            name: r.name,
+                            kind: match r.kind {
+                                GitRefKind::Head => GitRefKindInfo::Head,
+                                GitRefKind::Branch => GitRefKindInfo::Branch,
+                                GitRefKind::Remote => GitRefKindInfo::Remote,
+                                GitRefKind::Tag => GitRefKindInfo::Tag,
+                            },
+                        })
+                        .collect(),
+                    lane: commit.lane,
+                    passing: commit.passing,
+                    incoming: commit.incoming,
+                    outgoing: commit.outgoing,
+                })
+                .collect(),
+        )
     }
 
     /// Tags on `origin`; `None` when there is no `origin`. Contacts the
     /// remote, so call it off the main thread.
     pub fn git_remote_tags(&self) -> Result<Option<Vec<String>>, CoreError> {
-        Ok(galaxy_core::git::remote_tags(self.inner.root())?
-            .map(|tags| tags.into_iter().collect()))
+        Ok(
+            galaxy_core::git::remote_tags(self.inner.root())?
+                .map(|tags| tags.into_iter().collect()),
+        )
     }
 
     pub fn git_delete_tag(&self, name: String) -> Result<(), CoreError> {
@@ -2125,14 +2129,16 @@ impl Workspace {
         from: String,
         to: String,
     ) -> Result<Vec<GitFileDiffInfo>, CoreError> {
-        Ok(galaxy_core::git::compare_files(self.inner.root(), &from, &to)?
-            .into_iter()
-            .map(|file| GitFileDiffInfo {
-                path: file.path,
-                old_path: file.old_path,
-                status: file.status.to_string(),
-            })
-            .collect())
+        Ok(
+            galaxy_core::git::compare_files(self.inner.root(), &from, &to)?
+                .into_iter()
+                .map(|file| GitFileDiffInfo {
+                    path: file.path,
+                    old_path: file.old_path,
+                    status: file.status.to_string(),
+                })
+                .collect(),
+        )
     }
 
     pub fn git_compare_diff(
@@ -2803,6 +2809,10 @@ struct State {
     editor: Editor,
     path: PathBuf,
     indent: IndentConfig,
+    /// Add the closing tag when `>` or `</` is typed (HTML, PHP, JSX).
+    auto_close_tags: bool,
+    /// Rename a tag's partner when its name is edited.
+    auto_rename_tags: bool,
     /// `History::state_id` at the last load or save, for `is_modified`.
     saved_state: u64,
     /// What the file was when last loaded or saved (M2-03). `None` for
@@ -3245,6 +3255,14 @@ impl DocumentHandle {
         };
     }
 
+    /// Turns the HTML/JSX tag helpers on or off (`editor.autoClosingTags`,
+    /// `editor.linkedEditing`).
+    pub fn set_tag_editing(&self, auto_close: bool, auto_rename: bool) {
+        let mut st = self.lock();
+        st.auto_close_tags = auto_close;
+        st.auto_rename_tags = auto_rename;
+    }
+
     /// Replaces all selections (click, arrow keys, Opt+Click). `primary`
     /// indexes into `selections`. An empty list puts a caret at 0.
     pub fn set_selections(&self, selections: Vec<TextSelection>, primary: u64) {
@@ -3266,14 +3284,31 @@ impl DocumentHandle {
             .syntax
             .as_ref()
             .and_then(|syntax| syntax.language.comment_marker());
+        let flavor = st
+            .syntax
+            .as_ref()
+            .and_then(|syntax| galaxy_core::tags::Flavor::for_language(syntax.language));
+        let close_flavor = flavor.filter(|_| st.auto_close_tags);
+        let rename_flavor = flavor.filter(|_| st.auto_rename_tags);
         {
             let ed = &mut st.editor;
             let (doc, sel) = (&ed.doc, &ed.sel);
+            let rename = |tx: edit::Transaction| match rename_flavor {
+                Some(flavor) => edit::with_linked_rename(doc, sel, tx, flavor),
+                None => tx,
+            };
             let (tx, kind) = match &command {
                 EditCommand::InsertText { text } => {
                     let character =
                         (text.chars().count() == 1).then(|| text.chars().next().unwrap());
-                    if let Some(open) = character.filter(|c| edit::pair_for(*c).is_some()) {
+                    let tag_tx = close_flavor.and_then(|flavor| match character {
+                        Some('>') => edit::close_tag_gt(doc, sel, flavor),
+                        Some('/') => edit::close_tag_slash(doc, sel, flavor),
+                        _ => None,
+                    });
+                    if let Some(tx) = tag_tx {
+                        (tx, EditKind::Other)
+                    } else if let Some(open) = character.filter(|c| edit::pair_for(*c).is_some()) {
                         (edit::insert_pair(doc, sel, open), EditKind::Other)
                     } else if let Some(close) =
                         character.filter(|c| matches!(c, ')' | ']' | '}' | '\'' | '"'))
@@ -3284,12 +3319,16 @@ impl DocumentHandle {
                             insert_kind(text),
                         )
                     } else {
-                        (edit::insert_text(doc, sel, text), insert_kind(text))
+                        (rename(edit::insert_text(doc, sel, text)), insert_kind(text))
                     }
                 }
                 EditCommand::Paste { text } => (edit::paste(doc, sel, text), EditKind::Other),
-                EditCommand::Backspace => (edit::backspace(doc, sel, &cfg), EditKind::Delete),
-                EditCommand::DeleteForward => (edit::delete_forward(doc, sel), EditKind::Delete),
+                EditCommand::Backspace => {
+                    (rename(edit::backspace(doc, sel, &cfg)), EditKind::Delete)
+                }
+                EditCommand::DeleteForward => {
+                    (rename(edit::delete_forward(doc, sel)), EditKind::Delete)
+                }
                 EditCommand::Newline => (edit::newline(doc, sel, &cfg), EditKind::Other),
                 EditCommand::Indent => (edit::indent(doc, sel, &cfg), EditKind::Other),
                 EditCommand::Outdent => (edit::outdent(doc, sel, &cfg), EditKind::Other),
@@ -3796,6 +3835,8 @@ impl DocumentHandle {
                 editor: Editor::new(doc),
                 path,
                 indent: IndentConfig::default(),
+                auto_close_tags: true,
+                auto_rename_tags: true,
                 finder: None,
                 find_error: None,
                 syntax,
@@ -4373,6 +4414,99 @@ mod tests {
             Document::from_text(text),
             PathBuf::new(),
         ))
+    }
+
+    fn doc_at(path: &str, text: &str, caret_utf16: u64) -> Arc<DocumentHandle> {
+        let doc = Arc::new(DocumentHandle::new(
+            Document::from_text(text),
+            PathBuf::from(path),
+        ));
+        doc.set_selections(
+            vec![TextSelection {
+                anchor: TextPos {
+                    line: 0,
+                    col_utf16: caret_utf16,
+                },
+                head: TextPos {
+                    line: 0,
+                    col_utf16: caret_utf16,
+                },
+            }],
+            0,
+        );
+        doc
+    }
+
+    fn type_text(doc: &DocumentHandle, text: &str) {
+        doc.edit(EditCommand::InsertText { text: text.into() });
+    }
+
+    #[test]
+    fn typing_gt_and_slash_close_tags_in_markup_files() {
+        let html = doc_at("page.html", "<div", 4);
+        type_text(&html, ">");
+        assert_eq!(html.text(), "<div></div>");
+        assert_eq!(primary(&html), (5, 0), "caret between the tags");
+
+        let slash = doc_at("page.html", "<ul><li>a<", 10);
+        type_text(&slash, "/");
+        assert_eq!(slash.text(), "<ul><li>a</li>");
+
+        let tsx = doc_at("view.tsx", "const a = <Foo bar={() => 1}", 28);
+        type_text(&tsx, ">");
+        assert_eq!(tsx.text(), "const a = <Foo bar={() => 1}></Foo>");
+
+        let generic = doc_at("view.tsx", "let x: Array<string", 19);
+        type_text(&generic, ">");
+        assert_eq!(
+            generic.text(),
+            "let x: Array<string>",
+            "generic stays plain"
+        );
+
+        let ts = doc_at("lib.ts", "<div", 4);
+        type_text(&ts, ">");
+        assert_eq!(ts.text(), "<div>", "TypeScript has no tags");
+    }
+
+    #[test]
+    fn closing_a_tag_is_one_undo_step_and_can_be_switched_off() {
+        let doc = doc_at("page.html", "<div", 4);
+        type_text(&doc, ">");
+        assert!(doc.undo());
+        assert_eq!(doc.text(), "<div");
+
+        let off = doc_at("page.html", "<div", 4);
+        off.set_tag_editing(false, true);
+        type_text(&off, ">");
+        assert_eq!(off.text(), "<div>");
+    }
+
+    #[test]
+    fn editing_a_tag_name_renames_its_partner_in_one_undo_step() {
+        let doc = doc_at("page.html", "<div>x</div>", 4);
+        type_text(&doc, "s");
+        assert_eq!(doc.text(), "<divs>x</divs>");
+        assert_eq!(primary(&doc), (5, 0));
+        doc.edit(EditCommand::Backspace);
+        assert_eq!(doc.text(), "<div>x</div>");
+        assert!(doc.undo());
+        assert_eq!(
+            doc.text(),
+            "<divs>x</divs>",
+            "undo reverts both names together"
+        );
+        assert!(doc.undo());
+        assert_eq!(doc.text(), "<div>x</div>");
+
+        let off = doc_at("page.html", "<div>x</div>", 4);
+        off.set_tag_editing(true, false);
+        type_text(&off, "s");
+        assert_eq!(off.text(), "<divs>x</div>");
+
+        let text = doc_at("notes.md", "<div>x</div>", 4);
+        type_text(&text, "s");
+        assert_eq!(text.text(), "<divs>x</div>", "only markup languages rename");
     }
 
     fn primary(doc: &DocumentHandle) -> (u64, u64) {

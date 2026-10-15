@@ -137,6 +137,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private var memoryPressureSource: DispatchSourceMemoryPressure?
     var globalSettingsURL = GalaxySettings.globalURL
     private var settingsModified: Date?
+    /// `editor.autoClosingTags` and `editor.linkedEditing`, applied to every tab.
+    private var autoClosingTags = true
+    private var linkedEditing = true
     private var workspaceSettingsModified: Date?
     private(set) var settingsProblems: [String] = []
     private var autoSaveMode: AutoSaveMode = .off
@@ -1562,11 +1565,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             } ?? .empty
             settingsProblems = []
             let settings = global.merged(with: workspace)
+            autoClosingTags = settings.effectiveAutoClosingTags
+            linkedEditing = settings.effectiveLinkedEditing
             autoSaveMode = settings.effectiveAutoSave
             autoSaveDelay = settings.effectiveAutoSaveDelay
             if autoSaveMode != .afterDelay { autoSaveWorkItem?.cancel(); autoSaveWorkItem = nil }
             for tab in tabs {
                 bridge.setIndent(document: tab.doc, useTabs: settings.useTabs, tabSize: settings.effectiveTabSize)
+                applyTagEditing(to: tab)
             }
             editorView.renderWhitespace = settings.effectiveRenderWhitespace
             secondaryEditorView.renderWhitespace = settings.effectiveRenderWhitespace
@@ -2260,7 +2266,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     /// Adds `tab` after the active one, or puts it in place of tab
     /// `replacing`, and shows it.
+    private func applyTagEditing(to tab: EditorTab) {
+        bridge.setTagEditing(document: tab.doc, autoClose: autoClosingTags, autoRename: linkedEditing)
+    }
+
     private func add(_ tab: EditorTab, replacing: Int?) {
+        applyTagEditing(to: tab)
         if let r = replacing {
             if activeIndex == r {
                 noteLeaving(tabs[r])

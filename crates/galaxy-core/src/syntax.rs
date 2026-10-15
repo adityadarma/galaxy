@@ -171,7 +171,7 @@ impl SyntaxLanguage {
             "rs" => Some(Self::Rust),
             "ts" => Some(Self::TypeScript),
             "tsx" => Some(Self::Tsx),
-            "js" | "mjs" | "cjs" => Some(Self::JavaScript),
+            "js" | "mjs" | "cjs" | "jsx" => Some(Self::JavaScript),
             "json" | "jsonc" => Some(Self::Json),
             "toml" => Some(Self::Toml),
             "yaml" | "yml" => Some(Self::Yaml),
