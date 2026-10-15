@@ -12,6 +12,8 @@ struct GalaxySettings: Equatable {
     var autoClosingTags: Bool? = nil
     /// Rename a tag's partner when its name is edited.
     var linkedEditing: Bool? = nil
+    /// Author and age of the caret line, after the text (`editor.gitBlame`).
+    var gitBlame: Bool? = nil
 
     static let empty = GalaxySettings(insertSpaces: nil, tabSize: nil, autoSave: nil, autoSaveDelay: nil)
 
@@ -23,13 +25,15 @@ struct GalaxySettings: Equatable {
             autoSaveDelay: override.autoSaveDelay ?? autoSaveDelay,
             renderWhitespace: override.renderWhitespace ?? renderWhitespace,
             autoClosingTags: override.autoClosingTags ?? autoClosingTags,
-            linkedEditing: override.linkedEditing ?? linkedEditing
+            linkedEditing: override.linkedEditing ?? linkedEditing,
+            gitBlame: override.gitBlame ?? gitBlame
         )
     }
 
     var effectiveRenderWhitespace: WhitespaceRendering { renderWhitespace ?? .all }
     var effectiveAutoClosingTags: Bool { autoClosingTags ?? true }
     var effectiveLinkedEditing: Bool { linkedEditing ?? true }
+    var effectiveGitBlame: Bool { gitBlame ?? true }
 
     var useTabs: Bool { !(insertSpaces ?? true) }
     var effectiveTabSize: UInt32 { max(tabSize ?? 4, 1) }
@@ -69,7 +73,8 @@ struct GalaxySettings: Equatable {
                               autoSave: autoSave, autoSaveDelay: autoSaveDelay,
                               renderWhitespace: renderWhitespace,
                               autoClosingTags: editor["autoClosingTags"] as? Bool,
-                              linkedEditing: editor["linkedEditing"] as? Bool)
+                              linkedEditing: editor["linkedEditing"] as? Bool,
+                              gitBlame: editor["gitBlame"] as? Bool)
     }
 
     static func completionItems() -> [CompletionInfo] {
@@ -80,6 +85,7 @@ struct GalaxySettings: Equatable {
             CompletionInfo(label: "renderWhitespace", detail: "none | boundary | all", insertText: "renderWhitespace", isSnippet: false),
             CompletionInfo(label: "autoClosingTags", detail: "boolean: add </tag> after > (HTML, PHP, JSX)", insertText: "autoClosingTags", isSnippet: false),
             CompletionInfo(label: "linkedEditing", detail: "boolean: rename the matching tag", insertText: "linkedEditing", isSnippet: false),
+            CompletionInfo(label: "gitBlame", detail: "boolean: show who last changed the caret line", insertText: "gitBlame", isSnippet: false),
             CompletionInfo(label: "files.autoSave", detail: "off | afterDelay | onFocusChange", insertText: "files.autoSave", isSnippet: false),
             CompletionInfo(label: "files.autoSaveDelay", detail: "milliseconds", insertText: "files.autoSaveDelay", isSnippet: false),
         ]

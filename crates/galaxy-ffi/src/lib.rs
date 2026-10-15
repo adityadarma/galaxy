@@ -1708,6 +1708,27 @@ pub struct GitFileDiffInfo {
     pub status: String,
 }
 
+/// The commit behind some lines of a file (inline blame).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct BlameCommitInfo {
+    pub sha: String,
+    pub author: String,
+    pub email: String,
+    /// Author time, seconds since the Unix epoch.
+    pub time: i64,
+    pub summary: String,
+    /// Not committed yet (unsaved or uncommitted edits).
+    pub uncommitted: bool,
+}
+
+/// Blame for a whole file. `line_commit[n]` indexes `commits` for 0-based
+/// line `n`; `u32::MAX` means unknown.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct BlameInfo {
+    pub commits: Vec<BlameCommitInfo>,
+    pub line_commit: Vec<u32>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum GitLineChangeKind {
     Added,
@@ -2252,6 +2273,28 @@ impl Workspace {
                 new_len: h.new_len as u64,
             })
             .collect())
+    }
+
+    /// Who last changed each line of `rel_path`, counting `text` as the
+    /// current content. `None` for untracked files and outside a repository.
+    pub fn git_blame(&self, rel_path: String, text: String) -> Result<Option<BlameInfo>, CoreError> {
+        Ok(
+            galaxy_core::git::blame(self.inner.root(), &rel_path, &text)?.map(|blame| BlameInfo {
+                commits: blame
+                    .commits
+                    .into_iter()
+                    .map(|c| BlameCommitInfo {
+                        sha: c.sha,
+                        author: c.author,
+                        email: c.email,
+                        time: c.time,
+                        summary: c.summary,
+                        uncommitted: c.uncommitted,
+                    })
+                    .collect(),
+                line_commit: blame.line_commit,
+            }),
+        )
     }
 
     pub fn git_diff_lines(

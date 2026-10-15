@@ -259,6 +259,8 @@ fn valid_commit_id(rev: &str) -> bool {
 const LOCAL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Remote operations give up sooner: offline must not hang the panel.
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(20);
+/// Blame walks the file's whole history; a huge file may take a while.
+const BLAME_TIMEOUT: Duration = Duration::from_secs(15);
 /// The remote whose tags the graph compares against.
 const REMOTE: &str = "origin";
 
@@ -931,6 +933,108 @@ pub fn diff_lines(
     Ok(changes)
 }
 
+/// The commit that last touched some lines of a file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlameCommit {
+    pub sha: String,
+    pub author: String,
+    pub email: String,
+    /// Author time, seconds since the Unix epoch.
+    pub time: i64,
+    pub summary: String,
+    /// Lines not yet committed (edited, or staged but not committed).
+    pub uncommitted: bool,
+}
+
+/// Blame for a whole file: `line_commit[n]` indexes `commits` for 0-based
+/// line `n`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Blame {
+    pub commits: Vec<BlameCommit>,
+    pub line_commit: Vec<u32>,
+}
+
+/// Blame for `rel_path` as if the file held `working_text`, so unsaved edits
+/// show as uncommitted. `None` when git cannot blame the file (untracked, new
+/// repository, outside a repository).
+pub fn blame(root: &Path, rel_path: &str, working_text: &str) -> io::Result<Option<Blame>> {
+    use std::collections::HashMap;
+    use std::io::Write;
+
+    let mut contents = tempfile::NamedTempFile::new()?;
+    contents.write_all(working_text.as_bytes())?;
+    contents.flush()?;
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(root)
+        .args(["blame", "--porcelain", "--contents"])
+        .arg(contents.path())
+        .args(["--", rel_path]);
+    let output = output_within(cmd, BLAME_TIMEOUT)?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut blame = Blame::default();
+    let mut index: HashMap<&str, u32> = HashMap::new();
+    let mut current: Option<u32> = None;
+    let mut final_line = 0usize;
+    for line in text.split('\n') {
+        if line.starts_with('\t') {
+            // Content line: the group header before it said which commit.
+            if let Some(commit) = current {
+                if blame.line_commit.len() < final_line {
+                    blame.line_commit.resize(final_line, u32::MAX);
+                }
+                blame.line_commit[final_line - 1] = commit;
+            }
+            continue;
+        }
+        let mut parts = line.split(' ');
+        let (Some(sha), Some(orig), Some(fin)) = (parts.next(), parts.next(), parts.next()) else {
+            // A header line such as `summary ...`: attach it to the commit.
+            if let (Some(commit), Some((key, value))) = (current, line.split_once(' ')) {
+                set_blame_field(&mut blame.commits[commit as usize], key, value);
+            }
+            continue;
+        };
+        let is_group_header = (40..=64).contains(&sha.len())
+            && sha.bytes().all(|b| b.is_ascii_hexdigit())
+            && orig.parse::<usize>().is_ok();
+        if is_group_header {
+            let Ok(fin) = fin.parse::<usize>() else {
+                continue;
+            };
+            final_line = fin;
+            current = Some(*index.entry(sha).or_insert_with(|| {
+                blame.commits.push(BlameCommit {
+                    sha: sha.to_string(),
+                    author: String::new(),
+                    email: String::new(),
+                    time: 0,
+                    summary: String::new(),
+                    uncommitted: sha.bytes().all(|b| b == b'0'),
+                });
+                (blame.commits.len() - 1) as u32
+            }));
+        } else if let (Some(commit), Some((key, value))) = (current, line.split_once(' ')) {
+            set_blame_field(&mut blame.commits[commit as usize], key, value);
+        }
+    }
+    Ok(Some(blame))
+}
+
+fn set_blame_field(commit: &mut BlameCommit, key: &str, value: &str) {
+    match key {
+        "author" => commit.author = value.to_string(),
+        "author-mail" => commit.email = value.trim_matches(['<', '>']).to_string(),
+        "author-time" => commit.time = value.parse().unwrap_or(0),
+        "summary" => commit.summary = value.to_string(),
+        _ => {}
+    }
+}
+
 pub fn read_status(root: &Path) -> io::Result<Option<GitStatus>> {
     let repo = match gix::discover(root) {
         Ok(repo) => repo,
@@ -1588,6 +1692,58 @@ mod tests {
         assert!(renamed.contains("rename from old.txt"), "{renamed}");
         assert!(compare_files(d, &from, "--help").is_err());
         assert!(compare_diff(d, &from, &to, "", None).is_err());
+    }
+
+    fn commit_as(dir: &Path, name: &str, message: &str) {
+        run(
+            dir,
+            [
+                "-c",
+                &format!("user.name={name}"),
+                "-c",
+                &format!("user.email={}@example.com", name.to_lowercase()),
+                "commit",
+                "-m",
+                message,
+            ],
+        );
+    }
+
+    #[test]
+    fn blame_names_the_author_of_each_line_and_flags_unsaved_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        run(dir.path(), ["init", "-b", "main"]);
+        fs::write(dir.path().join("f.txt"), "one\ntwo\n").unwrap();
+        run(dir.path(), ["add", "f.txt"]);
+        commit_as(dir.path(), "Alice", "first");
+        fs::write(dir.path().join("f.txt"), "one\nTWO\nthree\n").unwrap();
+        run(dir.path(), ["add", "f.txt"]);
+        commit_as(dir.path(), "Bob", "shout two");
+
+        let blame = blame(dir.path(), "f.txt", "one\nTWO\nthree\nfour\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(blame.line_commit.len(), 4);
+        let at = |line: usize| &blame.commits[blame.line_commit[line] as usize];
+        assert_eq!(at(0).author, "Alice");
+        assert_eq!(at(0).email, "alice@example.com");
+        assert_eq!(at(0).summary, "first");
+        assert_eq!(at(1).author, "Bob");
+        assert_eq!(at(1).summary, "shout two");
+        assert!(at(1).time > 0 && !at(1).uncommitted);
+        assert_eq!(at(1).sha.len(), 40);
+        // Bob wrote line 3 too, in the same commit.
+        assert_eq!(blame.line_commit[1], blame.line_commit[2]);
+        // The unsaved fourth line belongs to no commit yet.
+        assert!(at(3).uncommitted);
+    }
+
+    #[test]
+    fn blame_is_none_for_untracked_files() {
+        let dir = tempfile::tempdir().unwrap();
+        run(dir.path(), ["init", "-b", "main"]);
+        fs::write(dir.path().join("new.txt"), "x\n").unwrap();
+        assert_eq!(blame(dir.path(), "new.txt", "x\n").unwrap(), None);
     }
 
     fn run<const N: usize>(dir: &Path, args: [&str; N]) {

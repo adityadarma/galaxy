@@ -399,6 +399,12 @@ const BUILTIN: &[(&str, &str, &str, &[&str])] = &[
         &["git", "history", "log", "commits", "branches"],
     ),
     (
+        "galaxy.toggleGitBlame",
+        "View",
+        "Toggle Git Blame",
+        &["git", "blame", "author", "annotate", "who", "history", "gitlens"],
+    ),
+    (
         "markdown.showPreviewToSide",
         "View",
         "Toggle Markdown Preview",

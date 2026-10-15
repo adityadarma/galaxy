@@ -64,6 +64,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private var terminalHandles: [TerminalHandle] = []
     private var activeTerminalIndex = 0
     let hoverPopover = HoverPopover()
+    let blamePopover = BlamePopover()
+    /// `editor.gitBlame`, or the View > Toggle Git Blame override of it.
+    private(set) var gitBlameEnabled = true
+    /// Commit behind the annotated line; what the blame card shows.
+    private var blameCommit: BlameCommitInfo?
+    private var blameRefreshItem: DispatchWorkItem?
+    private var blameHideItem: DispatchWorkItem?
+    /// Quiet time after the last edit before blame is recomputed.
+    static let blameRefreshDelay: TimeInterval = 0.5
     private let completionPopup = CompletionPopup()
     private let signaturePopup = SignaturePopup()
     private let codeActionPopup = CodeActionPopup()
@@ -586,6 +595,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             self?.requestCompletionIfNeeded()
             self?.refreshGitDiff()
             if self?.isMarkdownPreviewShown == true { self?.updateMarkdownPreview() }
+            self?.updateBlameAnnotation()
+            self?.scheduleBlameRefresh()
         }
         editorView.onSnippetInvalidated = { [weak self] in
             self?.snippetSession = nil
@@ -616,6 +627,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             }
             self?.statusBar.showCursor(primary: primary, count: count)
             self?.breadcrumbBar.show(symbols: self?.documentSymbols ?? [], atLine: primary.line)
+            self?.updateBlameAnnotation()
         }
         breadcrumbBar.onSelect = { [weak self] symbol in
             guard let self, let tab = self.activeTab else { return }
@@ -877,6 +889,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
         bottomPanelContent.isHidden = true
         detailView.addSubview(hoverPopover)
+        detailView.addSubview(blamePopover)
         detailView.addSubview(completionPopup)
         detailView.addSubview(signaturePopup)
         NSLayoutConstraint.activate([
@@ -956,6 +969,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         editorTerminalView.onExit = { [weak self] in self?.editorTerminalExited() }
         tabBar.menuForTab = { [weak self] index in self?.menu(forTab: index) }
         hoverPopover.isHidden = true
+        blamePopover.isHidden = true
+        blamePopover.translatesAutoresizingMaskIntoConstraints = true
+        blamePopover.onPointerEntered = { [weak self] in self?.cancelBlameHide() }
+        blamePopover.onPointerExited = { [weak self] in self?.scheduleBlameHide() }
+        editorView.onMouseExit = { [weak self] in self?.scheduleBlameHide() }
         completionPopup.isHidden = true
         signaturePopup.isHidden = true
         completionPopup.onClose = { [weak self] in self?.closeCompletion() }
@@ -1028,7 +1046,126 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
+    // MARK: Git blame
+
+    @objc func toggleGitBlame(_ sender: Any?) {
+        setGitBlame(!gitBlameEnabled)
+    }
+
+    private func setGitBlame(_ on: Bool) {
+        gitBlameEnabled = on
+        if on {
+            refreshBlame()
+        } else {
+            blameRefreshItem?.cancel()
+            updateBlameAnnotation()
+        }
+    }
+
+    /// Recomputes blame for the active file in the background. The text is
+    /// passed in, so unsaved edits show as uncommitted. A slower, older
+    /// answer is dropped by the per-tab generation.
+    private func refreshBlame() {
+        blameRefreshItem?.cancel()
+        guard gitBlameEnabled, let workspace, let tab = activeTab, tab.terminal == nil,
+              let path = tab.relPath else {
+            updateBlameAnnotation()
+            return
+        }
+        tab.blameGeneration += 1
+        let generation = tab.blameGeneration
+        let text = tab.doc.text()
+        let lines = tab.doc.lineCount()
+        DispatchQueue.global(qos: .utility).async { [weak self, workspace, path, text] in
+            let blame = try? workspace.gitBlame(relPath: path, text: text)
+            Task { @MainActor [weak self] in
+                guard let self,
+                      let tab = self.tabs.first(where: { $0.relPath == path }),
+                      tab.blameGeneration == generation else { return }
+                tab.blame = blame
+                tab.blameLineCount = lines
+                if self.activeTab === tab { self.updateBlameAnnotation() }
+            }
+        }
+    }
+
+    private func scheduleBlameRefresh() {
+        guard gitBlameEnabled else { return }
+        blameRefreshItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in self?.refreshBlame() }
+        blameRefreshItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.blameRefreshDelay, execute: item)
+    }
+
+    /// Shows the commit of the caret line after its text. Hidden when blame
+    /// is off, unknown, or stale (an edit added or removed lines since).
+    func updateBlameAnnotation() {
+        defer {
+            if editorView.blameAnnotation == nil { hideBlamePopover() }
+        }
+        blameCommit = nil
+        guard gitBlameEnabled, let tab = activeTab, tab.terminal == nil, let blame = tab.blame,
+              tab.doc.lineCount() == tab.blameLineCount else {
+            editorView.blameAnnotation = nil
+            return
+        }
+        let line = tab.doc.primaryCursor().line
+        guard Int(line) < blame.lineCommit.count else {
+            editorView.blameAnnotation = nil
+            return
+        }
+        let index = Int(blame.lineCommit[Int(line)])
+        guard blame.commits.indices.contains(index) else {
+            editorView.blameAnnotation = nil
+            return
+        }
+        let commit = blame.commits[index]
+        blameCommit = commit
+        editorView.blameAnnotation = EditorView.BlameAnnotation(line: line, text: BlameFormat.annotation(for: commit))
+    }
+
+    /// Opens the card when `point` (editor coordinates) is on the blame text.
+    /// Returns `true` when it is, so the LSP hover stays out of the way.
+    private func handleBlameHover(point: NSPoint) -> Bool {
+        guard let commit = blameCommit, let rect = editorView.blameAnnotationRect(), rect.contains(point) else {
+            if !blamePopover.isHidden { scheduleBlameHide() }
+            return false
+        }
+        cancelBlameHide()
+        hoverPopover.isHidden = true
+        if blamePopover.isHidden || blamePopover.sha != commit.sha {
+            blamePopover.show(commit)
+            let anchor = detailView.convert(rect, from: editorView)
+            let visible = detailView.convert(editorView.visibleRect, from: editorView).insetBy(dx: 8, dy: 4)
+            blamePopover.frame = HoverPopover.placement(size: blamePopover.fittingSize(), anchor: anchor, in: visible, gap: 2)
+            blamePopover.isHidden = false
+            blamePopover.needsLayout = true
+        }
+        return true
+    }
+
+    /// Closes the card after a short grace period, so the pointer can cross
+    /// the gap between the annotation and the card to reach `Copy SHA`.
+    private func scheduleBlameHide() {
+        guard !blamePopover.isHidden else { return }
+        blameHideItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in self?.hideBlamePopover() }
+        blameHideItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: item)
+    }
+
+    private func cancelBlameHide() {
+        blameHideItem?.cancel()
+        blameHideItem = nil
+    }
+
+    private func hideBlamePopover() {
+        cancelBlameHide()
+        blamePopover.isHidden = true
+    }
+
     private func beginHover(at position: TextPos, point: NSPoint) {
+        if handleBlameHover(point: point) { return }
         guard position.line != UInt64.max, let document = activeTab?.doc else {
             hoverPopover.isHidden = true
             return
@@ -1624,6 +1761,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             let settings = global.merged(with: workspace)
             autoClosingTags = settings.effectiveAutoClosingTags
             linkedEditing = settings.effectiveLinkedEditing
+        setGitBlame(settings.effectiveGitBlame)
             autoSaveMode = settings.effectiveAutoSave
             autoSaveDelay = settings.effectiveAutoSaveDelay
             if autoSaveMode != .afterDelay { autoSaveWorkItem?.cancel(); autoSaveWorkItem = nil }
@@ -1663,6 +1801,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         sourceControl.refresh(status: status)
         refreshTabBar()
         refreshGitDiff()
+        refreshBlame()
     }
 
     func updateSidebarContent() {
@@ -2082,6 +2221,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         activeIndex = index
         let tab = tabs[index]
         refreshGitDiff()
+        refreshBlame()
         tab.lastActiveAt = .now
         _ = tab.doc.resumeSyntax()
         let id = ObjectIdentifier(tab)
@@ -4342,6 +4482,9 @@ extension MainWindowController: NSMenuItemValidation {
             return ((item.representedObject as? EditorTab) ?? activeTab)?.terminal != nil
         case #selector(showNextTab(_:)), #selector(showPreviousTab(_:)), #selector(selectLastUsedTab(_:)):
             return tabs.count > 1
+        case #selector(toggleGitBlame(_:)):
+            item.state = gitBlameEnabled ? .on : .off
+            return true
         case #selector(toggleMarkdownPreview(_:)): return isMarkdownPreviewOn || canPreviewMarkdown
         case #selector(navigateBack(_:)): return navHistory.canGoBack()
         case #selector(navigateForward(_:)): return navHistory.canGoForward()

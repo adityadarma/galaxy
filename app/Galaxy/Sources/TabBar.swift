@@ -38,6 +38,13 @@ final class EditorTab {
     /// The file as committed at HEAD, shown read-only beside the working copy
     /// (opened from Source Control). `nil` is the plain single-pane view.
     var diffBase: DocumentHandle?
+    /// Who last changed each line, for the inline blame; refreshed after edits.
+    var blame: BlameInfo?
+    /// Document line count when `blame` was computed. Edits that add or remove
+    /// lines make the line numbers stale until the next refresh.
+    var blameLineCount: UInt64 = 0
+    /// Bumped per request, so a slow answer for old text is dropped.
+    var blameGeneration = 0
     /// Title with the file's state on disk.
     var displayTitle: String {
         if isDeletedOnDisk { return "\(title) (deleted)" }

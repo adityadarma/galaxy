@@ -77,6 +77,27 @@ final class EditorView: NSView {
         didSet { if inlayHints != oldValue { needsDisplay = true } }
     }
 
+    /// Git blame shown after the text of one line (`line` is 0-based).
+    struct BlameAnnotation: Equatable {
+        var line: UInt64
+        var text: String
+    }
+    var blameAnnotation: BlameAnnotation? {
+        didSet { if blameAnnotation != oldValue { needsDisplay = true } }
+    }
+    /// Space between the end of the line and its blame text.
+    static let blameGap: CGFloat = 40
+
+    /// Where the blame text of the annotated line is drawn, in view
+    /// coordinates, or `nil` when there is none.
+    func blameAnnotationRect() -> NSRect? {
+        guard let blame = blameAnnotation, let document else { return nil }
+        let text = document.displayLine(line: blame.line)
+        let x = textOriginX + xOffset(in: text, column: UInt64(text.utf16.count)) + Self.blameGap
+        let width = ceil((blame.text as NSString).size(withAttributes: [.font: font]).width)
+        return NSRect(x: x, y: CGFloat(blame.line) * metrics.lineHeight, width: width, height: metrics.lineHeight)
+    }
+
     /// Drops derived Core Text/LSP decorations while retaining the document.
     func releaseNonEssentialCaches() {
         layouts.removeAll()
@@ -192,9 +213,13 @@ final class EditorView: NSView {
         onHover?(textPosition(at: point), point)
     }
 
+    /// The pointer left the editor (the blame card uses it to close).
+    var onMouseExit: (() -> Void)?
+
     override func mouseExited(with event: NSEvent) {
         lastMousePoint = nil
         definitionLink = nil
+        onMouseExit?()
     }
 
     override func flagsChanged(with event: NSEvent) {
@@ -264,6 +289,12 @@ final class EditorView: NSView {
         caretOn = true
         updateBlinking()
         needsDisplay = true
+        // Clearing the flag above stops `draw` from reporting the caret, so
+        // report it here; mouse clicks and drags only come through this path.
+        if let snapshot {
+            let primary = snapshot.primary, count = snapshot.selectionCount
+            DispatchQueue.main.async { [weak self] in self?.onCursorChange?(primary, count) }
+        }
         return snapshot
     }
 
@@ -565,6 +596,17 @@ final class EditorView: NSView {
                 // Semantic runs come last so they win over Tree-sitter's.
                 let styles = (stylesByLine[line.line] ?? []) + (semanticStylesByLine[line.line] ?? [])
                 CTLineDraw(styles.isEmpty ? layout(for: line.text) : syntaxLayout(for: line.text, styles: styles), context)
+            }
+
+            // Git blame of the caret line, quiet and after the text.
+            if let blame = blameAnnotation, blame.line == line.line {
+                let fromContext = NSAttributedString.Key(kCTForegroundColorFromContextAttributeName as String)
+                let note = CTLineCreateWithAttributedString(NSAttributedString(
+                    string: blame.text, attributes: [.font: font, fromContext: true]))
+                context.setFillColor(NSColor.secondaryLabelColor.withAlphaComponent(0.75).cgColor)
+                let x = originX + xOffset(in: line.text, column: UInt64(line.text.utf16.count)) + Self.blameGap
+                context.textPosition = CGPoint(x: x, y: top + metrics.ascent)
+                CTLineDraw(note, context)
             }
 
             // LSP diagnostics sit above text decorations but beneath carets.

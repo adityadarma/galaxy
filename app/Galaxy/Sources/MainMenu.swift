@@ -113,6 +113,7 @@ enum MainMenu {
         viewMenu.addItem(withTitle: "New Terminal in Editor Area", action: #selector(MainWindowController.createTerminalEditor(_:)), keyEquivalent: "")
         viewMenu.addItem(withTitle: "Split Editor Right", action: #selector(MainWindowController.splitEditorRight(_:)), keyEquivalent: "")
         viewMenu.addItem(withTitle: "Split Editor Down", action: #selector(MainWindowController.splitEditorDown(_:)), keyEquivalent: "")
+        viewMenu.addItem(withTitle: "Toggle Git Blame", action: #selector(MainWindowController.toggleGitBlame(_:)), keyEquivalent: "")
         let mdPreview = viewMenu.addItem(withTitle: "Toggle Markdown Preview", action: #selector(MainWindowController.toggleMarkdownPreview(_:)), keyEquivalent: "v")
         mdPreview.keyEquivalentModifierMask = [.command, .shift]
         viewMenu.addItem(withTitle: "Close Editor Split", action: #selector(MainWindowController.closeEditorSplit(_:)), keyEquivalent: "")
