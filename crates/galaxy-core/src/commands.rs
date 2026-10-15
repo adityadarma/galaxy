@@ -393,6 +393,12 @@ const BUILTIN: &[(&str, &str, &str, &[&str])] = &[
         &["hide", "show", "explorer"],
     ),
     (
+        "galaxy.toggleGitGraph",
+        "View",
+        "Toggle Git Graph",
+        &["git", "history", "log", "commits", "branches"],
+    ),
+    (
         "workbench.action.togglePanel",
         "View",
         "Toggle Terminal",

@@ -51,6 +51,7 @@ final class CommandPaletteView: NSView, NSTextFieldDelegate, NSTableViewDataSour
         "workbench.action.showCommands": #selector(MainWindowController.showCommandPalette(_:)),
         "workbench.action.openGlobalKeybindingsFile": #selector(MainWindowController.openKeybindingsFile(_:)),
         "workbench.action.toggleSidebarVisibility": #selector(MainWindowController.toggleSidebarVisibility(_:)),
+         "galaxy.toggleGitGraph": #selector(MainWindowController.toggleGitGraph(_:)),
          "workbench.action.togglePanel": #selector(MainWindowController.toggleTerminal(_:)),
          "workbench.action.terminal.moveToEditor": #selector(MainWindowController.moveTerminalToEditor(_:)),
          "workbench.action.terminal.moveToTerminalPanel": #selector(MainWindowController.moveTerminalToPanel(_:)),

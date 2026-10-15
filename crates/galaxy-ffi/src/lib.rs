@@ -1658,6 +1658,51 @@ pub struct GitBranchInfo {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum GitRefKindInfo {
+    Head,
+    Branch,
+    Remote,
+    Tag,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GitRefInfo {
+    pub name: String,
+    pub kind: GitRefKindInfo,
+}
+
+/// One row of the Git Graph panel; see `galaxy_core::git::GitCommit` for
+/// what the lane lists mean.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GitCommitInfo {
+    pub hash: String,
+    pub author: String,
+    pub timestamp: i64,
+    pub subject: String,
+    pub refs: Vec<GitRefInfo>,
+    pub lane: u32,
+    pub passing: Vec<u32>,
+    pub incoming: Vec<u32>,
+    pub outgoing: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum GitResetModeInfo {
+    Soft,
+    Mixed,
+    Hard,
+}
+
+/// A file that differs between two commits. `status` is git's letter:
+/// A, M, D, R, C or T.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GitFileDiffInfo {
+    pub path: String,
+    pub old_path: Option<String>,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum GitLineChangeKind {
     Added,
     Modified,
@@ -1956,7 +2001,7 @@ impl Workspace {
     }
 
     pub fn git_branches(&self) -> Result<Vec<GitBranchInfo>, CoreError> {
-        Ok(galaxy_core::git::branches(&self.inner.root())?
+        Ok(galaxy_core::git::branches(self.inner.root())?
             .into_iter()
             .map(|branch| GitBranchInfo {
                 name: branch.name,
@@ -1966,38 +2011,193 @@ impl Workspace {
             .collect())
     }
 
+    pub fn git_log_graph(&self, limit: u32) -> Result<Vec<GitCommitInfo>, CoreError> {
+        use galaxy_core::git::GitRefKind;
+        Ok(galaxy_core::git::log_graph(self.inner.root(), limit as usize)?
+            .into_iter()
+            .map(|commit| GitCommitInfo {
+                hash: commit.hash,
+                author: commit.author,
+                timestamp: commit.timestamp,
+                subject: commit.subject,
+                refs: commit
+                    .refs
+                    .into_iter()
+                    .map(|r| GitRefInfo {
+                        name: r.name,
+                        kind: match r.kind {
+                            GitRefKind::Head => GitRefKindInfo::Head,
+                            GitRefKind::Branch => GitRefKindInfo::Branch,
+                            GitRefKind::Remote => GitRefKindInfo::Remote,
+                            GitRefKind::Tag => GitRefKindInfo::Tag,
+                        },
+                    })
+                    .collect(),
+                lane: commit.lane,
+                passing: commit.passing,
+                incoming: commit.incoming,
+                outgoing: commit.outgoing,
+            })
+            .collect())
+    }
+
+    /// Tags on `origin`; `None` when there is no `origin`. Contacts the
+    /// remote, so call it off the main thread.
+    pub fn git_remote_tags(&self) -> Result<Option<Vec<String>>, CoreError> {
+        Ok(galaxy_core::git::remote_tags(self.inner.root())?
+            .map(|tags| tags.into_iter().collect()))
+    }
+
+    pub fn git_delete_tag(&self, name: String) -> Result<(), CoreError> {
+        galaxy_core::git::delete_tag(self.inner.root(), &name)?;
+        Ok(())
+    }
+
+    pub fn git_delete_remote_tag(&self, name: String) -> Result<(), CoreError> {
+        galaxy_core::git::delete_remote_tag(self.inner.root(), &name)?;
+        Ok(())
+    }
+
+    pub fn git_push_tag(&self, name: String) -> Result<(), CoreError> {
+        galaxy_core::git::push_tag(self.inner.root(), &name)?;
+        Ok(())
+    }
+
+    pub fn git_cherry_pick(&self, hash: String) -> Result<(), CoreError> {
+        galaxy_core::git::cherry_pick(self.inner.root(), &hash)?;
+        Ok(())
+    }
+
+    pub fn git_revert(&self, hash: String) -> Result<(), CoreError> {
+        galaxy_core::git::revert(self.inner.root(), &hash)?;
+        Ok(())
+    }
+
+    pub fn git_commit_fixup(&self, hash: String) -> Result<(), CoreError> {
+        galaxy_core::git::commit_fixup(self.inner.root(), &hash)?;
+        Ok(())
+    }
+
+    pub fn git_commit_squash(&self, hash: String) -> Result<(), CoreError> {
+        galaxy_core::git::commit_squash(self.inner.root(), &hash)?;
+        Ok(())
+    }
+
+    pub fn git_reset_last_commit_soft(&self) -> Result<(), CoreError> {
+        galaxy_core::git::reset_last_commit_soft(self.inner.root())?;
+        Ok(())
+    }
+
+    pub fn git_reset_to(&self, hash: String, mode: GitResetModeInfo) -> Result<(), CoreError> {
+        use galaxy_core::git::GitResetMode;
+        let mode = match mode {
+            GitResetModeInfo::Soft => GitResetMode::Soft,
+            GitResetModeInfo::Mixed => GitResetMode::Mixed,
+            GitResetModeInfo::Hard => GitResetMode::Hard,
+        };
+        galaxy_core::git::reset_to(self.inner.root(), &hash, mode)?;
+        Ok(())
+    }
+
+    pub fn git_merge(&self, hash: String) -> Result<(), CoreError> {
+        galaxy_core::git::merge(self.inner.root(), &hash)?;
+        Ok(())
+    }
+
+    pub fn git_rebase_onto(&self, hash: String) -> Result<(), CoreError> {
+        galaxy_core::git::rebase_onto(self.inner.root(), &hash)?;
+        Ok(())
+    }
+
+    pub fn git_drop_commit(&self, hash: String) -> Result<(), CoreError> {
+        galaxy_core::git::drop_commit(self.inner.root(), &hash)?;
+        Ok(())
+    }
+
+    /// Whether a remote-tracking branch already holds the commit (local refs
+    /// only, no network).
+    pub fn git_is_on_remote(&self, hash: String) -> Result<bool, CoreError> {
+        Ok(galaxy_core::git::is_on_remote(self.inner.root(), &hash)?)
+    }
+
+    pub fn git_compare_files(
+        &self,
+        from: String,
+        to: String,
+    ) -> Result<Vec<GitFileDiffInfo>, CoreError> {
+        Ok(galaxy_core::git::compare_files(self.inner.root(), &from, &to)?
+            .into_iter()
+            .map(|file| GitFileDiffInfo {
+                path: file.path,
+                old_path: file.old_path,
+                status: file.status.to_string(),
+            })
+            .collect())
+    }
+
+    pub fn git_compare_diff(
+        &self,
+        from: String,
+        to: String,
+        path: String,
+        old_path: Option<String>,
+    ) -> Result<String, CoreError> {
+        Ok(galaxy_core::git::compare_diff(
+            self.inner.root(),
+            &from,
+            &to,
+            &path,
+            old_path.as_deref(),
+        )?)
+    }
+
+    pub fn git_checkout_commit(&self, hash: String) -> Result<(), CoreError> {
+        galaxy_core::git::checkout_commit(self.inner.root(), &hash)?;
+        Ok(())
+    }
+
+    pub fn git_create_branch_at(&self, name: String, hash: String) -> Result<(), CoreError> {
+        galaxy_core::git::create_branch_at(self.inner.root(), &name, &hash)?;
+        Ok(())
+    }
+
+    pub fn git_create_tag(&self, name: String, hash: String) -> Result<(), CoreError> {
+        galaxy_core::git::create_tag(self.inner.root(), &name, &hash)?;
+        Ok(())
+    }
+
     pub fn git_checkout(&self, name: String) -> Result<(), CoreError> {
-        galaxy_core::git::checkout(&self.inner.root(), &name)?;
+        galaxy_core::git::checkout(self.inner.root(), &name)?;
         Ok(())
     }
 
     pub fn git_create_branch(&self, name: String) -> Result<(), CoreError> {
-        galaxy_core::git::create_branch(&self.inner.root(), &name)?;
+        galaxy_core::git::create_branch(self.inner.root(), &name)?;
         Ok(())
     }
 
     pub fn git_stage(&self, path: String) -> Result<(), CoreError> {
-        galaxy_core::git::stage(&self.inner.root(), &path)?;
+        galaxy_core::git::stage(self.inner.root(), &path)?;
         Ok(())
     }
 
     pub fn git_stage_all(&self) -> Result<(), CoreError> {
-        galaxy_core::git::stage_all(&self.inner.root())?;
+        galaxy_core::git::stage_all(self.inner.root())?;
         Ok(())
     }
 
     pub fn git_unstage(&self, path: String) -> Result<(), CoreError> {
-        galaxy_core::git::unstage(&self.inner.root(), &path)?;
+        galaxy_core::git::unstage(self.inner.root(), &path)?;
         Ok(())
     }
 
     pub fn git_unstage_all(&self) -> Result<(), CoreError> {
-        galaxy_core::git::unstage_all(&self.inner.root())?;
+        galaxy_core::git::unstage_all(self.inner.root())?;
         Ok(())
     }
 
     pub fn git_commit(&self, message: String) -> Result<(), CoreError> {
-        galaxy_core::git::commit(&self.inner.root(), &message)?;
+        galaxy_core::git::commit(self.inner.root(), &message)?;
         Ok(())
     }
 

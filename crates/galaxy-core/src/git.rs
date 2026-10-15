@@ -1,8 +1,11 @@
 //! Read-only Git state for workspace UI (M6-01).
 
-use std::io;
+use std::collections::BTreeSet;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitFileStatus {
@@ -65,6 +68,644 @@ pub fn branches(root: &Path) -> io::Result<Vec<GitBranch>> {
     result.sort_by_key(|branch| (!branch.current, branch.remote, branch.name.clone()));
     result.dedup_by(|a, b| a.name == b.name);
     Ok(result)
+}
+
+/// A ref pointing at a commit, as shown next to it in the graph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitRef {
+    pub name: String,
+    pub kind: GitRefKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitRefKind {
+    /// `HEAD -> branch`: the checked-out branch, or a detached `HEAD`.
+    Head,
+    Branch,
+    Remote,
+    Tag,
+}
+
+/// One row of the commit graph. Lanes are 0-based columns. Drawing a row:
+/// `passing` lanes run the full row height, `incoming` lanes run from the
+/// row top into the node, `outgoing` lanes run from the node to the row
+/// bottom. A lane equal to `lane` is a straight segment, any other bends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitCommit {
+    pub hash: String,
+    pub parents: Vec<String>,
+    pub author: String,
+    /// Unix seconds, author date.
+    pub timestamp: i64,
+    pub subject: String,
+    pub refs: Vec<GitRef>,
+    pub lane: u32,
+    pub passing: Vec<u32>,
+    pub incoming: Vec<u32>,
+    pub outgoing: Vec<u32>,
+}
+
+/// Newest `limit` commits of every ref, in date order, with the lane
+/// layout for drawing them (the Git Graph panel).
+pub fn log_graph(root: &Path, limit: usize) -> io::Result<Vec<GitCommit>> {
+    let output = Command::new("git")
+        .args([
+            "-C",
+            &root.to_string_lossy(),
+            "log",
+            "--all",
+            "--date-order",
+            "-n",
+            &limit.to_string(),
+            "--format=%H%x1f%P%x1f%an%x1f%at%x1f%D%x1f%s%x1e",
+        ])
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("does not have any commits") {
+            return Ok(Vec::new());
+        }
+        return Err(io::Error::other(stderr.to_string()));
+    }
+    let mut commits = parse_log(&String::from_utf8_lossy(&output.stdout));
+    layout_lanes(&mut commits);
+    Ok(commits)
+}
+
+fn parse_log(text: &str) -> Vec<GitCommit> {
+    text.split('\x1e')
+        .filter_map(|record| {
+            let mut fields = record.trim_start_matches('\n').split('\x1f');
+            let hash = fields.next().filter(|h| !h.is_empty())?.to_owned();
+            let parents = fields
+                .next()?
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect();
+            let author = fields.next()?.to_owned();
+            let timestamp = fields.next()?.parse().unwrap_or(0);
+            let refs = parse_refs(fields.next()?);
+            let subject = fields.next()?.to_owned();
+            Some(GitCommit {
+                hash,
+                parents,
+                author,
+                timestamp,
+                subject,
+                refs,
+                lane: 0,
+                passing: Vec::new(),
+                incoming: Vec::new(),
+                outgoing: Vec::new(),
+            })
+        })
+        .collect()
+}
+
+/// Parses `%D`: `HEAD -> main, origin/main, tag: v1`.
+fn parse_refs(decoration: &str) -> Vec<GitRef> {
+    decoration
+        .split(", ")
+        .filter(|part| !part.is_empty() && !part.ends_with("/HEAD"))
+        .map(|part| {
+            if let Some(tag) = part.strip_prefix("tag: ") {
+                GitRef { name: tag.to_owned(), kind: GitRefKind::Tag }
+            } else if let Some(branch) = part.strip_prefix("HEAD -> ") {
+                GitRef { name: branch.to_owned(), kind: GitRefKind::Head }
+            } else if part == "HEAD" {
+                GitRef { name: "HEAD".to_owned(), kind: GitRefKind::Head }
+            } else if part.contains('/') {
+                GitRef { name: part.to_owned(), kind: GitRefKind::Remote }
+            } else {
+                GitRef { name: part.to_owned(), kind: GitRefKind::Branch }
+            }
+        })
+        .collect()
+}
+
+/// Assigns each commit a lane and the line segments around it. `lanes[i]`
+/// holds the hash the line in lane `i` is waiting to reach.
+fn layout_lanes(commits: &mut [GitCommit]) {
+    let mut lanes: Vec<Option<String>> = Vec::new();
+    for commit in commits {
+        let matching: Vec<usize> = lanes
+            .iter()
+            .enumerate()
+            .filter(|(_, hash)| hash.as_deref() == Some(commit.hash.as_str()))
+            .map(|(index, _)| index)
+            .collect();
+        let lane = matching
+            .first()
+            .copied()
+            .unwrap_or_else(|| free_lane(&mut lanes));
+        commit.lane = lane as u32;
+        commit.incoming = matching.iter().map(|&i| i as u32).collect();
+        commit.passing = lanes
+            .iter()
+            .enumerate()
+            .filter(|(index, hash)| hash.is_some() && !matching.contains(index))
+            .map(|(index, _)| index as u32)
+            .collect();
+        for &index in &matching {
+            lanes[index] = None;
+        }
+        let mut outgoing = Vec::new();
+        for (n, parent) in commit.parents.iter().enumerate() {
+            let target = if n == 0 {
+                lanes[lane] = Some(parent.clone());
+                lane
+            } else if let Some(existing) = lanes
+                .iter()
+                .position(|hash| hash.as_deref() == Some(parent.as_str()))
+            {
+                existing
+            } else {
+                let index = free_lane(&mut lanes);
+                lanes[index] = Some(parent.clone());
+                index
+            };
+            if !outgoing.contains(&(target as u32)) {
+                outgoing.push(target as u32);
+            }
+        }
+        commit.outgoing = outgoing;
+        while lanes.last().is_some_and(Option::is_none) {
+            lanes.pop();
+        }
+    }
+}
+
+fn free_lane(lanes: &mut Vec<Option<String>>) -> usize {
+    lanes.iter().position(Option::is_none).unwrap_or_else(|| {
+        lanes.push(None);
+        lanes.len() - 1
+    })
+}
+
+/// A branch or tag name safe to pass as a git argument.
+fn valid_ref_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('-')
+        && !name.contains(['\n', '\0', ' ', '~', '^', ':', '?', '*', '[', '\\'])
+        && !name.contains("..")
+}
+
+/// A commit id as printed by `git log`: hex only, so it cannot be an option.
+fn valid_commit_id(rev: &str) -> bool {
+    (4..=64).contains(&rev.len()) && rev.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Local git operations finish quickly; this only stops a stuck one.
+const LOCAL_TIMEOUT: Duration = Duration::from_secs(60);
+/// Remote operations give up sooner: offline must not hang the panel.
+const NETWORK_TIMEOUT: Duration = Duration::from_secs(20);
+/// The remote whose tags the graph compares against.
+const REMOTE: &str = "origin";
+
+/// Runs `cmd` without a terminal (no credential prompt can block it) and
+/// kills it after `limit`.
+fn output_within(mut cmd: Command, limit: Duration) -> io::Result<Output> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("GIT_TERMINAL_PROMPT", "0")
+        // Nothing here can answer an editor: take the default message.
+        .env("GIT_EDITOR", "true")
+        .env("GIT_SEQUENCE_EDITOR", "true")
+        .env("GIT_MERGE_AUTOEDIT", "no");
+    let mut child = cmd.spawn()?;
+    let mut stdout = child.stdout.take().ok_or_else(|| io::Error::other("no stdout"))?;
+    let mut stderr = child.stderr.take().ok_or_else(|| io::Error::other("no stderr"))?;
+    let out = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout.read_to_end(&mut buf);
+        buf
+    });
+    let err = thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        buf
+    });
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            // The reader threads are left to end on their own: a helper
+            // process may still hold the pipes open.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "git timed out"));
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    Ok(Output {
+        status,
+        stdout: out.join().unwrap_or_default(),
+        stderr: err.join().unwrap_or_default(),
+    })
+}
+
+fn git_output(root: &Path, args: &[&str], limit: Duration) -> io::Result<Output> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(root).args(args);
+    output_within(cmd, limit)
+}
+
+fn run_git(root: &Path, args: &[&str], what: &str, limit: Duration) -> io::Result<()> {
+    let output = git_output(root, args, limit)
+        .map_err(|e| io::Error::new(e.kind(), format!("{what} failed: {e}")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let reason = stderr.lines().next().unwrap_or("").trim();
+    Err(io::Error::other(if reason.is_empty() {
+        format!("{what} failed")
+    } else {
+        format!("{what} failed: {reason}")
+    }))
+}
+
+fn has_remote(root: &Path) -> bool {
+    git_output(root, &["remote"], LOCAL_TIMEOUT)
+        .map(|o| {
+            o.status.success()
+                && String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .any(|name| name == REMOTE)
+        })
+        .unwrap_or(false)
+}
+
+/// Names of the tags on `origin`, or `None` when there is no `origin`.
+/// Contacts the remote, so it can be slow or fail while offline.
+pub fn remote_tags(root: &Path) -> io::Result<Option<BTreeSet<String>>> {
+    if !has_remote(root) {
+        return Ok(None);
+    }
+    let output = git_output(
+        root,
+        &["ls-remote", "--tags", "--refs", REMOTE],
+        NETWORK_TIMEOUT,
+    )?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(io::Error::other(
+            stderr.lines().next().unwrap_or("ls-remote failed").trim().to_owned(),
+        ));
+    }
+    Ok(Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.split('\t').nth(1))
+            .filter_map(|name| name.strip_prefix("refs/tags/"))
+            .map(str::to_owned)
+            .collect(),
+    ))
+}
+
+/// Deletes the local tag `name`.
+pub fn delete_tag(root: &Path, name: &str) -> io::Result<()> {
+    if !valid_ref_name(name) {
+        return Err(io::Error::other("invalid tag name"));
+    }
+    run_git(root, &["tag", "-d", name], "deleting tag", LOCAL_TIMEOUT)
+}
+
+/// Deletes tag `name` on `origin`. The local tag stays.
+pub fn delete_remote_tag(root: &Path, name: &str) -> io::Result<()> {
+    if !valid_ref_name(name) {
+        return Err(io::Error::other("invalid tag name"));
+    }
+    let target = format!("refs/tags/{name}");
+    run_git(
+        root,
+        &["push", REMOTE, "--delete", &target],
+        "deleting remote tag",
+        NETWORK_TIMEOUT,
+    )
+}
+
+/// Pushes the local tag `name` to `origin`.
+pub fn push_tag(root: &Path, name: &str) -> io::Result<()> {
+    if !valid_ref_name(name) {
+        return Err(io::Error::other("invalid tag name"));
+    }
+    let target = format!("refs/tags/{name}");
+    run_git(root, &["push", REMOTE, &target], "pushing tag", NETWORK_TIMEOUT)
+}
+
+/// An unfinished cherry-pick, revert, merge or rebase: its name and the
+/// arguments that abort it.
+fn in_progress(root: &Path) -> Option<(&'static str, &'static [&'static str])> {
+    let repo = gix::discover(root).ok()?;
+    let dir = repo.git_dir();
+    let states: [(&str, &str, &'static [&'static str]); 5] = [
+        ("rebase-merge", "rebase", &["rebase", "--abort"]),
+        ("rebase-apply", "rebase", &["rebase", "--abort"]),
+        ("MERGE_HEAD", "merge", &["merge", "--abort"]),
+        ("CHERRY_PICK_HEAD", "cherry-pick", &["cherry-pick", "--abort"]),
+        ("REVERT_HEAD", "revert", &["revert", "--abort"]),
+    ];
+    states
+        .iter()
+        .find(|(file, _, _)| dir.join(file).exists())
+        .map(|&(_, name, abort)| (name, abort))
+}
+
+fn ensure_idle(root: &Path) -> io::Result<()> {
+    match in_progress(root) {
+        Some((name, _)) => Err(io::Error::other(format!(
+            "a {name} is already in progress; finish or abort it in the terminal first"
+        ))),
+        None => Ok(()),
+    }
+}
+
+fn checked_commit_id(rev: &str) -> io::Result<()> {
+    if valid_commit_id(rev) {
+        Ok(())
+    } else {
+        Err(io::Error::other("invalid commit id"))
+    }
+}
+
+fn parent_count(root: &Path, rev: &str) -> io::Result<usize> {
+    let output = git_output(root, &["rev-list", "--parents", "-n", "1", rev], LOCAL_TIMEOUT)?;
+    if !output.status.success() {
+        return Err(io::Error::other("unknown commit"));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .count()
+        .saturating_sub(1))
+}
+
+/// Runs an operation that can stop on conflicts. If it does, it is aborted
+/// so the repository is left exactly as it was.
+fn run_abortable(root: &Path, args: &[&str], what: &str) -> io::Result<()> {
+    ensure_idle(root)?;
+    match run_git(root, args, what, LOCAL_TIMEOUT) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if let Some((name, abort)) = in_progress(root) {
+                let _ = run_git(root, abort, "abort", LOCAL_TIMEOUT);
+                return Err(io::Error::other(format!(
+                    "{what} stopped on conflicts ({name}) and was aborted; nothing changed"
+                )));
+            }
+            Err(error)
+        }
+    }
+}
+
+/// Applies the changes of commit `rev` on top of HEAD.
+pub fn cherry_pick(root: &Path, rev: &str) -> io::Result<()> {
+    checked_commit_id(rev)?;
+    if parent_count(root, rev)? > 1 {
+        return Err(io::Error::other("a merge commit cannot be cherry-picked"));
+    }
+    run_abortable(root, &["cherry-pick", rev], "cherry-pick")
+}
+
+/// Adds a commit that undoes commit `rev`.
+pub fn revert(root: &Path, rev: &str) -> io::Result<()> {
+    checked_commit_id(rev)?;
+    if parent_count(root, rev)? > 1 {
+        return Err(io::Error::other("a merge commit cannot be reverted"));
+    }
+    run_abortable(root, &["revert", "--no-edit", rev], "revert")
+}
+
+fn commit_staged_for(root: &Path, flag: &str, rev: &str, what: &str) -> io::Result<()> {
+    checked_commit_id(rev)?;
+    ensure_idle(root)?;
+    // `diff --cached --quiet` exits 1 when something is staged.
+    let staged = git_output(root, &["diff", "--cached", "--quiet"], LOCAL_TIMEOUT)?;
+    if staged.status.code() != Some(1) {
+        return Err(io::Error::other(format!(
+            "{what} failed: nothing is staged; stage the changes first"
+        )));
+    }
+    run_git(root, &["commit", &format!("{flag}={rev}")], what, LOCAL_TIMEOUT)
+}
+
+/// Commits the staged changes as `fixup! <subject of rev>`.
+pub fn commit_fixup(root: &Path, rev: &str) -> io::Result<()> {
+    commit_staged_for(root, "--fixup", rev, "fixup commit")
+}
+
+/// Commits the staged changes as `squash! <subject of rev>`.
+pub fn commit_squash(root: &Path, rev: &str) -> io::Result<()> {
+    commit_staged_for(root, "--squash", rev, "squash commit")
+}
+
+/// Undoes the last commit and keeps its changes staged.
+pub fn reset_last_commit_soft(root: &Path) -> io::Result<()> {
+    ensure_idle(root)?;
+    let parent = git_output(root, &["rev-parse", "--verify", "--quiet", "HEAD~1"], LOCAL_TIMEOUT)?;
+    if !parent.status.success() {
+        return Err(io::Error::other("HEAD is the first commit; there is nothing to undo"));
+    }
+    run_git(root, &["reset", "--soft", "HEAD~1"], "reset", LOCAL_TIMEOUT)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GitResetMode {
+    /// Move the branch; keep the index and working tree.
+    Soft,
+    /// Move the branch and reset the index; keep the working tree.
+    Mixed,
+    /// Move the branch and discard every uncommitted change.
+    Hard,
+}
+
+/// Moves the current branch to commit `rev`.
+pub fn reset_to(root: &Path, rev: &str, mode: GitResetMode) -> io::Result<()> {
+    checked_commit_id(rev)?;
+    ensure_idle(root)?;
+    let flag = match mode {
+        GitResetMode::Soft => "--soft",
+        GitResetMode::Mixed => "--mixed",
+        GitResetMode::Hard => "--hard",
+    };
+    run_git(root, &["reset", flag, rev], "reset", LOCAL_TIMEOUT)
+}
+
+/// Merges commit `rev` into the current branch.
+pub fn merge(root: &Path, rev: &str) -> io::Result<()> {
+    checked_commit_id(rev)?;
+    run_abortable(root, &["merge", "--no-edit", rev], "merge")
+}
+
+/// Replays the current branch on top of commit `rev`.
+pub fn rebase_onto(root: &Path, rev: &str) -> io::Result<()> {
+    checked_commit_id(rev)?;
+    run_abortable(root, &["rebase", "--rebase-merges", rev], "rebase")
+}
+
+/// Removes commit `rev` from the current branch, keeping the rest. This
+/// rewrites every commit after it.
+pub fn drop_commit(root: &Path, rev: &str) -> io::Result<()> {
+    checked_commit_id(rev)?;
+    if parent_count(root, rev)? != 1 {
+        return Err(io::Error::other(
+            "only a commit with exactly one parent can be dropped",
+        ));
+    }
+    // `rebase --onto rev^ rev` replays rev..HEAD; for a commit outside this
+    // branch that would replay unrelated history.
+    let ancestor = git_output(root, &["merge-base", "--is-ancestor", rev, "HEAD"], LOCAL_TIMEOUT)?;
+    match ancestor.status.code() {
+        Some(0) => {}
+        Some(1) => return Err(io::Error::other("that commit is not part of the current branch")),
+        _ => return Err(io::Error::other("could not check the commit against HEAD")),
+    }
+    run_abortable(
+        root,
+        &["rebase", "--rebase-merges", "--onto", &format!("{rev}^"), rev],
+        "drop",
+    )
+}
+
+/// Whether some remote-tracking branch already contains `rev`, so
+/// rewriting it would diverge from what was pushed. Uses local refs only.
+pub fn is_on_remote(root: &Path, rev: &str) -> io::Result<bool> {
+    checked_commit_id(rev)?;
+    let output = git_output(
+        root,
+        &["for-each-ref", "--count=1", "--contains", rev, "refs/remotes"],
+        LOCAL_TIMEOUT,
+    )?;
+    if !output.status.success() {
+        return Err(io::Error::other("could not read remote branches"));
+    }
+    Ok(!String::from_utf8_lossy(&output.stdout).trim().is_empty())
+}
+
+/// A file that differs between two commits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitFileDiff {
+    pub path: String,
+    /// Where a renamed or copied file came from.
+    pub old_path: Option<String>,
+    /// `A`dded, `M`odified, `D`eleted, `R`enamed, `C`opied, `T`ype changed.
+    pub status: char,
+}
+
+/// Files that differ between commits `from` and `to`.
+pub fn compare_files(root: &Path, from: &str, to: &str) -> io::Result<Vec<GitFileDiff>> {
+    checked_commit_id(from)?;
+    checked_commit_id(to)?;
+    let output = git_output(
+        root,
+        &["diff", "--name-status", "-z", "--find-renames", from, to],
+        LOCAL_TIMEOUT,
+    )?;
+    if !output.status.success() {
+        return Err(io::Error::other(
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut fields = text.split('\0').filter(|field| !field.is_empty());
+    let mut files = Vec::new();
+    while let Some(status) = fields.next() {
+        let letter = status.chars().next().unwrap_or('M');
+        let Some(first) = fields.next() else { break };
+        if matches!(letter, 'R' | 'C') {
+            let Some(second) = fields.next() else { break };
+            files.push(GitFileDiff {
+                path: second.to_owned(),
+                old_path: Some(first.to_owned()),
+                status: letter,
+            });
+        } else {
+            files.push(GitFileDiff {
+                path: first.to_owned(),
+                old_path: None,
+                status: letter,
+            });
+        }
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(files)
+}
+
+/// The most diff text shown for one file.
+const MAX_DIFF_BYTES: usize = 2 * 1024 * 1024;
+
+/// Unified diff of one file between commits `from` and `to`.
+pub fn compare_diff(
+    root: &Path,
+    from: &str,
+    to: &str,
+    path: &str,
+    old_path: Option<&str>,
+) -> io::Result<String> {
+    checked_commit_id(from)?;
+    checked_commit_id(to)?;
+    if path.is_empty() || path.contains('\0') || old_path.is_some_and(|p| p.contains('\0')) {
+        return Err(io::Error::other("invalid path"));
+    }
+    let mut args = vec![
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        "--find-renames",
+        from,
+        to,
+        "--",
+    ];
+    if let Some(old) = old_path {
+        args.push(old);
+    }
+    args.push(path);
+    let output = git_output(root, &args, LOCAL_TIMEOUT)?;
+    if !output.status.success() {
+        return Err(io::Error::other(
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ));
+    }
+    let truncated = output.stdout.len() > MAX_DIFF_BYTES;
+    let bytes = &output.stdout[..output.stdout.len().min(MAX_DIFF_BYTES)];
+    let mut text = String::from_utf8_lossy(bytes).into_owned();
+    if truncated {
+        text.push_str("\n… diff truncated …\n");
+    }
+    Ok(text)
+}
+
+/// Creates `name` at commit `rev` and switches to it.
+pub fn create_branch_at(root: &Path, name: &str, rev: &str) -> io::Result<()> {
+    if !valid_ref_name(name) {
+        return Err(io::Error::other("invalid branch name"));
+    }
+    if !valid_commit_id(rev) {
+        return Err(io::Error::other("invalid commit id"));
+    }
+    run_git(root, &["switch", "-c", name, rev], "creating branch", LOCAL_TIMEOUT)
+}
+
+/// Creates a lightweight tag `name` at commit `rev`.
+pub fn create_tag(root: &Path, name: &str, rev: &str) -> io::Result<()> {
+    if !valid_ref_name(name) {
+        return Err(io::Error::other("invalid tag name"));
+    }
+    if !valid_commit_id(rev) {
+        return Err(io::Error::other("invalid commit id"));
+    }
+    run_git(root, &["tag", name, rev], "creating tag", LOCAL_TIMEOUT)
+}
+
+/// Checks out a commit, leaving HEAD detached.
+pub fn checkout_commit(root: &Path, rev: &str) -> io::Result<()> {
+    if !valid_commit_id(rev) {
+        return Err(io::Error::other("invalid commit id"));
+    }
+    run_git(root, &["checkout", "--detach", rev], "checkout", LOCAL_TIMEOUT)
 }
 
 pub fn checkout(root: &Path, name: &str) -> io::Result<()> {
@@ -530,6 +1171,423 @@ mod tests {
                 .iter()
                 .any(|change| change.kind == GitLineChangeKind::Deleted)
         );
+    }
+
+    #[test]
+    fn log_graph_lays_out_a_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = ["-c", "user.name=Test", "-c", "user.email=t@example.com"];
+        run(dir.path(), ["init", "-b", "main"]);
+        fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        run(dir.path(), ["add", "a.txt"]);
+        run(dir.path(), [id[0], id[1], id[2], id[3], "commit", "-m", "base"]);
+        run(dir.path(), ["switch", "-c", "feature"]);
+        fs::write(dir.path().join("b.txt"), "b\n").unwrap();
+        run(dir.path(), ["add", "b.txt"]);
+        run(dir.path(), [id[0], id[1], id[2], id[3], "commit", "-m", "on feature"]);
+        run(dir.path(), ["switch", "main"]);
+        fs::write(dir.path().join("c.txt"), "c\n").unwrap();
+        run(dir.path(), ["add", "c.txt"]);
+        run(dir.path(), [id[0], id[1], id[2], id[3], "commit", "-m", "on main"]);
+        run(
+            dir.path(),
+            [id[0], id[1], id[2], id[3], "merge", "--no-ff", "feature", "-m", "merge"],
+        );
+
+        let commits = log_graph(dir.path(), 50).unwrap();
+        let subjects: Vec<_> = commits.iter().map(|c| c.subject.as_str()).collect();
+        assert_eq!(subjects.len(), 4);
+        assert_eq!(subjects[0], "merge");
+        assert_eq!(subjects[3], "base");
+        let merge = &commits[0];
+        assert_eq!(merge.parents.len(), 2);
+        assert_eq!(merge.lane, 0);
+        assert_eq!(merge.outgoing, [0, 1], "first parent stays, second branches");
+        assert!(merge.refs.iter().any(|r| r.kind == GitRefKind::Head && r.name == "main"));
+        let base = commits.last().unwrap();
+        assert_eq!(base.lane, 0);
+        assert_eq!(base.incoming, [0, 1], "both lines end at the root commit");
+        assert!(base.outgoing.is_empty());
+    }
+
+    #[test]
+    fn log_graph_of_an_empty_repository_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        run(dir.path(), ["init", "-b", "main"]);
+        assert!(log_graph(dir.path(), 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_refs_classifies_decorations() {
+        let refs = parse_refs("HEAD -> main, origin/main, origin/HEAD, tag: v1, feature");
+        let kinds: Vec<_> = refs.iter().map(|r| (r.name.as_str(), r.kind)).collect();
+        assert_eq!(
+            kinds,
+            [
+                ("main", GitRefKind::Head),
+                ("origin/main", GitRefKind::Remote),
+                ("v1", GitRefKind::Tag),
+                ("feature", GitRefKind::Branch),
+            ]
+        );
+    }
+
+    #[test]
+    fn creates_branch_and_tag_at_a_commit_and_rejects_bad_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = ["-c", "user.name=Test", "-c", "user.email=t@example.com"];
+        run(dir.path(), ["init", "-b", "main"]);
+        fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        run(dir.path(), ["add", "a.txt"]);
+        run(dir.path(), [id[0], id[1], id[2], id[3], "commit", "-m", "one"]);
+        fs::write(dir.path().join("a.txt"), "b\n").unwrap();
+        run(dir.path(), [id[0], id[1], id[2], id[3], "commit", "-am", "two"]);
+        let commits = log_graph(dir.path(), 10).unwrap();
+        let first = commits[1].hash.clone();
+
+        create_tag(dir.path(), "v1", &first).unwrap();
+        create_branch_at(dir.path(), "old", &first).unwrap();
+        let status = read_status(dir.path()).unwrap().unwrap();
+        assert_eq!(status.branch.as_deref(), Some("old"));
+        let refs = log_graph(dir.path(), 10).unwrap();
+        let on_first = refs.iter().find(|c| c.hash == first).unwrap();
+        assert!(on_first.refs.iter().any(|r| r.kind == GitRefKind::Tag && r.name == "v1"));
+
+        checkout_commit(dir.path(), &commits[0].hash).unwrap();
+        assert_eq!(read_status(dir.path()).unwrap().unwrap().branch, None, "detached");
+
+        assert!(create_branch_at(dir.path(), "-bad", &first).is_err());
+        assert!(create_branch_at(dir.path(), "has space", &first).is_err());
+        assert!(create_tag(dir.path(), "v1", &first).is_err(), "tag exists");
+        assert!(checkout_commit(dir.path(), "--help").is_err());
+        assert!(create_tag(dir.path(), "x", "main").is_err(), "only commit ids");
+    }
+
+    #[test]
+    fn compares_local_tags_with_origin_and_deletes_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        let remote = dir.path().join("remote.git");
+        fs::create_dir(&work).unwrap();
+        run(dir.path(), ["init", "--bare", "-b", "main", "remote.git"]);
+        let id = ["-c", "user.name=Test", "-c", "user.email=t@example.com"];
+        run(&work, ["init", "-b", "main"]);
+        assert_eq!(remote_tags(&work).unwrap(), None, "no origin yet");
+        run(&work, ["remote", "add", "origin", remote.to_str().unwrap()]);
+        fs::write(work.join("a.txt"), "a\n").unwrap();
+        run(&work, ["add", "a.txt"]);
+        run(&work, [id[0], id[1], id[2], id[3], "commit", "-m", "one"]);
+        let hash = log_graph(&work, 5).unwrap()[0].hash.clone();
+
+        create_tag(&work, "v1", &hash).unwrap();
+        create_tag(&work, "v2", &hash).unwrap();
+        push_tag(&work, "v1").unwrap();
+        let names = |tags: Option<BTreeSet<String>>| {
+            tags.unwrap().into_iter().collect::<Vec<_>>()
+        };
+        assert_eq!(names(remote_tags(&work).unwrap()), ["v1"], "v2 is local only");
+
+        delete_remote_tag(&work, "v1").unwrap();
+        assert!(names(remote_tags(&work).unwrap()).is_empty());
+        let local = log_graph(&work, 5).unwrap();
+        assert!(
+            local[0].refs.iter().any(|r| r.name == "v1"),
+            "deleting on origin keeps the local tag"
+        );
+
+        delete_tag(&work, "v1").unwrap();
+        let after = log_graph(&work, 5).unwrap();
+        assert!(!after[0].refs.iter().any(|r| r.name == "v1"));
+        assert!(delete_tag(&work, "v1").is_err(), "already gone");
+        assert!(delete_tag(&work, "-d").is_err());
+        assert!(delete_remote_tag(&work, "a b").is_err());
+    }
+
+    #[test]
+    fn remote_tags_fails_instead_of_hanging_on_an_unreachable_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        run(dir.path(), ["init", "-b", "main"]);
+        let missing = dir.path().join("does-not-exist.git");
+        run(dir.path(), ["remote", "add", "origin", missing.to_str().unwrap()]);
+        assert!(remote_tags(dir.path()).is_err());
+    }
+
+    /// A repository with a committer identity, so history-changing
+    /// operations can run.
+    fn identified_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        run(dir.path(), ["init", "-b", "main"]);
+        run(dir.path(), ["config", "user.name", "Test"]);
+        run(dir.path(), ["config", "user.email", "t@example.com"]);
+        dir
+    }
+
+    fn commit_file(dir: &Path, name: &str, content: &str, message: &str) -> String {
+        fs::write(dir.join(name), content).unwrap();
+        run(dir, ["add", "-A"]);
+        run(dir, ["commit", "-m", message]);
+        head(dir)
+    }
+
+    fn head(dir: &Path) -> String {
+        let out = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_owned()
+    }
+
+    fn subjects(dir: &Path) -> Vec<String> {
+        log_graph(dir, 50)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.subject)
+            .collect()
+    }
+
+    fn is_clean(dir: &Path) -> bool {
+        read_status(dir).unwrap().unwrap().files.is_empty()
+    }
+
+    #[test]
+    fn cherry_pick_and_revert_apply_one_commit() {
+        let repo = identified_repo();
+        let d = repo.path();
+        commit_file(d, "a.txt", "a\n", "base");
+        run(d, ["switch", "-c", "feature"]);
+        let picked = commit_file(d, "f.txt", "f\n", "add f");
+        run(d, ["switch", "main"]);
+        assert!(!d.join("f.txt").exists());
+
+        cherry_pick(d, &picked).unwrap();
+        assert!(d.join("f.txt").exists());
+        assert_eq!(subjects(d)[0], "add f");
+
+        revert(d, &head(d)).unwrap();
+        assert!(!d.join("f.txt").exists());
+        assert!(subjects(d)[0].starts_with("Revert"));
+        assert!(is_clean(d));
+    }
+
+    #[test]
+    fn conflicts_are_aborted_and_leave_the_repository_untouched() {
+        let repo = identified_repo();
+        let d = repo.path();
+        commit_file(d, "a.txt", "base\n", "base");
+        run(d, ["switch", "-c", "feature"]);
+        let theirs = commit_file(d, "a.txt", "theirs\n", "theirs");
+        run(d, ["switch", "main"]);
+        let ours = commit_file(d, "a.txt", "ours\n", "ours");
+
+        for result in [
+            cherry_pick(d, &theirs),
+            merge(d, &theirs),
+            rebase_onto(d, &theirs),
+        ] {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("aborted"), "{error}");
+            assert_eq!(in_progress(d), None);
+            assert_eq!(head(d), ours, "HEAD unchanged");
+            assert!(is_clean(d));
+            assert_eq!(fs::read_to_string(d.join("a.txt")).unwrap(), "ours\n");
+        }
+    }
+
+    #[test]
+    fn refuses_to_start_while_another_operation_is_unfinished() {
+        let repo = identified_repo();
+        let d = repo.path();
+        commit_file(d, "a.txt", "base\n", "base");
+        run(d, ["switch", "-c", "feature"]);
+        let theirs = commit_file(d, "a.txt", "theirs\n", "theirs");
+        run(d, ["switch", "main"]);
+        commit_file(d, "a.txt", "ours\n", "ours");
+        // Leave a conflicted cherry-pick behind, as a terminal user could.
+        let _ = Command::new("git")
+            .args(["cherry-pick", &theirs])
+            .current_dir(d)
+            .output();
+        assert!(in_progress(d).is_some());
+        let error = merge(d, &theirs).unwrap_err().to_string();
+        assert!(error.contains("already in progress"), "{error}");
+        assert!(in_progress(d).is_some(), "the user's operation is not aborted");
+    }
+
+    #[test]
+    fn merge_commits_cannot_be_cherry_picked_reverted_or_dropped() {
+        let repo = identified_repo();
+        let d = repo.path();
+        commit_file(d, "a.txt", "a\n", "base");
+        run(d, ["switch", "-c", "feature"]);
+        commit_file(d, "f.txt", "f\n", "on feature");
+        run(d, ["switch", "main"]);
+        commit_file(d, "m.txt", "m\n", "on main");
+        run(d, ["merge", "--no-ff", "feature", "-m", "merge"]);
+        let merged = head(d);
+        assert!(cherry_pick(d, &merged).is_err());
+        assert!(revert(d, &merged).is_err());
+        assert!(drop_commit(d, &merged).is_err());
+        let root = log_graph(d, 50).unwrap().pop().unwrap().hash;
+        assert!(drop_commit(d, &root).is_err(), "a root commit has no parent");
+    }
+
+    #[test]
+    fn fixup_and_squash_commit_staged_changes_only() {
+        let repo = identified_repo();
+        let d = repo.path();
+        let target = commit_file(d, "a.txt", "a\n", "target");
+        commit_file(d, "b.txt", "b\n", "later");
+
+        let error = commit_fixup(d, &target).unwrap_err().to_string();
+        assert!(error.contains("nothing is staged"), "{error}");
+
+        fs::write(d.join("a.txt"), "a2\n").unwrap();
+        run(d, ["add", "a.txt"]);
+        commit_fixup(d, &target).unwrap();
+        assert_eq!(subjects(d)[0], "fixup! target");
+
+        fs::write(d.join("a.txt"), "a3\n").unwrap();
+        run(d, ["add", "a.txt"]);
+        commit_squash(d, &target).unwrap();
+        assert_eq!(subjects(d)[0], "squash! target");
+    }
+
+    #[test]
+    fn reset_moves_the_branch_and_keeps_or_discards_changes() {
+        let repo = identified_repo();
+        let d = repo.path();
+        let first = commit_file(d, "a.txt", "one\n", "one");
+        commit_file(d, "a.txt", "two\n", "two");
+
+        reset_last_commit_soft(d).unwrap();
+        assert_eq!(head(d), first);
+        let status = read_status(d).unwrap().unwrap();
+        assert!(status.files.iter().any(|f| f.path == "a.txt" && f.staged), "kept staged");
+
+        run(d, ["commit", "-am", "two again"]);
+        reset_to(d, &first, GitResetMode::Mixed).unwrap();
+        let status = read_status(d).unwrap().unwrap();
+        assert!(status.files.iter().any(|f| f.path == "a.txt" && !f.staged), "kept unstaged");
+        assert_eq!(fs::read_to_string(d.join("a.txt")).unwrap(), "two\n");
+
+        reset_to(d, &first, GitResetMode::Hard).unwrap();
+        assert!(is_clean(d));
+        assert_eq!(fs::read_to_string(d.join("a.txt")).unwrap(), "one\n");
+
+        let only = log_graph(d, 5).unwrap().pop().unwrap().hash;
+        reset_to(d, &only, GitResetMode::Soft).unwrap();
+        assert!(reset_last_commit_soft(d).is_err(), "first commit has no parent");
+    }
+
+    #[test]
+    fn merge_rebase_and_drop_rewrite_the_current_branch() {
+        let repo = identified_repo();
+        let d = repo.path();
+        commit_file(d, "a.txt", "a\n", "base");
+        run(d, ["switch", "-c", "feature"]);
+        let feature = commit_file(d, "f.txt", "f\n", "feature work");
+        run(d, ["switch", "main"]);
+        let main_tip = commit_file(d, "m.txt", "m\n", "main work");
+
+        merge(d, &feature).unwrap();
+        assert!(d.join("f.txt").exists() && d.join("m.txt").exists());
+        reset_to(d, &main_tip, GitResetMode::Hard).unwrap();
+
+        run(d, ["switch", "feature"]);
+        rebase_onto(d, &main_tip).unwrap();
+        assert!(d.join("m.txt").exists(), "feature now sits on main");
+        let list = subjects(d);
+        assert_eq!(&list[..2], ["feature work", "main work"]);
+
+        let middle = commit_file(d, "g.txt", "g\n", "middle");
+        commit_file(d, "h.txt", "h\n", "top");
+        drop_commit(d, &middle).unwrap();
+        assert!(!d.join("g.txt").exists(), "dropped commit's change is gone");
+        assert!(d.join("h.txt").exists(), "later commits stay");
+        assert!(!subjects(d).contains(&"middle".to_owned()));
+        assert!(is_clean(d));
+
+        // The tip can be dropped too.
+        let tip_before = head(d);
+        drop_commit(d, &tip_before).unwrap();
+        assert_ne!(head(d), tip_before);
+        assert!(!d.join("h.txt").exists());
+
+        // A commit on another branch is refused, and nothing changes.
+        run(d, ["switch", "main"]);
+        let before = head(d);
+        let error = drop_commit(d, &feature).unwrap_err().to_string();
+        assert!(error.contains("not part of the current branch"), "{error}");
+        assert_eq!(head(d), before);
+        assert_eq!(in_progress(d), None);
+    }
+
+    #[test]
+    fn dirty_tree_stops_a_rebase_without_leaving_state() {
+        let repo = identified_repo();
+        let d = repo.path();
+        let base = commit_file(d, "a.txt", "a\n", "base");
+        commit_file(d, "b.txt", "b\n", "next");
+        fs::write(d.join("a.txt"), "dirty\n").unwrap();
+        assert!(rebase_onto(d, &base).is_err());
+        assert_eq!(in_progress(d), None);
+        assert_eq!(fs::read_to_string(d.join("a.txt")).unwrap(), "dirty\n");
+    }
+
+    #[test]
+    fn detects_whether_a_commit_was_pushed() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        fs::create_dir(&work).unwrap();
+        run(dir.path(), ["init", "--bare", "-b", "main", "remote.git"]);
+        run(&work, ["init", "-b", "main"]);
+        run(&work, ["config", "user.name", "Test"]);
+        run(&work, ["config", "user.email", "t@example.com"]);
+        run(&work, ["remote", "add", "origin", dir.path().join("remote.git").to_str().unwrap()]);
+        let pushed = commit_file(&work, "a.txt", "a\n", "pushed");
+        assert!(!is_on_remote(&work, &pushed).unwrap(), "nothing pushed yet");
+        run(&work, ["push", "-u", "origin", "main"]);
+        let local = commit_file(&work, "b.txt", "b\n", "local");
+        assert!(is_on_remote(&work, &pushed).unwrap());
+        assert!(!is_on_remote(&work, &local).unwrap());
+    }
+
+    #[test]
+    fn compares_two_commits_file_by_file() {
+        let repo = identified_repo();
+        let d = repo.path();
+        let from = commit_file(d, "keep.txt", "k\n", "one");
+        fs::write(d.join("old.txt"), "same content\nline 2\nline 3\n").unwrap();
+        run(d, ["add", "-A"]);
+        run(d, ["commit", "-m", "two"]);
+        let mid = head(d);
+        fs::write(d.join("keep.txt"), "k changed\n").unwrap();
+        run(d, ["mv", "old.txt", "new.txt"]);
+        fs::write(d.join("added.txt"), "x\n").unwrap();
+        run(d, ["add", "-A"]);
+        run(d, ["commit", "-m", "three"]);
+        let to = head(d);
+
+        let files = compare_files(d, &mid, &to).unwrap();
+        let summary: Vec<_> = files
+            .iter()
+            .map(|f| (f.path.as_str(), f.old_path.as_deref(), f.status))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("added.txt", None, 'A'),
+                ("keep.txt", None, 'M'),
+                ("new.txt", Some("old.txt"), 'R'),
+            ]
+        );
+        let diff = compare_diff(d, &mid, &to, "keep.txt", None).unwrap();
+        assert!(diff.contains("-k\n") && diff.contains("+k changed"), "{diff}");
+        let renamed = compare_diff(d, &mid, &to, "new.txt", Some("old.txt")).unwrap();
+        assert!(renamed.contains("rename from old.txt"), "{renamed}");
+        assert!(compare_files(d, &from, "--help").is_err());
+        assert!(compare_diff(d, &from, &to, "", None).is_err());
     }
 
     fn run<const N: usize>(dir: &Path, args: [&str; N]) {

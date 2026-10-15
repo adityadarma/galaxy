@@ -289,6 +289,59 @@ final class TabTests: XCTestCase {
         return tab
     }
 
+    private func crowdedBar(tabs: Int, width: CGFloat) -> TabBar {
+        let bar = TabBar(frame: NSRect(x: 0, y: 0, width: width, height: Theme.tabHeight))
+        let items = (0..<tabs).map {
+            TabBar.Item(title: "file-number-\($0).ts", isPreview: false, isEdited: false, isGitChanged: false)
+        }
+        bar.set(items: items, selected: 0)
+        bar.layoutSubtreeIfNeeded()
+        return bar
+    }
+
+    func testManyTabsKeepTheirWidthAndTheStripScrolls() {
+        let bar = crowdedBar(tabs: 30, width: 600)
+        XCTAssertGreaterThan(bar.contentWidth, 600, "tabs are not squeezed to fit")
+        XCTAssertEqual(bar.scrollView.frame.width, 600, accuracy: 0.5, "the strip fills the bar")
+        XCTAssertEqual(bar.scrollView.documentView?.frame.width ?? 0, bar.contentWidth, accuracy: 0.5)
+        XCTAssertTrue(bar.tabViews.allSatisfy { $0.frame.width >= TabBar.minTabWidth - 0.5 }, "no tab is squeezed under the minimum")
+        XCTAssertEqual(bar.scrollView.contentView.bounds.origin.x, 0)
+    }
+
+    func testActiveTabIsScrolledIntoView() {
+        let bar = crowdedBar(tabs: 30, width: 600)
+        let items = bar.items
+        bar.set(items: items, selected: 29)
+        bar.layoutSubtreeIfNeeded()
+        let clip = bar.scrollView.contentView.bounds
+        XCTAssertGreaterThan(clip.origin.x, 0)
+        let last = bar.tabViews[29].frame
+        XCTAssertGreaterThanOrEqual(last.minX, clip.minX - 0.5)
+        XCTAssertLessThanOrEqual(last.maxX, clip.maxX + 0.5, "the last tab is fully visible")
+
+        bar.set(items: items, selected: 0)
+        bar.layoutSubtreeIfNeeded()
+        XCTAssertEqual(bar.scrollView.contentView.bounds.origin.x, 0, accuracy: 0.5, "back to the first tab")
+    }
+
+    func testMouseWheelScrollsTheTabsSideways() throws {
+        let bar = crowdedBar(tabs: 30, width: 600)
+        let cg = try XCTUnwrap(CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 1, wheel1: -3, wheel2: 0, wheel3: 0))
+        let wheel = try XCTUnwrap(NSEvent(cgEvent: cg))
+        bar.scrollView.scrollWheel(with: wheel)
+        XCTAssertGreaterThan(bar.scrollView.contentView.bounds.origin.x, 0, "a vertical wheel moves the tabs along")
+        bar.scrollView.scroll(toX: -500)
+        XCTAssertEqual(bar.scrollView.contentView.bounds.origin.x, 0, "it stops at the first tab")
+        bar.scrollView.scroll(toX: 1_000_000)
+        XCTAssertEqual(bar.scrollView.contentView.bounds.origin.x, bar.contentWidth - 600, accuracy: 0.5, "and at the last")
+    }
+
+    func testFewTabsLeaveRoomToDragTheWindow() {
+        let bar = crowdedBar(tabs: 2, width: 800)
+        XCTAssertLessThan(bar.scrollView.frame.width, 800)
+        XCTAssertEqual(bar.scrollView.frame.width, bar.contentWidth, accuracy: 0.5)
+    }
+
     func testNarrowTabKeepsTheTitleAndShowsCloseOnlyOnHover() {
         let tab = laidOutTab(title: "AppServiceProvider.php", width: TabBar.minTabWidth)
         XCTAssertTrue(tab.closeButton.isHidden, "no room: the title wins over the X")

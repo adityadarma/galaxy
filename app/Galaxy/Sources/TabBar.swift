@@ -60,10 +60,33 @@ final class EditorTab {
     }
 }
 
+/// Scroll view of the tab strip. No scrollers; the mouse wheel and the
+/// trackpad both move it sideways, as in VSCode.
+@MainActor
+final class TabScrollView: NSScrollView {
+    override func scrollWheel(with event: NSEvent) {
+        let dx = event.scrollingDeltaX, dy = event.scrollingDeltaY
+        var delta = abs(dx) >= abs(dy) ? dx : dy
+        if !event.hasPreciseScrollingDeltas { delta *= 12 }
+        scroll(toX: contentView.bounds.origin.x - delta)
+    }
+
+    /// Moves the strip so `x` is the left edge, within the strip's ends.
+    func scroll(toX x: CGFloat) {
+        let maxX = max(0, (documentView?.frame.width ?? 0) - contentView.bounds.width)
+        let clamped = min(max(0, x), maxX)
+        guard abs(clamped - contentView.bounds.origin.x) > 0.01 else { return }
+        contentView.scroll(to: NSPoint(x: clamped, y: contentView.bounds.origin.y))
+        reflectScrolledClipView(contentView)
+    }
+}
+
 /// Tab strip in the title bar row. The active tab takes the editor's color
 /// and a copper rule on top; preview tabs have an italic title; unsaved
 /// tabs show a copper dot where the close button is (the button returns on
-/// hover). Drag a tab to reorder it, middle-click to close it.
+/// hover). Drag a tab to reorder it, middle-click to close it. Tabs keep the
+/// width of their title; when they do not all fit, the strip scrolls and the
+/// active tab is brought into view.
 @MainActor
 final class TabBar: NSView {
     struct Item: Equatable {
@@ -103,7 +126,15 @@ final class TabBar: NSView {
     /// Context menu for tab `index`, if any.
     var menuForTab: ((Int) -> NSMenu?)?
 
+    let scrollView = TabScrollView()
+    /// Document view of `scrollView`: as wide as all the tabs together.
+    private let strip = NSView()
     private let stack = NSStackView()
+    /// Selection or tab count changed: scroll the active tab into view on
+    /// the next layout, once the bar has a width.
+    private var needsReveal = false
+    /// Width of all the tabs together.
+    private(set) var contentWidth: CGFloat = 0
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -118,24 +149,63 @@ final class TabBar: NSView {
         stack.alignment = .centerY
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.setHuggingPriority(.defaultHigh, for: .horizontal)
-        addSubview(stack)
+        strip.addSubview(stack)
+
+        scrollView.documentView = strip
+        scrollView.hasHorizontalScroller = false
+        scrollView.hasVerticalScroller = false
+        scrollView.horizontalScrollElasticity = .none
+        scrollView.verticalScrollElasticity = .none
+        scrollView.drawsBackground = false
+        scrollView.borderType = .noBorder
+        scrollView.contentView.copiesOnScroll = false
+        addSubview(scrollView)
 
         let rule = NSBox()
         rule.boxType = .separator
         rule.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(rule, positioned: .below, relativeTo: stack)
+        addSubview(rule, positioned: .below, relativeTo: scrollView)
 
         NSLayoutConstraint.activate([
             heightAnchor.constraint(equalToConstant: Theme.tabHeight),
             widthAnchor.constraint(greaterThanOrEqualToConstant: 0),
-            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
+            stack.leadingAnchor.constraint(equalTo: strip.leadingAnchor),
+            stack.topAnchor.constraint(equalTo: strip.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: strip.bottomAnchor),
             rule.bottomAnchor.constraint(equalTo: bottomAnchor),
             rule.leadingAnchor.constraint(equalTo: leadingAnchor),
             rule.trailingAnchor.constraint(equalTo: trailingAnchor),
-            stack.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor),
-            stack.topAnchor.constraint(equalTo: topAnchor),
-            stack.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
+    }
+
+    /// Width a tab takes: its title, within the tab limits.
+    private static func width(of tab: TabItemView) -> CGFloat {
+        min(max(tab.intrinsicContentSize.width, minTabWidth), maxTabWidth)
+    }
+
+    override func layout() {
+        super.layout()
+        let widths = tabViews.map(Self.width(of:))
+        contentWidth = widths.reduce(0, +)
+        strip.setFrameSize(NSSize(width: max(contentWidth, 1), height: bounds.height))
+        // The scroll view only covers the tabs, so the empty strip after them
+        // stays a title bar to drag the window by.
+        scrollView.frame = NSRect(x: 0, y: 0, width: min(contentWidth, bounds.width), height: bounds.height)
+        guard bounds.width > 0 else { return }
+        // Keep the offset valid after the bar grows or tabs close.
+        scrollView.scroll(toX: scrollView.contentView.bounds.origin.x)
+        if needsReveal, let selectedIndex, widths.indices.contains(selectedIndex) {
+            needsReveal = false
+            let left = widths[..<selectedIndex].reduce(0, +)
+            let right = left + widths[selectedIndex]
+            let origin = scrollView.contentView.bounds.origin.x
+            let visible = scrollView.contentView.bounds.width
+            if left < origin {
+                scrollView.scroll(toX: left)
+            } else if right > origin + visible {
+                scrollView.scroll(toX: right - visible)
+            }
+        }
     }
 
     @available(*, unavailable)
@@ -171,8 +241,10 @@ final class TabBar: NSView {
                 return view
             }
         }
+        if selected != selectedIndex || items.count != self.items.count { needsReveal = true }
         self.items = items
         selectedIndex = selected
+        needsLayout = true
         for (i, view) in tabViews.enumerated() {
             view.index = i
             view.isSelected = i == selected

@@ -188,6 +188,10 @@ final class CoreBridge {
         (try? workspace.gitBranches()) ?? []
     }
 
+    func gitLogGraph(workspace: Workspace, limit: UInt32 = 500) -> [GitCommitInfo] {
+        (try? workspace.gitLogGraph(limit: limit)) ?? []
+    }
+
     func gitCheckout(workspace: Workspace, name: String) -> Bool {
         (try? workspace.gitCheckout(name: name)) != nil
     }

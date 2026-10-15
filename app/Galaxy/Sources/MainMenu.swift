@@ -107,6 +107,7 @@ enum MainMenu {
         viewMenu.addItem(withTitle: "Toggle Sidebar", action: #selector(MainWindowController.toggleSidebarVisibility(_:)), keyEquivalent: "b")
         let terminal = viewMenu.addItem(withTitle: "Toggle Terminal", action: #selector(MainWindowController.toggleTerminal(_:)), keyEquivalent: "j")
         terminal.keyEquivalentModifierMask = [.command]
+        viewMenu.addItem(withTitle: "Toggle Git Graph", action: #selector(MainWindowController.toggleGitGraph(_:)), keyEquivalent: "")
         viewMenu.addItem(withTitle: "Move Terminal into Editor Area", action: #selector(MainWindowController.moveTerminalToEditor(_:)), keyEquivalent: "")
         viewMenu.addItem(withTitle: "Move Terminal into Panel", action: #selector(MainWindowController.moveTerminalToPanel(_:)), keyEquivalent: "")
         viewMenu.addItem(withTitle: "New Terminal in Editor Area", action: #selector(MainWindowController.createTerminalEditor(_:)), keyEquivalent: "")

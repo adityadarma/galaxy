@@ -46,6 +46,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     let editorTerminalView = TerminalView()
     private let outputPanel = OutputPanel()
     private let portsPanel = PortsPanel()
+    private let gitGraphPanel = GitGraphPanel()
     private let bottomPanelHeader = BottomPanelHeader()
     private let bottomPanelContent = BottomPanelContentView()
     private var bottomPanelHeight: NSLayoutConstraint!
@@ -254,6 +255,17 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         secondaryEditorView.requestDocumentRefresh(scrollCaret: false)
     }
 
+    /// Shows the Git Graph tab in the bottom panel, or hides the panel when
+    /// that tab is already the one showing.
+    @objc func toggleGitGraph(_ sender: Any?) {
+        if isBottomPanelVisible && bottomPanelTab == .gitGraph {
+            setBottomPanelOpen(false)
+        } else {
+            setBottomPanelOpen(true)
+            showBottomPanel(tab: .gitGraph)
+        }
+    }
+
     @objc func toggleTerminal(_ sender: Any?) {
         setBottomPanelOpen(!isBottomPanelVisible)
         if isBottomPanelVisible { showBottomPanel(tab: bottomPanelTab) }
@@ -270,12 +282,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             if window?.firstResponder === terminalView { window?.makeFirstResponder(editorView) }
             outputPanel.stop()
             portsPanel.stop()
+            gitGraphPanel.stop()
         }
         bottomPanelHeight.constant = open ? currentBottomPanelHeight() : 0
         bottomPanelHeaderHeight.constant = open ? BottomPanelHeader.height : 0
         bottomPanelHeader.isHidden = !open
         bottomPanelContent.isHidden = !open
         titleBar.setPanelVisible(open)
+        titleBar.setGitGraphVisible(open && bottomPanelTab == .gitGraph)
         detailView.needsLayout = true
     }
 
@@ -327,6 +341,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         problemsPanel.isHidden = tab != .problems
         outputPanel.isHidden = tab != .output
         portsPanel.isHidden = tab != .ports
+        gitGraphPanel.isHidden = tab != .gitGraph
         bottomPanelPlaceholder.isHidden = tab != .debugConsole
         if tab == .terminal {
             ensureTerminal()
@@ -334,6 +349,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
         if tab == .output { outputPanel.start() } else { outputPanel.stop() }
         if tab == .ports { portsPanel.start() } else { portsPanel.stop() }
+        if tab == .gitGraph {
+            gitGraphPanel.workspace = workspace
+            gitGraphPanel.start()
+        } else {
+            gitGraphPanel.stop()
+        }
+        titleBar.setGitGraphVisible(isBottomPanelVisible && tab == .gitGraph)
     }
 
     private func ensureTerminal() {
@@ -629,6 +651,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
         titleBar.onToggleSidebar = { [weak self] in self?.toggleSidebarVisibility(nil) }
         titleBar.onTogglePanel = { [weak self] in self?.toggleTerminal(nil) }
+        titleBar.onToggleGitGraph = { [weak self] in self?.toggleGitGraph(nil) }
+        gitGraphPanel.onMessage = { [weak self] message in self?.statusLabel.stringValue = message }
+        gitGraphPanel.onRepositoryChanged = { [weak self] in self?.refreshGitStatus() }
         titleBar.setSidebarVisible(true)
         titleBar.setPanelVisible(false)
         sourceControl.onOpen = { [weak self] relPath in
@@ -745,7 +770,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         // `BottomPanelContentView.layout()` sizes these (never below its
         // minimum). No autoresizing mask: one tied to the collapsed,
         // zero-height container conflicts with the panels' own constraints.
-        for panel in [terminalView, outputPanel, portsPanel, problemsPanel] as [NSView] {
+        for panel in [terminalView, outputPanel, portsPanel, gitGraphPanel, problemsPanel] as [NSView] {
             panel.translatesAutoresizingMaskIntoConstraints = true
             panel.autoresizingMask = []
             // A zero frame would become a `height == 0` constraint before
@@ -787,7 +812,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         bottomPanelPlaceholder.textColor = .secondaryLabelColor
         bottomPanelPlaceholder.alignment = .center
         bottomPanelPlaceholder.isHidden = true
-        for panel in [terminalView, problemsPanel, outputPanel, portsPanel, bottomPanelPlaceholder] as [NSView] {
+        for panel in [terminalView, problemsPanel, outputPanel, portsPanel, gitGraphPanel, bottomPanelPlaceholder] as [NSView] {
             bottomPanelContent.addSubview(panel)
         }
         bottomPanelContent.isHidden = true
@@ -836,6 +861,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         problemsPanel.isHidden = true
         outputPanel.isHidden = true
         portsPanel.isHidden = true
+        gitGraphPanel.isHidden = true
         referencesPanel.removeFromSuperview()
         terminalView.isHidden = true
         problemsPanel.isHidden = true

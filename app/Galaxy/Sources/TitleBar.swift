@@ -7,9 +7,11 @@ import AppKit
 final class TitleBar: NSView {
     var onToggleSidebar: (() -> Void)?
     var onTogglePanel: (() -> Void)?
+    var onToggleGitGraph: (() -> Void)?
 
     let sidebarButton = TitleBar.toggle(symbol: "sidebar.left", title: "Toggle Primary Side Bar (⌘B)")
     let panelButton = TitleBar.toggle(symbol: "rectangle.bottomthird.inset.filled", title: "Toggle Panel (⌘J)")
+    let gitGraphButton = TitleBar.toggle(symbol: "point.3.connected.trianglepath.dotted", title: "Toggle Git Graph")
     private let projectTitle = NSTextField(labelWithString: "")
 
     override init(frame: NSRect) {
@@ -27,7 +29,11 @@ final class TitleBar: NSView {
         panelButton.target = self
         panelButton.action = #selector(togglePanel(_:))
         panelButton.setAccessibilityIdentifier("toggle-panel")
-        let buttons = NSStackView(views: [sidebarButton, panelButton])
+        gitGraphButton.target = self
+        gitGraphButton.action = #selector(toggleGitGraph(_:))
+        gitGraphButton.setAccessibilityIdentifier("toggle-git-graph")
+
+        let buttons = NSStackView(views: [gitGraphButton, sidebarButton, panelButton])
         buttons.orientation = .horizontal
         buttons.spacing = 4
         buttons.translatesAutoresizingMaskIntoConstraints = false
@@ -65,6 +71,12 @@ final class TitleBar: NSView {
         panelButton.contentTintColor = visible ? .labelColor : .secondaryLabelColor
     }
 
+    func setGitGraphVisible(_ visible: Bool) {
+        gitGraphButton.state = visible ? .on : .off
+        gitGraphButton.contentTintColor = visible ? .labelColor : .secondaryLabelColor
+    }
+
+    @objc private func toggleGitGraph(_ sender: Any?) { onToggleGitGraph?() }
     @objc private func toggleSidebar(_ sender: Any?) { onToggleSidebar?() }
     @objc private func togglePanel(_ sender: Any?) { onTogglePanel?() }
 
