@@ -48,7 +48,8 @@ final class SessionTests: XCTestCase {
         XCTAssertGreaterThan(savedScroll, 100, "scrolled down to line 300")
         first.newDocument(nil)  // Untitled: not saved
         first.selectTab(0)
-        first.window?.close()  // saves
+        first.saveSession()  // closing a window starts fresh; only quitting saves
+        first.window?.close()
 
         let saved = try XCTUnwrap(Session.load(from: sessionURL))
         XCTAssertEqual(saved.workspace, root.appendingPathComponent("ws").path)

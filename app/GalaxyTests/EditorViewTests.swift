@@ -269,7 +269,7 @@ final class EditorViewTests: XCTestCase {
         XCTAssertEqual(selectedLineFarRight, line0, accuracy: 0.005)
     }
 
-    func testCaretLineNumberIsCopper() throws {
+    func testCaretLineNumberUsesTheAccent() throws {
         let (view, _, url) = try makeView(text: "      \n      ")
         defer { try? FileManager.default.removeItem(at: url) }
         view.forcedCaretVisible = false
@@ -277,13 +277,13 @@ final class EditorViewTests: XCTestCase {
         let rep = try bitmap(view)
         let scale = CGFloat(rep.pixelsWide) / view.bounds.width
         let h = view.metrics.lineHeight
-        // Warmest pixel in each gutter cell: red minus blue.
+        // Bluest pixel in each gutter cell: blue minus red.
         func warmth(line: Int) -> CGFloat {
             var best: CGFloat = 0
             for xi in stride(from: CGFloat(0), to: view.gutterWidth, by: 0.5) {
                 for yi in stride(from: CGFloat(line) * h, to: CGFloat(line + 1) * h, by: 0.5) {
                     guard let c = rep.colorAt(x: Int(xi * scale), y: Int(yi * scale))?.usingColorSpace(.sRGB) else { continue }
-                    best = max(best, c.redComponent - c.blueComponent)
+                    best = max(best, c.blueComponent - c.redComponent)
                 }
             }
             return best

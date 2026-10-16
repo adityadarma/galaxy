@@ -135,7 +135,8 @@ final class KeybindingsTests: XCTestCase {
         doc.edit(command: .insertText(text: "[ { "))
         c.editorView.didChangeDocument()
         XCTAssertTrue(c.save())
-        XCTAssertNil(c.keybindings.commandByKey["cmd+t"])
+        XCTAssertEqual(c.keybindings.commandByKey["cmd+t"], "workbench.action.gotoWorkspaceSymbol",
+                       "a broken file falls back to the default for cmd+t")
         XCTAssertTrue(c.statusLabel.stringValue.hasPrefix("Keyboard shortcuts: keybindings.json line 1"),
                       c.statusLabel.stringValue)
     }

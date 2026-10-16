@@ -172,7 +172,7 @@ final class ExplorerTests: XCTestCase {
         XCTAssertEqual(frame(controller.sidebar).minX, ActivityBar.width, accuracy: 0.5)
         XCTAssertEqual(activity.active, .explorer)
         XCTAssertTrue(activity.isEnabled(.explorer))
-        XCTAssertFalse(activity.isEnabled(.search), "not built yet")
+        XCTAssertTrue(activity.isEnabled(.search))
         XCTAssertTrue(activity.isEnabled(.sourceControl))
 
         // Status bar along the bottom, full width.
@@ -320,12 +320,13 @@ final class ExplorerTests: XCTestCase {
         XCTAssertEqual(titleFrame.maxY, content.bounds.maxY, accuracy: 0.5)
         XCTAssertEqual(titleFrame.width, content.bounds.width, accuracy: 0.5)
         XCTAssertEqual(titleFrame.minY, window.contentLayoutRect.maxY, accuracy: 0.5, "ends where the title bar ends")
-        // Only the separator and VS Code-style layout toggles; no text.
-        XCTAssertTrue(controller.titleBar.subviews.allSatisfy { $0 is NSBox || $0 is NSStackView },
-                      "only layout toggles in the title bar")
-        XCTAssertFalse(controller.titleBar.subviews.contains { $0 is NSTextField }, "no text in the title bar")
-        // The folder name appears once: the sidebar section.
-        XCTAssertEqual(controller.sectionHeader.label.stringValue, root.lastPathComponent.uppercased())
+        // The separator, the layout toggles and the project name.
+        XCTAssertTrue(controller.titleBar.subviews.allSatisfy { $0 is NSBox || $0 is NSStackView || $0 is NSTextField },
+                      "only layout toggles and the project name in the title bar")
+        let titleText = try XCTUnwrap(controller.titleBar.subviews.compactMap { $0 as? NSTextField }.first)
+        XCTAssertEqual(titleText.stringValue, try XCTUnwrap(controller.workspace).name())
+        // The sidebar section stays "EXPLORER"; the folder name is in the title bar.
+        XCTAssertEqual(controller.sectionHeader.label.stringValue, "EXPLORER")
 
         // Tabs at the top of the editor column; breadcrumb right under them.
         let tabsFrame = content.convert(controller.tabBar.bounds, from: controller.tabBar)
@@ -366,11 +367,11 @@ final class ExplorerTests: XCTestCase {
             try XCTUnwrap(explorer.outlineView.view(atColumn: 0, row: row, makeIfNecessary: true) as? ExplorerCell)
         }
 
-        // Folders: chevron, no icon. Files: no chevron, a type glyph, and
+        // Folders: chevron and folder icon. Files: no chevron, a type glyph, and
         // the name lined up with folder names.
         let src = try cell(1)
         XCTAssertNotNil(src.chevron.image)
-        XCTAssertTrue(src.icon.isHidden)
+        XCTAssertFalse(src.icon.isHidden)
         let readme = try cell(2)
         XCTAssertNil(readme.chevron.image)
         XCTAssertFalse(readme.icon.isHidden)
@@ -412,7 +413,7 @@ final class ExplorerTests: XCTestCase {
 
         controller.open(url: root)
         controller.window?.contentView?.layoutSubtreeIfNeeded()
-        XCTAssertEqual(header.label.stringValue, root.lastPathComponent.uppercased())
+        XCTAssertEqual(header.label.stringValue, "EXPLORER", "the folder name is in the title bar")
         XCTAssertEqual(header.tools.map(\.toolTip), ["New File…", "New Folder…", "Refresh Explorer",
                                                       "Collapse Folders in Explorer", "More Actions…"])
         XCTAssertTrue(header.tools.allSatisfy { !$0.isHidden && $0.image != nil }, "always visible")

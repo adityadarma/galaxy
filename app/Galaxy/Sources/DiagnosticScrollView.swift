@@ -15,6 +15,10 @@ final class DiagnosticScrollView: NSScrollView {
 
 @MainActor
 final class DiagnosticScroller: NSScroller {
+    // Without this AppKit refuses `.overlay` for a custom scroller class and
+    // falls back to the wide legacy scroller.
+    override class var isCompatibleWithOverlayScrollers: Bool { true }
+
     private var markers: [(line: UInt64, severity: UInt8)] = []
     private var lineCount: UInt64 = 1
 

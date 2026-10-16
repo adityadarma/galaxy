@@ -17,9 +17,9 @@ final class StatusBarTests: XCTestCase {
     func testGitStatusShowsBranchAndChangedCount() {
         let bar = StatusBar()
         bar.showGit(branch: "main", changedCount: 2)
-        XCTAssertEqual(bar.git.stringValue, "Git: main · 2")
+        XCTAssertEqual(bar.git.stringValue, "main")
         bar.showGit(branch: "main", changedCount: 0)
-        XCTAssertEqual(bar.git.stringValue, "Git: main")
+        XCTAssertEqual(bar.git.stringValue, "main")
         bar.showGit(branch: nil, changedCount: 0)
         XCTAssertEqual(bar.git.stringValue, "")
     }
