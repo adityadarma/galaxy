@@ -375,9 +375,7 @@ final class SearchInputFieldContainer: NSView {
         let bounds = self.bounds
         let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 4, yRadius: 4)
 
-        let bgColor = isDark
-            ? (NSColor(hex: "#1E2227") ?? NSColor(srgbRed: 0.12, green: 0.13, blue: 0.15, alpha: 1.0))
-            : NSColor.textBackgroundColor
+        let bgColor = Theme.editorBackground.resolved(for: effectiveAppearance)
         bgColor.setFill()
         path.fill()
 

@@ -25,7 +25,7 @@ final class StickyScopeView: NSView {
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
     override func draw(_ dirtyRect: NSRect) {
-        NSColor.textBackgroundColor.withAlphaComponent(0.96).setFill()
+        Theme.editorBackground.resolved(for: effectiveAppearance).withAlphaComponent(0.96).setFill()
         dirtyRect.intersection(bounds).fill()
         NSColor.separatorColor.setFill()
         NSRect(x: 0, y: bounds.height - 1, width: bounds.width, height: 1).fill()

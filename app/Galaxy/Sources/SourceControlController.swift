@@ -328,9 +328,7 @@ final class CommitMessageInputContainer: NSView {
             let normalBorder = isDark ? NSColor(white: 0.24, alpha: 1.0) : NSColor.separatorColor.withAlphaComponent(0.6)
             layer?.borderColor = (isFocused ? Theme.accent : normalBorder).cgColor
             layer?.borderWidth = isFocused ? 1.5 : 1.0
-            layer?.backgroundColor = isDark
-                ? (NSColor(hex: "#1E2227") ?? NSColor(white: 0.14, alpha: 1.0)).cgColor
-                : NSColor.textBackgroundColor.cgColor
+            layer?.backgroundColor = Theme.editorBackground.resolved(for: effectiveAppearance).cgColor
         }
     }
 

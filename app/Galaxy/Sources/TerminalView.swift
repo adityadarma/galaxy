@@ -645,7 +645,7 @@ struct TerminalPalette {
 
     init(appearance: NSAppearance) {
         let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        background = NSColor.textBackgroundColor.resolved(for: appearance)
+        background = Theme.editorBackground.resolved(for: appearance)
         if dark {
             foreground = NSColor(hex: "#CCCCCC") ?? .textColor
             cursor = NSColor(hex: "#AEAFAD") ?? .textColor

@@ -62,7 +62,7 @@ final class PathBar: NSView {
 
     /// Same color as the editor, so the editor column runs to the top edge.
     override func draw(_ dirtyRect: NSRect) {
-        NSColor.textBackgroundColor.setFill()
+        Theme.editorBackground.resolved(for: effectiveAppearance).setFill()
         dirtyRect.intersection(bounds).fill()
     }
 

@@ -611,7 +611,7 @@ final class GitGraphLaneView: NSView {
         let dot = NSBezierPath(ovalIn: NSRect(x: center.x - radius, y: center.y - radius,
                                               width: radius * 2, height: radius * 2))
         if row.commit == nil {
-            NSColor.textBackgroundColor.setFill()
+            Theme.editorBackground.resolved(for: effectiveAppearance).setFill()
             dot.fill()
             NSColor.secondaryLabelColor.setStroke()
             dot.lineWidth = 1.5

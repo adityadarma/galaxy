@@ -42,10 +42,12 @@ pub enum SyntaxLanguage {
     Css,
     Bash,
     Php,
+    /// `.blade.php`: HTML grammar plus the [`crate::blade`] overlay.
+    Blade,
 }
 
 impl SyntaxLanguage {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::Rust,
         Self::TypeScript,
         Self::Tsx,
@@ -60,6 +62,7 @@ impl SyntaxLanguage {
         Self::Css,
         Self::Bash,
         Self::Php,
+        Self::Blade,
     ];
 
     pub fn name(self) -> &'static str {
@@ -78,6 +81,7 @@ impl SyntaxLanguage {
             Self::Css => "CSS",
             Self::Bash => "Bash",
             Self::Php => "PHP",
+            Self::Blade => "Blade",
         }
     }
 
@@ -87,7 +91,7 @@ impl SyntaxLanguage {
         match self {
             Self::Rust | Self::TypeScript | Self::Tsx | Self::JavaScript | Self::Go => Some("//"),
             Self::Toml | Self::Yaml | Self::Python | Self::Bash => Some("#"),
-            Self::Json | Self::Html | Self::Css | Self::Markdown => None,
+            Self::Json | Self::Html | Self::Css | Self::Markdown | Self::Blade => None,
             Self::Php => Some("//"),
         }
     }
@@ -104,7 +108,7 @@ impl SyntaxLanguage {
             Self::Markdown => tree_sitter_md_025::LANGUAGE.into(),
             Self::Python => tree_sitter_python::LANGUAGE.into(),
             Self::Go => tree_sitter_go::LANGUAGE.into(),
-            Self::Html => tree_sitter_html::LANGUAGE.into(),
+            Self::Html | Self::Blade => tree_sitter_html::LANGUAGE.into(),
             Self::Css => tree_sitter_css::LANGUAGE.into(),
             Self::Bash => tree_sitter_bash::LANGUAGE.into(),
             Self::Php => tree_sitter_php::LANGUAGE_PHP.into(),
@@ -125,7 +129,7 @@ impl SyntaxLanguage {
             Self::Markdown => tree_sitter_md_025::HIGHLIGHT_QUERY_BLOCK,
             Self::Python => tree_sitter_python::HIGHLIGHTS_QUERY,
             Self::Go => tree_sitter_go::HIGHLIGHTS_QUERY,
-            Self::Html => tree_sitter_html::HIGHLIGHTS_QUERY,
+            Self::Html | Self::Blade => tree_sitter_html::HIGHLIGHTS_QUERY,
             Self::Css => tree_sitter_css::HIGHLIGHTS_QUERY,
             Self::Bash => BASH_HIGHLIGHTS,
             Self::Php => tree_sitter_php::HIGHLIGHTS_QUERY,
@@ -165,6 +169,9 @@ impl SyntaxLanguage {
         };
         if by_name.is_some() {
             return by_name;
+        }
+        if name.ends_with(".blade.php") {
+            return Some(Self::Blade);
         }
         let extension = name.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("");
         let by_extension = match extension {
@@ -217,7 +224,7 @@ pub struct OutlineSymbol {
 pub fn is_markup_text(doc: &Document, tree: &Tree, language: SyntaxLanguage, pos: usize) -> bool {
     let kind = match language {
         SyntaxLanguage::Tsx | SyntaxLanguage::JavaScript => "jsx_text",
-        SyntaxLanguage::Html | SyntaxLanguage::Php => "text",
+        SyntaxLanguage::Html | SyntaxLanguage::Php | SyntaxLanguage::Blade => "text",
         _ => return false,
     };
     let rope = doc.rope();
@@ -447,39 +454,61 @@ pub fn style_runs_for_viewport(
     let mut cursor = QueryCursor::new();
     cursor.set_byte_range(start_byte..end_byte);
     // Predicates read node text through Rope chunks; no full-document copy.
-    let mut runs = Vec::new();
+    let mut spans: Vec<(usize, usize, HighlightScope)> = Vec::new();
     let mut matches = cursor.matches(query, tree.root_node(), RopeTextProvider(rope));
     while let Some(m) = matches.next() {
         for capture in m.captures {
             let Some(scope) = HighlightScope::from_capture(names[capture.index as usize]) else {
                 continue;
             };
-            let node = capture.node;
-            let start = node.start_byte().max(start_byte);
-            let end = node.end_byte().min(end_byte);
-            if start >= end {
-                continue;
+            let start = capture.node.start_byte().max(start_byte);
+            let end = capture.node.end_byte().min(end_byte);
+            if start < end {
+                spans.push((start, end, scope));
             }
-            let start_char = rope.byte_to_char(start);
-            let end_char = rope.byte_to_char(end);
-            let start_line = rope.char_to_line(start_char);
-            let end_line = rope.char_to_line(end_char);
-            for line in start_line..=end_line.min(last - 1) {
-                let line_start = rope.line_to_char(line);
-                let line_end = doc
-                    .line_end_char(line)
-                    .min(line_start + crate::viewport::MAX_LINE_DISPLAY_CHARS);
-                let from = start_char.max(line_start);
-                let to = end_char.min(line_end);
-                if from < to {
-                    let base = rope.char_to_utf16_cu(line_start);
-                    runs.push(StyleRun {
-                        line,
-                        start: rope.char_to_utf16_cu(from) - base,
-                        end: rope.char_to_utf16_cu(to) - base,
-                        scope,
-                    });
-                }
+        }
+    }
+    if language == SyntaxLanguage::Blade {
+        // Blade syntax is scanned from the first requested line, so a
+        // directive or comment opened further up the file is not seen.
+        let text = rope.byte_slice(start_byte..end_byte).to_string();
+        let overlay = crate::blade::scan(&text);
+        spans = crate::blade::subtract(
+            spans,
+            &overlay
+                .claimed
+                .iter()
+                .map(|&(s, e)| (s + start_byte, e + start_byte))
+                .collect::<Vec<_>>(),
+        );
+        spans.extend(
+            overlay
+                .spans
+                .into_iter()
+                .map(|(s, e, scope)| (s + start_byte, e + start_byte, scope)),
+        );
+    }
+    let mut runs = Vec::new();
+    for (start, end, scope) in spans {
+        let start_char = rope.byte_to_char(start);
+        let end_char = rope.byte_to_char(end);
+        let start_line = rope.char_to_line(start_char);
+        let end_line = rope.char_to_line(end_char);
+        for line in start_line..=end_line.min(last - 1) {
+            let line_start = rope.line_to_char(line);
+            let line_end = doc
+                .line_end_char(line)
+                .min(line_start + crate::viewport::MAX_LINE_DISPLAY_CHARS);
+            let from = start_char.max(line_start);
+            let to = end_char.min(line_end);
+            if from < to {
+                let base = rope.char_to_utf16_cu(line_start);
+                runs.push(StyleRun {
+                    line,
+                    start: rope.char_to_utf16_cu(from) - base,
+                    end: rope.char_to_utf16_cu(to) - base,
+                    scope,
+                });
             }
         }
     }
@@ -537,7 +566,7 @@ impl<'a> Iterator for RopeByteChunks<'a> {
 }
 
 fn cached_tags_query(language: SyntaxLanguage) -> Option<&'static Query> {
-    static QUERIES: [OnceLock<Option<Query>>; 14] = [const { OnceLock::new() }; 14];
+    static QUERIES: [OnceLock<Option<Query>>; 15] = [const { OnceLock::new() }; 15];
     let slot = &QUERIES[language as usize];
     slot.get_or_init(|| {
         language
@@ -548,7 +577,7 @@ fn cached_tags_query(language: SyntaxLanguage) -> Option<&'static Query> {
 }
 
 fn cached_highlight_query(language: SyntaxLanguage) -> Option<&'static Query> {
-    static QUERIES: [OnceLock<Option<Query>>; 14] = [const { OnceLock::new() }; 14];
+    static QUERIES: [OnceLock<Option<Query>>; 15] = [const { OnceLock::new() }; 15];
     let slot = &QUERIES[language as usize];
     slot.get_or_init(|| language.compile_highlights().ok())
         .as_ref()
@@ -1042,6 +1071,10 @@ mod tests {
                 SyntaxLanguage::Php,
                 "<?php function hello(string $name): string { return $name; }",
             ),
+            (
+                SyntaxLanguage::Blade,
+                "<p>{{ $name }}</p>\n@if ($a)\n@endif",
+            ),
         ];
         assert_eq!(SyntaxLanguage::ALL.len(), samples.len());
         for (language, source) in samples {
@@ -1178,7 +1211,7 @@ mod tests {
         );
         assert_eq!(
             SyntaxLanguage::detect("resources/views/welcome.blade.php", "<?php"),
-            Some(SyntaxLanguage::Php)
+            Some(SyntaxLanguage::Blade)
         );
     }
 
@@ -1247,6 +1280,48 @@ mod tests {
         let runs = style_runs_for_viewport(&doc, &tree, language, 0, 2);
         assert!(runs.iter().any(|run| run.scope == HighlightScope::Keyword));
         assert!(runs.iter().any(|run| run.scope == HighlightScope::String));
+    }
+
+    #[test]
+    fn blade_views_get_html_and_blade_styles() {
+        let src = "<title>{{ $title ?? 'Good' }}</title>\n<link href=\"{{ asset('a.css') }}\">\n@yield('content')\n";
+        let doc = Document::from_text(src);
+        let language = SyntaxLanguage::detect("resources/views/auth.blade.php", "").unwrap();
+        assert_eq!(language, SyntaxLanguage::Blade);
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(doc.text(), None).unwrap();
+        let runs = style_runs_for_viewport(&doc, &tree, language, 0, 3);
+        let at = |line: usize, text: &str, scope: HighlightScope| {
+            let line_text = crate::viewport::display_text(&doc, line);
+            let start = line_text[..line_text.find(text).unwrap()]
+                .encode_utf16()
+                .count();
+            let end = start + text.encode_utf16().count();
+            runs.iter()
+                .any(|r| r.line == line && r.start == start && r.end == end && r.scope == scope)
+        };
+        // HTML still works around the Blade syntax.
+        assert!(at(0, "title", HighlightScope::Tag));
+        assert!(at(1, "href", HighlightScope::Attribute));
+        // Blade echoes and directives.
+        assert!(at(0, "$title", HighlightScope::Variable));
+        assert!(at(0, "'Good'", HighlightScope::String));
+        assert!(at(1, "asset", HighlightScope::Function));
+        assert!(at(2, "@yield", HighlightScope::Keyword));
+        assert!(at(2, "'content'", HighlightScope::String));
+        // The HTML attribute value is not painted over the Blade expression.
+        assert!(
+            !runs.iter().any(|r| r.line == 1
+                && r.scope == HighlightScope::String
+                && r.start <= 12
+                && r.end >= 30),
+            "{runs:?}"
+        );
+        for run in &runs {
+            let text = crate::viewport::display_text(&doc, run.line);
+            assert!(run.start < run.end && run.end <= text.encode_utf16().count());
+        }
     }
 
     #[test]

@@ -594,7 +594,7 @@ final class ExplorerCell: NSTableCellView {
         label.isEditable = editing
         label.isSelectable = editing
         label.drawsBackground = editing
-        label.backgroundColor = editing ? .textBackgroundColor : nil
+        label.backgroundColor = editing ? Theme.editorBackground : nil
         label.isBordered = editing
         label.lineBreakMode = editing ? .byClipping : .byTruncatingMiddle
         label.cell?.isScrollable = editing

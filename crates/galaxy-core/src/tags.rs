@@ -53,7 +53,7 @@ impl Flavor {
                 jsx: false,
                 php: false,
             }),
-            SyntaxLanguage::Php => Some(Self {
+            SyntaxLanguage::Php | SyntaxLanguage::Blade => Some(Self {
                 html: true,
                 jsx: false,
                 php: true,

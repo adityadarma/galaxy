@@ -39,8 +39,8 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
         stack.translatesAutoresizingMaskIntoConstraints = false
         content.addSubview(stack)
 
-        appearance.addItems(withTitles: ["System", "Light", "Dark"])
-        appearance.selectItem(withTitle: UserDefaults.standard.string(forKey: "Appearance") ?? "System")
+        appearance.addItems(withTitles: Theme.names)
+        appearance.selectItem(withTitle: Theme.names.contains(Theme.selectedName) ? Theme.selectedName : Theme.systemName)
         appearance.target = self; appearance.action = #selector(saveAppearance(_:))
         let installedFonts = Self.installedFontFamilies()
         font.addItems(withTitles: ["System Monospaced"] + installedFonts)
@@ -52,7 +52,7 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
         fontSize.target = self; fontSize.action = #selector(saveFontSize(_:))
         updateFontSizeLabel()
 
-        stack.addArrangedSubview(row("Appearance", appearance))
+        stack.addArrangedSubview(row("Theme", appearance))
         stack.addArrangedSubview(row("Editor font", font))
         let sizeRow = NSStackView(views: [NSTextField(labelWithString: "Font size"), fontSize, fontSizeLabel])
         sizeRow.spacing = 12
@@ -182,7 +182,7 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
     }
 
     @objc private func saveAppearance(_ sender: Any?) {
-        UserDefaults.standard.set(appearance.titleOfSelectedItem, forKey: "Appearance")
+        Theme.select(appearance.titleOfSelectedItem ?? Theme.systemName)
         onChange()
     }
 

@@ -450,7 +450,7 @@ final class TabItemView: NSView {
     }
 
     private var backgroundColorBehind: NSColor {
-        if isSelected { return .textBackgroundColor }
+        if isSelected { return Theme.editorBackground }
         return isHovered ? Theme.chrome.blended(withFraction: 0.04, of: .labelColor) ?? Theme.chrome : Theme.chrome
     }
 
@@ -501,7 +501,7 @@ final class TabItemView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         if isSelected {
-            NSColor.textBackgroundColor.setFill()
+            Theme.editorBackground.resolved(for: effectiveAppearance).setFill()
             bounds.fill()
             Theme.accent.setFill()
             NSRect(x: 0, y: bounds.maxY - 2, width: bounds.width, height: 2).fill()

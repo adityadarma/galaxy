@@ -757,7 +757,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         scrollView.automaticallyAdjustsContentInsets = false
         scrollView.contentInsets = NSEdgeInsets(top: Theme.editorTopInset, left: 0, bottom: 0, right: 0)
         scrollView.drawsBackground = true
-        scrollView.backgroundColor = .textBackgroundColor
+        scrollView.backgroundColor = Theme.editorBackground
         scrollView.borderType = .noBorder
         scrollView.translatesAutoresizingMaskIntoConstraints = true
         scrollView.autoresizingMask = [.width, .height]
@@ -769,7 +769,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         secondaryScrollView.automaticallyAdjustsContentInsets = false
         secondaryScrollView.contentInsets = scrollView.contentInsets
         secondaryScrollView.drawsBackground = true
-        secondaryScrollView.backgroundColor = .textBackgroundColor
+        secondaryScrollView.backgroundColor = Theme.editorBackground
         secondaryScrollView.translatesAutoresizingMaskIntoConstraints = true
         secondaryScrollView.autoresizingMask = [.width, .height]
         secondaryEditorView.autoresizingMask = [.width]

@@ -94,11 +94,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func applyAppearancePreference() {
-        switch UserDefaults.standard.string(forKey: "Appearance") {
-        case "Light": NSApp.appearance = NSAppearance(named: .aqua)
-        case "Dark": NSApp.appearance = NSAppearance(named: .darkAqua)
-        default: NSApp.appearance = nil
-        }
+        Theme.apply()
     }
 
     /// Off for benchmarks, tests, and an explicit no-restore launch.

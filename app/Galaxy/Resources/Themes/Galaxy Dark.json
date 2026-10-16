@@ -1,11 +1,1 @@
-{
-  "name": "Galaxy Dark",
-  "type": "dark",
-  "scopes": {
-    "attribute": "#7CC7FF", "comment": "#87909D", "constant": "#7CC7FF",
-    "constructor": "#D7A2EE", "function": "#7CC7FF", "keyword": "#FF9AA9",
-    "label": "#7CC7FF", "number": "#7CC7FF", "operator": "#C3CAD5",
-    "property": "#7CC7FF", "punctuation": "#C3CAD5", "string": "#8DD694",
-    "tag": "#FF9AA9", "type": "#D7A2EE", "variable": "#E5E9F0"
-  }
-}
+{"name":"Galaxy Dark","type":"dark","scopes":{"attribute":"#D19A66","comment":"#5C6370","constant":"#D19A66","constructor":"#E5C07B","function":"#61AFEF","keyword":"#C678DD","label":"#E5C07B","number":"#D19A66","operator":"#56B6C2","property":"#E06C75","punctuation":"#ABB2BF","string":"#98C379","tag":"#E06C75","type":"#E5C07B","variable":"#ABB2BF"},"ui":{"editorBackground":"#1E1E1E","editorForeground":"#FFFFFF","chrome":"#21252B","sidebar":"#282C34"}}

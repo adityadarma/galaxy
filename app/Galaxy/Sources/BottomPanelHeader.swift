@@ -177,7 +177,7 @@ final class BottomPanelHeader: NSView {
     }
 
     override func draw(_ dirtyRect: NSRect) {
-        NSColor.textBackgroundColor.setFill()
+        Theme.editorBackground.resolved(for: effectiveAppearance).setFill()
         dirtyRect.fill()
         // The line between the editor and the panel.
         NSColor.separatorColor.setFill()

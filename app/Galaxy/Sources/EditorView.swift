@@ -474,7 +474,7 @@ final class EditorView: NSView {
     override func draw(_ dirtyRect: NSRect) {
         let drawStart = ProcessInfo.processInfo.systemUptime
         defer { LatencyProbe.shared.drawFinished(drawStart: drawStart) }
-        NSColor.textBackgroundColor.setFill()
+        Theme.editorBackground.resolved(for: effectiveAppearance).setFill()
         dirtyRect.fill()
 
         guard let document, let context = NSGraphicsContext.current?.cgContext else { return }
@@ -591,7 +591,7 @@ final class EditorView: NSView {
             // Text uses a one-frame attributed layout only if Tree-sitter
             // supplied semantic runs; otherwise the shared plain cache wins.
             if !line.text.isEmpty {
-                context.setFillColor(NSColor.textColor.cgColor)
+                context.setFillColor(Theme.editorForeground.resolved(for: effectiveAppearance).cgColor)
                 context.textPosition = CGPoint(x: originX, y: top + metrics.ascent)
                 // Semantic runs come last so they win over Tree-sitter's.
                 let styles = (stylesByLine[line.line] ?? []) + (semanticStylesByLine[line.line] ?? [])
@@ -745,7 +745,7 @@ final class EditorView: NSView {
         // No `kCTForegroundColorFromContextAttributeName` here: it makes
         // CoreText draw every run in the context's fill color, so all syntax
         // colors came out as `textColor`. Unstyled text gets it explicitly.
-        let base = NSColor.textColor.resolved(for: effectiveAppearance)
+        let base = Theme.editorForeground.resolved(for: effectiveAppearance)
         let attributed = NSMutableAttributedString(string: text, attributes: [.font: font, .foregroundColor: base])
         let length = (text as NSString).length
         for style in styles {
