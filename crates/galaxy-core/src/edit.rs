@@ -515,6 +515,279 @@ pub fn toggle_comment(doc: &Document, sel: &SelectionSet, marker: &str) -> Trans
     finish_with_map(doc, sel, changes, |_| false)
 }
 
+// --- Line operations (Selection and Edit menus) ---------------------------
+
+/// Inclusive line ranges touched by the selections, merged when they
+/// overlap or touch. A selection that ends at the start of a line does not
+/// include that line.
+fn line_blocks(doc: &Document, sel: &SelectionSet) -> Vec<(usize, usize)> {
+    let mut ranges: Vec<(usize, usize)> = sel
+        .iter()
+        .map(|s| {
+            let first = doc.char_to_line(s.start());
+            let mut last = doc.char_to_line(s.end());
+            if last > first && s.end() == doc.line_to_char(last) {
+                last -= 1;
+            }
+            (first, last)
+        })
+        .collect();
+    ranges.sort_unstable();
+    let mut blocks: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (first, last) in ranges {
+        match blocks.last_mut() {
+            Some(prev) if first <= prev.1 + 1 => prev.1 = prev.1.max(last),
+            _ => blocks.push((first, last)),
+        }
+    }
+    blocks
+}
+
+fn text_between(doc: &Document, start: usize, end: usize) -> String {
+    doc.rope().slice(start..end).to_string()
+}
+
+/// Moves every selection by the offset of the block its first line is in.
+fn shift_selections(
+    doc: &Document,
+    sel: &SelectionSet,
+    blocks: &[(usize, usize)],
+    delta: impl Fn(usize) -> isize,
+) -> Vec<Selection> {
+    sel.iter()
+        .map(|s| {
+            let line = doc.char_to_line(s.start());
+            let index = blocks.iter().position(|&(a, b)| (a..=b).contains(&line));
+            let d = index.map_or(0, &delta);
+            let shift = |p: usize| p.checked_add_signed(d).unwrap_or(0);
+            Selection::new(shift(s.anchor), shift(s.head))
+        })
+        .collect()
+}
+
+/// Alt+Up / Alt+Down: swaps each block of selected lines with the line
+/// above or below it. The selections travel with their lines.
+pub fn move_lines(doc: &Document, sel: &SelectionSet, up: bool) -> Transaction {
+    let blocks = line_blocks(doc, sel);
+    let last_line = doc.line_count() - 1;
+    let mut changes = Vec::new();
+    let mut deltas = vec![0isize; blocks.len()];
+    for (i, &(a, b)) in blocks.iter().enumerate() {
+        if up {
+            if a == 0 {
+                continue;
+            }
+            let prev = a - 1;
+            let start = doc.line_to_char(prev);
+            let end = doc.line_end_char(b);
+            let prev_text = text_between(doc, start, doc.line_end_char(prev));
+            let block = text_between(doc, doc.line_to_char(a), end);
+            changes.push(Change::new(start, end, format!("{block}\n{prev_text}")));
+            deltas[i] = -(doc.line_len_chars(prev) as isize + 1);
+        } else {
+            if b >= last_line {
+                continue;
+            }
+            let next = b + 1;
+            let start = doc.line_to_char(a);
+            let end = doc.line_end_char(next);
+            let block = text_between(doc, start, doc.line_end_char(b));
+            let next_text = text_between(doc, doc.line_to_char(next), end);
+            changes.push(Change::new(start, end, format!("{next_text}\n{block}")));
+            deltas[i] = doc.line_len_chars(next) as isize + 1;
+        }
+    }
+    Transaction {
+        changes: ChangeSet::new(changes, doc.len_chars()),
+        selections: shift_selections(doc, sel, &blocks, |i| deltas[i]),
+        primary: sel.primary_index(),
+    }
+}
+
+/// Shift+Alt+Up / Shift+Alt+Down: duplicates each block of selected lines
+/// above or below. The selections end up on the copy.
+pub fn copy_lines(doc: &Document, sel: &SelectionSet, up: bool) -> Transaction {
+    let blocks = line_blocks(doc, sel);
+    let mut changes = Vec::new();
+    let mut deltas = vec![0isize; blocks.len()];
+    // Chars inserted by the blocks before this one.
+    let mut inserted = 0isize;
+    for (i, &(a, b)) in blocks.iter().enumerate() {
+        let start = doc.line_to_char(a);
+        let end = doc.line_end_char(b);
+        let block = text_between(doc, start, end);
+        let added = block.chars().count() as isize + 1;
+        if up {
+            changes.push(Change::insert(start, format!("{block}\n")));
+            deltas[i] = inserted;
+        } else {
+            changes.push(Change::insert(end, format!("\n{block}")));
+            deltas[i] = inserted + added;
+        }
+        inserted += added;
+    }
+    Transaction {
+        changes: ChangeSet::new(changes, doc.len_chars()),
+        selections: shift_selections(doc, sel, &blocks, |i| deltas[i]),
+        primary: sel.primary_index(),
+    }
+}
+
+/// Cmd+Shift+K: deletes every line a selection touches, line break included.
+pub fn delete_lines(doc: &Document, sel: &SelectionSet) -> Transaction {
+    let last_line = doc.line_count() - 1;
+    let changes = line_blocks(doc, sel)
+        .into_iter()
+        .map(|(a, b)| {
+            if b < last_line {
+                Change::delete(doc.line_to_char(a), doc.line_to_char(b + 1))
+            } else if a > 0 {
+                // The last line has no break after it: take the one before.
+                Change::delete(doc.line_end_char(a - 1), doc.line_end_char(b))
+            } else {
+                Change::delete(0, doc.line_end_char(b))
+            }
+        })
+        .collect();
+    finish_with_map(doc, sel, changes, |_| true)
+}
+
+/// Ctrl+J: joins each caret's line with the next one, or all the lines of
+/// a multi-line selection. The next line's indentation becomes one space.
+pub fn join_lines(doc: &Document, sel: &SelectionSet) -> Transaction {
+    let last_line = doc.line_count() - 1;
+    let mut joins = BTreeSet::new();
+    for s in sel.iter() {
+        let first = doc.char_to_line(s.start());
+        let mut last = doc.char_to_line(s.end());
+        if last > first && s.end() == doc.line_to_char(last) {
+            last -= 1;
+        }
+        if last == first {
+            joins.insert(first);
+        } else {
+            joins.extend(first..last);
+        }
+    }
+    let changes = joins
+        .into_iter()
+        .filter(|&line| line < last_line)
+        .map(|line| {
+            let end = doc.line_end_char(line);
+            let next_start = doc.line_to_char(line + 1);
+            let next_text = text_between(doc, next_start, doc.line_end_char(line + 1));
+            let trimmed = next_text.trim_start_matches([' ', '\t']);
+            let skipped = next_text.chars().count() - trimmed.chars().count();
+            let separator = if doc.line_len_chars(line) == 0 || trimmed.is_empty() {
+                ""
+            } else {
+                " "
+            };
+            Change::new(end, next_start + skipped, separator)
+        })
+        .collect();
+    finish_with_map(doc, sel, changes, |_| false)
+}
+
+/// Upper or lower cases each selection, or the word at an empty caret.
+pub fn transform_case(doc: &Document, sel: &SelectionSet, upper: bool) -> Transaction {
+    let mut ranges: Vec<(usize, usize)> = sel
+        .iter()
+        .map(|s| {
+            if s.is_empty() {
+                word_range(doc, s.head)
+            } else {
+                (s.start(), s.end())
+            }
+        })
+        .filter(|(start, end)| start < end)
+        .collect();
+    ranges.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (start, end) in ranges {
+        match merged.last_mut() {
+            Some(prev) if start < prev.1 => prev.1 = prev.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    let changes = merged
+        .into_iter()
+        .filter_map(|(start, end)| {
+            let text = text_between(doc, start, end);
+            let changed = if upper {
+                text.to_uppercase()
+            } else {
+                text.to_lowercase()
+            };
+            (changed != text).then(|| Change::new(start, end, changed))
+        })
+        .collect();
+    finish_keeping(doc, sel, changes)
+}
+
+/// Removes spaces and tabs at the end of every line in the document.
+pub fn trim_trailing_whitespace(doc: &Document, sel: &SelectionSet) -> Transaction {
+    let changes = (0..doc.line_count())
+        .filter_map(|line| {
+            let start = doc.line_to_char(line);
+            let end = doc.line_end_char(line);
+            let text = text_between(doc, start, end);
+            let trailing = text.len() - text.trim_end_matches([' ', '\t']).len();
+            (trailing > 0).then(|| Change::delete(end - trailing, end))
+        })
+        .collect();
+    finish_with_map(doc, sel, changes, |_| false)
+}
+
+/// Sorts the lines of each multi-line selection.
+pub fn sort_lines(doc: &Document, sel: &SelectionSet, descending: bool) -> Transaction {
+    let changes = line_blocks(doc, sel)
+        .into_iter()
+        .filter(|&(a, b)| b > a)
+        .filter_map(|(a, b)| {
+            let start = doc.line_to_char(a);
+            let end = doc.line_end_char(b);
+            let mut lines: Vec<String> = (a..=b)
+                .map(|line| text_between(doc, doc.line_to_char(line), doc.line_end_char(line)))
+                .collect();
+            lines.sort();
+            if descending {
+                lines.reverse();
+            }
+            let text = lines.join("\n");
+            (text != text_between(doc, start, end)).then(|| Change::new(start, end, text))
+        })
+        .collect();
+    finish_keeping(doc, sel, changes)
+}
+
+fn word_range(doc: &Document, pos: usize) -> (usize, usize) {
+    let rope = doc.rope();
+    let mut start = pos;
+    while start > 0 && is_word(rope.char(start - 1)) {
+        start -= 1;
+    }
+    let mut end = pos;
+    while end < rope.len_chars() && is_word(rope.char(end)) {
+        end += 1;
+    }
+    (start, end)
+}
+
+/// Keeps the selections as they are when no change alters the text length
+/// (case changes, sorting); otherwise maps them through the changes.
+fn finish_keeping(doc: &Document, sel: &SelectionSet, changes: Vec<Change>) -> Transaction {
+    if changes.iter().all(|c| c.inserted_len() == c.removed_len()) {
+        Transaction {
+            changes: ChangeSet::new(changes, doc.len_chars()),
+            selections: sel.iter().copied().collect(),
+            primary: sel.primary_index(),
+        }
+    } else {
+        finish_with_map(doc, sel, changes, |_| false)
+    }
+}
+
 // ---------------------------------------------------------------------------
 
 /// One change produced for one selection, plus where its caret lands.
@@ -944,6 +1217,111 @@ mod tests {
         assert_eq!(doc.text(), "  // one\n    // two\n  // three");
         toggle_comment(&doc, &sel, "//").apply(&mut doc, &mut sel);
         assert_eq!(doc.text(), "  one\n    two\n  three");
+    }
+
+    fn lines_op(marked: &str, f: impl Fn(&Document, &SelectionSet) -> Transaction) -> String {
+        let (mut doc, mut sel) = setup(marked);
+        f(&doc, &sel).apply(&mut doc, &mut sel);
+        render(&doc, &sel)
+    }
+
+    #[test]
+    fn move_lines_swaps_with_neighbor_and_keeps_selection_on_the_lines() {
+        assert_eq!(
+            lines_op("a\nb|\nc", |d, s| move_lines(d, s, true)),
+            "b|\na\nc"
+        );
+        assert_eq!(
+            lines_op("a|\nb\nc", |d, s| move_lines(d, s, false)),
+            "b\na|\nc"
+        );
+        assert_eq!(
+            lines_op("a\n[b\nc]\nd", |d, s| move_lines(d, s, true)),
+            "[b\nc]\na\nd"
+        );
+        // Edges do nothing.
+        assert_eq!(lines_op("a|\nb", |d, s| move_lines(d, s, true)), "a|\nb");
+        assert_eq!(lines_op("a\nb|", |d, s| move_lines(d, s, false)), "a\nb|");
+        // Moving into the unterminated last line.
+        assert_eq!(lines_op("a|\nb", |d, s| move_lines(d, s, false)), "b\na|");
+    }
+
+    #[test]
+    fn copy_lines_duplicates_and_selection_follows_the_copy() {
+        assert_eq!(
+            lines_op("a|b\nc", |d, s| copy_lines(d, s, false)),
+            "ab\na|b\nc"
+        );
+        assert_eq!(
+            lines_op("a|b\nc", |d, s| copy_lines(d, s, true)),
+            "a|b\nab\nc"
+        );
+        assert_eq!(
+            lines_op("a\nb|", |d, s| copy_lines(d, s, false)),
+            "a\nb\nb|"
+        );
+    }
+
+    #[test]
+    fn delete_lines_removes_whole_lines_including_the_last() {
+        assert_eq!(lines_op("a\nb|\nc", delete_lines), "a\n|c");
+        assert_eq!(lines_op("a\nb\nc|", delete_lines), "a\nb|");
+        assert_eq!(lines_op("a|", delete_lines), "|");
+        assert_eq!(lines_op("[a\nb]\nc", delete_lines), "|c");
+    }
+
+    #[test]
+    fn join_lines_replaces_break_and_indent_with_one_space() {
+        assert_eq!(lines_op("a|\n    b\nc", join_lines), "a| b\nc");
+        assert_eq!(lines_op("[a\nb\nc]", join_lines), "[a b c]");
+        assert_eq!(lines_op("a\nb|", join_lines), "a\nb|", "last line");
+        assert_eq!(
+            lines_op("|\n  b", join_lines),
+            "|b",
+            "no space after empty line"
+        );
+    }
+
+    #[test]
+    fn case_transforms_selection_or_word_at_caret() {
+        assert_eq!(
+            lines_op("[abc] def", |d, s| transform_case(d, s, true)),
+            "[ABC] def"
+        );
+        assert_eq!(
+            lines_op("ab|c def", |d, s| transform_case(d, s, true)),
+            "AB|C def"
+        );
+        assert_eq!(
+            lines_op("[ABC]", |d, s| transform_case(d, s, false)),
+            "[abc]"
+        );
+        assert_eq!(
+            lines_op("| x", |d, s| transform_case(d, s, true)),
+            "| x",
+            "no word, no change"
+        );
+    }
+
+    #[test]
+    fn trim_trailing_whitespace_and_sort_lines() {
+        assert_eq!(
+            lines_op("a  \nb\t|\nc", trim_trailing_whitespace),
+            "a\nb|\nc"
+        );
+        assert_eq!(
+            lines_op("[c\na\nb]", |d, s| sort_lines(d, s, false)),
+            "[a\nb\nc]"
+        );
+        assert_eq!(
+            lines_op("[a\nc\nb]", |d, s| sort_lines(d, s, true)),
+            "[c\nb\na]"
+        );
+        assert_eq!(
+            lines_op("c|\na", |d, s| sort_lines(d, s, false)),
+            "c|\na",
+            "needs a multi-line selection"
+        );
     }
 
     /// Renders the document with selections marked the same way.

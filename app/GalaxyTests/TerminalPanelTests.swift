@@ -217,4 +217,43 @@ final class TerminalPanelTests: XCTestCase {
         XCTAssertTrue(c.terminalTabs.isEmpty)
         handle.kill()
     }
+
+    func testTerminalMenuHasItsOwnCommands() throws {
+        let menu = try XCTUnwrap(MainMenu.build().items.compactMap(\.submenu).first { $0.title == "Terminal" })
+        for title in ["New Terminal", "Run Selected Text", "Run Active File", "Clear Terminal", "Kill Terminal"] {
+            XCTAssertNotNil(menu.item(withTitle: title), title)
+        }
+        let view = try XCTUnwrap(MainMenu.build().items.compactMap(\.submenu).first { $0.title == "View" })
+        XCTAssertNil(view.item(withTitle: "Move Terminal into Panel"), "terminal items moved out of View")
+        Keybindings.defaults.apply(to: menu)
+        let new = try XCTUnwrap(menu.item(withTitle: "New Terminal"))
+        XCTAssertEqual(new.keyEquivalent, "`")
+        XCTAssertEqual(new.keyEquivalentModifierMask, [.control, .shift])
+    }
+
+    func testRunSelectedTextAndKillTerminal() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-term-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try "echo ok".write(to: root.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let c = MainWindowController(bridge: CoreBridge())
+        c.askSaveChoice = { _ in .discard }
+        c.showWindow(nil)
+        defer { c.window?.orderOut(nil) }
+        try c.openWorkspace(at: root)
+        try c.openFile(at: root.appendingPathComponent("a.txt"))
+
+        let kill = NSMenuItem(title: "Kill Terminal", action: #selector(MainWindowController.killTerminal(_:)), keyEquivalent: "")
+        XCTAssertFalse(c.validateMenuItem(kill), "nothing to kill yet")
+
+        // No terminal yet: running text opens one in the panel.
+        c.editorView.document?.selectAll()
+        c.runSelectedTextInTerminal(nil)
+        XCTAssertTrue(c.isBottomPanelVisible)
+        XCTAssertTrue(c.validateMenuItem(kill))
+
+        c.killTerminal(nil)
+        XCTAssertFalse(c.isBottomPanelVisible, "the panel closes with its last terminal")
+        XCTAssertFalse(c.validateMenuItem(kill))
+    }
 }

@@ -45,6 +45,48 @@ final class EditorView: NSView {
     private(set) var font: NSFont
     private(set) var metrics: Metrics
     private(set) var lineCount = 0
+    /// Visual rows: `lineCount` unless soft wrap splits long lines.
+    private(set) var rowCount = 0
+    /// Soft wrap (Toggle Word Wrap). Applies only to the view that sets it.
+    var wrapEnabled = false {
+        didSet { if wrapEnabled != oldValue { wrapSettingsChanged() } }
+    }
+    /// Wrap is off while this is set, e.g. in a side-by-side diff where both
+    /// panes must keep one row per line.
+    var wrapSuspended = false {
+        didSet { if wrapSuspended != oldValue { wrapSettingsChanged() } }
+    }
+    /// Columns the core wraps at, or `nil` while wrap is not in effect.
+    private(set) var appliedWrapColumns: Int?
+    private var lastWrapWidth: CGFloat = 0
+    var wrapActive: Bool { appliedWrapColumns != nil }
+    /// 0-based lines with a breakpoint, drawn on their line numbers.
+    var breakpointLines: Set<UInt64> = [] {
+        didSet { if breakpointLines != oldValue { needsDisplay = true } }
+    }
+    /// 0-based line the debugged program is stopped on.
+    var debugStopLine: Int? {
+        didSet { if debugStopLine != oldValue { needsDisplay = true } }
+    }
+    /// A click on the line numbers; the window turns it into a breakpoint.
+    var onToggleBreakpoint: ((UInt64) -> Void)?
+
+    /// Width at the right edge kept clear for another view (the minimap).
+    /// The document view is that much narrower than its scroll view.
+    var rightInset: CGFloat = 0 {
+        didSet { if rightInset != oldValue { applyRightInset() } }
+    }
+
+    /// Sizes the view to the scroll view's width minus `rightInset`. Safe to
+    /// call again: it works from the scroll view, not from the current frame.
+    func applyRightInset() {
+        guard let width = enclosingScrollView?.contentSize.width else { return }
+        // Autoresizing keeps this offset from the scroll view's width.
+        setFrameSize(NSSize(width: max(width - rightInset, 1), height: frame.height))
+    }
+    /// The document, its size or its scroll range changed; overview views
+    /// redraw from this.
+    var onLayoutChange: (() -> Void)?
     /// Number of `CTLine`s built so far. Tests use it to prove caching.
     private(set) var layoutsCreated = 0
     /// Lines drawn by the most recent `draw(_:)`, for tests and diagnostics.
@@ -93,9 +135,10 @@ final class EditorView: NSView {
     func blameAnnotationRect() -> NSRect? {
         guard let blame = blameAnnotation, let document else { return nil }
         let text = document.displayLine(line: blame.line)
-        let x = textOriginX + xOffset(in: text, column: UInt64(text.utf16.count)) + Self.blameGap
+        let end = point(column: text.utf16.count, text: text, rows: lineRows(blame.line),
+                        top: rowTop(of: blame.line), originX: textOriginX)
         let width = ceil((blame.text as NSString).size(withAttributes: [.font: font]).width)
-        return NSRect(x: x, y: CGFloat(blame.line) * metrics.lineHeight, width: width, height: metrics.lineHeight)
+        return NSRect(x: end.x + Self.blameGap, y: end.y, width: width, height: metrics.lineHeight)
     }
 
     /// Drops derived Core Text/LSP decorations while retaining the document.
@@ -113,7 +156,7 @@ final class EditorView: NSView {
     private var layouts = TwoGenerationCache<String, CTLine>(capacity: 1024)
     /// Caret rectangles from the last draw, keyed by line, so a blink only
     /// invalidates those few rects instead of the whole view.
-    private var caretRects: [Int: NSRect] = [:]
+    private var caretRects: [Int: [NSRect]] = [:]
     private var blinkTimer: Timer?
     private var caretOn = true
 
@@ -145,8 +188,8 @@ final class EditorView: NSView {
                 || definitionLink?.start != oldValue?.start
                 || definitionLink?.end != oldValue?.end else { return }
             for link in [oldValue, definitionLink].compactMap({ $0 }) {
-                setNeedsDisplay(NSRect(x: 0, y: CGFloat(link.line) * metrics.lineHeight,
-                                       width: bounds.width, height: metrics.lineHeight))
+                setNeedsDisplay(NSRect(x: 0, y: rowTop(of: link.line), width: bounds.width,
+                                       height: metrics.lineHeight * CGFloat(lineRows(link.line).count)))
             }
             // Cursor rects would reset a bare `set()` on the next move.
             window?.invalidateCursorRects(for: self)
@@ -174,6 +217,11 @@ final class EditorView: NSView {
 
     var document: DocumentHandle? {
         didSet {
+            // The core keeps one wrap width per document: release the old one
+            // and give the new one this view's width.
+            if appliedWrapColumns != nil { oldValue?.setWrapColumns(columns: nil) }
+            appliedWrapColumns = nil
+            applyWrapColumns()
             syntaxAwaiting = document?.syntaxLanguage() != nil
             startSyntaxPollingIfNeeded()
             reloadDocument()
@@ -263,6 +311,13 @@ final class EditorView: NSView {
         let visible = rect.intersection(bounds)
         guard !visible.isNull, !visible.isEmpty, lineCount > 0 else { return 0..<0 }
         let height = metrics.lineHeight
+        if wrapActive, let document {
+            let firstRow = UInt64(max(0, floor(visible.minY / height)))
+            let lastRow = UInt64(max(0, ceil(visible.maxY / height) - 1))
+            let first = min(lineCount, Int(document.lineAtRow(row: firstRow).line))
+            let last = min(lineCount, Int(document.lineAtRow(row: lastRow).line) + 1)
+            return first..<max(first, last)
+        }
         let first = min(lineCount, max(0, Int(floor(visible.minY / height))))
         let last = min(lineCount, max(0, Int(ceil(visible.maxY / height))))
         return first..<max(first, last)
@@ -289,6 +344,7 @@ final class EditorView: NSView {
         caretOn = true
         updateBlinking()
         needsDisplay = true
+        onLayoutChange?()
         // Clearing the flag above stops `draw` from reporting the caret, so
         // report it here; mouse clicks and drags only come through this path.
         if let snapshot {
@@ -300,9 +356,137 @@ final class EditorView: NSView {
 
     private func applyDocumentMetadata(lineCount newCount: UInt64?) {
         lineCount = Int(newCount ?? 0)
-        let virtual = CGFloat(lineCount) * metrics.lineHeight
+        rowCount = wrapActive ? Int(document?.totalRows() ?? 0) : lineCount
+        let virtual = CGFloat(rowCount) * metrics.lineHeight
         let visible = enclosingScrollView?.contentSize.height ?? 0
         setFrameSize(NSSize(width: frame.width, height: max(virtual, visible)))
+    }
+
+    // MARK: Soft wrap
+
+    private func wrapSettingsChanged() {
+        applyWrapColumns()
+        reloadDocument()
+    }
+
+    /// Columns that fit between the gutter and the right edge.
+    private var fittingColumns: Int {
+        guard metrics.spaceWidth > 0 else { return 80 }
+        let room = bounds.width - textOriginX - Self.caretWidth - 6
+        return max(2, Int(floor(room / metrics.spaceWidth)))
+    }
+
+    /// Pushes the wrap width to the core. Returns `true` if it changed.
+    @discardableResult
+    private func applyWrapColumns() -> Bool {
+        let columns: Int? = (wrapEnabled && !wrapSuspended) ? fittingColumns : nil
+        guard columns != appliedWrapColumns else { return false }
+        appliedWrapColumns = columns
+        document?.setWrapColumns(columns: columns.map { UInt32($0) })
+        return true
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        onLayoutChange?()
+        guard newSize.width != lastWrapWidth else { return }
+        lastWrapWidth = newSize.width
+        // A new width re-wraps every line: resize to the new row count.
+        if wrapEnabled, !wrapSuspended, applyWrapColumns() || wrapActive {
+            let rows = Int(document?.totalRows() ?? 0)
+            guard rows != rowCount else { needsDisplay = true; return }
+            rowCount = rows
+            let visible = enclosingScrollView?.contentSize.height ?? 0
+            super.setFrameSize(NSSize(width: newSize.width, height: max(CGFloat(rows) * metrics.lineHeight, visible)))
+            needsDisplay = true
+            onLayoutChange?()
+        }
+    }
+
+    /// Where the rows of one logical line start, in UTF-16 columns.
+    struct LineRows {
+        /// Columns at which rows after the first begin; empty for one row.
+        let breaks: [Int]
+        var count: Int { breaks.count + 1 }
+        func start(of row: Int) -> Int { row == 0 ? 0 : breaks[row - 1] }
+        func end(of row: Int) -> Int { row < breaks.count ? breaks[row] : Int.max }
+        /// The row a caret at `column` is drawn on; a break column belongs
+        /// to the row it starts.
+        func row(containing column: Int) -> Int { breaks.firstIndex { $0 > column } ?? breaks.count }
+    }
+
+    func lineRows(_ line: UInt64) -> LineRows {
+        guard wrapActive, let document else { return LineRows(breaks: []) }
+        return LineRows(breaks: document.lineBreaks(line: line).map(Int.init))
+    }
+
+    /// Y of the first row of `line`.
+    func rowTop(of line: UInt64) -> CGFloat {
+        guard wrapActive, let document else { return CGFloat(line) * metrics.lineHeight }
+        return CGFloat(document.rowOfLine(line: line)) * metrics.lineHeight
+    }
+
+    /// The line (and row within it) drawn at document-space `y`.
+    func line(atY y: CGFloat) -> (line: UInt64, row: Int) {
+        let row = y.isFinite ? max(0, floor(y / metrics.lineHeight)) : 0
+        guard wrapActive, let document else { return (UInt64(min(row, CGFloat(max(lineCount - 1, 0)))), 0) }
+        let position = document.lineAtRow(row: UInt64(row))
+        return (position.line, Int(position.row))
+    }
+
+    /// Source line at `y` with the fraction of the way through it, for
+    /// scroll sync with the Markdown preview.
+    func fractionalLine(atY y: CGFloat) -> Double {
+        guard wrapActive, let document else { return Double(y / metrics.lineHeight) }
+        let rowFloat = max(0, y / metrics.lineHeight)
+        if UInt64(rowFloat) >= document.totalRows() { return Double(lineCount) }
+        let position = document.lineAtRow(row: UInt64(rowFloat))
+        let rows = Double(max(1, document.rowsOfLine(line: position.line)))
+        return Double(position.line) + (Double(position.row) + Double(rowFloat - floor(rowFloat))) / rows
+    }
+
+    func y(forFractionalLine line: Double) -> CGFloat {
+        guard wrapActive, let document else { return CGFloat(line) * metrics.lineHeight }
+        let whole = UInt64(max(0, floor(line)))
+        let rows = Double(document.rowsOfLine(line: whole))
+        let row = CGFloat(document.rowOfLine(line: whole)) + CGFloat((line - floor(line)) * rows)
+        return row * metrics.lineHeight
+    }
+
+    /// Top-left of the cell at `column` of a line: x includes `originX`,
+    /// y is the top of the row holding it.
+    func point(column: Int, text: String, rows: LineRows, top: CGFloat, originX: CGFloat) -> CGPoint {
+        let row = rows.row(containing: column)
+        let shift = row == 0 ? 0 : xOffset(in: text, column: UInt64(rows.start(of: row)))
+        return CGPoint(x: originX + xOffset(in: text, column: UInt64(column)) - shift,
+                       y: top + CGFloat(row) * metrics.lineHeight)
+    }
+
+    /// One rect per row touched by `[start, end)`; a span that ends past a
+    /// row's end stops at it. `trailing` widens the last row (line break).
+    func spanRects(_ start: Int, _ end: Int, text: String, rows: LineRows, top: CGFloat, originX: CGFloat,
+                   minWidth: CGFloat = 0, trailing: CGFloat = 0) -> [CGRect] {
+        var out: [CGRect] = []
+        for row in 0..<rows.count {
+            let rowStart = rows.start(of: row)
+            let a = max(start, rowStart), b = min(end, rows.end(of: row))
+            // A single-row line keeps empty spans (empty-line selection).
+            guard a < b || (rows.count == 1 && a <= b) else { continue }
+            let shift = rowStart == 0 ? 0 : xOffset(in: text, column: UInt64(rowStart))
+            let x0 = originX + xOffset(in: text, column: UInt64(a)) - shift
+            var x1 = originX + xOffset(in: text, column: UInt64(b)) - shift
+            if row == rows.count - 1 { x1 += trailing }
+            out.append(CGRect(x: x0, y: top + CGFloat(row) * metrics.lineHeight,
+                              width: max(minWidth, x1 - x0), height: metrics.lineHeight))
+        }
+        return out
+    }
+
+    /// Caret-sized rect at `column` of `line`, in view coordinates.
+    func rect(forLine line: UInt64, column: UInt64, width: CGFloat = 1) -> NSRect {
+        let text = document?.displayLine(line: line) ?? ""
+        let p = point(column: Int(column), text: text, rows: lineRows(line), top: rowTop(of: line), originX: textOriginX)
+        return NSRect(x: p.x, y: p.y, width: width, height: metrics.lineHeight)
     }
 
     /// Invalidates visual document state. In a window this is deliberately
@@ -466,7 +650,7 @@ final class EditorView: NSView {
 
     private func toggleCaret() {
         caretOn.toggle()
-        for rect in caretRects.values { setNeedsDisplay(rect) }
+        for rect in caretRects.values.joined() { setNeedsDisplay(rect) }
     }
 
     // MARK: Drawing
@@ -489,6 +673,7 @@ final class EditorView: NSView {
         if metadataNeedsRefresh {
             applyDocumentMetadata(lineCount: snapshot.lineCount)
             metadataNeedsRefresh = false
+            DispatchQueue.main.async { [weak self] in self?.onLayoutChange?() }
             // After this draw: changing a label mid-draw can trigger layout.
             let primary = snapshot.primary, count = snapshot.selectionCount
             DispatchQueue.main.async { [weak self] in self?.onCursorChange?(primary, count) }
@@ -517,27 +702,38 @@ final class EditorView: NSView {
 
         let stylesByLine = Dictionary(grouping: snapshot.styles, by: { $0.line })
         for line in snapshot.lines {
-            let top = CGFloat(line.line) * lineHeight
+            let rows = lineRows(line.line)
+            let top = rowTop(of: line.line)
+            let block = lineHeight * CGFloat(rows.count)
             let hasCaret = !line.carets.isEmpty
+            let span = { (start: UInt64, end: UInt64, minWidth: CGFloat, trailing: CGFloat) in
+                self.spanRects(Int(start), Int(end), text: line.text, rows: rows, top: top,
+                               originX: originX, minWidth: minWidth, trailing: trailing)
+            }
             if let tint = lineTints[line.line] {
                 context.setFillColor(tint.cgColor)
-                context.fill(CGRect(x: 0, y: top, width: bounds.width, height: lineHeight))
+                context.fill(CGRect(x: 0, y: top, width: bounds.width, height: block))
             }
             for hint in inlayHints where hint.line == line.line {
-                let x = originX + xOffset(in: line.text, column: hint.character)
+                let p = point(column: Int(hint.character), text: line.text, rows: rows, top: top, originX: originX)
                 NSColor.secondaryLabelColor.withAlphaComponent(0.7).setFill()
-                NSAttributedString(string: "  \(hint.label)", attributes: [.font: NSFont.monospacedSystemFont(ofSize: font.pointSize - 1, weight: .regular), .foregroundColor: NSColor.secondaryLabelColor]).draw(at: NSPoint(x: x, y: top + 1))
+                NSAttributedString(string: "  \(hint.label)", attributes: [.font: NSFont.monospacedSystemFont(ofSize: font.pointSize - 1, weight: .regular), .foregroundColor: NSColor.secondaryLabelColor]).draw(at: NSPoint(x: p.x, y: p.y + 1))
             }
 
             // Current line: lines with a caret and no selection on them.
             if hasCaret, line.selections.isEmpty {
                 context.setFillColor(Theme.currentLine.cgColor)
-                context.fill(CGRect(x: 0, y: top, width: bounds.width, height: lineHeight))
+                context.fill(CGRect(x: 0, y: top, width: bounds.width, height: block))
+            }
+
+            if debugStopLine == Int(line.line) {
+                context.setFillColor(NSColor.systemYellow.withAlphaComponent(0.22).cgColor)
+                context.fill(CGRect(x: 0, y: top, width: bounds.width, height: block))
             }
 
             // Subtle divider between line numbers and source text.
             context.setFillColor(NSColor.separatorColor.withAlphaComponent(0.28).cgColor)
-            context.fill(CGRect(x: gutterWidth - 1, y: top, width: 1, height: lineHeight))
+            context.fill(CGRect(x: gutterWidth - 1, y: top, width: 1, height: block))
 
             // Indent guides sit behind text and whitespace markers. Draw one
             // guide for each complete four-space indentation level.
@@ -549,53 +745,58 @@ final class EditorView: NSView {
                 // visually noisy; keep only the parent-level guides.
                 while column < indentColumns {
                     let x = originX + CGFloat(column) * metrics.spaceWidth - 0.5
-                    context.fill(CGRect(x: x, y: top, width: 1, height: lineHeight))
+                    context.fill(CGRect(x: x, y: top, width: 1, height: block))
                     column += 4
                 }
             }
 
             // Matching delimiter cells, below selections and above text.
             context.setFillColor(Theme.bracketMatch.cgColor)
-            for span in line.brackets {
-                let x0 = originX + xOffset(in: line.text, column: span.start)
-                let x1 = originX + xOffset(in: line.text, column: span.end)
-                context.fill(CGRect(x: x0, y: top, width: max(metrics.spaceWidth, x1 - x0), height: lineHeight))
+            for bracket in line.brackets {
+                for rect in span(bracket.start, bracket.end, metrics.spaceWidth, 0) { context.fill(rect) }
             }
 
             // Find matches, under the selection so the current one stays clear.
             if !line.matches.isEmpty {
                 context.setFillColor(Self.matchColor.cgColor)
-                for span in line.matches {
-                    let x0 = originX + xOffset(in: line.text, column: span.start)
-                    let x1 = originX + xOffset(in: line.text, column: span.end)
-                    context.fill(CGRect(x: x0, y: top, width: max(0, x1 - x0), height: lineHeight))
+                for match in line.matches {
+                    for rect in span(match.start, match.end, 0, 0) { context.fill(rect) }
                 }
             }
 
             // Whitespace markers sit under selection fills, so selecting a
             // line keeps the selection color uniform.
             if renderWhitespace != .none, !line.text.isEmpty {
-                drawWhitespace(in: line.text, originX: originX, top: top, context: context)
+                drawWhitespace(in: line.text, rows: rows, originX: originX, top: top, context: context)
             }
 
             // Selections. A span that continues past the line end is
             // extended by one space so empty lines show as selected too.
             context.setFillColor(selectionColor.cgColor)
-            for span in line.selections {
-                let x0 = originX + xOffset(in: line.text, column: span.start)
-                var x1 = originX + xOffset(in: line.text, column: span.end)
-                if span.includesEol { x1 += metrics.spaceWidth }
-                context.fill(CGRect(x: x0, y: top, width: max(0, x1 - x0), height: lineHeight))
+            for selection in line.selections {
+                let eol = selection.includesEol ? metrics.spaceWidth : 0
+                for rect in span(selection.start, selection.end, 0, eol) { context.fill(rect) }
             }
 
             // Text uses a one-frame attributed layout only if Tree-sitter
             // supplied semantic runs; otherwise the shared plain cache wins.
             if !line.text.isEmpty {
                 context.setFillColor(Theme.editorForeground.resolved(for: effectiveAppearance).cgColor)
-                context.textPosition = CGPoint(x: originX, y: top + metrics.ascent)
                 // Semantic runs come last so they win over Tree-sitter's.
                 let styles = (stylesByLine[line.line] ?? []) + (semanticStylesByLine[line.line] ?? [])
-                CTLineDraw(styles.isEmpty ? layout(for: line.text) : syntaxLayout(for: line.text, styles: styles), context)
+                let ctLine = styles.isEmpty ? layout(for: line.text) : syntaxLayout(for: line.text, styles: styles)
+                for row in 0..<rows.count {
+                    let rowTopY = top + CGFloat(row) * lineHeight
+                    let shift = row == 0 ? 0 : xOffset(in: line.text, column: UInt64(rows.start(of: row)))
+                    if rows.count > 1 {
+                        // The whole line is laid out once; clip to this row.
+                        context.saveGState()
+                        context.clip(to: CGRect(x: originX, y: rowTopY, width: bounds.width, height: lineHeight))
+                    }
+                    context.textPosition = CGPoint(x: originX - shift, y: rowTopY + metrics.ascent)
+                    CTLineDraw(ctLine, context)
+                    if rows.count > 1 { context.restoreGState() }
+                }
             }
 
             // Git blame of the caret line, quiet and after the text.
@@ -604,40 +805,40 @@ final class EditorView: NSView {
                 let note = CTLineCreateWithAttributedString(NSAttributedString(
                     string: blame.text, attributes: [.font: font, fromContext: true]))
                 context.setFillColor(NSColor.secondaryLabelColor.withAlphaComponent(0.75).cgColor)
-                let x = originX + xOffset(in: line.text, column: UInt64(line.text.utf16.count)) + Self.blameGap
-                context.textPosition = CGPoint(x: x, y: top + metrics.ascent)
+                let end = point(column: line.text.utf16.count, text: line.text, rows: rows, top: top, originX: originX)
+                context.textPosition = CGPoint(x: end.x + Self.blameGap, y: end.y + metrics.ascent)
                 CTLineDraw(note, context)
             }
 
             // LSP diagnostics sit above text decorations but beneath carets.
             // Cmd hover: underline the identifier Cmd+click would open.
             if let link = definitionLink, link.line == line.line {
-                let x0 = originX + xOffset(in: line.text, column: link.start)
-                let x1 = originX + xOffset(in: line.text, column: link.end)
                 context.setFillColor(NSColor.linkColor.cgColor)
-                context.fill(CGRect(x: x0, y: top + metrics.ascent + 2, width: max(1, x1 - x0), height: 1))
+                for rect in span(link.start, link.end, 1, 0) {
+                    context.fill(CGRect(x: rect.minX, y: rect.minY + metrics.ascent + 2, width: rect.width, height: 1))
+                }
             }
-            for span in line.diagnostics {
-                let x0 = originX + xOffset(in: line.text, column: span.start)
-                let x1 = originX + xOffset(in: line.text, column: span.end)
-                context.setFillColor(Theme.diagnostic(span.severity).cgColor)
-                context.fill(CGRect(x: x0, y: top + lineHeight - 2, width: max(1, x1 - x0), height: 1))
+            for diagnostic in line.diagnostics {
+                context.setFillColor(Theme.diagnostic(diagnostic.severity).cgColor)
+                for rect in span(diagnostic.start, diagnostic.end, 1, 0) {
+                    context.fill(CGRect(x: rect.minX, y: rect.maxY - 2, width: rect.width, height: 1))
+                }
             }
 
             // IME marked text: thin underline under the preedit.
             if let marked = line.marked {
-                let x0 = originX + xOffset(in: line.text, column: marked.start)
-                let x1 = originX + xOffset(in: line.text, column: marked.end)
                 context.setFillColor(NSColor.textColor.cgColor)
-                context.fill(CGRect(x: x0, y: top + lineHeight - 2, width: max(0, x1 - x0), height: 1))
+                for rect in span(marked.start, marked.end, 0, 0) {
+                    context.fill(CGRect(x: rect.minX, y: rect.maxY - 2, width: rect.width, height: 1))
+                }
             }
 
             // Carets. Rects are recorded even while the caret is off so the
             // blink timer knows what to invalidate.
             for column in line.carets {
-                let x = originX + xOffset(in: line.text, column: column)
-                let rect = CGRect(x: x, y: top, width: Self.caretWidth, height: lineHeight)
-                caretRects[Int(line.line)] = rect
+                let p = point(column: Int(column), text: line.text, rows: rows, top: top, originX: originX)
+                let rect = CGRect(x: p.x, y: p.y, width: Self.caretWidth, height: lineHeight)
+                caretRects[Int(line.line), default: []].append(rect)
                 if drawCarets {
                     context.setFillColor(Theme.caret.cgColor)
                     context.fill(rect)
@@ -647,7 +848,14 @@ final class EditorView: NSView {
             // Gutter: right-aligned line number, copper on caret lines.
             let number = layout(for: String(line.line + 1))
             let width = CGFloat(CTLineGetTypographicBounds(number, nil, nil, nil))
-            context.setFillColor((hasCaret ? Theme.accent : Theme.gutterText).cgColor)
+            let hasBreakpoint = breakpointLines.contains(line.line)
+            if hasBreakpoint {
+                let tag = CGRect(x: gutterRight - width - 4, y: top + 1, width: width + 7, height: lineHeight - 2)
+                context.addPath(CGPath(roundedRect: tag, cornerWidth: 4, cornerHeight: 4, transform: nil))
+                context.setFillColor(NSColor.systemRed.cgColor)
+                context.fillPath()
+            }
+            context.setFillColor(hasBreakpoint ? NSColor.white.cgColor : (hasCaret ? Theme.accent : Theme.gutterText).cgColor)
             context.textPosition = CGPoint(x: gutterRight - width, y: top + metrics.ascent)
             CTLineDraw(number, context)
             if let severity = line.diagnostics.map(\.severity).min() {
@@ -661,7 +869,7 @@ final class EditorView: NSView {
                 case .deleted: NSColor.systemRed
                 }
                 context.setFillColor(color.cgColor)
-                let markerHeight: CGFloat = change == .deleted ? 3 : lineHeight
+                let markerHeight: CGFloat = change == .deleted ? 3 : block
                 context.fill(CGRect(x: 1, y: top, width: 3, height: markerHeight))
             }
         }
@@ -696,18 +904,20 @@ final class EditorView: NSView {
         return columns
     }
 
-    private func drawWhitespace(in text: String, originX: CGFloat, top: CGFloat, context: CGContext) {
+    private func drawWhitespace(in text: String, rows: LineRows, originX: CGFloat, top: CGFloat, context: CGContext) {
         let columns = Self.whitespaceColumns(in: text, mode: renderWhitespace)
         guard !columns.isEmpty else { return }
         let units = Array(text.utf16)
         let tab = UInt16(UInt8(ascii: "\t"))
         // Centered on the x-height, where VSCode puts its middle dots.
-        let midY = top + metrics.ascent - max(font.xHeight, 1) / 2
+        let midOffset = metrics.ascent - max(font.xHeight, 1) / 2
         let radius = max(1, (font.pointSize / 13).rounded(.down)) * 0.9
         context.setFillColor(Theme.whitespace.cgColor)
         for column in columns {
-            let x0 = originX + xOffset(in: text, column: UInt64(column))
-            let x1 = originX + xOffset(in: text, column: UInt64(column + 1))
+            let origin = point(column: column, text: text, rows: rows, top: top, originX: originX)
+            let x0 = origin.x
+            let x1 = x0 + xOffset(in: text, column: UInt64(column + 1)) - xOffset(in: text, column: UInt64(column))
+            let midY = origin.y + midOffset
             if units[column] == tab {
                 context.fill(CGRect(x: x0 + 2, y: midY - 0.5, width: max(1, x1 - x0 - 4), height: 1))
             } else {

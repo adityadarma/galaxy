@@ -55,12 +55,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private let bottomPanelContent = BottomPanelContentView()
     private var bottomPanelHeight: NSLayoutConstraint!
     private var bottomPanelHeaderHeight: NSLayoutConstraint!
-    private var bottomPanelTab = BottomPanelHeader.Tab.terminal
+    private(set) var bottomPanelTab = BottomPanelHeader.Tab.terminal
     var isBottomPanelVisible: Bool { bottomPanelHeight.constant > 0 }
     /// Panel content height when open, and whether it fills the editor area.
     private var bottomPanelOpenHeight: CGFloat = 240
     private(set) var isBottomPanelMaximized = false
-    private let bottomPanelPlaceholder = NSTextField(labelWithString: "Debug console is not connected")
+    private let debugConsole = DebugConsolePanel()
+    let debugger = DebugCoordinator()
     private var terminalHandles: [TerminalHandle] = []
     private var activeTerminalIndex = 0
     let hoverPopover = HoverPopover()
@@ -251,6 +252,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     @objc func splitEditorDown(_ sender: Any?) { setEditorSplit(vertical: false) }
     @objc func closeEditorSplit(_ sender: Any?) {
         isEditorSplit = false
+        updateWrapState()
         guard !isDiffPaneShown else { return }
         secondaryScrollView.removeFromSuperview()
         editorSplitView.isVertical = true
@@ -266,6 +268,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             updateMarkdownPreview()
         }
         isEditorSplit = true
+        updateWrapState()
         userSplitVertical = vertical
         editorSplitView.isVertical = vertical
         if secondaryScrollView.superview == nil {
@@ -424,7 +427,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         problemsPanel.isHidden = tab != .problems
         outputPanel.isHidden = tab != .output
         portsPanel.isHidden = tab != .ports
-        bottomPanelPlaceholder.isHidden = tab != .debugConsole
+        debugConsole.isHidden = tab != .debugConsole
         if tab == .terminal {
             ensureTerminal()
             window?.makeFirstResponder(terminalView)
@@ -513,6 +516,248 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             return NSSound.beep()
         }
         openTerminalTab(handle)
+    }
+
+    // MARK: Debugger
+
+    /// Start, or continue when the program is paused.
+    @objc func startDebugging(_ sender: Any?) {
+        switch debugger.state {
+        case .paused:
+            debugger.resume()
+        case .idle:
+            guard let workspace else { return NSSound.beep() }
+            revealBottomPanel(.debugConsole)
+            guard let target = DebugTargets.detect(in: URL(fileURLWithPath: workspace.root())) else {
+                debugConsole.append("Nothing to debug. Add .galaxy/launch.json with {\"program\": \"path/to/binary\"}, or open a Cargo project.\n", category: "stderr")
+                return
+            }
+            debugConsole.clear()
+            Task { @MainActor in await self.debugger.launch(target) }
+        case .building, .running:
+            break
+        }
+    }
+
+    @objc func stopDebugging(_ sender: Any?) { debugger.stop() }
+    @objc func debugStepOver(_ sender: Any?) { debugger.stepOver() }
+    @objc func debugStepInto(_ sender: Any?) { debugger.stepIn() }
+    @objc func debugStepOut(_ sender: Any?) { debugger.stepOut() }
+    @objc func removeAllBreakpoints(_ sender: Any?) { debugger.removeAllBreakpoints() }
+
+    @objc func showDebugConsole(_ sender: Any?) {
+        revealBottomPanel(.debugConsole)
+        debugConsole.focusInput()
+    }
+
+    @objc func toggleBreakpoint(_ sender: Any?) {
+        guard let doc = activeTab?.doc else { return NSSound.beep() }
+        toggleBreakpoint(line: doc.primaryCursor().line)
+    }
+
+    /// `line` is 0-based; breakpoints are 1-based like the adapter's.
+    private func toggleBreakpoint(line: UInt64) {
+        guard let tab = activeTab, tab.isDocument, let key = tab.fileKey else { return NSSound.beep() }
+        debugger.toggleBreakpoint(path: key, line: UInt32(line + 1))
+    }
+
+    private func refreshDebugMarkers() {
+        guard let tab = activeTab, tab.isDocument, let key = tab.fileKey else {
+            editorView.breakpointLines = []
+            editorView.debugStopLine = nil
+            return
+        }
+        editorView.breakpointLines = Set(debugger.lines(in: key).map { UInt64($0 - 1) })
+        editorView.debugStopLine = debugger.stoppedLocation.flatMap { stop in
+            stop.path == key ? Int(stop.line) - 1 : nil
+        }
+    }
+
+    private func debugStateChanged() {
+        refreshDebugMarkers()
+        debugConsole.showState(frames: debugger.frames, variables: debugger.variables,
+                               reason: debugger.state == .paused ? debugger.stopReason : nil)
+    }
+
+    // MARK: Minimap
+
+    private let minimap = MinimapView(frame: .zero)
+    private(set) var minimapEnabled = UserDefaults.standard.object(forKey: "Minimap") as? Bool ?? true
+
+    @objc func toggleMinimap(_ sender: Any?) {
+        minimapEnabled.toggle()
+        UserDefaults.standard.set(minimapEnabled, forKey: "Minimap")
+        updateMinimap()
+    }
+
+    /// The minimap sits over the right edge of the primary editor, under
+    /// the scroller; the diff pane has its own layout and goes without.
+    private func updateMinimap() {
+        let show = minimapEnabled && !isDiffPaneShown
+        if minimap.superview == nil {
+            minimap.editor = editorView
+            minimap.scrollView = scrollView
+            minimap.autoresizingMask = []
+            // Below the overlay scroller, so it keeps drawing over the map.
+            scrollView.addSubview(minimap, positioned: .below, relativeTo: scrollView.verticalScroller)
+            editorView.onLayoutChange = { [weak self] in self?.minimap.needsDisplay = true }
+            scrollView.contentView.postsBoundsChangedNotifications = true
+            scrollView.postsFrameChangedNotifications = true
+            let center = NotificationCenter.default
+            center.addObserver(forName: NSView.boundsDidChangeNotification, object: scrollView.contentView, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.minimap.needsDisplay = true }
+            }
+            // The scroll view is created empty and sized by its split view
+            // later, so the map follows every resize.
+            center.addObserver(forName: NSView.frameDidChangeNotification, object: scrollView, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.layoutMinimap() }
+            }
+        }
+        minimap.isHidden = !show
+        editorView.rightInset = show ? MinimapView.width : 0
+        editorView.applyRightInset()
+        layoutMinimap()
+    }
+
+    private func layoutMinimap() {
+        // Autoresizing alone loses the inset when the scroll view started
+        // out narrower than the minimap; set the width from the scroll view.
+        editorView.applyRightInset()
+        let width = MinimapView.width
+        minimap.frame = NSRect(x: scrollView.bounds.width - width, y: 0, width: width, height: scrollView.bounds.height)
+        minimap.needsDisplay = true
+    }
+
+    // MARK: Word wrap
+
+    private(set) var wordWrapEnabled = UserDefaults.standard.bool(forKey: "WordWrap")
+
+    @objc func toggleWordWrap(_ sender: Any?) {
+        wordWrapEnabled.toggle()
+        UserDefaults.standard.set(wordWrapEnabled, forKey: "WordWrap")
+        updateWrapState()
+    }
+
+    /// Wrap needs one row table per document, so the split and diff panes,
+    /// which show a document twice, keep one row per line.
+    private func updateWrapState() {
+        let suspended = isDiffPaneShown || isEditorSplit
+        editorView.wrapEnabled = wordWrapEnabled
+        editorView.wrapSuspended = suspended
+        secondaryEditorView.wrapSuspended = true
+        updateStickyScope()
+    }
+
+    // MARK: View menu
+
+    @objc func showProblemsPanel(_ sender: Any?) { revealBottomPanel(.problems) }
+    @objc func showOutputPanel(_ sender: Any?) { revealBottomPanel(.output) }
+
+    private func revealBottomPanel(_ tab: BottomPanelHeader.Tab) {
+        if !isBottomPanelVisible { setBottomPanelOpen(true) }
+        showBottomPanel(tab: tab)
+    }
+
+    static let minEditorFontSize: CGFloat = 10
+    static let maxEditorFontSize: CGFloat = 24
+
+    /// Changes the editor font size by `delta` points, within the range
+    /// Settings allows, and keeps it for the next launch.
+    private func zoomEditor(by delta: CGFloat?) {
+        let defaults = UserDefaults.standard
+        let current = defaults.object(forKey: "EditorFontSize") as? CGFloat ?? 13
+        let next = delta.map { current + $0 } ?? 13
+        defaults.set(Double(min(max(next, Self.minEditorFontSize), Self.maxEditorFontSize)), forKey: "EditorFontSize")
+        applyPreferences()
+    }
+
+    @objc func zoomEditorIn(_ sender: Any?) { zoomEditor(by: 1) }
+    @objc func zoomEditorOut(_ sender: Any?) { zoomEditor(by: -1) }
+    @objc func zoomEditorReset(_ sender: Any?) { zoomEditor(by: nil) }
+
+    @objc func toggleBreadcrumbs(_ sender: Any?) {
+        let on = !breadcrumbBar.isEnabled
+        breadcrumbBar.isEnabled = on
+        UserDefaults.standard.set(on, forKey: "ShowBreadcrumbs")
+        breadcrumbBar.show(symbols: documentSymbols, atLine: editorView.document?.primaryCursor().line ?? 0)
+    }
+
+    @objc func toggleStickyScroll(_ sender: Any?) {
+        let on = !stickyScopeView.isEnabled
+        stickyScopeView.isEnabled = on
+        UserDefaults.standard.set(on, forKey: "StickyScroll")
+        updateStickyScope()
+    }
+
+    // MARK: Run menu
+
+    @objc func runBuildTask(_ sender: Any?) { runTask("build") { $0.build } }
+    @objc func runTestTask(_ sender: Any?) { runTask("test") { $0.test } }
+
+    /// Sends the project's build or test command to the panel terminal.
+    private func runTask(_ name: String, pick: (RunTasks.Detected) -> String?) {
+        guard let workspace else { return NSSound.beep() }
+        let detected = RunTasks.detect(in: URL(fileURLWithPath: workspace.root()))
+        guard let command = pick(detected) else {
+            statusLabel.stringValue = "No \(name) task found for this folder."
+            return NSSound.beep()
+        }
+        if terminalHandles.isEmpty {
+            newTerminal()
+        } else {
+            revealBottomPanel(.terminal)
+        }
+        guard terminalHandles.indices.contains(activeTerminalIndex) else { return NSSound.beep() }
+        try? terminalHandles[activeTerminalIndex].write(input: command + "\r")
+        statusLabel.stringValue = "Running: \(command)"
+    }
+
+    // MARK: Terminal menu
+
+    /// The terminal that input goes to: the active terminal tab, else the
+    /// panel's active terminal.
+    private var activeTerminalHandle: TerminalHandle? {
+        if let handle = activeTab?.terminal { return handle }
+        return terminalHandles.indices.contains(activeTerminalIndex) ? terminalHandles[activeTerminalIndex] : nil
+    }
+
+    /// Like `activeTerminalHandle`, but opens the panel terminal if there is none.
+    private func terminalForInput() -> TerminalHandle? {
+        if activeTerminalHandle == nil { newTerminal() }
+        return activeTerminalHandle
+    }
+
+    @objc func createTerminal(_ sender: Any?) { newTerminal() }
+
+    @objc func killTerminal(_ sender: Any?) {
+        if let index = activeIndex, tabs[index].terminal != nil {
+            tabs[index].terminal?.kill()
+            closeTab(at: index, keepTerminal: true)
+        } else {
+            killActiveTerminal()
+        }
+    }
+
+    @objc func clearActiveTerminal(_ sender: Any?) {
+        try? activeTerminalHandle?.write(input: "\u{0c}")
+    }
+
+    /// Sends the selection (or the current line, when nothing is selected)
+    /// to the active terminal and presses Return.
+    @objc func runSelectedTextInTerminal(_ sender: Any?) {
+        guard let document = activeTab.flatMap({ $0.isDocument ? $0.doc : nil }) else { return NSSound.beep() }
+        var text = document.copy().text
+        while text.hasSuffix("\n") { text.removeLast() }
+        guard !text.isEmpty, let handle = terminalForInput() else { return NSSound.beep() }
+        try? handle.write(input: text.replacingOccurrences(of: "\n", with: "\r") + "\r")
+    }
+
+    /// Sends the active file's path, quoted, to the active terminal.
+    @objc func runActiveFileInTerminal(_ sender: Any?) {
+        guard let path = activeTab?.fileKey, activeTab?.isDocument == true else { return NSSound.beep() }
+        guard let handle = terminalForInput() else { return NSSound.beep() }
+        let quoted = "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        try? handle.write(input: quoted + "\r")
     }
 
     /// Moves a terminal tab (the clicked one from the tab menu, else the
@@ -771,6 +1016,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         scrollView.autoresizingMask = [.width, .height]
         editorView.autoresizingMask = [.width]
         scrollView.documentView = editorView
+        updateMinimap()
         secondaryScrollView.hasVerticalScroller = true
         secondaryScrollView.hasHorizontalScroller = false
         secondaryScrollView.scrollerStyle = .overlay
@@ -844,13 +1090,17 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         pathBar.translatesAutoresizingMaskIntoConstraints = false
         pathBar.show([])
         breadcrumbBar.translatesAutoresizingMaskIntoConstraints = false
+        breadcrumbBar.isEnabled = UserDefaults.standard.object(forKey: "ShowBreadcrumbs") as? Bool ?? true
+        stickyScopeView.isEnabled = UserDefaults.standard.object(forKey: "StickyScroll") as? Bool ?? true
+        updateWrapState()
+        updateMinimap()
         breadcrumbBar.clear()
         findBarSlot.translatesAutoresizingMaskIntoConstraints = false
         stickyScopeView.translatesAutoresizingMaskIntoConstraints = false
         // `BottomPanelContentView.layout()` sizes these (never below its
         // minimum). No autoresizing mask: one tied to the collapsed,
         // zero-height container conflicts with the panels' own constraints.
-        for panel in [terminalView, outputPanel, portsPanel, problemsPanel] as [NSView] {
+        for panel in [terminalView, outputPanel, portsPanel, problemsPanel, debugConsole] as [NSView] {
             panel.translatesAutoresizingMaskIntoConstraints = true
             panel.autoresizingMask = []
             // A zero frame would become a `height == 0` constraint before
@@ -891,10 +1141,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         detailView.addSubview(bottomPanelContent)
         // Every panel is added once and switched with `isHidden`; see
         // `setBottomPanelOpen`.
-        bottomPanelPlaceholder.textColor = .secondaryLabelColor
-        bottomPanelPlaceholder.alignment = .center
-        bottomPanelPlaceholder.isHidden = true
-        for panel in [terminalView, problemsPanel, outputPanel, portsPanel, bottomPanelPlaceholder] as [NSView] {
+        debugConsole.isHidden = true
+        for panel in [terminalView, problemsPanel, outputPanel, portsPanel, debugConsole] as [NSView] {
             bottomPanelContent.addSubview(panel)
         }
         bottomPanelContent.isHidden = true
@@ -946,6 +1194,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
           ])
         problemsPanel.onSelect = { [weak self] problem in self?.showProblem(problem) }
         referencesPanel.onSelect = { [weak self] location in self?.showReference(location) }
+        debugger.onOutput = { [weak self] category, text in self?.debugConsole.append(text, category: category) }
+        debugger.onChange = { [weak self] in self?.debugStateChanged() }
+        debugger.onStop = { [weak self] path, line in
+            _ = self?.show(NavLocation(key: path, line: UInt64(max(line, 1) - 1), col: 0))
+        }
+        debugConsole.onEvaluate = { [weak self] expression in self?.debugger.evaluate(expression) }
+        editorView.onToggleBreakpoint = { [weak self] line in self?.toggleBreakpoint(line: line) }
         problemsPanel.isHidden = true
         outputPanel.isHidden = true
         portsPanel.isHidden = true
@@ -1238,9 +1493,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         let line = position.line
         let text = activeTab?.doc.displayLine(line: line) ?? ""
         let column = hover.startLine == line ? (hover.startCharacter ?? position.colUtf16) : position.colUtf16
-        let wordX = editor.textOriginX + editor.xOffset(in: text, column: column)
-        let lineTop = CGFloat(line) * editor.metrics.lineHeight
-        let wordRect = NSRect(x: wordX, y: lineTop, width: 1, height: editor.metrics.lineHeight)
+        _ = text
+        let wordRect = editor.rect(forLine: line, column: column)
         let anchor = detailView.convert(wordRect, from: editor)
         let visible = detailView.convert(editor.visibleRect, from: editor).insetBy(dx: 8, dy: 4)
         let size = hoverPopover.fittingSize(maxHeight: min(HoverPopover.maxHeight, max(60, visible.height / 2)))
@@ -1292,7 +1546,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
         completionPopup.update(items, query: completionQuery)
         if completionPopup.isHidden { return }
-        completionPopup.frame = NSRect(x: editorView.textOriginX + 8, y: CGFloat(completionPosition.line + 1) * editorView.metrics.lineHeight + 8, width: 420, height: 192)
+        completionPopup.frame = NSRect(x: editorView.textOriginX + 8, y: editorView.rect(forLine: completionPosition.line, column: completionPosition.colUtf16).maxY + 8, width: 420, height: 192)
     }
 
     private func closeCompletion() {
@@ -1314,7 +1568,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         guard let signature = bridge.signatureHelp(document: document) else { signaturePopup.isHidden = true; return }
         signaturePopup.show(signature)
         signaturePopup.isHidden = false
-        signaturePopup.frame = NSRect(x: editorView.textOriginX + 8, y: CGFloat(completionPosition.line + 1) * editorView.metrics.lineHeight + 8, width: 520, height: signature.documentation == nil ? 48 : 78)
+        signaturePopup.frame = NSRect(x: editorView.textOriginX + 8, y: editorView.rect(forLine: completionPosition.line, column: completionPosition.colUtf16).maxY + 8, width: 520, height: signature.documentation == nil ? 48 : 78)
     }
 
     private func requestDefinition(at position: TextPos) -> Bool {
@@ -2077,6 +2331,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
         if !isDiffPaneShown {
             isDiffPaneShown = true
+            updateWrapState()
+            updateMinimap()
             markdownPreview.removeFromSuperview()
             secondaryScrollView.removeFromSuperview()
             editorSplitView.isVertical = true
@@ -2095,6 +2351,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     private func leaveDiffPane() {
         isDiffPaneShown = false
+        updateWrapState()
+        updateMinimap()
         diffMap = DiffLineMap()
         secondaryEditorView.isReadOnly = false
         secondaryEditorView.lineTints = [:]
@@ -2155,10 +2413,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// Moves the Markdown preview to the source line at the top of the editor.
     private func syncPreviewToEditor() {
         guard isMarkdownPreviewShown, !isSyncingPreviewScroll else { return }
-        let lineHeight = editorView.metrics.lineHeight
-        guard lineHeight > 0 else { return }
+        guard editorView.metrics.lineHeight > 0 else { return }
         let y = max(0, scrollView.contentView.bounds.origin.y + scrollView.contentInsets.top)
-        markdownPreview.scroll(toSourceLine: Double(y / lineHeight))
+        markdownPreview.scroll(toSourceLine: editorView.fractionalLine(atY: y))
     }
 
     /// Moves the editor to `line`, the source line at the top of the preview.
@@ -2166,7 +2423,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         let lineHeight = editorView.metrics.lineHeight
         guard isMarkdownPreviewShown, lineHeight > 0 else { return }
         let clip = scrollView.contentView
-        let wanted = NSPoint(x: clip.bounds.origin.x, y: CGFloat(line) * lineHeight - scrollView.contentInsets.top)
+        let wanted = NSPoint(x: clip.bounds.origin.x, y: editorView.y(forFractionalLine: line) - scrollView.contentInsets.top)
         let target = clip.constrainBoundsRect(NSRect(origin: wanted, size: clip.bounds.size)).origin
         isSyncingPreviewScroll = true
         defer { isSyncingPreviewScroll = false }
@@ -2245,6 +2502,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         tabOrderByUse.insert(id, at: 0)
         pathBar.show(tab.pathComponents)
         editorView.document = tab.doc
+        refreshDebugMarkers()
         applyDiffPane(for: tab)
         updateMarkdownPreview()
         let root = workspace?.root() ?? (tab.doc.path() as NSString).deletingLastPathComponent
@@ -3289,8 +3547,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             stickyScopeView.show([])
             return
         }
-        let lineHeight = editorView.metrics.lineHeight
-        let firstVisible = UInt64(max(0, Int(floor(scrollView.contentView.bounds.origin.y / lineHeight))))
+        let firstVisible = editorView.line(atY: max(0, scrollView.contentView.bounds.origin.y)).line
         guard firstVisible > 0 else {
             stickyScopeView.show([])
             return
@@ -3390,6 +3647,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// (typing, a text field's own ⌘A, a disabled command).
     @discardableResult
     func performKeyBinding(_ id: String) -> Bool {
+        // Bare and shifted function keys belong to the shell's programs
+        // (htop, vim) while a terminal has focus.
+        if window?.firstResponder is TerminalView, !id.contains("cmd+"),
+           id.range(of: #"f\d+$"#, options: .regularExpression) != nil {
+            return false
+        }
         guard let command = keybindings.commandByKey[id],
               let action = CommandPaletteView.actions[command],
               let target = target(for: action) else { return false }
@@ -4144,6 +4407,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         syntaxEvictionTimer = nil
         lspTimer?.invalidate()
         lspTimer = nil
+        debugger.stop()
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
         keyMonitor = nil
         workspaceWatch?.stop()
@@ -4640,14 +4904,42 @@ extension MainWindowController: NSMenuItemValidation {
             return workspace != nil && explorer.selectedEntry != nil
         case #selector(closeTab(_:)):
             return true
-        case #selector(moveTerminalToEditor(_:)), #selector(createTerminalEditor(_:)):
+        case #selector(moveTerminalToEditor(_:)), #selector(createTerminalEditor(_:)), #selector(createTerminal(_:)),
+             #selector(runBuildTask(_:)), #selector(runTestTask(_:)):
             return workspace != nil
+        case #selector(killTerminal(_:)), #selector(clearActiveTerminal(_:)):
+            return activeTerminalHandle != nil
+        case #selector(runSelectedTextInTerminal(_:)), #selector(runActiveFileInTerminal(_:)):
+            return workspace != nil && activeTab?.isDocument == true
         case #selector(moveTerminalToPanel(_:)):
             return ((item.representedObject as? EditorTab) ?? activeTab)?.terminal != nil
         case #selector(showNextTab(_:)), #selector(showPreviousTab(_:)), #selector(selectLastUsedTab(_:)):
             return tabs.count > 1
         case #selector(toggleGitBlame(_:)):
             item.state = gitBlameEnabled ? .on : .off
+            return true
+        case #selector(startDebugging(_:)):
+            item.title = debugger.state == .paused ? "Continue" : "Start Debugging"
+            return workspace != nil && (debugger.state == .idle || debugger.state == .paused)
+        case #selector(stopDebugging(_:)):
+            return debugger.isActive
+        case #selector(debugStepOver(_:)), #selector(debugStepInto(_:)), #selector(debugStepOut(_:)):
+            return debugger.state == .paused
+        case #selector(toggleBreakpoint(_:)):
+            return activeTab?.isDocument == true && activeTab?.fileKey != nil
+        case #selector(removeAllBreakpoints(_:)):
+            return !debugger.breakpoints.isEmpty
+        case #selector(toggleMinimap(_:)):
+            item.state = minimapEnabled ? .on : .off
+            return true
+        case #selector(toggleWordWrap(_:)):
+            item.state = wordWrapEnabled ? .on : .off
+            return true
+        case #selector(toggleBreadcrumbs(_:)):
+            item.state = breadcrumbBar.isEnabled ? .on : .off
+            return true
+        case #selector(toggleStickyScroll(_:)):
+            item.state = stickyScopeView.isEnabled ? .on : .off
             return true
         case #selector(toggleMarkdownPreview(_:)): return isMarkdownPreviewOn || canPreviewMarkdown
         case #selector(navigateBack(_:)): return navHistory.canGoBack()

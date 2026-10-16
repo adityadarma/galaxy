@@ -73,6 +73,27 @@ extension EditorView: @preconcurrency NSTextInputClient {
         didChangeDocument()
     }
 
+    // MARK: Line operations (Edit and Selection menus)
+
+    private func runEdit(_ command: EditCommand) {
+        guard !isReadOnly, let document else { return }
+        document.edit(command: command)
+        onSnippetInvalidated?()
+        didChangeDocument()
+    }
+
+    @objc func moveLinesUp(_ sender: Any?) { runEdit(.moveLinesUp) }
+    @objc func moveLinesDown(_ sender: Any?) { runEdit(.moveLinesDown) }
+    @objc func copyLinesUp(_ sender: Any?) { runEdit(.copyLinesUp) }
+    @objc func copyLinesDown(_ sender: Any?) { runEdit(.copyLinesDown) }
+    @objc func deleteLines(_ sender: Any?) { runEdit(.deleteLines) }
+    @objc func joinLines(_ sender: Any?) { runEdit(.joinLines) }
+    @objc func transformToUppercase(_ sender: Any?) { runEdit(.upperCase) }
+    @objc func transformToLowercase(_ sender: Any?) { runEdit(.lowerCase) }
+    @objc func trimTrailingWhitespace(_ sender: Any?) { runEdit(.trimTrailingWhitespace) }
+    @objc func sortLinesAscending(_ sender: Any?) { runEdit(.sortLinesAscending) }
+    @objc func sortLinesDescending(_ sender: Any?) { runEdit(.sortLinesDescending) }
+
     /// Refreshes size and drawing after the core changed, and keeps the
     /// primary caret in view.
     func didChangeDocument() {
@@ -88,9 +109,9 @@ extension EditorView: @preconcurrency NSTextInputClient {
     /// after the vertical scroll; this avoids a second FFI query.
     func scrollCaretToVisible(primary cursor: CursorInfo, lineText: String? = nil) {
         let text = lineText ?? ""
-        let x = textOriginX + xOffset(in: text, column: cursor.colUtf16)
-        let rect = NSRect(x: x, y: CGFloat(cursor.line) * metrics.lineHeight,
-                          width: Self.caretWidth, height: metrics.lineHeight)
+        let p = point(column: Int(cursor.colUtf16), text: text, rows: lineRows(cursor.line),
+                      top: rowTop(of: cursor.line), originX: textOriginX)
+        let rect = NSRect(x: p.x, y: p.y, width: Self.caretWidth, height: metrics.lineHeight)
         scrollToVisible(rect.insetBy(dx: -40, dy: 0))
     }
 
@@ -161,10 +182,7 @@ extension EditorView: @preconcurrency NSTextInputClient {
         guard let document, let window else { return .zero }
         let location = range.location == NSNotFound ? 0 : range.location
         let pos = document.positionAt(offset: UInt64(location))
-        let text = document.displayLine(line: pos.line)
-        let x = textOriginX + xOffset(in: text, column: pos.colUtf16)
-        let rect = NSRect(x: x, y: CGFloat(pos.line) * metrics.lineHeight,
-                          width: 1, height: metrics.lineHeight)
+        let rect = self.rect(forLine: pos.line, column: pos.colUtf16)
         actualRange?.pointee = NSRange(location: location, length: 0)
         return window.convertToScreen(convert(rect, to: nil))
     }

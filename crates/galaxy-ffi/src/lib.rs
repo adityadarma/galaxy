@@ -1752,6 +1752,250 @@ pub struct GitDiffHunkInfo {
     pub new_len: u64,
 }
 
+/// One frame of the call stack of a stopped program.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct DebugFrameInfo {
+    pub id: i64,
+    pub name: String,
+    pub path: Option<String>,
+    /// 1-based.
+    pub line: u32,
+    pub column: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct DebugScopeInfo {
+    pub name: String,
+    pub variables_reference: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct DebugVariableInfo {
+    pub name: String,
+    pub value: String,
+    pub type_name: Option<String>,
+    /// Non-zero when the value has children to expand.
+    pub variables_reference: i64,
+}
+
+/// Breakpoint lines (1-based) of one file.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct DebugBreakpointSet {
+    pub path: String,
+    pub lines: Vec<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
+pub enum DebugEventInfo {
+    Initialized,
+    Output {
+        category: String,
+        text: String,
+    },
+    Stopped {
+        thread_id: i64,
+        reason: String,
+        description: Option<String>,
+    },
+    Continued,
+    Terminated,
+    Exited {
+        code: i64,
+    },
+    Frames {
+        thread_id: i64,
+        frames: Vec<DebugFrameInfo>,
+    },
+    Variables {
+        reference: i64,
+        variables: Vec<DebugVariableInfo>,
+    },
+    Scopes {
+        frame_id: i64,
+        scopes: Vec<DebugScopeInfo>,
+    },
+    Evaluated {
+        expression: String,
+        result: String,
+        ok: bool,
+    },
+    Error {
+        message: String,
+    },
+    AdapterClosed,
+}
+
+impl From<galaxy_core::dap::DebugEvent> for DebugEventInfo {
+    fn from(event: galaxy_core::dap::DebugEvent) -> Self {
+        use galaxy_core::dap::DebugEvent as E;
+        match event {
+            E::Initialized => Self::Initialized,
+            E::Output { category, text } => Self::Output { category, text },
+            E::Stopped {
+                thread_id,
+                reason,
+                description,
+            } => Self::Stopped {
+                thread_id,
+                reason,
+                description,
+            },
+            E::Continued => Self::Continued,
+            E::Terminated => Self::Terminated,
+            E::Exited { code } => Self::Exited { code },
+            E::Frames { thread_id, frames } => Self::Frames {
+                thread_id,
+                frames: frames
+                    .into_iter()
+                    .map(|f| DebugFrameInfo {
+                        id: f.id,
+                        name: f.name,
+                        path: f.path,
+                        line: f.line,
+                        column: f.column,
+                    })
+                    .collect(),
+            },
+            E::Variables {
+                reference,
+                variables,
+            } => Self::Variables {
+                reference,
+                variables: variables
+                    .into_iter()
+                    .map(|v| DebugVariableInfo {
+                        name: v.name,
+                        value: v.value,
+                        type_name: v.type_name,
+                        variables_reference: v.variables_reference,
+                    })
+                    .collect(),
+            },
+            E::Scopes { frame_id, scopes } => Self::Scopes {
+                frame_id,
+                scopes: scopes
+                    .into_iter()
+                    .map(|s| DebugScopeInfo {
+                        name: s.name,
+                        variables_reference: s.variables_reference,
+                    })
+                    .collect(),
+            },
+            E::Evaluated {
+                expression,
+                result,
+                ok,
+            } => Self::Evaluated {
+                expression,
+                result,
+                ok,
+            },
+            E::Error(message) => Self::Error { message },
+            E::AdapterClosed => Self::AdapterClosed,
+        }
+    }
+}
+
+/// A running debug session. The app polls it from a timer; nothing blocks.
+#[derive(uniffi::Object)]
+pub struct DebugHandle {
+    session: Mutex<galaxy_core::dap::DebugSession>,
+}
+
+/// Starts debugging `program`. An empty `adapter` picks Xcode's `lldb-dap`.
+#[uniffi::export]
+pub fn start_debug(
+    adapter: Vec<String>,
+    program: String,
+    args: Vec<String>,
+    cwd: Option<String>,
+    stop_on_entry: bool,
+    breakpoints: Vec<DebugBreakpointSet>,
+) -> Result<Arc<DebugHandle>, CoreError> {
+    let adapter = if adapter.is_empty() {
+        let path = galaxy_core::dap::find_lldb_dap().ok_or_else(|| CoreError::Io {
+            message: "no debug adapter found: install Xcode (lldb-dap)".to_owned(),
+        })?;
+        vec![path]
+    } else {
+        adapter
+    };
+    let config = galaxy_core::dap::LaunchConfig {
+        program,
+        args,
+        cwd,
+        stop_on_entry,
+    };
+    let breakpoints = breakpoints
+        .into_iter()
+        .map(|set| (set.path, set.lines))
+        .collect();
+    let session = galaxy_core::dap::DebugSession::start(&adapter, config, breakpoints)
+        .map_err(|message| CoreError::Io { message })?;
+    Ok(Arc::new(DebugHandle {
+        session: Mutex::new(session),
+    }))
+}
+
+#[uniffi::export]
+impl DebugHandle {
+    /// Events since the last call, oldest first.
+    pub fn poll(&self) -> Vec<DebugEventInfo> {
+        self.lock().poll().into_iter().map(Into::into).collect()
+    }
+
+    pub fn set_breakpoints(&self, path: String, lines: Vec<u32>) {
+        self.lock().set_breakpoints(&path, &lines);
+    }
+
+    pub fn resume(&self) {
+        self.lock().continue_();
+    }
+
+    pub fn pause(&self) {
+        self.lock().pause();
+    }
+
+    pub fn step_over(&self) {
+        self.lock().step_over();
+    }
+
+    pub fn step_in(&self) {
+        self.lock().step_in();
+    }
+
+    pub fn step_out(&self) {
+        self.lock().step_out();
+    }
+
+    pub fn request_scopes(&self, frame_id: i64) {
+        self.lock().request_scopes(frame_id);
+    }
+
+    pub fn request_variables(&self, reference: i64) {
+        self.lock().request_variables(reference);
+    }
+
+    pub fn evaluate(&self, expression: String, frame_id: Option<i64>) {
+        self.lock().evaluate(&expression, frame_id);
+    }
+
+    /// Ends the session and the program. Safe to call twice.
+    pub fn stop(&self) {
+        self.lock().stop();
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.lock().is_running()
+    }
+}
+
+impl DebugHandle {
+    fn lock(&self) -> std::sync::MutexGuard<'_, galaxy_core::dap::DebugSession> {
+        self.session.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 #[derive(uniffi::Object)]
 pub struct TerminalHandle {
     session: TerminalSession,
@@ -2277,7 +2521,11 @@ impl Workspace {
 
     /// Who last changed each line of `rel_path`, counting `text` as the
     /// current content. `None` for untracked files and outside a repository.
-    pub fn git_blame(&self, rel_path: String, text: String) -> Result<Option<BlameInfo>, CoreError> {
+    pub fn git_blame(
+        &self,
+        rel_path: String,
+        text: String,
+    ) -> Result<Option<BlameInfo>, CoreError> {
         Ok(
             galaxy_core::git::blame(self.inner.root(), &rel_path, &text)?.map(|blame| BlameInfo {
                 commits: blame
@@ -2530,6 +2778,14 @@ pub struct TextSelection {
     pub head: TextPos,
 }
 
+/// A visual row: a logical line and the row within it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct RowPosition {
+    pub line: u64,
+    /// Row within the line, 0 for its first.
+    pub row: u64,
+}
+
 /// Cursor motions for arrow keys and friends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum CursorMotion {
@@ -2596,6 +2852,17 @@ pub enum EditCommand {
     Indent,
     Outdent,
     ToggleComment,
+    MoveLinesUp,
+    MoveLinesDown,
+    CopyLinesUp,
+    CopyLinesDown,
+    DeleteLines,
+    JoinLines,
+    UpperCase,
+    LowerCase,
+    TrimTrailingWhitespace,
+    SortLinesAscending,
+    SortLinesDescending,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
@@ -2876,6 +3143,10 @@ struct State {
     syntax: Option<SyntaxState>,
     diagnostics: Vec<DiagnosticInfo>,
     diagnostics_revision: u64,
+    /// Soft wrap width in columns; `None` while wrap is off.
+    wrap_columns: Option<usize>,
+    /// Row table for `wrap_columns`, rebuilt when the text or width changes.
+    wrap_map: Option<galaxy_core::wrap::WrapMap>,
 }
 
 struct SyntaxState {
@@ -2938,6 +3209,19 @@ impl SyntaxState {
 }
 
 impl State {
+    /// The row table for the current text and wrap width, rebuilt if stale.
+    fn wrap(&mut self) -> Option<&galaxy_core::wrap::WrapMap> {
+        let columns = self.wrap_columns?;
+        let stale = self
+            .wrap_map
+            .as_ref()
+            .is_none_or(|m| !m.is_current(&self.editor.doc, columns));
+        if stale {
+            self.wrap_map = Some(galaxy_core::wrap::WrapMap::build(&self.editor.doc, columns));
+        }
+        self.wrap_map.as_ref()
+    }
+
     /// Edits since the last load or save, ignoring the file's state.
     fn has_unsaved_edits(&self) -> bool {
         // Marked IME text is in the buffer but not yet in the history.
@@ -3402,6 +3686,23 @@ impl DocumentHandle {
                     Some(marker) => (edit::toggle_comment(doc, sel, marker), EditKind::Other),
                     None => return,
                 },
+                EditCommand::MoveLinesUp => (edit::move_lines(doc, sel, true), EditKind::Other),
+                EditCommand::MoveLinesDown => (edit::move_lines(doc, sel, false), EditKind::Other),
+                EditCommand::CopyLinesUp => (edit::copy_lines(doc, sel, true), EditKind::Other),
+                EditCommand::CopyLinesDown => (edit::copy_lines(doc, sel, false), EditKind::Other),
+                EditCommand::DeleteLines => (edit::delete_lines(doc, sel), EditKind::Other),
+                EditCommand::JoinLines => (edit::join_lines(doc, sel), EditKind::Other),
+                EditCommand::UpperCase => (edit::transform_case(doc, sel, true), EditKind::Other),
+                EditCommand::LowerCase => (edit::transform_case(doc, sel, false), EditKind::Other),
+                EditCommand::TrimTrailingWhitespace => {
+                    (edit::trim_trailing_whitespace(doc, sel), EditKind::Other)
+                }
+                EditCommand::SortLinesAscending => {
+                    (edit::sort_lines(doc, sel, false), EditKind::Other)
+                }
+                EditCommand::SortLinesDescending => {
+                    (edit::sort_lines(doc, sel, true), EditKind::Other)
+                }
             };
             ed.apply(tx, kind, Instant::now());
         }
@@ -3416,10 +3717,84 @@ impl DocumentHandle {
     /// Arrow keys, Home/End, Page Up/Down. `extend` is the Shift key.
     pub fn move_cursors(&self, motion: CursorMotion, extend: bool) {
         let mut st = self.lock();
+        let columns = st.wrap_columns;
         let ed = &mut st.editor;
-        let next = movement::move_selections(&ed.doc, &ed.sel, motion.into(), extend);
+        let next = match columns {
+            Some(columns) => {
+                movement::move_selections_wrapped(&ed.doc, &ed.sel, motion.into(), extend, columns)
+            }
+            None => movement::move_selections(&ed.doc, &ed.sel, motion.into(), extend),
+        };
         ed.set_selections(next);
         ed.history.break_group();
+    }
+
+    /// Turns soft wrap on at `columns` monospace columns, or off with
+    /// `None`. Row queries below answer in logical lines while it is off.
+    pub fn set_wrap_columns(&self, columns: Option<u32>) {
+        let mut st = self.lock();
+        let columns = columns.map(|c| (c as usize).max(galaxy_core::wrap::MIN_COLUMNS));
+        if st.wrap_columns != columns {
+            st.wrap_columns = columns;
+            st.wrap_map = None;
+        }
+    }
+
+    /// Visual rows in the document: `line_count` while wrap is off.
+    pub fn total_rows(&self) -> u64 {
+        let mut st = self.lock();
+        let lines = st.editor.doc.line_count() as u64;
+        st.wrap().map_or(lines, |m| m.total_rows())
+    }
+
+    /// First visual row of `line`.
+    pub fn row_of_line(&self, line: u64) -> u64 {
+        let mut st = self.lock();
+        let line = clamp_usize(line);
+        st.wrap().map_or(line as u64, |m| m.row_of_line(line))
+    }
+
+    /// Visual rows `line` takes.
+    pub fn rows_of_line(&self, line: u64) -> u64 {
+        let mut st = self.lock();
+        let line = clamp_usize(line);
+        st.wrap().map_or(1, |m| m.rows_of_line(line))
+    }
+
+    /// The line and row within it that a global visual row falls on.
+    pub fn line_at_row(&self, row: u64) -> RowPosition {
+        let mut st = self.lock();
+        let last = st.editor.doc.line_count().saturating_sub(1) as u64;
+        match st.wrap() {
+            Some(m) => {
+                let (line, in_line) = m.line_at_row(row);
+                RowPosition {
+                    line: line as u64,
+                    row: in_line as u64,
+                }
+            }
+            None => RowPosition {
+                line: row.min(last),
+                row: 0,
+            },
+        }
+    }
+
+    /// UTF-16 columns, within `line`, where rows after its first start.
+    /// Empty while wrap is off or when the line fits one row.
+    pub fn line_breaks(&self, line: u64) -> Vec<u64> {
+        let st = self.lock();
+        let Some(columns) = st.wrap_columns else {
+            return Vec::new();
+        };
+        let doc = &st.editor.doc;
+        let line = clamp_usize(line).min(doc.line_count().saturating_sub(1));
+        let start = doc.line_to_char(line);
+        let base = doc.char_to_utf16_offset(start);
+        galaxy_core::wrap::breaks_for_line(doc, line, columns)
+            .into_iter()
+            .map(|at| (doc.char_to_utf16_offset(start + at) - base) as u64)
+            .collect()
     }
 
     pub fn select_all(&self) {
@@ -3908,6 +4283,8 @@ impl DocumentHandle {
                 syntax,
                 diagnostics: Vec::new(),
                 diagnostics_revision: 0,
+                wrap_columns: None,
+                wrap_map: None,
             }),
         }
     }

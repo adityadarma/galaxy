@@ -1784,11 +1784,13 @@ impl LspManager {
                             self.workspace_symbols.insert(root, result);
                         }
                         if let Some(uri) = self.semantic_token_requests.remove(&(key.clone(), id))
-                            && let Some(result) = message
-                                .get("result")
-                                .and_then(|value| {
-                                    parse_semantic_tokens(value, &server.semantic_legend, server.declaration_bit)
-                                })
+                            && let Some(result) = message.get("result").and_then(|value| {
+                                parse_semantic_tokens(
+                                    value,
+                                    &server.semantic_legend,
+                                    server.declaration_bit,
+                                )
+                            })
                         {
                             self.semantic_tokens.insert(uri, result);
                         }
@@ -2243,7 +2245,9 @@ fn parse_declaration_bit(initialize: &Value) -> Option<u32> {
 /// server only adds value on names (types, functions, variables).
 fn semantic_scope(token_type: &str) -> Option<&'static str> {
     Some(match token_type {
-        "namespace" | "type" | "class" | "enum" | "interface" | "struct" | "typeParameter" => "type",
+        "namespace" | "type" | "class" | "enum" | "interface" | "struct" | "typeParameter" => {
+            "type"
+        }
         "parameter" | "variable" => "variable",
         "property" | "event" => "property",
         "enumMember" => "constant",
@@ -2281,8 +2285,11 @@ fn parse_semantic_tokens(
             start,
             length,
             scope: scope.to_owned(),
-            is_declaration: declaration_bit
-                .is_some_and(|bit| chunk[4].as_u64().is_some_and(|modifiers| modifiers >> bit & 1 == 1)),
+            is_declaration: declaration_bit.is_some_and(|bit| {
+                chunk[4]
+                    .as_u64()
+                    .is_some_and(|modifiers| modifiers >> bit & 1 == 1)
+            }),
         });
     }
     Some(output)
@@ -2337,7 +2344,7 @@ pub const LSP_RUNTIME_THREADS: usize = 2;
 /// One small Tokio runtime shared by every language-server transport. It
 /// lives for the process; it is never dropped, so dropping a transport from
 /// any context is safe.
-fn shared_runtime() -> io::Result<&'static Runtime> {
+pub(crate) fn shared_runtime() -> io::Result<&'static Runtime> {
     static RUNTIME: OnceLock<Runtime> = OnceLock::new();
     if let Some(runtime) = RUNTIME.get() {
         return Ok(runtime);
@@ -2465,7 +2472,7 @@ impl Drop for LspTransport {
     }
 }
 
-fn frame(payload: &[u8]) -> Vec<u8> {
+pub(crate) fn frame(payload: &[u8]) -> Vec<u8> {
     let mut out = format!("Content-Length: {}\r\n\r\n", payload.len()).into_bytes();
     out.extend_from_slice(payload);
     out
@@ -2505,7 +2512,7 @@ async fn read_messages<R: AsyncRead + Unpin>(
     }
 }
 
-async fn read_frame<R: AsyncRead + Unpin>(
+pub(crate) async fn read_frame<R: AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
 ) -> io::Result<Option<Vec<u8>>> {
     let mut headers = Vec::new();
@@ -2708,8 +2715,20 @@ mod tests {
         assert_eq!(
             tokens,
             vec![
-                SemanticTokenInfo { line: 1, start: 2, length: 3, scope: "type".into(), is_declaration: false },
-                SemanticTokenInfo { line: 1, start: 7, length: 2, scope: "variable".into(), is_declaration: false },
+                SemanticTokenInfo {
+                    line: 1,
+                    start: 2,
+                    length: 3,
+                    scope: "type".into(),
+                    is_declaration: false
+                },
+                SemanticTokenInfo {
+                    line: 1,
+                    start: 7,
+                    length: 2,
+                    scope: "variable".into(),
+                    is_declaration: false
+                },
             ]
         );
     }
@@ -2725,7 +2744,11 @@ mod tests {
             .collect();
         assert_eq!(
             scopes,
-            vec![(0, "variable".into()), (2, "type".into()), (6, "function".into())],
+            vec![
+                (0, "variable".into()),
+                (2, "type".into()),
+                (6, "function".into())
+            ],
             "keywords and strings are left to Tree-sitter"
         );
     }
@@ -2741,7 +2764,10 @@ mod tests {
         // Modifier bitsets: 0b10 declares, 0b01 only readonly.
         let value = serde_json::json!({ "data": [0, 0, 3, 0, 2, 0, 5, 3, 0, 1] });
         let tokens = parse_semantic_tokens(&value, &legend, bit).unwrap();
-        assert_eq!(tokens.iter().map(|t| t.is_declaration).collect::<Vec<_>>(), vec![true, false]);
+        assert_eq!(
+            tokens.iter().map(|t| t.is_declaration).collect::<Vec<_>>(),
+            vec![true, false]
+        );
         assert_eq!(parse_declaration_bit(&serde_json::json!({})), None);
     }
 
@@ -2756,8 +2782,14 @@ mod tests {
         let reply = serde_json::json!({ "id": 0, "result": { "capabilities": {
             "semanticTokensProvider": { "legend": { "tokenTypes": ["class", "parameter"], "tokenModifiers": [] } }
         } } });
-        assert_eq!(parse_semantic_legend(&reply), legend(&["class", "parameter"]));
-        assert!(parse_semantic_legend(&serde_json::json!({ "result": { "capabilities": {} } })).is_empty());
+        assert_eq!(
+            parse_semantic_legend(&reply),
+            legend(&["class", "parameter"])
+        );
+        assert!(
+            parse_semantic_legend(&serde_json::json!({ "result": { "capabilities": {} } }))
+                .is_empty()
+        );
     }
 
     #[test]

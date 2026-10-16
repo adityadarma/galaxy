@@ -169,15 +169,30 @@ fn parse_refs(decoration: &str) -> Vec<GitRef> {
         .filter(|part| !part.is_empty() && !part.ends_with("/HEAD"))
         .map(|part| {
             if let Some(tag) = part.strip_prefix("tag: ") {
-                GitRef { name: tag.to_owned(), kind: GitRefKind::Tag }
+                GitRef {
+                    name: tag.to_owned(),
+                    kind: GitRefKind::Tag,
+                }
             } else if let Some(branch) = part.strip_prefix("HEAD -> ") {
-                GitRef { name: branch.to_owned(), kind: GitRefKind::Head }
+                GitRef {
+                    name: branch.to_owned(),
+                    kind: GitRefKind::Head,
+                }
             } else if part == "HEAD" {
-                GitRef { name: "HEAD".to_owned(), kind: GitRefKind::Head }
+                GitRef {
+                    name: "HEAD".to_owned(),
+                    kind: GitRefKind::Head,
+                }
             } else if part.contains('/') {
-                GitRef { name: part.to_owned(), kind: GitRefKind::Remote }
+                GitRef {
+                    name: part.to_owned(),
+                    kind: GitRefKind::Remote,
+                }
             } else {
-                GitRef { name: part.to_owned(), kind: GitRefKind::Branch }
+                GitRef {
+                    name: part.to_owned(),
+                    kind: GitRefKind::Branch,
+                }
             }
         })
         .collect()
@@ -276,8 +291,14 @@ fn output_within(mut cmd: Command, limit: Duration) -> io::Result<Output> {
         .env("GIT_SEQUENCE_EDITOR", "true")
         .env("GIT_MERGE_AUTOEDIT", "no");
     let mut child = cmd.spawn()?;
-    let mut stdout = child.stdout.take().ok_or_else(|| io::Error::other("no stdout"))?;
-    let mut stderr = child.stderr.take().ok_or_else(|| io::Error::other("no stderr"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("no stdout"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("no stderr"))?;
     let out = thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = stdout.read_to_end(&mut buf);
@@ -355,7 +376,12 @@ pub fn remote_tags(root: &Path) -> io::Result<Option<BTreeSet<String>>> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(io::Error::other(
-            stderr.lines().next().unwrap_or("ls-remote failed").trim().to_owned(),
+            stderr
+                .lines()
+                .next()
+                .unwrap_or("ls-remote failed")
+                .trim()
+                .to_owned(),
         ));
     }
     Ok(Some(
@@ -396,7 +422,12 @@ pub fn push_tag(root: &Path, name: &str) -> io::Result<()> {
         return Err(io::Error::other("invalid tag name"));
     }
     let target = format!("refs/tags/{name}");
-    run_git(root, &["push", REMOTE, &target], "pushing tag", NETWORK_TIMEOUT)
+    run_git(
+        root,
+        &["push", REMOTE, &target],
+        "pushing tag",
+        NETWORK_TIMEOUT,
+    )
 }
 
 /// An unfinished cherry-pick, revert, merge or rebase: its name and the
@@ -408,7 +439,11 @@ fn in_progress(root: &Path) -> Option<(&'static str, &'static [&'static str])> {
         ("rebase-merge", "rebase", &["rebase", "--abort"]),
         ("rebase-apply", "rebase", &["rebase", "--abort"]),
         ("MERGE_HEAD", "merge", &["merge", "--abort"]),
-        ("CHERRY_PICK_HEAD", "cherry-pick", &["cherry-pick", "--abort"]),
+        (
+            "CHERRY_PICK_HEAD",
+            "cherry-pick",
+            &["cherry-pick", "--abort"],
+        ),
         ("REVERT_HEAD", "revert", &["revert", "--abort"]),
     ];
     states
@@ -435,7 +470,11 @@ fn checked_commit_id(rev: &str) -> io::Result<()> {
 }
 
 fn parent_count(root: &Path, rev: &str) -> io::Result<usize> {
-    let output = git_output(root, &["rev-list", "--parents", "-n", "1", rev], LOCAL_TIMEOUT)?;
+    let output = git_output(
+        root,
+        &["rev-list", "--parents", "-n", "1", rev],
+        LOCAL_TIMEOUT,
+    )?;
     if !output.status.success() {
         return Err(io::Error::other("unknown commit"));
     }
@@ -491,7 +530,12 @@ fn commit_staged_for(root: &Path, flag: &str, rev: &str, what: &str) -> io::Resu
             "{what} failed: nothing is staged; stage the changes first"
         )));
     }
-    run_git(root, &["commit", &format!("{flag}={rev}")], what, LOCAL_TIMEOUT)
+    run_git(
+        root,
+        &["commit", &format!("{flag}={rev}")],
+        what,
+        LOCAL_TIMEOUT,
+    )
 }
 
 /// Commits the staged changes as `fixup! <subject of rev>`.
@@ -507,9 +551,15 @@ pub fn commit_squash(root: &Path, rev: &str) -> io::Result<()> {
 /// Undoes the last commit and keeps its changes staged.
 pub fn reset_last_commit_soft(root: &Path) -> io::Result<()> {
     ensure_idle(root)?;
-    let parent = git_output(root, &["rev-parse", "--verify", "--quiet", "HEAD~1"], LOCAL_TIMEOUT)?;
+    let parent = git_output(
+        root,
+        &["rev-parse", "--verify", "--quiet", "HEAD~1"],
+        LOCAL_TIMEOUT,
+    )?;
     if !parent.status.success() {
-        return Err(io::Error::other("HEAD is the first commit; there is nothing to undo"));
+        return Err(io::Error::other(
+            "HEAD is the first commit; there is nothing to undo",
+        ));
     }
     run_git(root, &["reset", "--soft", "HEAD~1"], "reset", LOCAL_TIMEOUT)
 }
@@ -559,15 +609,29 @@ pub fn drop_commit(root: &Path, rev: &str) -> io::Result<()> {
     }
     // `rebase --onto rev^ rev` replays rev..HEAD; for a commit outside this
     // branch that would replay unrelated history.
-    let ancestor = git_output(root, &["merge-base", "--is-ancestor", rev, "HEAD"], LOCAL_TIMEOUT)?;
+    let ancestor = git_output(
+        root,
+        &["merge-base", "--is-ancestor", rev, "HEAD"],
+        LOCAL_TIMEOUT,
+    )?;
     match ancestor.status.code() {
         Some(0) => {}
-        Some(1) => return Err(io::Error::other("that commit is not part of the current branch")),
+        Some(1) => {
+            return Err(io::Error::other(
+                "that commit is not part of the current branch",
+            ));
+        }
         _ => return Err(io::Error::other("could not check the commit against HEAD")),
     }
     run_abortable(
         root,
-        &["rebase", "--rebase-merges", "--onto", &format!("{rev}^"), rev],
+        &[
+            "rebase",
+            "--rebase-merges",
+            "--onto",
+            &format!("{rev}^"),
+            rev,
+        ],
         "drop",
     )
 }
@@ -578,7 +642,13 @@ pub fn is_on_remote(root: &Path, rev: &str) -> io::Result<bool> {
     checked_commit_id(rev)?;
     let output = git_output(
         root,
-        &["for-each-ref", "--count=1", "--contains", rev, "refs/remotes"],
+        &[
+            "for-each-ref",
+            "--count=1",
+            "--contains",
+            rev,
+            "refs/remotes",
+        ],
         LOCAL_TIMEOUT,
     )?;
     if !output.status.success() {
@@ -688,7 +758,12 @@ pub fn create_branch_at(root: &Path, name: &str, rev: &str) -> io::Result<()> {
     if !valid_commit_id(rev) {
         return Err(io::Error::other("invalid commit id"));
     }
-    run_git(root, &["switch", "-c", name, rev], "creating branch", LOCAL_TIMEOUT)
+    run_git(
+        root,
+        &["switch", "-c", name, rev],
+        "creating branch",
+        LOCAL_TIMEOUT,
+    )
 }
 
 /// Creates a lightweight tag `name` at commit `rev`.
@@ -707,7 +782,12 @@ pub fn checkout_commit(root: &Path, rev: &str) -> io::Result<()> {
     if !valid_commit_id(rev) {
         return Err(io::Error::other("invalid commit id"));
     }
-    run_git(root, &["checkout", "--detach", rev], "checkout", LOCAL_TIMEOUT)
+    run_git(
+        root,
+        &["checkout", "--detach", rev],
+        "checkout",
+        LOCAL_TIMEOUT,
+    )
 }
 
 pub fn checkout(root: &Path, name: &str) -> io::Result<()> {
@@ -1284,18 +1364,29 @@ mod tests {
         run(dir.path(), ["init", "-b", "main"]);
         fs::write(dir.path().join("a.txt"), "a\n").unwrap();
         run(dir.path(), ["add", "a.txt"]);
-        run(dir.path(), [id[0], id[1], id[2], id[3], "commit", "-m", "base"]);
+        run(
+            dir.path(),
+            [id[0], id[1], id[2], id[3], "commit", "-m", "base"],
+        );
         run(dir.path(), ["switch", "-c", "feature"]);
         fs::write(dir.path().join("b.txt"), "b\n").unwrap();
         run(dir.path(), ["add", "b.txt"]);
-        run(dir.path(), [id[0], id[1], id[2], id[3], "commit", "-m", "on feature"]);
+        run(
+            dir.path(),
+            [id[0], id[1], id[2], id[3], "commit", "-m", "on feature"],
+        );
         run(dir.path(), ["switch", "main"]);
         fs::write(dir.path().join("c.txt"), "c\n").unwrap();
         run(dir.path(), ["add", "c.txt"]);
-        run(dir.path(), [id[0], id[1], id[2], id[3], "commit", "-m", "on main"]);
         run(
             dir.path(),
-            [id[0], id[1], id[2], id[3], "merge", "--no-ff", "feature", "-m", "merge"],
+            [id[0], id[1], id[2], id[3], "commit", "-m", "on main"],
+        );
+        run(
+            dir.path(),
+            [
+                id[0], id[1], id[2], id[3], "merge", "--no-ff", "feature", "-m", "merge",
+            ],
         );
 
         let commits = log_graph(dir.path(), 50).unwrap();
@@ -1306,8 +1397,17 @@ mod tests {
         let merge = &commits[0];
         assert_eq!(merge.parents.len(), 2);
         assert_eq!(merge.lane, 0);
-        assert_eq!(merge.outgoing, [0, 1], "first parent stays, second branches");
-        assert!(merge.refs.iter().any(|r| r.kind == GitRefKind::Head && r.name == "main"));
+        assert_eq!(
+            merge.outgoing,
+            [0, 1],
+            "first parent stays, second branches"
+        );
+        assert!(
+            merge
+                .refs
+                .iter()
+                .any(|r| r.kind == GitRefKind::Head && r.name == "main")
+        );
         let base = commits.last().unwrap();
         assert_eq!(base.lane, 0);
         assert_eq!(base.incoming, [0, 1], "both lines end at the root commit");
@@ -1343,9 +1443,15 @@ mod tests {
         run(dir.path(), ["init", "-b", "main"]);
         fs::write(dir.path().join("a.txt"), "a\n").unwrap();
         run(dir.path(), ["add", "a.txt"]);
-        run(dir.path(), [id[0], id[1], id[2], id[3], "commit", "-m", "one"]);
+        run(
+            dir.path(),
+            [id[0], id[1], id[2], id[3], "commit", "-m", "one"],
+        );
         fs::write(dir.path().join("a.txt"), "b\n").unwrap();
-        run(dir.path(), [id[0], id[1], id[2], id[3], "commit", "-am", "two"]);
+        run(
+            dir.path(),
+            [id[0], id[1], id[2], id[3], "commit", "-am", "two"],
+        );
         let commits = log_graph(dir.path(), 10).unwrap();
         let first = commits[1].hash.clone();
 
@@ -1355,16 +1461,28 @@ mod tests {
         assert_eq!(status.branch.as_deref(), Some("old"));
         let refs = log_graph(dir.path(), 10).unwrap();
         let on_first = refs.iter().find(|c| c.hash == first).unwrap();
-        assert!(on_first.refs.iter().any(|r| r.kind == GitRefKind::Tag && r.name == "v1"));
+        assert!(
+            on_first
+                .refs
+                .iter()
+                .any(|r| r.kind == GitRefKind::Tag && r.name == "v1")
+        );
 
         checkout_commit(dir.path(), &commits[0].hash).unwrap();
-        assert_eq!(read_status(dir.path()).unwrap().unwrap().branch, None, "detached");
+        assert_eq!(
+            read_status(dir.path()).unwrap().unwrap().branch,
+            None,
+            "detached"
+        );
 
         assert!(create_branch_at(dir.path(), "-bad", &first).is_err());
         assert!(create_branch_at(dir.path(), "has space", &first).is_err());
         assert!(create_tag(dir.path(), "v1", &first).is_err(), "tag exists");
         assert!(checkout_commit(dir.path(), "--help").is_err());
-        assert!(create_tag(dir.path(), "x", "main").is_err(), "only commit ids");
+        assert!(
+            create_tag(dir.path(), "x", "main").is_err(),
+            "only commit ids"
+        );
     }
 
     #[test]
@@ -1386,10 +1504,12 @@ mod tests {
         create_tag(&work, "v1", &hash).unwrap();
         create_tag(&work, "v2", &hash).unwrap();
         push_tag(&work, "v1").unwrap();
-        let names = |tags: Option<BTreeSet<String>>| {
-            tags.unwrap().into_iter().collect::<Vec<_>>()
-        };
-        assert_eq!(names(remote_tags(&work).unwrap()), ["v1"], "v2 is local only");
+        let names = |tags: Option<BTreeSet<String>>| tags.unwrap().into_iter().collect::<Vec<_>>();
+        assert_eq!(
+            names(remote_tags(&work).unwrap()),
+            ["v1"],
+            "v2 is local only"
+        );
 
         delete_remote_tag(&work, "v1").unwrap();
         assert!(names(remote_tags(&work).unwrap()).is_empty());
@@ -1412,7 +1532,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         run(dir.path(), ["init", "-b", "main"]);
         let missing = dir.path().join("does-not-exist.git");
-        run(dir.path(), ["remote", "add", "origin", missing.to_str().unwrap()]);
+        run(
+            dir.path(),
+            ["remote", "add", "origin", missing.to_str().unwrap()],
+        );
         assert!(remote_tags(dir.path()).is_err());
     }
 
@@ -1515,7 +1638,10 @@ mod tests {
         assert!(in_progress(d).is_some());
         let error = merge(d, &theirs).unwrap_err().to_string();
         assert!(error.contains("already in progress"), "{error}");
-        assert!(in_progress(d).is_some(), "the user's operation is not aborted");
+        assert!(
+            in_progress(d).is_some(),
+            "the user's operation is not aborted"
+        );
     }
 
     #[test]
@@ -1533,7 +1659,10 @@ mod tests {
         assert!(revert(d, &merged).is_err());
         assert!(drop_commit(d, &merged).is_err());
         let root = log_graph(d, 50).unwrap().pop().unwrap().hash;
-        assert!(drop_commit(d, &root).is_err(), "a root commit has no parent");
+        assert!(
+            drop_commit(d, &root).is_err(),
+            "a root commit has no parent"
+        );
     }
 
     #[test]
@@ -1567,12 +1696,18 @@ mod tests {
         reset_last_commit_soft(d).unwrap();
         assert_eq!(head(d), first);
         let status = read_status(d).unwrap().unwrap();
-        assert!(status.files.iter().any(|f| f.path == "a.txt" && f.staged), "kept staged");
+        assert!(
+            status.files.iter().any(|f| f.path == "a.txt" && f.staged),
+            "kept staged"
+        );
 
         run(d, ["commit", "-am", "two again"]);
         reset_to(d, &first, GitResetMode::Mixed).unwrap();
         let status = read_status(d).unwrap().unwrap();
-        assert!(status.files.iter().any(|f| f.path == "a.txt" && !f.staged), "kept unstaged");
+        assert!(
+            status.files.iter().any(|f| f.path == "a.txt" && !f.staged),
+            "kept unstaged"
+        );
         assert_eq!(fs::read_to_string(d.join("a.txt")).unwrap(), "two\n");
 
         reset_to(d, &first, GitResetMode::Hard).unwrap();
@@ -1581,7 +1716,10 @@ mod tests {
 
         let only = log_graph(d, 5).unwrap().pop().unwrap().hash;
         reset_to(d, &only, GitResetMode::Soft).unwrap();
-        assert!(reset_last_commit_soft(d).is_err(), "first commit has no parent");
+        assert!(
+            reset_last_commit_soft(d).is_err(),
+            "first commit has no parent"
+        );
     }
 
     #[test]
@@ -1648,7 +1786,15 @@ mod tests {
         run(&work, ["init", "-b", "main"]);
         run(&work, ["config", "user.name", "Test"]);
         run(&work, ["config", "user.email", "t@example.com"]);
-        run(&work, ["remote", "add", "origin", dir.path().join("remote.git").to_str().unwrap()]);
+        run(
+            &work,
+            [
+                "remote",
+                "add",
+                "origin",
+                dir.path().join("remote.git").to_str().unwrap(),
+            ],
+        );
         let pushed = commit_file(&work, "a.txt", "a\n", "pushed");
         assert!(!is_on_remote(&work, &pushed).unwrap(), "nothing pushed yet");
         run(&work, ["push", "-u", "origin", "main"]);
@@ -1687,7 +1833,10 @@ mod tests {
             ]
         );
         let diff = compare_diff(d, &mid, &to, "keep.txt", None).unwrap();
-        assert!(diff.contains("-k\n") && diff.contains("+k changed"), "{diff}");
+        assert!(
+            diff.contains("-k\n") && diff.contains("+k changed"),
+            "{diff}"
+        );
         let renamed = compare_diff(d, &mid, &to, "new.txt", Some("old.txt")).unwrap();
         assert!(renamed.contains("rename from old.txt"), "{renamed}");
         assert!(compare_files(d, &from, "--help").is_err());

@@ -42,12 +42,25 @@ pub enum SyntaxLanguage {
     Css,
     Bash,
     Php,
+    C,
+    Cpp,
+    CSharp,
+    Java,
+    Ruby,
+    Lua,
+    Swift,
+    Sql,
+    Make,
+    Ini,
+    PowerShell,
+    Dart,
+    R,
     /// `.blade.php`: HTML grammar plus the [`crate::blade`] overlay.
     Blade,
 }
 
 impl SyntaxLanguage {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 28] = [
         Self::Rust,
         Self::TypeScript,
         Self::Tsx,
@@ -62,6 +75,19 @@ impl SyntaxLanguage {
         Self::Css,
         Self::Bash,
         Self::Php,
+        Self::C,
+        Self::Cpp,
+        Self::CSharp,
+        Self::Java,
+        Self::Ruby,
+        Self::Lua,
+        Self::Swift,
+        Self::Sql,
+        Self::Make,
+        Self::Ini,
+        Self::PowerShell,
+        Self::Dart,
+        Self::R,
         Self::Blade,
     ];
 
@@ -81,6 +107,19 @@ impl SyntaxLanguage {
             Self::Css => "CSS",
             Self::Bash => "Bash",
             Self::Php => "PHP",
+            Self::C => "C",
+            Self::Cpp => "C++",
+            Self::CSharp => "C#",
+            Self::Java => "Java",
+            Self::Ruby => "Ruby",
+            Self::Lua => "Lua",
+            Self::Swift => "Swift",
+            Self::Sql => "SQL",
+            Self::Make => "Makefile",
+            Self::Ini => "INI",
+            Self::PowerShell => "PowerShell",
+            Self::Dart => "Dart",
+            Self::R => "R",
             Self::Blade => "Blade",
         }
     }
@@ -91,6 +130,12 @@ impl SyntaxLanguage {
         match self {
             Self::Rust | Self::TypeScript | Self::Tsx | Self::JavaScript | Self::Go => Some("//"),
             Self::Toml | Self::Yaml | Self::Python | Self::Bash => Some("#"),
+            Self::Ruby | Self::Make | Self::PowerShell | Self::R => Some("#"),
+            Self::C | Self::Cpp | Self::CSharp | Self::Java | Self::Swift | Self::Dart => {
+                Some("//")
+            }
+            Self::Lua | Self::Sql => Some("--"),
+            Self::Ini => Some(";"),
             Self::Json | Self::Html | Self::Css | Self::Markdown | Self::Blade => None,
             Self::Php => Some("//"),
         }
@@ -112,6 +157,19 @@ impl SyntaxLanguage {
             Self::Css => tree_sitter_css::LANGUAGE.into(),
             Self::Bash => tree_sitter_bash::LANGUAGE.into(),
             Self::Php => tree_sitter_php::LANGUAGE_PHP.into(),
+            Self::C => tree_sitter_c::LANGUAGE.into(),
+            Self::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+            Self::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
+            Self::Java => tree_sitter_java::LANGUAGE.into(),
+            Self::Ruby => tree_sitter_ruby::LANGUAGE.into(),
+            Self::Lua => tree_sitter_lua::LANGUAGE.into(),
+            Self::Swift => tree_sitter_swift::LANGUAGE.into(),
+            Self::Sql => tree_sitter_sequel::LANGUAGE.into(),
+            Self::Make => tree_sitter_make::LANGUAGE.into(),
+            Self::Ini => tree_sitter_ini::LANGUAGE.into(),
+            Self::PowerShell => tree_sitter_powershell::LANGUAGE.into(),
+            Self::Dart => tree_sitter_dart::LANGUAGE.into(),
+            Self::R => tree_sitter_r::LANGUAGE.into(),
         }
     }
 
@@ -133,6 +191,19 @@ impl SyntaxLanguage {
             Self::Css => tree_sitter_css::HIGHLIGHTS_QUERY,
             Self::Bash => BASH_HIGHLIGHTS,
             Self::Php => tree_sitter_php::HIGHLIGHTS_QUERY,
+            Self::C => tree_sitter_c::HIGHLIGHT_QUERY,
+            Self::Cpp => tree_sitter_cpp::HIGHLIGHT_QUERY,
+            Self::CSharp => tree_sitter_c_sharp::HIGHLIGHTS_QUERY,
+            Self::Java => tree_sitter_java::HIGHLIGHTS_QUERY,
+            Self::Ruby => tree_sitter_ruby::HIGHLIGHTS_QUERY,
+            Self::Lua => tree_sitter_lua::HIGHLIGHTS_QUERY,
+            Self::Swift => tree_sitter_swift::HIGHLIGHTS_QUERY,
+            Self::Sql => tree_sitter_sequel::HIGHLIGHTS_QUERY,
+            Self::Make => tree_sitter_make::HIGHLIGHTS_QUERY,
+            Self::Ini => tree_sitter_ini::HIGHLIGHTS_QUERY,
+            Self::PowerShell => tree_sitter_powershell::HIGHLIGHTS_QUERY,
+            Self::Dart => tree_sitter_dart::HIGHLIGHTS_QUERY,
+            Self::R => tree_sitter_r::HIGHLIGHTS_QUERY,
         }
     }
 
@@ -145,6 +216,13 @@ impl SyntaxLanguage {
             Self::JavaScript => Some(tree_sitter_javascript::TAGS_QUERY),
             Self::Python => Some(tree_sitter_python::TAGS_QUERY),
             Self::Go => Some(tree_sitter_go::TAGS_QUERY),
+            Self::C => Some(tree_sitter_c::TAGS_QUERY),
+            Self::Cpp => Some(tree_sitter_cpp::TAGS_QUERY),
+            Self::CSharp => Some(tree_sitter_c_sharp::TAGS_QUERY),
+            Self::Java => Some(tree_sitter_java::TAGS_QUERY),
+            Self::Ruby => Some(tree_sitter_ruby::TAGS_QUERY),
+            Self::Lua => Some(tree_sitter_lua::TAGS_QUERY),
+            Self::Swift => Some(tree_sitter_swift::TAGS_QUERY),
             _ => None,
         }
     }
@@ -165,6 +243,8 @@ impl SyntaxLanguage {
         let by_name = match name.as_str() {
             "dockerfile" => None,
             "cargo.toml" => Some(Self::Toml),
+            "makefile" | "gnumakefile" => Some(Self::Make),
+            "gemfile" | "rakefile" => Some(Self::Ruby),
             _ => None,
         };
         if by_name.is_some() {
@@ -189,6 +269,19 @@ impl SyntaxLanguage {
             "css" => Some(Self::Css),
             "sh" | "bash" | "zsh" => Some(Self::Bash),
             "php" => Some(Self::Php),
+            "c" | "h" => Some(Self::C),
+            "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => Some(Self::Cpp),
+            "cs" => Some(Self::CSharp),
+            "java" => Some(Self::Java),
+            "rb" | "rake" | "gemspec" => Some(Self::Ruby),
+            "lua" => Some(Self::Lua),
+            "swift" => Some(Self::Swift),
+            "sql" => Some(Self::Sql),
+            "mk" | "mak" => Some(Self::Make),
+            "ini" | "cfg" | "conf" => Some(Self::Ini),
+            "ps1" | "psm1" | "psd1" => Some(Self::PowerShell),
+            "dart" => Some(Self::Dart),
+            "r" => Some(Self::R),
             _ => None,
         };
         if by_extension.is_some() {
@@ -204,6 +297,9 @@ impl SyntaxLanguage {
             "bash" | "sh" | "zsh" => Some(Self::Bash),
             "python" | "python3" => Some(Self::Python),
             "node" | "deno" => Some(Self::JavaScript),
+            "ruby" => Some(Self::Ruby),
+            "lua" => Some(Self::Lua),
+            "pwsh" => Some(Self::PowerShell),
             _ => None,
         }
     }
@@ -566,7 +662,8 @@ impl<'a> Iterator for RopeByteChunks<'a> {
 }
 
 fn cached_tags_query(language: SyntaxLanguage) -> Option<&'static Query> {
-    static QUERIES: [OnceLock<Option<Query>>; 15] = [const { OnceLock::new() }; 15];
+    const N: usize = SyntaxLanguage::ALL.len();
+    static QUERIES: [OnceLock<Option<Query>>; N] = [const { OnceLock::new() }; N];
     let slot = &QUERIES[language as usize];
     slot.get_or_init(|| {
         language
@@ -577,7 +674,8 @@ fn cached_tags_query(language: SyntaxLanguage) -> Option<&'static Query> {
 }
 
 fn cached_highlight_query(language: SyntaxLanguage) -> Option<&'static Query> {
-    static QUERIES: [OnceLock<Option<Query>>; 15] = [const { OnceLock::new() }; 15];
+    const N: usize = SyntaxLanguage::ALL.len();
+    static QUERIES: [OnceLock<Option<Query>>; N] = [const { OnceLock::new() }; N];
     let slot = &QUERIES[language as usize];
     slot.get_or_init(|| language.compile_highlights().ok())
         .as_ref()
@@ -1071,6 +1169,22 @@ mod tests {
                 SyntaxLanguage::Php,
                 "<?php function hello(string $name): string { return $name; }",
             ),
+            (SyntaxLanguage::C, "int main(void) { return 0; }"),
+            (
+                SyntaxLanguage::Cpp,
+                "class A { public: int f() { return 1; } };",
+            ),
+            (SyntaxLanguage::CSharp, "class A { int F() { return 1; } }"),
+            (SyntaxLanguage::Java, "class A { int f() { return 1; } }"),
+            (SyntaxLanguage::Ruby, "def f\n  1\nend"),
+            (SyntaxLanguage::Lua, "local n = 1"),
+            (SyntaxLanguage::Swift, "func f() -> Int { return 1 }"),
+            (SyntaxLanguage::Sql, "SELECT id FROM users;"),
+            (SyntaxLanguage::Make, "all:\n\techo hi\n"),
+            (SyntaxLanguage::Ini, "[core]\nname = galaxy\n"),
+            (SyntaxLanguage::PowerShell, "$n = 1"),
+            (SyntaxLanguage::Dart, "int f() { return 1; }"),
+            (SyntaxLanguage::R, "x <- 1"),
             (
                 SyntaxLanguage::Blade,
                 "<p>{{ $name }}</p>\n@if ($a)\n@endif",
@@ -1213,6 +1327,24 @@ mod tests {
             SyntaxLanguage::detect("resources/views/welcome.blade.php", "<?php"),
             Some(SyntaxLanguage::Blade)
         );
+        for (path, expected) in [
+            ("main.c", SyntaxLanguage::C),
+            ("main.cpp", SyntaxLanguage::Cpp),
+            ("Program.cs", SyntaxLanguage::CSharp),
+            ("Main.java", SyntaxLanguage::Java),
+            ("app.rb", SyntaxLanguage::Ruby),
+            ("Gemfile", SyntaxLanguage::Ruby),
+            ("init.lua", SyntaxLanguage::Lua),
+            ("App.swift", SyntaxLanguage::Swift),
+            ("query.sql", SyntaxLanguage::Sql),
+            ("Makefile", SyntaxLanguage::Make),
+            ("setup.ini", SyntaxLanguage::Ini),
+            ("run.ps1", SyntaxLanguage::PowerShell),
+            ("main.dart", SyntaxLanguage::Dart),
+            ("plot.R", SyntaxLanguage::R),
+        ] {
+            assert_eq!(SyntaxLanguage::detect(path, ""), Some(expected), "{path}");
+        }
     }
 
     #[test]
@@ -1242,6 +1374,56 @@ mod tests {
         );
         assert_eq!(symbols[0].kind, "class");
         assert_eq!(symbols[1].kind, "method");
+    }
+
+    #[test]
+    fn every_tags_query_compiles_and_outlines_its_sample() {
+        let samples = [
+            (SyntaxLanguage::Rust, "fn alpha() {}\n", "alpha"),
+            (
+                SyntaxLanguage::C,
+                "int alpha(void) { return 0; }\n",
+                "alpha",
+            ),
+            (
+                SyntaxLanguage::Cpp,
+                "class Alpha { public: int f() { return 1; } };\n",
+                "Alpha",
+            ),
+            (
+                SyntaxLanguage::CSharp,
+                "class Alpha { int F() { return 1; } }\n",
+                "Alpha",
+            ),
+            (
+                SyntaxLanguage::Java,
+                "class Alpha { int f() { return 1; } }\n",
+                "Alpha",
+            ),
+            (SyntaxLanguage::Ruby, "def alpha\n  1\nend\n", "alpha"),
+            (SyntaxLanguage::Lua, "function alpha() end\n", "alpha"),
+            (
+                SyntaxLanguage::Swift,
+                "func alpha() -> Int { return 1 }\n",
+                "alpha",
+            ),
+        ];
+        for (language, source, expected) in samples {
+            let tags = language.tags_query().expect("tags query");
+            Query::new(&language.grammar(), tags).unwrap_or_else(|error| {
+                panic!("{} tags query did not compile: {error}", language.name())
+            });
+            let doc = Document::from_text(source);
+            let mut parser = Parser::new();
+            parser.set_language(&language.grammar()).unwrap();
+            let tree = parser.parse(source, None).unwrap();
+            let symbols = outline_symbols(&doc, &tree, language);
+            assert!(
+                symbols.iter().any(|symbol| symbol.name == expected),
+                "{} outline missing {expected}: {symbols:?}",
+                language.name()
+            );
+        }
     }
 
     #[test]

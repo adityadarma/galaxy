@@ -77,6 +77,146 @@ fn move_one(doc: &Document, s: Selection, motion: Motion, extend: bool) -> Selec
     moved.with_goal_col(goal)
 }
 
+/// Like `move_selections`, but with soft wrap on: up/down/page move by
+/// visual row, and Home/End act on the row under the caret.
+pub fn move_selections_wrapped(
+    doc: &Document,
+    sel: &SelectionSet,
+    motion: Motion,
+    extend: bool,
+    columns: usize,
+) -> SelectionSet {
+    match motion {
+        Motion::Up | Motion::Down | Motion::PageUp(_) | Motion::PageDown(_) | Motion::LineEnd => {
+            let mut out = sel.clone();
+            out.transform(doc, |s| move_wrapped(doc, s, motion, extend, columns));
+            out
+        }
+        // Home keeps its smart toggle on the first row only.
+        Motion::LineStart => {
+            let mut out = sel.clone();
+            out.transform(doc, |s| {
+                let head = s.head.min(doc.len_chars());
+                let (line, row) = row_of(doc, head, columns);
+                if row == 0 {
+                    return move_one(doc, s, motion, extend);
+                }
+                let target = row_start_char(doc, line, row, columns);
+                let moved = if extend {
+                    Selection::new(s.anchor.min(doc.len_chars()), target)
+                } else {
+                    Selection::caret(target)
+                };
+                moved.with_goal_col(None)
+            });
+            out
+        }
+        _ => move_selections(doc, sel, motion, extend),
+    }
+}
+
+/// `(line, row within the line)` of the char offset `head`.
+fn row_of(doc: &Document, head: usize, columns: usize) -> (usize, usize) {
+    let line = doc.char_to_line(head);
+    let col = head - doc.line_to_char(line);
+    let breaks = crate::wrap::breaks_for_line(doc, line, columns);
+    (line, breaks.partition_point(|b| *b <= col))
+}
+
+fn row_start_char(doc: &Document, line: usize, row: usize, columns: usize) -> usize {
+    let start = doc.line_to_char(line);
+    if row == 0 {
+        return start;
+    }
+    start + crate::wrap::breaks_for_line(doc, line, columns)[row - 1]
+}
+
+/// Last caret slot of a row: the line end for the last row, else just
+/// before the first grapheme of the next row.
+fn row_end_char(doc: &Document, line: usize, row: usize, columns: usize) -> usize {
+    let breaks = crate::wrap::breaks_for_line(doc, line, columns);
+    match breaks.get(row) {
+        Some(next) => doc.prev_grapheme_boundary(doc.line_to_char(line) + next),
+        None => doc.line_end_char(line),
+    }
+}
+
+/// One visual row down (`true`) or up (`false`), or `None` at the edge.
+fn step_row(
+    doc: &Document,
+    line: usize,
+    row: usize,
+    down: bool,
+    columns: usize,
+) -> Option<(usize, usize)> {
+    if down {
+        if row + 1 < crate::wrap::rows_in_line(doc, line, columns) {
+            Some((line, row + 1))
+        } else if line + 1 < doc.line_count() {
+            Some((line + 1, 0))
+        } else {
+            None
+        }
+    } else if row > 0 {
+        Some((line, row - 1))
+    } else if line > 0 {
+        let rows = crate::wrap::rows_in_line(doc, line - 1, columns);
+        Some((line - 1, rows - 1))
+    } else {
+        None
+    }
+}
+
+fn move_wrapped(
+    doc: &Document,
+    s: Selection,
+    motion: Motion,
+    extend: bool,
+    columns: usize,
+) -> Selection {
+    let head = s.head.min(doc.len_chars());
+    let (line, row) = row_of(doc, head, columns);
+    let (target, goal) = if motion == Motion::LineEnd {
+        (snap(doc, row_end_char(doc, line, row, columns)), None)
+    } else {
+        let (down, count) = match motion {
+            Motion::Up => (false, 1),
+            Motion::Down => (true, 1),
+            Motion::PageUp(n) => (false, n.max(1)),
+            Motion::PageDown(n) => (true, n.max(1)),
+            _ => unreachable!("handled by the caller"),
+        };
+        let col = s
+            .goal_col
+            .unwrap_or(head - row_start_char(doc, line, row, columns));
+        let (mut l, mut r) = (line, row);
+        let mut hit_edge = false;
+        for _ in 0..count {
+            match step_row(doc, l, r, down, columns) {
+                Some(next) => (l, r) = next,
+                None => {
+                    hit_edge = true;
+                    break;
+                }
+            }
+        }
+        if hit_edge && (l, r) == (line, row) {
+            // Already on the first or last row: jump to the document edge.
+            (if down { doc.len_chars() } else { 0 }, Some(col))
+        } else {
+            let start = row_start_char(doc, l, r, columns);
+            let end = row_end_char(doc, l, r, columns);
+            (snap(doc, (start + col).min(end)), Some(col))
+        }
+    };
+    let moved = if extend {
+        Selection::new(s.anchor.min(doc.len_chars()), target)
+    } else {
+        Selection::caret(target)
+    };
+    moved.with_goal_col(goal)
+}
+
 /// Vertical movement keeps a sticky column. Past the first or last line the
 /// caret jumps to the document start or end, as in VSCode.
 fn vertical(doc: &Document, s: &Selection, head: usize, delta: isize) -> (usize, Option<usize>) {
@@ -577,5 +717,68 @@ mod tests {
             let l = line_at(&d, pos);
             prop_assert!(l.start() <= pos.min(len) && pos.min(len) <= l.end());
         }
+    }
+}
+
+#[cfg(test)]
+mod wrap_tests {
+    use super::*;
+    use crate::selection::SelectionSet;
+
+    fn at(_doc: &Document, pos: usize) -> SelectionSet {
+        SelectionSet::single(Selection::caret(pos))
+    }
+    fn head(sel: &SelectionSet) -> usize {
+        sel.primary().head
+    }
+
+    // 4 columns: "abcd" | "efgh" | "ij", then "xy"
+    const TEXT: &str = "abcdefghij\nxy";
+
+    #[test]
+    fn down_and_up_move_by_visual_row() {
+        let d = Document::from_text(TEXT);
+        let s = move_selections_wrapped(&d, &at(&d, 1), Motion::Down, false, 4);
+        assert_eq!(head(&s), 5, "same column on the second row");
+        let s = move_selections_wrapped(&d, &s, Motion::Down, false, 4);
+        assert_eq!(head(&s), 9, "third row is shorter: clamps to its end");
+        let s = move_selections_wrapped(&d, &s, Motion::Down, false, 4);
+        assert_eq!(head(&s), 12, "next logical line, sticky column 1");
+        let s = move_selections_wrapped(&d, &s, Motion::Up, false, 4);
+        assert_eq!(head(&s), 9);
+    }
+
+    #[test]
+    fn first_and_last_row_jump_to_the_document_edges() {
+        let d = Document::from_text(TEXT);
+        let s = move_selections_wrapped(&d, &at(&d, 2), Motion::Up, false, 4);
+        assert_eq!(head(&s), 0);
+        let s = move_selections_wrapped(&d, &at(&d, 12), Motion::Down, false, 4);
+        assert_eq!(head(&s), d.len_chars());
+    }
+
+    #[test]
+    fn page_moves_several_rows() {
+        let d = Document::from_text(TEXT);
+        let s = move_selections_wrapped(&d, &at(&d, 0), Motion::PageDown(3), false, 4);
+        assert_eq!(head(&s), 11, "four rows total, three down is the last");
+    }
+
+    #[test]
+    fn home_and_end_act_on_the_visual_row() {
+        let d = Document::from_text(TEXT);
+        let s = move_selections_wrapped(&d, &at(&d, 6), Motion::LineEnd, false, 4);
+        assert_eq!(head(&s), 7, "end of row two stops before the next row");
+        let s = move_selections_wrapped(&d, &at(&d, 6), Motion::LineStart, false, 4);
+        assert_eq!(head(&s), 4);
+        let s = move_selections_wrapped(&d, &at(&d, 9), Motion::LineEnd, false, 4);
+        assert_eq!(head(&s), 10, "last row ends at the line end");
+    }
+
+    #[test]
+    fn extend_keeps_the_anchor() {
+        let d = Document::from_text(TEXT);
+        let s = move_selections_wrapped(&d, &at(&d, 1), Motion::Down, true, 4);
+        assert_eq!((s.primary().anchor, s.primary().head), (1, 5));
     }
 }

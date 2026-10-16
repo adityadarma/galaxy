@@ -6,6 +6,8 @@ final class BreadcrumbBar: NSView {
     private let stack = NSStackView()
     private var heightConstraint: NSLayoutConstraint!
     private var visibleSymbols: [OutlineSymbol] = []
+    /// Off: the bar stays hidden whatever the cursor is in.
+    var isEnabled = true
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -29,7 +31,7 @@ final class BreadcrumbBar: NSView {
 
     func show(symbols: [OutlineSymbol], atLine line: UInt64) {
         stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
-        let visible = symbols
+        let visible = (isEnabled ? symbols : [])
             .filter { $0.line <= line }
             .sorted { $0.line == $1.line ? $0.column < $1.column : $0.line < $1.line }
         visibleSymbols = visible

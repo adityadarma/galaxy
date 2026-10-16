@@ -25,6 +25,55 @@ final class MainWindowTests: XCTestCase {
         XCTAssertEqual(view.document?.lines(first: 0, count: 1), ["hello"])
     }
 
+    func testViewMenuZoomPanelsAndToggles() throws {
+        let defaults = UserDefaults.standard
+        let savedSize = defaults.object(forKey: "EditorFontSize")
+        let savedCrumbs = defaults.object(forKey: "ShowBreadcrumbs")
+        let savedSticky = defaults.object(forKey: "StickyScroll")
+        defer {
+            defaults.set(savedSize, forKey: "EditorFontSize")
+            defaults.set(savedCrumbs, forKey: "ShowBreadcrumbs")
+            defaults.set(savedSticky, forKey: "StickyScroll")
+        }
+        defaults.set(13.0, forKey: "EditorFontSize")
+        let c = MainWindowController(bridge: CoreBridge())
+        c.showWindow(nil)
+        defer { c.window?.orderOut(nil) }
+
+        c.zoomEditorIn(nil)
+        XCTAssertEqual(c.editorView.font.pointSize, 14)
+        c.zoomEditorOut(nil)
+        c.zoomEditorOut(nil)
+        XCTAssertEqual(c.editorView.font.pointSize, 12)
+        c.zoomEditorReset(nil)
+        XCTAssertEqual(c.editorView.font.pointSize, 13)
+        defaults.set(24.0, forKey: "EditorFontSize")
+        c.zoomEditorIn(nil)
+        XCTAssertEqual(c.editorView.font.pointSize, 24, "stays within the Settings range")
+
+        XCTAssertFalse(c.isBottomPanelVisible)
+        c.showProblemsPanel(nil)
+        XCTAssertTrue(c.isBottomPanelVisible)
+        XCTAssertEqual(c.bottomPanelTab, .problems)
+        c.showOutputPanel(nil)
+        XCTAssertEqual(c.bottomPanelTab, .output)
+
+        let crumbs = NSMenuItem(title: "", action: #selector(MainWindowController.toggleBreadcrumbs(_:)), keyEquivalent: "")
+        XCTAssertTrue(c.validateMenuItem(crumbs))
+        XCTAssertEqual(crumbs.state, .on)
+        c.toggleBreadcrumbs(nil)
+        _ = c.validateMenuItem(crumbs)
+        XCTAssertEqual(crumbs.state, .off)
+        XCTAssertEqual(defaults.bool(forKey: "ShowBreadcrumbs"), false)
+
+        let sticky = NSMenuItem(title: "", action: #selector(MainWindowController.toggleStickyScroll(_:)), keyEquivalent: "")
+        _ = c.validateMenuItem(sticky)
+        XCTAssertEqual(sticky.state, .on)
+        c.toggleStickyScroll(nil)
+        _ = c.validateMenuItem(sticky)
+        XCTAssertEqual(sticky.state, .off)
+    }
+
     func testEditorHasTopInsetOverlayScrollerAndCopperCaretLine() throws {
         let controller = MainWindowController(bridge: CoreBridge())
         controller.showWindow(nil)

@@ -52,6 +52,7 @@ extension EditorView {
 
     /// Lines in one page, keeping one line of overlap.
     var pageLines: UInt32 {
+        // Counted in rows when wrap is on; the core moves by visual row.
         UInt32(max(1, Int(visibleRect.height / metrics.lineHeight) - 1))
     }
 
@@ -83,13 +84,21 @@ extension EditorView {
     /// below or beside the text clamp to the nearest valid position.
     func textPosition(at point: NSPoint) -> TextPos {
         guard let document, lineCount > 0 else { return TextPos(line: 0, colUtf16: 0) }
-        let row = point.y / metrics.lineHeight
-        let clamped = row.isFinite ? min(max(row, 0), CGFloat(lineCount - 1)) : 0
-        let line = Int(floor(clamped))
-        let text = document.displayLine(line: UInt64(line))
-        let index = text.isEmpty ? 0 : max(0, CTLineGetStringIndexForPosition(
-            layout(for: text), CGPoint(x: point.x - textOriginX, y: 0)))
-        return TextPos(line: UInt64(line), colUtf16: UInt64(index))
+        let (line, row) = self.line(atY: min(max(point.y, 0), CGFloat(max(rowCount, 1)) * metrics.lineHeight - 1))
+        let text = document.displayLine(line: line)
+        guard !text.isEmpty else { return TextPos(line: line, colUtf16: 0) }
+        let rows = lineRows(line)
+        // Later rows are drawn shifted left by where they start.
+        let shift = row == 0 ? 0 : xOffset(in: text, column: UInt64(rows.start(of: row)))
+        var index = max(0, CTLineGetStringIndexForPosition(
+            layout(for: text), CGPoint(x: point.x - textOriginX + shift, y: 0)))
+        if rows.count > 1 {
+            // A point past a wrapped row's end is the row's last slot, not
+            // the first column of the next row.
+            let upper = row < rows.breaks.count ? rows.end(of: row) - 1 : Int.max
+            index = min(max(index, rows.start(of: row)), upper)
+        }
+        return TextPos(line: line, colUtf16: UInt64(index))
     }
 
     override func mouseDown(with event: NSEvent) {
@@ -98,6 +107,11 @@ extension EditorView {
         if document.hasMarkedText() { inputContext?.discardMarkedText() }
         let local = convert(event.locationInWindow, from: nil)
         let pos = textPosition(at: local)
+        // Clicking the line numbers sets or clears a breakpoint.
+        if local.x < gutterWidth, event.clickCount == 1, let onToggleBreakpoint {
+            onToggleBreakpoint(pos.line)
+            return
+        }
         let flags = event.modifierFlags
         // ⌘+click on a keyword or comment is a plain click, not a lookup.
         if flags.contains(.command), event.clickCount == 1, navigableRange(at: pos) != nil,
@@ -173,11 +187,15 @@ extension EditorView {
             return
         }
         let row = point.y / metrics.lineHeight
-        guard row.isFinite, row >= 0, Int(row) < lineCount else { definitionLink = nil; return }
+        guard row.isFinite, row >= 0, Int(row) < rowCount else { definitionLink = nil; return }
         let pos = textPosition(at: point)
         let text = document.displayLine(line: pos.line)
         // Hit-testing returns the nearest caret slot; ignore points past the text.
-        guard point.x - textOriginX <= xOffset(in: text, column: UInt64(text.utf16.count)) else {
+        let rows = lineRows(pos.line)
+        let lineRow = rows.row(containing: Int(pos.colUtf16))
+        let rowEnd = min(rows.end(of: lineRow), text.utf16.count)
+        let shift = lineRow == 0 ? 0 : xOffset(in: text, column: UInt64(rows.start(of: lineRow)))
+        guard point.x - textOriginX + shift <= xOffset(in: text, column: UInt64(rowEnd)) else {
             definitionLink = nil
             return
         }
@@ -484,7 +502,7 @@ extension EditorView {
         guard let scrollView = enclosingScrollView else { return }
         let clip = scrollView.contentView
         let height = metrics.lineHeight
-        let top = CGFloat(line) * height
+        let top = rowTop(of: UInt64(line))
         let visible = clip.bounds
         if top >= visible.minY, top + height <= visible.maxY { return }
         let inset = scrollView.contentInsets.top

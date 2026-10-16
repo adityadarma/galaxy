@@ -110,6 +110,28 @@ final class TextInputTests: XCTestCase {
         XCTAssertEqual(doc.lines(first: 0, count: 1), ["  let value = 1"])
     }
 
+    func testLineOperationsFromTheMenuActions() throws {
+        let (view, doc, url) = try makeView(text: "b\na\nc  ")
+        defer { try? FileManager.default.removeItem(at: url) }
+        view.moveLinesDown(nil)
+        XCTAssertEqual(doc.text(), "a\nb\nc  ")
+        view.copyLinesDown(nil)
+        XCTAssertEqual(doc.text(), "a\nb\nb\nc  ")
+        view.deleteLines(nil)
+        XCTAssertEqual(doc.text(), "a\nb\nc  ")
+        view.trimTrailingWhitespace(nil)
+        XCTAssertEqual(doc.text(), "a\nb\nc")
+        view.selectAll(nil)
+        view.sortLinesDescending(nil)
+        XCTAssertEqual(doc.text(), "c\nb\na")
+        view.transformToUppercase(nil)
+        XCTAssertEqual(doc.text(), "C\nB\nA")
+        view.joinLines(nil)
+        XCTAssertEqual(doc.text(), "C B A")
+        view.undoEdit(nil)
+        XCTAssertEqual(doc.text(), "C\nB\nA", "one undo step per command")
+    }
+
     func testAttributedSubstringAndRangesAreDocumentWide() throws {
         let (view, _, url) = try makeView(text: "😀\nabc")
         defer { try? FileManager.default.removeItem(at: url) }

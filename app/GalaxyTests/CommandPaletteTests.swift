@@ -61,6 +61,10 @@ final class CommandPaletteTests: XCTestCase {
                 if item.submenu == nil, let action = item.action, !actions.contains(action),
                    action != #selector(NSApplication.hide(_:)),
                    action != #selector(NSApplication.hideOtherApplications(_:)),
+                   action != #selector(NSWindow.performMiniaturize(_:)),  // system window items
+                   action != #selector(NSWindow.performZoom(_:)),
+                   action != #selector(NSApplication.arrangeInFront(_:)),
+                   action != #selector(NSWindow.makeKeyAndOrderFront(_:)),  // AppKit's open-window list
                    action != #selector(MainWindowController.showCommandPalette(_:)),
                    action != #selector(MainWindowController.openRecentProject(_:)) {  // a list, not one command
                     missing.append(NSStringFromSelector(action))

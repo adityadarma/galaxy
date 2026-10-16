@@ -3,6 +3,8 @@ import AppKit
 @MainActor
 final class StickyScopeView: NSView {
     private let label = NSTextField(labelWithString: "")
+    /// Off: no scope header, whatever the scroll position.
+    var isEnabled = true
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -34,6 +36,6 @@ final class StickyScopeView: NSView {
     func show(_ symbols: [OutlineSymbol]) {
         label.stringValue = symbols.map(\.name).joined(separator: "  ›  ")
         label.setAccessibilityValue(label.stringValue)
-        isHidden = symbols.isEmpty
+        isHidden = symbols.isEmpty || !isEnabled
     }
 }

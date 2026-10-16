@@ -22,7 +22,9 @@ pub fn to_html(source: &str) -> String {
         .chain(source.match_indices('\n').map(|(i, _)| i + 1))
         .collect();
     let line_of = |offset: usize| line_starts.partition_point(|&s| s <= offset) - 1;
-    let anchor = |line: usize| Event::Html(format!("<span class=\"src\" data-line=\"{line}\"></span>").into());
+    let anchor = |line: usize| {
+        Event::Html(format!("<span class=\"src\" data-line=\"{line}\"></span>").into())
+    };
 
     let mut events: Vec<Event> = Vec::new();
     let mut depth = 0usize;
@@ -82,7 +84,10 @@ mod tests {
     fn top_level_blocks_carry_their_source_line() {
         let html = to_html("# A\n\npara\nmore\n\n- x\n- y\n\n```\ncode\n```\n");
         for line in [0, 2, 5, 8] {
-            assert!(html.contains(&format!("data-line=\"{line}\"")), "line {line}: {html}");
+            assert!(
+                html.contains(&format!("data-line=\"{line}\"")),
+                "line {line}: {html}"
+            );
         }
         // Nested list items get no marker of their own; the end marker is the last line.
         assert_eq!(html.matches("class=\"src\"").count(), 5);

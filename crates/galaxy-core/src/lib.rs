@@ -9,6 +9,7 @@ pub mod change;
 pub mod clipboard;
 pub mod commands;
 pub mod composition;
+pub mod dap;
 pub mod disk;
 pub mod document;
 pub mod edit;
@@ -21,8 +22,8 @@ pub mod jsonc;
 pub mod keymap;
 pub mod laravel;
 pub mod logging;
-pub mod markdown;
 pub mod lsp;
+pub mod markdown;
 pub mod movement;
 pub mod multicursor;
 pub mod navigation;
@@ -37,6 +38,7 @@ pub mod terminal;
 pub mod viewport;
 pub mod watcher;
 pub mod workspace;
+pub mod wrap;
 
 /// Semantic version of the core, exposed to the UI for diagnostics.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

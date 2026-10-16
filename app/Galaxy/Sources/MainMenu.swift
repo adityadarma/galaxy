@@ -57,6 +57,11 @@ enum MainMenu {
         above.keyEquivalentModifierMask = [.command, .option]
         let below = selectionMenu.addItem(withTitle: "Add Cursor Below", action: #selector(EditorView.addCursorBelow(_:)), keyEquivalent: "\u{F701}")
         below.keyEquivalentModifierMask = [.command, .option]
+        selectionMenu.addItem(.separator())
+        selectionMenu.addItem(withTitle: "Copy Line Up", action: #selector(EditorView.copyLinesUp(_:)), keyEquivalent: "")
+        selectionMenu.addItem(withTitle: "Copy Line Down", action: #selector(EditorView.copyLinesDown(_:)), keyEquivalent: "")
+        selectionMenu.addItem(withTitle: "Move Line Up", action: #selector(EditorView.moveLinesUp(_:)), keyEquivalent: "")
+        selectionMenu.addItem(withTitle: "Move Line Down", action: #selector(EditorView.moveLinesDown(_:)), keyEquivalent: "")
         selectionItem.submenu = selectionMenu
 
         let findItem = NSMenuItem()
@@ -108,9 +113,6 @@ enum MainMenu {
         let terminal = viewMenu.addItem(withTitle: "Toggle Terminal", action: #selector(MainWindowController.toggleTerminal(_:)), keyEquivalent: "j")
         terminal.keyEquivalentModifierMask = [.command]
         viewMenu.addItem(withTitle: "Toggle Git Graph", action: #selector(MainWindowController.toggleGitGraph(_:)), keyEquivalent: "")
-        viewMenu.addItem(withTitle: "Move Terminal into Editor Area", action: #selector(MainWindowController.moveTerminalToEditor(_:)), keyEquivalent: "")
-        viewMenu.addItem(withTitle: "Move Terminal into Panel", action: #selector(MainWindowController.moveTerminalToPanel(_:)), keyEquivalent: "")
-        viewMenu.addItem(withTitle: "New Terminal in Editor Area", action: #selector(MainWindowController.createTerminalEditor(_:)), keyEquivalent: "")
         viewMenu.addItem(withTitle: "Split Editor Right", action: #selector(MainWindowController.splitEditorRight(_:)), keyEquivalent: "")
         viewMenu.addItem(withTitle: "Split Editor Down", action: #selector(MainWindowController.splitEditorDown(_:)), keyEquivalent: "")
         viewMenu.addItem(withTitle: "Toggle Git Blame", action: #selector(MainWindowController.toggleGitBlame(_:)), keyEquivalent: "")
@@ -125,6 +127,20 @@ enum MainMenu {
         scm.keyEquivalentModifierMask = [.control, .shift]
         let extensionsItem = viewMenu.addItem(withTitle: "Show Extensions", action: #selector(MainWindowController.showExtensionsAction(_:)), keyEquivalent: "x")
         extensionsItem.keyEquivalentModifierMask = [.command, .shift]
+        viewMenu.addItem(.separator())
+        viewMenu.addItem(withTitle: "Show Problems", action: #selector(MainWindowController.showProblemsPanel(_:)), keyEquivalent: "")
+        viewMenu.addItem(withTitle: "Show Debug Console", action: #selector(MainWindowController.showDebugConsole(_:)), keyEquivalent: "")
+        viewMenu.addItem(withTitle: "Show Output", action: #selector(MainWindowController.showOutputPanel(_:)), keyEquivalent: "")
+        viewMenu.addItem(.separator())
+        viewMenu.addItem(withTitle: "Toggle Full Screen", action: #selector(NSWindow.toggleFullScreen(_:)), keyEquivalent: "")
+        viewMenu.addItem(withTitle: "Zoom In", action: #selector(MainWindowController.zoomEditorIn(_:)), keyEquivalent: "")
+        viewMenu.addItem(withTitle: "Zoom Out", action: #selector(MainWindowController.zoomEditorOut(_:)), keyEquivalent: "")
+        viewMenu.addItem(withTitle: "Reset Zoom", action: #selector(MainWindowController.zoomEditorReset(_:)), keyEquivalent: "")
+        viewMenu.addItem(withTitle: "Toggle Minimap", action: #selector(MainWindowController.toggleMinimap(_:)), keyEquivalent: "")
+        let wordWrap = viewMenu.addItem(withTitle: "Toggle Word Wrap", action: #selector(MainWindowController.toggleWordWrap(_:)), keyEquivalent: "z")
+        wordWrap.keyEquivalentModifierMask = [.option]
+        viewMenu.addItem(withTitle: "Toggle Breadcrumbs", action: #selector(MainWindowController.toggleBreadcrumbs(_:)), keyEquivalent: "")
+        viewMenu.addItem(withTitle: "Toggle Sticky Scroll", action: #selector(MainWindowController.toggleStickyScroll(_:)), keyEquivalent: "")
         viewMenu.addItem(.separator())
         let nextTab = viewMenu.addItem(withTitle: "Show Next Tab", action: #selector(MainWindowController.showNextTab(_:)), keyEquivalent: "]")
         nextTab.keyEquivalentModifierMask = [.command, .shift]
@@ -141,6 +157,37 @@ enum MainMenu {
         viewMenu.addItem(withTitle: "Open Workspace Settings (JSON)…", action: #selector(MainWindowController.openWorkspaceSettingsJson(_:)), keyEquivalent: "")
         viewItem.submenu = viewMenu
 
+        let runItem = NSMenuItem()
+        let runMenu = NSMenu(title: "Run")
+        runMenu.addItem(withTitle: "Start Debugging", action: #selector(MainWindowController.startDebugging(_:)), keyEquivalent: "")
+        runMenu.addItem(withTitle: "Stop Debugging", action: #selector(MainWindowController.stopDebugging(_:)), keyEquivalent: "")
+        runMenu.addItem(.separator())
+        runMenu.addItem(withTitle: "Step Over", action: #selector(MainWindowController.debugStepOver(_:)), keyEquivalent: "")
+        runMenu.addItem(withTitle: "Step Into", action: #selector(MainWindowController.debugStepInto(_:)), keyEquivalent: "")
+        runMenu.addItem(withTitle: "Step Out", action: #selector(MainWindowController.debugStepOut(_:)), keyEquivalent: "")
+        runMenu.addItem(.separator())
+        runMenu.addItem(withTitle: "Toggle Breakpoint", action: #selector(MainWindowController.toggleBreakpoint(_:)), keyEquivalent: "")
+        runMenu.addItem(withTitle: "Remove All Breakpoints", action: #selector(MainWindowController.removeAllBreakpoints(_:)), keyEquivalent: "")
+        runMenu.addItem(.separator())
+        runMenu.addItem(withTitle: "Run Build Task", action: #selector(MainWindowController.runBuildTask(_:)), keyEquivalent: "")
+        runMenu.addItem(withTitle: "Run Test Task", action: #selector(MainWindowController.runTestTask(_:)), keyEquivalent: "")
+        runItem.submenu = runMenu
+
+        let terminalItem = NSMenuItem()
+        let terminalMenu = NSMenu(title: "Terminal")
+        terminalMenu.addItem(withTitle: "New Terminal", action: #selector(MainWindowController.createTerminal(_:)), keyEquivalent: "")
+        terminalMenu.addItem(withTitle: "New Terminal in Editor Area", action: #selector(MainWindowController.createTerminalEditor(_:)), keyEquivalent: "")
+        terminalMenu.addItem(.separator())
+        terminalMenu.addItem(withTitle: "Run Selected Text", action: #selector(MainWindowController.runSelectedTextInTerminal(_:)), keyEquivalent: "")
+        terminalMenu.addItem(withTitle: "Run Active File", action: #selector(MainWindowController.runActiveFileInTerminal(_:)), keyEquivalent: "")
+        terminalMenu.addItem(.separator())
+        terminalMenu.addItem(withTitle: "Move Terminal into Editor Area", action: #selector(MainWindowController.moveTerminalToEditor(_:)), keyEquivalent: "")
+        terminalMenu.addItem(withTitle: "Move Terminal into Panel", action: #selector(MainWindowController.moveTerminalToPanel(_:)), keyEquivalent: "")
+        terminalMenu.addItem(.separator())
+        terminalMenu.addItem(withTitle: "Clear Terminal", action: #selector(MainWindowController.clearActiveTerminal(_:)), keyEquivalent: "")
+        terminalMenu.addItem(withTitle: "Kill Terminal", action: #selector(MainWindowController.killTerminal(_:)), keyEquivalent: "")
+        terminalItem.submenu = terminalMenu
+
         let editItem = NSMenuItem()
         let editMenu = NSMenu(title: "Edit")
         editMenu.addItem(withTitle: "Undo", action: #selector(EditorView.undoEdit(_:)), keyEquivalent: "z")
@@ -152,12 +199,41 @@ enum MainMenu {
         editMenu.addItem(withTitle: "Paste", action: #selector(EditorView.paste(_:)), keyEquivalent: "v")
         editMenu.addItem(withTitle: "Select All", action: #selector(EditorView.selectAll(_:)), keyEquivalent: "a")
         editMenu.addItem(withTitle: "Toggle Line Comment", action: #selector(EditorView.toggleComment(_:)), keyEquivalent: "/")
+        editMenu.addItem(.separator())
+        editMenu.addItem(withTitle: "Delete Line", action: #selector(EditorView.deleteLines(_:)), keyEquivalent: "")
+        editMenu.addItem(withTitle: "Join Lines", action: #selector(EditorView.joinLines(_:)), keyEquivalent: "")
+        editMenu.addItem(withTitle: "Sort Lines Ascending", action: #selector(EditorView.sortLinesAscending(_:)), keyEquivalent: "")
+        editMenu.addItem(withTitle: "Sort Lines Descending", action: #selector(EditorView.sortLinesDescending(_:)), keyEquivalent: "")
+        editMenu.addItem(withTitle: "Trim Trailing Whitespace", action: #selector(EditorView.trimTrailingWhitespace(_:)), keyEquivalent: "")
+        editMenu.addItem(.separator())
+        editMenu.addItem(withTitle: "Transform to Uppercase", action: #selector(EditorView.transformToUppercase(_:)), keyEquivalent: "")
+        editMenu.addItem(withTitle: "Transform to Lowercase", action: #selector(EditorView.transformToLowercase(_:)), keyEquivalent: "")
         editItem.submenu = editMenu
         main.addItem(editItem)
         main.addItem(selectionItem)
         main.addItem(findItem)
         main.addItem(viewItem)
         main.addItem(goItem)
+        main.addItem(runItem)
+        main.addItem(terminalItem)
+
+        // AppKit fills the Window menu with the open windows, and adds the
+        // menu search field to Help.
+        let windowItem = NSMenuItem()
+        let windowMenu = NSMenu(title: "Window")
+        windowMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        windowMenu.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
+        windowMenu.addItem(.separator())
+        windowMenu.addItem(withTitle: "Bring All to Front", action: #selector(NSApplication.arrangeInFront(_:)), keyEquivalent: "")
+        windowItem.submenu = windowMenu
+        main.addItem(windowItem)
+        NSApp?.windowsMenu = windowMenu
+
+        let helpItem = NSMenuItem()
+        let helpMenu = NSMenu(title: "Help")
+        helpItem.submenu = helpMenu
+        main.addItem(helpItem)
+        NSApp?.helpMenu = helpMenu
 
         return main
     }
