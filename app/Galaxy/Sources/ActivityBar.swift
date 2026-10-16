@@ -84,10 +84,6 @@ final class ActivityBar: NSView {
     override func draw(_ dirtyRect: NSRect) {
         Theme.chrome.setFill()
         dirtyRect.intersection(bounds).fill()
-        // Right edge. Drawn rather than an NSBox: a vertical separator box
-        // hugs its intrinsic height hard enough to shrink the window.
-        NSColor.separatorColor.setFill()
-        NSRect(x: bounds.maxX - 1, y: 0, width: 1, height: bounds.height).fill()
     }
 
     func isEnabled(_ item: Item) -> Bool { buttons[item]?.isEnabled ?? false }

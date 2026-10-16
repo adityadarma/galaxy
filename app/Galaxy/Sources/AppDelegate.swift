@@ -30,8 +30,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         StartupProbe.mark("menu")
         let controller = makeWindowController()
         StartupProbe.mark("window_built")
-        controller.showWindow(nil)
-        StartupProbe.mark("window_shown")
+        // Left in full screen at the last quit: open in full screen again.
+        // The project is restored before the window appears, so the
+        // transition does not start from an empty window.
+        let resumeFullScreen = Self.shouldRestoreSession
+            && UserDefaults.standard.bool(forKey: "MainWindowFullScreen")
+        if !resumeFullScreen { showMainWindow(controller) }
         // `Galaxy -OpenPath <file or folder>`; UI tests use this instead of
         // driving the open panel.
         if pendingURL == nil, let path = Self.launchOpenPath {
@@ -44,6 +48,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // The prior workspace and its tabs are restored only after a quit.
         } else {
             controller.newDocument(nil)
+        }
+        if resumeFullScreen {
+            showMainWindow(controller)
+            controller.window?.toggleFullScreen(nil)
         }
 
         // `scripts/measure-footprint.sh`: open extra files as tabs after the
@@ -111,6 +119,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return false
         }
         return true
+    }
+
+    private func showMainWindow(_ controller: MainWindowController) {
+        controller.showWindow(nil)
+        controller.centerTrafficLights()
+        StartupProbe.mark("window_shown")
     }
 
     private func restoreSession(in controller: MainWindowController) -> Bool {

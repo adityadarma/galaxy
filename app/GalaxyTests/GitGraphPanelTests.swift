@@ -44,29 +44,48 @@ final class GitGraphPanelTests: XCTestCase {
         XCTAssertEqual(GitGraphPanel.text(for: "Author", item: rows[0]), "*")
     }
 
-    func testToggleShowsAndHidesTheGitGraphTab() {
+    func testToggleOpensTheGitGraphAsAnEditorTabAndClosesIt() {
         let c = MainWindowController(bridge: CoreBridge())
         c.showWindow(nil)
         defer { c.window?.orderOut(nil) }
-        XCTAssertFalse(c.isBottomPanelVisible)
+        let before = c.tabs.count
         c.toggleGitGraph(nil)
-        XCTAssertTrue(c.isBottomPanelVisible)
-        XCTAssertEqual(c.bottomPanelHeaderForTesting.selectedTab, .gitGraph)
-        XCTAssertEqual(c.titleBar.gitGraphButton.state, .on)
+        XCTAssertEqual(c.tabs.count, before + 1)
+        XCTAssertTrue(c.isGitGraphTabShown)
+        XCTAssertEqual(c.activeTab?.title, "Git Graph")
+        XCTAssertFalse(c.isBottomPanelVisible, "not in the bottom panel")
+        XCTAssertEqual(c.statusLabel.stringValue, "", "the status bar button already names the tab")
+        XCTAssertEqual(c.statusBar.gitGraph.contentTintColor, .labelColor)
         c.toggleGitGraph(nil)
-        XCTAssertFalse(c.isBottomPanelVisible)
-        XCTAssertEqual(c.titleBar.gitGraphButton.state, .off)
+        XCTAssertEqual(c.tabs.count, before)
+        XCTAssertFalse(c.isGitGraphTabShown)
+        XCTAssertEqual(c.statusBar.gitGraph.contentTintColor, .secondaryLabelColor)
     }
 
-    func testToggleSwitchesFromAnotherTabInsteadOfClosing() {
+    func testToggleSwitchesBackToTheOpenGraphTabInsteadOfOpeningASecond() {
         let c = MainWindowController(bridge: CoreBridge())
         c.showWindow(nil)
         defer { c.window?.orderOut(nil) }
-        c.toggleTerminal(nil)
-        XCTAssertTrue(c.isBottomPanelVisible)
         c.toggleGitGraph(nil)
-        XCTAssertTrue(c.isBottomPanelVisible)
-        XCTAssertEqual(c.bottomPanelHeaderForTesting.selectedTab, .gitGraph)
+        let graphIndex = c.activeIndex
+        c.newDocument(nil)
+        XCTAssertFalse(c.isGitGraphTabShown)
+        let count = c.tabs.count
+        c.toggleGitGraph(nil)
+        XCTAssertTrue(c.isGitGraphTabShown)
+        XCTAssertEqual(c.activeIndex, graphIndex)
+        XCTAssertEqual(c.tabs.count, count, "one graph tab at a time")
+    }
+
+    func testPanelIsOpaqueSoTheBreadcrumbBehindItDoesNotShowThrough() {
+        // The table header is translucent; without its own background the
+        // path bar under the tab ("Git Graph") showed blurred through it.
+        XCTAssertTrue(GitGraphPanel().isOpaque)
+    }
+
+    func testBottomPanelHasNoGitGraphTab() {
+        XCTAssertEqual(BottomPanelHeader.Tab.allCases.map(\.title),
+                       ["PROBLEMS", "OUTPUT", "DEBUG CONSOLE", "TERMINAL", "PORTS"])
     }
 
     func testContextMenuOffersCommitActionsAndBranchCheckout() {
@@ -233,6 +252,22 @@ final class GitGraphPanelTests: XCTestCase {
         _ = item.target?.perform(item.action, with: item)
         XCTAssertTrue(waitUntil { message != nil }, file: file, line: line)
         return message ?? ""
+    }
+
+    func testHistoryBeyondOnePageIsLoadedWhenScrolledToTheEnd() throws {
+        let dir = try makeRepo()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        for i in 1...7 { try commitFile(dir, "f.txt", "\(i)\n", "commit \(i)") }
+        let panel = GitGraphPanel()
+        panel.pageSize = 3
+        panel.workspace = try CoreBridge().core.openWorkspace(path: dir.path)
+        panel.refresh()
+        XCTAssertTrue(waitUntil { !panel.rows.isEmpty })
+        // Nothing lays the panel out here, so every page counts as "near the
+        // end" and loading continues until the history runs out.
+        XCTAssertTrue(waitUntil { panel.rows.count == 7 }, "all 7 commits, not just the first page of 3")
+        XCTAssertTrue(waitUntil { !panel.hasMore })
+        XCTAssertEqual(panel.rows.last?.commit?.subject, "commit 1", "the oldest commit is reached")
     }
 
     func testMenuActionsRunAgainstARealRepository() throws {

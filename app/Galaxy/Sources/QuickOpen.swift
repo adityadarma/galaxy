@@ -1,9 +1,13 @@
 import AppKit
 
 /// Go to File (⌘P, M2-07): a VSCode-style quick-open panel floating over
-/// the top of the editor. Type to fuzzy-search the workspace's files;
+/// the top of the window. Type to fuzzy-search the workspace's files;
 /// ↑/↓ choose, Return opens, Esc closes. Matched characters are drawn in
 /// the accent color.
+///
+/// With an empty field it also lists the other modes (`>` commands, `@`
+/// symbols, `:` line, `%` text). Typing one of those characters first, or
+/// clicking its row, hands over to that panel through `onMode`.
 ///
 /// The panel only shows results. `MainWindowController` owns the
 /// `FileFinder` and opens the chosen file.
@@ -26,6 +30,17 @@ final class QuickOpen: NSView, NSTextFieldDelegate, NSTableViewDataSource, NSTab
     private(set) var results: [FileMatch] = []
     var onOpen: ((FileMatch) -> Void)?
     var onClose: (() -> Void)?
+    /// A mode prefix (`>`, `@`, `:`, `%`) was typed or clicked; the text
+    /// is the whole field, prefix included.
+    var onMode: ((String) -> Void)?
+    static let modePrefixes: Set<Character> = [">", "@", ":", "%"]
+
+    /// Shortcut text per command id, shown on the mode rows.
+    var hintShortcuts: [String: String] = [:] {
+        didSet { hints.shortcuts = hintShortcuts }
+    }
+    private let hints = QuickOpenHints()
+    private var hintsHeight: NSLayoutConstraint!
 
     /// Set once the workspace has been indexed. A newer index (files
     /// added since) may replace it while the panel is open; the selected
@@ -57,7 +72,7 @@ final class QuickOpen: NSView, NSTextFieldDelegate, NSTableViewDataSource, NSTab
         setAccessibilityLabel("Go to File")
         setAccessibilityIdentifier("quick-open")
 
-        field.placeholderString = "Search files by name"
+        field.placeholderString = "Search files by name (append : to go to line or @ to go to symbol)"
         field.font = .systemFont(ofSize: 14)
         field.focusRingType = .none
         field.bezelStyle = .roundedBezel
@@ -96,18 +111,29 @@ final class QuickOpen: NSView, NSTextFieldDelegate, NSTableViewDataSource, NSTab
         message.setAccessibilityIdentifier("quick-open-message")
         message.translatesAutoresizingMaskIntoConstraints = false
 
-        for view in [field, scroll, message] { addSubview(view) }
+        hints.translatesAutoresizingMaskIntoConstraints = false
+        hints.onPick = { [weak self] prefix in
+            guard let self else { return }
+            if prefix.isEmpty { self.focus() } else { self.onMode?(prefix) }
+        }
+        hintsHeight = hints.heightAnchor.constraint(equalToConstant: QuickOpenHints.collapsedHeight)
+
+        for view in [field, hints, scroll, message] { addSubview(view) }
         heightConstraint = heightAnchor.constraint(equalToConstant: 48)
         NSLayoutConstraint.activate([
             heightConstraint,
             field.topAnchor.constraint(equalTo: topAnchor, constant: 8),
             field.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
             field.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
-            scroll.topAnchor.constraint(equalTo: field.bottomAnchor, constant: 6),
+            hints.topAnchor.constraint(equalTo: field.bottomAnchor),
+            hints.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
+            hints.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
+            hintsHeight,
+            scroll.topAnchor.constraint(equalTo: hints.bottomAnchor),
             scroll.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
             scroll.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
             scroll.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -4),
-            message.topAnchor.constraint(equalTo: field.bottomAnchor, constant: 8),
+            message.topAnchor.constraint(equalTo: hints.bottomAnchor, constant: 2),
             message.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
             message.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -14),
         ])
@@ -182,15 +208,25 @@ final class QuickOpen: NSView, NSTextFieldDelegate, NSTableViewDataSource, NSTab
         }
         message.isHidden = !found.isEmpty
         scroll.isHidden = found.isEmpty
+        let showHints = query.isEmpty
+        hints.isHidden = !showHints
+        hintsHeight.constant = showHints ? QuickOpenHints.expandedHeight : QuickOpenHints.collapsedHeight
         let rows = min(found.count, Self.maxVisibleRows)
-        heightConstraint.constant = found.isEmpty ? 76 : 8 + 28 + 6 + CGFloat(rows) * Self.rowHeight + 4
+        heightConstraint.constant = found.isEmpty
+            ? 70 + hintsHeight.constant
+            : 8 + 28 + hintsHeight.constant + CGFloat(rows) * Self.rowHeight + 4
         setAccessibilityValue(found.isEmpty ? message.stringValue : "\(found.count) files")
         onResults?()
     }
 
     // MARK: Keys
 
-    func controlTextDidChange(_ obj: Notification) { runSearch() }
+    func controlTextDidChange(_ obj: Notification) {
+        if let first = field.stringValue.first, Self.modePrefixes.contains(first) {
+            return onMode?(field.stringValue) ?? runSearch()
+        }
+        runSearch()
+    }
 
     func controlTextDidEndEditing(_ obj: Notification) {
         // Focus moved elsewhere (a click outside, the window lost key).
@@ -251,6 +287,109 @@ final class QuickOpen: NSView, NSTextFieldDelegate, NSTableViewDataSource, NSTab
     func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
         tableView.makeView(withIdentifier: QuickOpenRowView.reuseID, owner: self) as? QuickOpenRowView
             ?? QuickOpenRowView()
+    }
+}
+
+/// The other modes, listed under an empty field. Rows are clickable; the
+/// keyboard selection stays on the file list.
+@MainActor
+final class QuickOpenHints: NSView {
+    static let rowHeight: CGFloat = 24
+    static let modes: [(title: String, prefix: String, command: String)] = [
+        ("Go to File", "", "workbench.action.quickOpen"),
+        ("Show and Run Commands", ">", "workbench.action.showCommands"),
+        ("Search for Text", "%", "workbench.action.findInFiles"),
+        ("Go to Symbol in Editor", "@", "workbench.action.gotoSymbol"),
+        ("Go to Line", ":", "workbench.action.gotoLine"),
+    ]
+    static let collapsedHeight: CGFloat = 6
+    static let expandedHeight: CGFloat = 6 + CGFloat(modes.count) * rowHeight + 6
+
+    var onPick: ((String) -> Void)?
+    var shortcuts: [String: String] = [:] { didSet { rebuild() } }
+    private let stack = NSStackView()
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        stack.orientation = .vertical
+        stack.spacing = 0
+        stack.alignment = .leading
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: topAnchor, constant: 6),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor),
+        ])
+        setAccessibilityIdentifier("quick-open-modes")
+        rebuild()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override var isFlipped: Bool { true }
+
+    private func rebuild() {
+        for view in stack.arrangedSubviews { stack.removeArrangedSubview(view); view.removeFromSuperview() }
+        for mode in Self.modes {
+            let row = QuickOpenHintRow(title: mode.title, prefix: mode.prefix, shortcut: shortcuts[mode.command])
+            row.onPick = { [weak self] in self?.onPick?(mode.prefix) }
+            row.translatesAutoresizingMaskIntoConstraints = false
+            stack.addArrangedSubview(row)
+            row.leadingAnchor.constraint(equalTo: stack.leadingAnchor).isActive = true
+            row.trailingAnchor.constraint(equalTo: stack.trailingAnchor).isActive = true
+            row.heightAnchor.constraint(equalToConstant: Self.rowHeight).isActive = true
+        }
+    }
+}
+
+@MainActor
+final class QuickOpenHintRow: NSView {
+    var onPick: (() -> Void)?
+    private var hovering = false { didSet { needsDisplay = true } }
+
+    init(title: String, prefix: String, shortcut: String?) {
+        super.init(frame: .zero)
+        let name = NSTextField(labelWithString: title)
+        name.font = .systemFont(ofSize: 13)
+        let tag = NSTextField(labelWithString: prefix)
+        tag.font = .systemFont(ofSize: 12)
+        tag.textColor = .secondaryLabelColor
+        tag.isHidden = prefix.isEmpty
+        let keys = NSTextField(labelWithString: shortcut ?? "")
+        keys.font = .systemFont(ofSize: 12)
+        keys.textColor = .secondaryLabelColor
+        keys.isHidden = shortcut == nil
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.init(1), for: .horizontal)
+        let row = NSStackView(views: [name, tag, spacer, keys])
+        row.spacing = 8
+        row.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(row)
+        NSLayoutConstraint.activate([
+            row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            row.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
+            row.centerYAnchor.constraint(equalTo: centerYAnchor),
+        ])
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+        setAccessibilityLabel(title)
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+                                       owner: self, userInfo: nil))
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override func mouseEntered(with event: NSEvent) { hovering = true }
+    override func mouseExited(with event: NSEvent) { hovering = false }
+    override func mouseDown(with event: NSEvent) { onPick?() }
+
+    override func draw(_ dirtyRect: NSRect) {
+        guard hovering else { return }
+        Theme.accent.withAlphaComponent(0.12).setFill()
+        NSBezierPath(roundedRect: bounds.insetBy(dx: 2, dy: 0), xRadius: 5, yRadius: 5).fill()
     }
 }
 

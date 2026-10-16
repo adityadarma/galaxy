@@ -92,8 +92,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private var hoverShownRange: (line: UInt64, start: UInt64, end: UInt64)?
     private var hoverShownContents: String?
     private var hoverShownPosition: TextPos?
-    private let splitView = NSSplitView()
-    private let detailView = NSView()
+    private let splitView = CardSplitView()
+    private let detailView = CardView()
     /// Holds the find bar's place in the layout. The bar itself is built on
     /// first use (⌘F): it costs about 20 ms, a tenth of the startup budget.
     private let findBarSlot = NSView()
@@ -286,7 +286,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private var canPreviewMarkdown: Bool {
-        guard let tab = activeTab, tab.terminal == nil else { return false }
+        guard let tab = activeTab, tab.isDocument else { return false }
         return MarkdownPreviewView.isMarkdown(path: tab.doc.path())
     }
 
@@ -321,14 +321,33 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
-    /// Shows the Git Graph tab in the bottom panel, or hides the panel when
-    /// that tab is already the one showing.
+    /// Opens the Git Graph as an editor tab, or closes it when it is the
+    /// tab showing. One graph tab at a time.
     @objc func toggleGitGraph(_ sender: Any?) {
-        if isBottomPanelVisible && bottomPanelTab == .gitGraph {
-            setBottomPanelOpen(false)
-        } else {
-            setBottomPanelOpen(true)
-            showBottomPanel(tab: .gitGraph)
+        if let i = tabs.firstIndex(where: \.isGitGraph) {
+            if activeIndex == i { closeTab(at: i) } else { selectTab(i) }
+            return
+        }
+        let tab = EditorTab(doc: bridge.newDocument(), title: "Git Graph", pathComponents: ["Git Graph"],
+                            windowTitle: "Git Graph", isPreview: false, status: "", isGitGraph: true)
+        add(tab, replacing: nil)
+    }
+
+    var isGitGraphTabShown: Bool { activeTab?.isGitGraph == true }
+
+    /// Shows or hides the Git Graph for the active tab, and keeps it
+    /// refreshing only while it is showing.
+    private func showEditorGitGraph(for tab: EditorTab?) {
+        if tab?.isGitGraph == true {
+            gitGraphPanel.workspace = workspace
+            gitGraphPanel.isHidden = false
+            gitGraphPanel.start()
+        } else if !gitGraphPanel.isHidden {
+            if (window?.firstResponder as? NSView)?.isDescendant(of: gitGraphPanel) == true {
+                window?.makeFirstResponder(editorView)
+            }
+            gitGraphPanel.stop()
+            gitGraphPanel.isHidden = true
         }
     }
 
@@ -348,14 +367,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             if window?.firstResponder === terminalView { window?.makeFirstResponder(editorView) }
             outputPanel.stop()
             portsPanel.stop()
-            gitGraphPanel.stop()
         }
         bottomPanelHeight.constant = open ? currentBottomPanelHeight() : 0
         bottomPanelHeaderHeight.constant = open ? BottomPanelHeader.height : 0
         bottomPanelHeader.isHidden = !open
         bottomPanelContent.isHidden = !open
         titleBar.setPanelVisible(open)
-        titleBar.setGitGraphVisible(open && bottomPanelTab == .gitGraph)
         detailView.needsLayout = true
     }
 
@@ -407,7 +424,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         problemsPanel.isHidden = tab != .problems
         outputPanel.isHidden = tab != .output
         portsPanel.isHidden = tab != .ports
-        gitGraphPanel.isHidden = tab != .gitGraph
         bottomPanelPlaceholder.isHidden = tab != .debugConsole
         if tab == .terminal {
             ensureTerminal()
@@ -415,13 +431,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
         if tab == .output { outputPanel.start() } else { outputPanel.stop() }
         if tab == .ports { portsPanel.start() } else { portsPanel.stop() }
-        if tab == .gitGraph {
-            gitGraphPanel.workspace = workspace
-            gitGraphPanel.start()
-        } else {
-            gitGraphPanel.stop()
-        }
-        titleBar.setGitGraphVisible(isBottomPanelVisible && tab == .gitGraph)
     }
 
     private func ensureTerminal() {
@@ -607,6 +616,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             _ = self.navHistory.recordJump(
                 from: NavLocation(key: tab.navKey, line: before.line, col: before.col),
                 to: NavLocation(key: tab.navKey, line: after.line, col: after.col))
+            self.refreshNavigationButtons()
         }
         editorView.onHover = { [weak self] position, point in
             self?.beginHover(at: position, point: point)
@@ -651,6 +661,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             }
         }
         statusBar.onGitClick = { [weak self] in self?.showGitBranchPicker() }
+        statusBar.onGitGraphClick = { [weak self] in self?.toggleGitGraph(nil) }
     }
 
     private func installMemoryPressureHandler() {
@@ -680,11 +691,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
-
-    /// Bottom edge of the (transparent) title bar, in content coordinates.
-    private var titleBarBottom: NSLayoutYAxisAnchor {
-        (window?.contentLayoutGuide as? NSLayoutGuide)?.topAnchor ?? detailView.topAnchor
-    }
 
     private func buildContent() {
         guard let content = window?.contentView else { return }
@@ -721,7 +727,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
         titleBar.onToggleSidebar = { [weak self] in self?.toggleSidebarVisibility(nil) }
         titleBar.onTogglePanel = { [weak self] in self?.toggleTerminal(nil) }
-        titleBar.onToggleGitGraph = { [weak self] in self?.toggleGitGraph(nil) }
+        titleBar.onBack = { [weak self] in self?.navigateBack(nil) }
+        titleBar.onForward = { [weak self] in self?.navigateForward(nil) }
+        titleBar.onSearch = { [weak self] in self?.showQuickAccess(nil) }
         gitGraphPanel.onMessage = { [weak self] message in self?.statusLabel.stringValue = message }
         gitGraphPanel.onRepositoryChanged = { [weak self] in self?.refreshGitStatus() }
         titleBar.setSidebarVisible(true)
@@ -842,7 +850,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         // `BottomPanelContentView.layout()` sizes these (never below its
         // minimum). No autoresizing mask: one tied to the collapsed,
         // zero-height container conflicts with the panels' own constraints.
-        for panel in [terminalView, outputPanel, portsPanel, gitGraphPanel, problemsPanel] as [NSView] {
+        for panel in [terminalView, outputPanel, portsPanel, problemsPanel] as [NSView] {
             panel.translatesAutoresizingMaskIntoConstraints = true
             panel.autoresizingMask = []
             // A zero frame would become a `height == 0` constraint before
@@ -873,6 +881,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         editorTerminalView.translatesAutoresizingMaskIntoConstraints = false
         editorTerminalView.isHidden = true
         detailView.addSubview(editorTerminalView)
+        gitGraphPanel.translatesAutoresizingMaskIntoConstraints = false
+        detailView.addSubview(gitGraphPanel)
         // `TerminalView` is layer-backed. Without a layer here, it was
         // composited above every non-layer sibling and blanked the tab bar
         // and path bar while a terminal tab was active.
@@ -884,7 +894,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         bottomPanelPlaceholder.textColor = .secondaryLabelColor
         bottomPanelPlaceholder.alignment = .center
         bottomPanelPlaceholder.isHidden = true
-        for panel in [terminalView, problemsPanel, outputPanel, portsPanel, gitGraphPanel, bottomPanelPlaceholder] as [NSView] {
+        for panel in [terminalView, problemsPanel, outputPanel, portsPanel, bottomPanelPlaceholder] as [NSView] {
             bottomPanelContent.addSubview(panel)
         }
         bottomPanelContent.isHidden = true
@@ -920,6 +930,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
              editorTerminalView.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
              editorTerminalView.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
              editorTerminalView.bottomAnchor.constraint(equalTo: bottomPanelHeader.topAnchor),
+             // The Git Graph tab covers the same area.
+             gitGraphPanel.topAnchor.constraint(equalTo: tabBar.bottomAnchor),
+             gitGraphPanel.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
+             gitGraphPanel.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
+             gitGraphPanel.bottomAnchor.constraint(equalTo: bottomPanelHeader.topAnchor),
              bottomPanelHeader.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
              bottomPanelHeader.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
              bottomPanelHeaderHeight,
@@ -1010,14 +1025,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             activityBar.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             activityBar.bottomAnchor.constraint(equalTo: statusBar.topAnchor),
             splitView.topAnchor.constraint(equalTo: titleBar.bottomAnchor),
-            splitView.leadingAnchor.constraint(equalTo: activityBar.trailingAnchor),
-            splitView.trailingAnchor.constraint(equalTo: content.trailingAnchor),
-            splitView.bottomAnchor.constraint(equalTo: statusBar.topAnchor),
+            splitView.leadingAnchor.constraint(equalTo: activityBar.trailingAnchor, constant: Theme.cardGap / 2),
+            splitView.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -Theme.cardGap),
+            splitView.bottomAnchor.constraint(equalTo: statusBar.topAnchor, constant: -Theme.cardGap),
             statusBar.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             statusBar.trailingAnchor.constraint(equalTo: content.trailingAnchor),
             statusBar.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-            // Only valid once the bar is in the window.
-            titleBar.bottomAnchor.constraint(equalTo: titleBarBottom),
+            // Own height, not the system title bar's: that one is gone in
+            // full screen, and shorter than this in a window.
+            titleBar.heightAnchor.constraint(equalToConstant: TitleBar.minimumHeight),
         ])
     }
 
@@ -1067,7 +1083,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// answer is dropped by the per-tab generation.
     private func refreshBlame() {
         blameRefreshItem?.cancel()
-        guard gitBlameEnabled, let workspace, let tab = activeTab, tab.terminal == nil,
+        guard gitBlameEnabled, let workspace, let tab = activeTab, tab.isDocument,
               let path = tab.relPath else {
             updateBlameAnnotation()
             return
@@ -1104,7 +1120,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             if editorView.blameAnnotation == nil { hideBlamePopover() }
         }
         blameCommit = nil
-        guard gitBlameEnabled, let tab = activeTab, tab.terminal == nil, let blame = tab.blame,
+        guard gitBlameEnabled, let tab = activeTab, tab.isDocument, let blame = tab.blame,
               tab.doc.lineCount() == tab.blameLineCount else {
             editorView.blameAnnotation = nil
             return
@@ -1335,7 +1351,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private func jump(to location: DefinitionLocation) {
         guard let path = URL(string: location.uri)?.path else { return }
         let target = NavLocation(key: path, line: location.line, col: location.column)
-        if let current = activeTab.map(location(of:)) { _ = navHistory.recordJump(from: current, to: target) }
+        if let current = activeTab.map(location(of:)) { _ = navHistory.recordJump(from: current, to: target); refreshNavigationButtons() }
         _ = show(target)
     }
 
@@ -2232,7 +2248,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         applyDiffPane(for: tab)
         updateMarkdownPreview()
         let root = workspace?.root() ?? (tab.doc.path() as NSString).deletingLastPathComponent
-        if tab.terminal == nil {
+        if tab.isDocument {
             _ = bridge.startLSP(document: tab.doc, language: tab.doc.syntaxLanguage() ?? StatusBar.language(for: tab.doc.path()), root: root)
         }
         if let y = tab.scrollY {
@@ -2250,9 +2266,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             explorer.reveal(relPath: rel)
         }
         showEditorTerminal(for: tab)
+        showEditorGitGraph(for: tab)
         if tab.terminal != nil {
             if isFindVisible { closeFind(nil) }
             window?.makeFirstResponder(editorTerminalView)
+        } else if tab.isGitGraph {
+            if isFindVisible { closeFind(nil) }
+            gitGraphPanel.focus()
         } else if isFindVisible {
             applyFind(select: false)
         } else {
@@ -2350,7 +2370,38 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         refreshTabBar()
     }
 
+    private static let fullScreenKey = "MainWindowFullScreen"
+
+    /// Remembered so the next launch opens full screen again, as it was left.
+    func windowDidEnterFullScreen(_ notification: Notification) {
+        UserDefaults.standard.set(true, forKey: Self.fullScreenKey)
+    }
+
+    func windowDidExitFullScreen(_ notification: Notification) {
+        UserDefaults.standard.set(false, forKey: Self.fullScreenKey)
+        centerTrafficLights()
+    }
+
+    func windowDidResize(_ notification: Notification) { centerTrafficLights() }
+
+    /// The system title bar is made as tall as `TitleBar`, and the close,
+    /// minimise and zoom buttons are centred in it.
+    func centerTrafficLights() {
+        guard let window, !window.styleMask.contains(.fullScreen),
+              let close = window.standardWindowButton(.closeButton),
+              let container = close.superview?.superview else { return }
+        let height = TitleBar.minimumHeight
+        let frame = NSRect(x: 0, y: window.frame.height - height, width: window.frame.width, height: height)
+        if container.frame != frame { container.frame = frame }
+        for kind in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+            guard let button = window.standardWindowButton(kind), let bar = button.superview else { continue }
+            let y = ((bar.bounds.height - button.frame.height) / 2).rounded()
+            if button.frame.origin.y != y { button.setFrameOrigin(NSPoint(x: button.frame.origin.x, y: y)) }
+        }
+    }
+
     func windowDidBecomeKey(_ notification: Notification) {
+        centerTrafficLights()
         // Files outside the workspace are not watched; this catches them,
         // and a conflict that waited for the window.
         checkOpenFiles()
@@ -2430,6 +2481,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             if activeIndex == index { showEditorTerminal(for: nil) }
             if !keepTerminal { handle.kill() }
         }
+        if tabs[index].isGitGraph, activeIndex == index { showEditorGitGraph(for: nil) }
         editorView.flushPendingUpdates()
         if tabs[index].doc.isModified() {
             if activeIndex != index { selectTab(index) }
@@ -2483,10 +2535,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 isGitChanged: isChanged,
                 gitStatus: status,
                 isTerminal: tab.terminal != nil,
-                glyphName: tab.diffBase == nil ? nil : tab.title
+                glyphName: tab.diffBase == nil ? nil : tab.title,
+                isGitGraph: tab.isGitGraph
             )
         },
                    selected: activeIndex)
+        statusBar.setGitGraphVisible(isGitGraphTabShown)
     }
 
     /// Adds `tab` after the active one, or puts it in place of tab
@@ -2516,7 +2570,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// over an untouched empty "Untitled" tab, or (nil) a new tab.
     private func slotForOpening(preview: Bool) -> Int? {
         if preview, let i = tabs.firstIndex(where: { $0.isPreview && !$0.isEdited }) { return i }
-        guard let i = activeIndex, tabs[i].terminal == nil else { return nil }
+        guard let i = activeIndex, tabs[i].isDocument else { return nil }
         let doc = tabs[i].doc
         return doc.path().isEmpty && !doc.isModified() && doc.lenBytes() == 0 ? i : nil
     }
@@ -2536,6 +2590,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         activeIndex = nil
         if isFindVisible { closeFind(nil) }
         showEditorTerminal(for: nil)
+        showEditorGitGraph(for: nil)
         if isDiffPaneShown { leaveDiffPane() }
         editorView.document = nil
         updateMarkdownPreview()
@@ -2563,9 +2618,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         let preferred = panel.widthAnchor.constraint(equalToConstant: CommandPaletteView.width)
         preferred.priority = .defaultHigh
         NSLayoutConstraint.activate([
-            panel.topAnchor.constraint(equalTo: tabBar.topAnchor, constant: 6),
-            panel.centerXAnchor.constraint(equalTo: detailView.centerXAnchor),
-            panel.widthAnchor.constraint(lessThanOrEqualTo: detailView.widthAnchor, constant: -24),
+            panel.topAnchor.constraint(equalTo: titleBar.topAnchor, constant: 6),
+            panel.centerXAnchor.constraint(equalTo: titleBar.centerXAnchor),
+            panel.widthAnchor.constraint(lessThanOrEqualTo: titleBar.widthAnchor, constant: -24),
             preferred,
         ])
         loadedPalette = panel
@@ -3090,6 +3145,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         guard let tab = activeTab else { return }
         let from = location(of: tab)
         _ = navHistory.recordJump(from: from, to: NavLocation(key: tab.navKey, line: target.line, col: target.col ?? 0))
+        refreshNavigationButtons()
         move(tab, toLine: target.line, col: target.col)
     }
 
@@ -3105,9 +3161,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         closeOverlays()
         let current = activeTab.map(location(of:))
         while let loc = forward ? navHistory.forward(current: current) : navHistory.back(current: current) {
-            if show(loc) { return }
+            if show(loc) { return refreshNavigationButtons() }
             navHistory.forget(key: loc.key)
         }
+        refreshNavigationButtons()
         NSSound.beep()
     }
 
@@ -3266,6 +3323,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         _ = navHistory.recordJump(
             from: from,
             to: NavLocation(key: tab.navKey, line: symbol.line, col: symbol.column))
+        refreshNavigationButtons()
         move(tab, toLine: symbol.line, col: symbol.column)
     }
 
@@ -3276,6 +3334,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         findOrigin = nil
         guard origin.key == tab.navKey else { return }
         _ = navHistory.recordJump(from: origin, to: location(of: tab))
+        refreshNavigationButtons()
     }
 
     /// Runs `move` and records where the caret was if it went far.
@@ -3284,6 +3343,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         let from = location(of: tab)
         move()
         _ = navHistory.recordJump(from: from, to: location(of: tab))
+        refreshNavigationButtons()
     }
 
     func location(of tab: EditorTab) -> NavLocation {
@@ -3294,6 +3354,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private func noteLeaving(_ tab: EditorTab) {
         guard !isNavigating else { return }
         navHistory.record(from: location(of: tab))
+        refreshNavigationButtons()
+    }
+
+    /// Greys the title bar's back and forward buttons when there is nowhere to go.
+    func refreshNavigationButtons() {
+        titleBar.setNavigation(canGoBack: navHistory.canGoBack(), canGoForward: navHistory.canGoForward())
     }
 
     /// Every keyboard shortcut goes through here (M2-10), before menus
@@ -3467,13 +3533,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         panel.translatesAutoresizingMaskIntoConstraints = false
         panel.onOpen = { [weak self] match in self?.openQuickOpenMatch(match) }
         panel.onClose = { [weak self] in self?.closeGoToFile() }
+        panel.onMode = { [weak self] text in self?.switchQuickAccess(to: text) }
         window?.contentView?.addSubview(panel)
         let preferred = panel.widthAnchor.constraint(equalToConstant: QuickOpen.width)
         preferred.priority = .defaultHigh
         NSLayoutConstraint.activate([
-            panel.topAnchor.constraint(equalTo: tabBar.topAnchor, constant: 6),
-            panel.centerXAnchor.constraint(equalTo: detailView.centerXAnchor),
-            panel.widthAnchor.constraint(lessThanOrEqualTo: detailView.widthAnchor, constant: -24),
+            panel.topAnchor.constraint(equalTo: titleBar.topAnchor, constant: 6),
+            panel.centerXAnchor.constraint(equalTo: titleBar.centerXAnchor),
+            panel.widthAnchor.constraint(lessThanOrEqualTo: titleBar.widthAnchor, constant: -24),
             preferred,
         ])
         loadedQuickOpen = panel
@@ -3492,9 +3559,54 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         let panel = quickOpen
         fileFinder?.setContext(current: activeTab.flatMap { relativePath($0.doc.path()) }, recent: recentFiles)
         panel.finder = fileFinder
+        panel.hintShortcuts = keybindings.shortcutTexts
         panel.isHidden = false
         panel.reset()
         panel.focus()
+    }
+
+    /// The title bar's search box: Go to File with the mode list, or the
+    /// command palette when no folder is open.
+    @objc func showQuickAccess(_ sender: Any?) {
+        guard workspace != nil else { return showCommandPalette(nil) }
+        if isQuickOpenVisible { return closeGoToFile() }
+        showGoToFile(nil)
+    }
+
+    /// Hands the quick-access field over to the panel for its prefix:
+    /// `>` commands, `@` symbols, `:` line, `%` text. The rest of the text
+    /// is carried over.
+    private func switchQuickAccess(to text: String) {
+        guard let prefix = text.first else { return }
+        let rest = String(text.dropFirst())
+        closeGoToFile()
+        switch prefix {
+        case ">":
+            showCommandPalette(nil)
+            commandPalette.setQuery(rest)
+            Self.caretToEnd(commandPalette.field)
+        case "@":
+            showGoToSymbol(nil)
+            guard isOutlinePickerVisible else { return }
+            outlinePicker.setQuery(rest)
+            Self.caretToEnd(outlinePicker.field)
+        case ":":
+            showGoToLine(nil)
+            guard isGoToLineVisible else { return }
+            goToLine.setInput(rest)
+            Self.caretToEnd(goToLine.field)
+        case "%":
+            showWorkspaceSearch(nil)
+            guard isWorkspaceSearchVisible, !rest.isEmpty else { return }
+            workspaceSearch.field.stringValue = rest
+            workspaceSearch.controlTextDidChange(Notification(name: NSControl.textDidChangeNotification))
+            Self.caretToEnd(workspaceSearch.field)
+        default: break
+        }
+    }
+
+    private static func caretToEnd(_ field: NSTextField) {
+        field.currentEditor()?.selectedRange = NSRange(location: field.stringValue.utf16.count, length: 0)
     }
 
     func closeGoToFile() {
@@ -3827,7 +3939,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// was cancelled.
     @discardableResult
     func save() -> Bool {
-        guard activeTab?.terminal == nil, let doc = editorView.document else { return true }
+        guard activeTab?.isDocument != false, let doc = editorView.document else { return true }
         if doc.path().isEmpty { return saveAs() }
         if doc.checkDisk() == .changed, let tab = activeTab {
             tab.hasDiskConflict = false
@@ -3854,7 +3966,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     @discardableResult
     func saveAs() -> Bool {
-        guard activeTab?.terminal == nil, let doc = editorView.document, let url = askSaveLocation(documentName) else { return false }
+        guard activeTab?.isDocument != false, let doc = editorView.document, let url = askSaveLocation(documentName) else { return false }
         do {
             try doc.saveAs(path: url.path)
         } catch {
@@ -3989,7 +4101,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
 
     func saveSessionForQuit() {
-        if !didCloseWindow { saveSession() }
+        if !didCloseWindow {
+            saveSession()
+            if let window { UserDefaults.standard.set(window.styleMask.contains(.fullScreen), forKey: Self.fullScreenKey) }
+        }
     }
 
     func prepareForApplicationQuit() { isTerminatingApplication = true }
@@ -4187,9 +4302,53 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
 }
 
+/// A rounded panel with a hairline border, clipping what it holds to its
+/// corners. The sidebar and the editor area are cards on the chrome colour.
+@MainActor
+class CardView: NSView {
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.cornerRadius = Theme.cardRadius
+        layer?.cornerCurve = .continuous
+        layer?.masksToBounds = true
+        layer?.borderWidth = 1
+        refreshBorder()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        refreshBorder()
+    }
+
+    /// Dynamic colours do not follow appearance changes on a layer by themselves.
+    private func refreshBorder() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.borderColor = NSColor.separatorColor.cgColor
+        }
+    }
+}
+
+/// Holds the two cards: draws the chrome colour in the gap between them and
+/// no divider line, but keeps the gap draggable.
+@MainActor
+final class CardSplitView: NSSplitView {
+    override var dividerThickness: CGFloat { Theme.cardGap }
+    override func drawDivider(in rect: NSRect) {}
+
+    override func draw(_ dirtyRect: NSRect) {
+        Theme.chrome.setFill()
+        dirtyRect.intersection(bounds).fill()
+        super.draw(dirtyRect)
+    }
+}
+
 /// Solid sidebar background (no vibrancy): matches the flat chrome.
 @MainActor
-final class SidebarView: NSView {
+final class SidebarView: CardView {
     override func draw(_ dirtyRect: NSRect) {
         Theme.sidebar.setFill()
         dirtyRect.intersection(bounds).fill()
@@ -4455,13 +4614,18 @@ extension MainWindowController: NSSplitViewDelegate {
     }
 
     func splitView(_ splitView: NSSplitView, canCollapseSubview subview: NSView) -> Bool { subview === sidebar }
+
+    /// No gap to drag while the sidebar is hidden.
+    func splitView(_ splitView: NSSplitView, shouldHideDividerAt dividerIndex: Int) -> Bool {
+        splitView.isSubviewCollapsed(sidebar)
+    }
 }
 
 extension MainWindowController: NSMenuItemValidation {
     /// Disables menu items (and palette commands) that cannot do anything
     /// right now.
     func validateMenuItem(_ item: NSMenuItem) -> Bool {
-        let hasDocument = editorView.document != nil && activeTab?.terminal == nil
+        let hasDocument = editorView.document != nil && activeTab?.isDocument != false
         switch item.action {
         case #selector(saveDocument(_:)), #selector(saveDocumentAs(_:)),
              #selector(showFind(_:)), #selector(showFindAndReplace(_:)),

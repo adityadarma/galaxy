@@ -11,7 +11,6 @@ final class BottomPanelHeader: NSView {
         case debugConsole
         case terminal
         case ports
-        case gitGraph
 
         var title: String {
             switch self {
@@ -20,7 +19,6 @@ final class BottomPanelHeader: NSView {
             case .debugConsole: "DEBUG CONSOLE"
             case .terminal: "TERMINAL"
             case .ports: "PORTS"
-            case .gitGraph: "GIT GRAPH"
             }
         }
     }

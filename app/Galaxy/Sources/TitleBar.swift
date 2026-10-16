@@ -1,27 +1,32 @@
 import AppKit
 
 /// Plain strip in the (transparent) title bar: holds the traffic lights and
-/// drags the window. On the right, like VS Code's layout controls, two
-/// buttons show and hide the sidebar (⌘B) and the bottom panel (⌘J).
+/// drags the window. In the centre, back and forward buttons sit beside a
+/// search pill that opens the command palette. On the right, like VS Code's
+/// layout controls, buttons show and hide the sidebar (⌘B) and the bottom
+/// panel (⌘J).
 @MainActor
 final class TitleBar: NSView {
+    /// Height of the bar. The system title bar is stretched to match in a
+    /// window; full screen has none, so the bar keeps this height itself.
+    static let minimumHeight: CGFloat = 38
+
     var onToggleSidebar: (() -> Void)?
     var onTogglePanel: (() -> Void)?
-    var onToggleGitGraph: (() -> Void)?
+    var onBack: (() -> Void)?
+    var onForward: (() -> Void)?
+    var onSearch: (() -> Void)?
 
     let sidebarButton = TitleBar.toggle(symbol: "sidebar.left", title: "Toggle Primary Side Bar (⌘B)")
     let panelButton = TitleBar.toggle(symbol: "rectangle.bottomthird.inset.filled", title: "Toggle Panel (⌘J)")
-    let gitGraphButton = TitleBar.toggle(symbol: "point.3.connected.trianglepath.dotted", title: "Toggle Git Graph")
-    private let projectTitle = NSTextField(labelWithString: "")
+    let backButton = TitleBar.toggle(symbol: "arrow.left", title: "Go Back")
+    let forwardButton = TitleBar.toggle(symbol: "arrow.right", title: "Go Forward")
+    let searchPill = SearchPill()
+    private static let searchPlaceholder = "Search"
 
     override init(frame: NSRect) {
         super.init(frame: frame)
         setAccessibilityElement(false)
-
-        let separator = NSBox()
-        separator.boxType = .separator
-        separator.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(separator)
 
         sidebarButton.target = self
         sidebarButton.action = #selector(toggleSidebar(_:))
@@ -29,36 +34,57 @@ final class TitleBar: NSView {
         panelButton.target = self
         panelButton.action = #selector(togglePanel(_:))
         panelButton.setAccessibilityIdentifier("toggle-panel")
-        gitGraphButton.target = self
-        gitGraphButton.action = #selector(toggleGitGraph(_:))
-        gitGraphButton.setAccessibilityIdentifier("toggle-git-graph")
 
-        let buttons = NSStackView(views: [gitGraphButton, sidebarButton, panelButton])
+        let buttons = NSStackView(views: [sidebarButton, panelButton])
         buttons.orientation = .horizontal
         buttons.spacing = 4
         buttons.translatesAutoresizingMaskIntoConstraints = false
         addSubview(buttons)
 
-        projectTitle.font = .systemFont(ofSize: 13, weight: .medium)
-        projectTitle.textColor = .secondaryLabelColor
-        projectTitle.lineBreakMode = .byTruncatingMiddle
-        projectTitle.alignment = .center
-        projectTitle.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(projectTitle)
+        backButton.target = self
+        backButton.action = #selector(goBack(_:))
+        backButton.setAccessibilityIdentifier("navigate-back")
+        forwardButton.target = self
+        forwardButton.action = #selector(goForward(_:))
+        forwardButton.setAccessibilityIdentifier("navigate-forward")
+        for b in [backButton, forwardButton] {
+            b.setButtonType(.momentaryChange)
+            b.isEnabled = false
+        }
+
+        searchPill.text = Self.searchPlaceholder
+        searchPill.target = self
+        searchPill.action = #selector(openSearch(_:))
+        searchPill.setAccessibilityIdentifier("title-search")
+        searchPill.setAccessibilityLabel("Search commands")
+        searchPill.toolTip = "Command Palette (⇧⌘P)"
+
+        let navigation = NSStackView(views: [backButton, forwardButton, searchPill])
+        navigation.orientation = .horizontal
+        navigation.spacing = 8
+        navigation.alignment = .centerY
+        navigation.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(navigation)
 
         NSLayoutConstraint.activate([
-            separator.bottomAnchor.constraint(equalTo: bottomAnchor),
-            separator.leadingAnchor.constraint(equalTo: leadingAnchor),
-            separator.trailingAnchor.constraint(equalTo: trailingAnchor),
             buttons.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
             buttons.centerYAnchor.constraint(equalTo: centerYAnchor),
-            projectTitle.centerXAnchor.constraint(equalTo: centerXAnchor),
-            projectTitle.centerYAnchor.constraint(equalTo: centerYAnchor),
-            projectTitle.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, multiplier: 0.45),
+            navigation.centerXAnchor.constraint(equalTo: centerXAnchor),
+            navigation.centerYAnchor.constraint(equalTo: centerYAnchor),
+            searchPill.widthAnchor.constraint(equalToConstant: 360).prioritized(.defaultHigh),
+            searchPill.widthAnchor.constraint(lessThanOrEqualTo: widthAnchor, multiplier: 0.4),
+            searchPill.heightAnchor.constraint(equalToConstant: 26),
         ])
     }
 
-    func setProjectTitle(_ name: String?) { projectTitle.stringValue = name ?? "" }
+    func setProjectTitle(_ name: String?) {
+        searchPill.text = (name?.isEmpty == false) ? name! : Self.searchPlaceholder
+    }
+
+    func setNavigation(canGoBack: Bool, canGoForward: Bool) {
+        if backButton.isEnabled != canGoBack { backButton.isEnabled = canGoBack }
+        if forwardButton.isEnabled != canGoForward { forwardButton.isEnabled = canGoForward }
+    }
 
     /// Filled when the part is shown, as VS Code tints its layout controls.
     func setSidebarVisible(_ visible: Bool) {
@@ -71,12 +97,9 @@ final class TitleBar: NSView {
         panelButton.contentTintColor = visible ? .labelColor : .secondaryLabelColor
     }
 
-    func setGitGraphVisible(_ visible: Bool) {
-        gitGraphButton.state = visible ? .on : .off
-        gitGraphButton.contentTintColor = visible ? .labelColor : .secondaryLabelColor
-    }
-
-    @objc private func toggleGitGraph(_ sender: Any?) { onToggleGitGraph?() }
+    @objc private func goBack(_ sender: Any?) { onBack?() }
+    @objc private func goForward(_ sender: Any?) { onForward?() }
+    @objc private func openSearch(_ sender: Any?) { onSearch?() }
     @objc private func toggleSidebar(_ sender: Any?) { onToggleSidebar?() }
     @objc private func togglePanel(_ sender: Any?) { onTogglePanel?() }
 
@@ -137,5 +160,64 @@ final class TitleBar: NSView {
     override func draw(_ dirtyRect: NSRect) {
         Theme.chrome.setFill()
         dirtyRect.intersection(bounds).fill()
+    }
+}
+
+private extension NSLayoutConstraint {
+    func prioritized(_ p: NSLayoutConstraint.Priority) -> NSLayoutConstraint {
+        priority = p
+        return self
+    }
+}
+
+/// Borderless rounded field in the title bar. Looks like a search box but
+/// is a button: a click opens the command palette instead of taking text.
+@MainActor
+final class SearchPill: NSButton {
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        isBordered = false
+        setButtonType(.momentaryChange)
+        alignment = .left
+        font = .systemFont(ofSize: 13)
+        lineBreakMode = .byTruncatingTail
+        wantsLayer = true
+        layer?.cornerRadius = 6
+        translatesAutoresizingMaskIntoConstraints = false
+        refreshColors()
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    var text = "" {
+        didSet { refreshColors() }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        refreshColors()
+    }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .arrow)
+    }
+
+    /// Dynamic colours do not follow appearance changes on a layer by themselves.
+    private func refreshColors() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.07).cgColor
+        }
+        let style = NSMutableParagraphStyle()
+        style.alignment = .left
+        style.lineBreakMode = .byTruncatingTail
+        style.firstLineHeadIndent = 10
+        style.headIndent = 10
+        style.tailIndent = -10
+        attributedTitle = NSAttributedString(string: text, attributes: [
+            .font: NSFont.systemFont(ofSize: 13),
+            .foregroundColor: NSColor.secondaryLabelColor,
+            .paragraphStyle: style,
+        ])
     }
 }

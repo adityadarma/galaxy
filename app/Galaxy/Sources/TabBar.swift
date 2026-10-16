@@ -9,6 +9,11 @@ final class EditorTab {
     /// buffer: it has no path and is never modified, so saving, the
     /// session and the unsaved prompts skip the tab.
     let terminal: TerminalHandle?
+    /// The Git Graph view as a tab. Like a terminal tab, `doc` is an empty,
+    /// never-shown buffer.
+    let isGitGraph: Bool
+    /// A real text document: not a terminal and not the Git Graph.
+    var isDocument: Bool { terminal == nil && !isGitGraph }
     /// File name shown on the tab.
     var title: String
     /// Breadcrumb for the path bar: workspace, folders, file.
@@ -56,9 +61,10 @@ final class EditorTab {
     var navKey: String { fileKey ?? untitledKey }
 
     init(doc: DocumentHandle, title: String, pathComponents: [String], windowTitle: String,
-         isPreview: Bool, status: String, terminal: TerminalHandle? = nil) {
+         isPreview: Bool, status: String, terminal: TerminalHandle? = nil, isGitGraph: Bool = false) {
         self.doc = doc
         self.terminal = terminal
+        self.isGitGraph = isGitGraph
         self.title = title
         self.pathComponents = pathComponents
         self.windowTitle = windowTitle
@@ -104,12 +110,15 @@ final class TabBar: NSView {
         var gitStatus: GitFileStatus
         /// Terminal tab: terminal icon instead of a file glyph.
         var isTerminal = false
+        /// Git Graph tab: graph icon instead of a file glyph.
+        var isGitGraph = false
         /// File name the glyph is chosen from, when the title has a suffix.
         var glyphName: String?
 
         init(title: String, isPreview: Bool, isEdited: Bool, isGitChanged: Bool, gitStatus: GitFileStatus = .none,
-             isTerminal: Bool = false, glyphName: String? = nil) {
+             isTerminal: Bool = false, glyphName: String? = nil, isGitGraph: Bool = false) {
             self.isTerminal = isTerminal
+            self.isGitGraph = isGitGraph
             self.glyphName = glyphName
             self.title = title
             self.isPreview = isPreview
@@ -469,6 +478,10 @@ final class TabItemView: NSView {
         }
         if item.isTerminal {
             icon.image = NSImage(systemSymbolName: "apple.terminal", accessibilityDescription: nil)?
+                .withSymbolConfiguration(.init(pointSize: 12, weight: .regular))
+            icon.contentTintColor = .secondaryLabelColor
+        } else if item.isGitGraph {
+            icon.image = NSImage(systemSymbolName: "point.3.connected.trianglepath.dotted", accessibilityDescription: nil)?
                 .withSymbolConfiguration(.init(pointSize: 12, weight: .regular))
             icon.contentTintColor = .secondaryLabelColor
         } else {

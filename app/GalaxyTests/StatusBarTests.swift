@@ -24,6 +24,19 @@ final class StatusBarTests: XCTestCase {
         XCTAssertEqual(bar.git.stringValue, "")
     }
 
+    func testGitGraphButtonSitsBesideTheBranchAndOpensTheGraph() {
+        let bar = StatusBar()
+        XCTAssertTrue(bar.gitGraph.isHidden, "no repository, no graph button")
+        bar.showGit(branch: "main", changedCount: 0)
+        XCTAssertFalse(bar.gitGraph.isHidden)
+        var opened = 0
+        bar.onGitGraphClick = { opened += 1 }
+        bar.gitGraph.performClick(nil)
+        XCTAssertEqual(opened, 1)
+        bar.showGit(branch: nil, changedCount: 0)
+        XCTAssertTrue(bar.gitGraph.isHidden)
+    }
+
     func testGitDecorationsAreRepresentedByViewModels() {
         let item = TabBar.Item(title: "main.rs", isPreview: false, isEdited: false, isGitChanged: true)
         XCTAssertTrue(item.isGitChanged)

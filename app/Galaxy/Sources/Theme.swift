@@ -190,6 +190,10 @@ enum Theme {
     /// Sidebar: between chrome and editor.
     static let sidebar = NSColor(name: "GalaxySidebar") { definition(for: $0).sidebar }
     static let tabHeight: CGFloat = 34
+    /// Sidebar and editor are rounded cards on the chrome colour, with this
+    /// gap between them and to the window edge.
+    static let cardGap: CGFloat = 6
+    static let cardRadius: CGFloat = 10
 
     static var editorFont: NSFont {
         let defaults = UserDefaults.standard

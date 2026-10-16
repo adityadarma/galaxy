@@ -169,7 +169,7 @@ final class ExplorerTests: XCTestCase {
         XCTAssertEqual(frame(activity).width, ActivityBar.width)
         XCTAssertEqual(frame(activity).maxY, frame(controller.titleBar).minY, accuracy: 0.5)
         XCTAssertEqual(frame(activity).minY, frame(controller.statusBar).maxY, accuracy: 0.5)
-        XCTAssertEqual(frame(controller.sidebar).minX, ActivityBar.width, accuracy: 0.5)
+        XCTAssertEqual(frame(controller.sidebar).minX, ActivityBar.width + Theme.cardGap / 2, accuracy: 0.5, "the sidebar card starts after a small gap")
         XCTAssertEqual(activity.active, .explorer)
         XCTAssertTrue(activity.isEnabled(.explorer))
         XCTAssertTrue(activity.isEnabled(.search))
@@ -319,12 +319,11 @@ final class ExplorerTests: XCTestCase {
         let titleFrame = content.convert(controller.titleBar.bounds, from: controller.titleBar)
         XCTAssertEqual(titleFrame.maxY, content.bounds.maxY, accuracy: 0.5)
         XCTAssertEqual(titleFrame.width, content.bounds.width, accuracy: 0.5)
-        XCTAssertEqual(titleFrame.minY, window.contentLayoutRect.maxY, accuracy: 0.5, "ends where the title bar ends")
-        // The separator, the layout toggles and the project name.
-        XCTAssertTrue(controller.titleBar.subviews.allSatisfy { $0 is NSBox || $0 is NSStackView || $0 is NSTextField },
-                      "only layout toggles and the project name in the title bar")
-        let titleText = try XCTUnwrap(controller.titleBar.subviews.compactMap { $0 as? NSTextField }.first)
-        XCTAssertEqual(titleText.stringValue, try XCTUnwrap(controller.workspace).name())
+        XCTAssertEqual(titleFrame.height, TitleBar.minimumHeight, accuracy: 0.5, "keeps its own height, also in full screen")
+        // The separator, the navigation and search group, the layout toggles.
+        XCTAssertTrue(controller.titleBar.subviews.allSatisfy { $0 is NSBox || $0 is NSStackView },
+                      "only navigation, search and layout toggles in the title bar")
+        XCTAssertEqual(controller.titleBar.searchPill.text, try XCTUnwrap(controller.workspace).name())
         // The sidebar section stays "EXPLORER"; the folder name is in the title bar.
         XCTAssertEqual(controller.sectionHeader.label.stringValue, "EXPLORER")
 

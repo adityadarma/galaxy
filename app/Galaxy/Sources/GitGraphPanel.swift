@@ -45,17 +45,28 @@ enum GitGraphRows {
     }
 }
 
-/// The Git Graph bottom-panel tab: a commit table whose first column draws
+/// The Git Graph editor tab: a commit table whose first column draws
 /// the branch lanes, like the Git Graph extension in VS Code.
 @MainActor
 final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, NSMenuDelegate {
     static let rowHeight: CGFloat = 24
     static let laneWidth: CGFloat = 14
+    /// Commits loaded first, and added each time the list is scrolled to its end.
     static let commitLimit: UInt32 = 500
 
     var workspace: Workspace? {
-        didSet { loadPinned() }
+        didSet {
+            loadPinned()
+            limit = pageSize
+            hasMore = false
+        }
     }
+    /// Size of one page of history. Tests use a small one.
+    var pageSize: UInt32 = GitGraphPanel.commitLimit
+    /// How many commits to read now; grows by a page when scrolling reaches the end.
+    private var limit: UInt32 = GitGraphPanel.commitLimit
+    /// The last read filled the limit, so older commits probably exist.
+    private(set) var hasMore = false
     /// Status-line text for the result of a context-menu action.
     var onMessage: ((String) -> Void)?
     /// Called after an action changed the repository (branch, tag, HEAD).
@@ -159,6 +170,9 @@ final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, N
         refreshButton.translatesAutoresizingMaskIntoConstraints = false
 
         scroll.documentView = table
+        scroll.contentView.postsBoundsChangedNotifications = true
+        NotificationCenter.default.addObserver(self, selector: #selector(scrolled(_:)),
+                                               name: NSView.boundsDidChangeNotification, object: scroll.contentView)
         scroll.hasVerticalScroller = true
         scroll.scrollerStyle = .overlay
         scroll.drawsBackground = false
@@ -197,6 +211,18 @@ final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, N
 
     func stop() { timer?.invalidate(); timer = nil }
 
+    /// Own background: the editor's path bar sits behind this tab, and the
+    /// translucent table header would blur it through.
+    override var isOpaque: Bool { true }
+
+    override func draw(_ dirtyRect: NSRect) {
+        Theme.editorBackground.setFill()
+        dirtyRect.intersection(bounds).fill()
+    }
+
+    /// Keys go to the table, not to the editor hidden behind this tab.
+    func focus() { window?.makeFirstResponder(table) }
+
     @objc private func refreshClicked(_ sender: Any?) { refresh(includeOrigin: true) }
 
     /// Reloads the commits. Reading origin's tags contacts the network, so
@@ -213,17 +239,37 @@ final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, N
         if includeOrigin { refreshOriginTags(workspace) }
         guard !loading else { return }
         loading = true
+        let limit = self.limit
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let commits = (try? workspace.gitLogGraph(limit: Self.commitLimit)) ?? []
+            let commits = (try? workspace.gitLogGraph(limit: limit)) ?? []
             let uncommitted = ((try? workspace.gitStatus())??.changes.count) ?? 0
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.loading = false
                 self.commits = commits
                 self.uncommitted = uncommitted
+                self.hasMore = commits.count >= Int(limit)
                 self.rebuild()
+                // The page may not have been enough to fill the view.
+                self.loadMoreIfNeeded()
             }
         }
+    }
+
+    /// Reads one more page of history. The lanes are laid out over the whole
+    /// list, so it is read again with a larger limit rather than appended.
+    func loadMore() {
+        guard hasMore, !loading, workspace != nil else { return }
+        limit += pageSize
+        refresh()
+    }
+
+    @objc private func scrolled(_ note: Notification) { loadMoreIfNeeded() }
+
+    private func loadMoreIfNeeded() {
+        guard hasMore, !loading, !scroll.isHidden else { return }
+        let nearEnd = scroll.contentView.bounds.maxY >= table.bounds.height - 12 * Self.rowHeight
+        if nearEnd { loadMore() }
     }
 
     private func refreshOriginTags(_ workspace: Workspace) {

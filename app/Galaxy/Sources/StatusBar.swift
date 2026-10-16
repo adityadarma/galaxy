@@ -16,6 +16,9 @@ final class StatusBar: NSView {
     let largeFileBadge = NSTextField(labelWithString: "Large file")
     let git = StatusBarGitButton(title: "", target: nil, action: nil)
     var onGitClick: (() -> Void)?
+    /// Opens the Git Graph tab of the bottom panel; shown beside the branch.
+    let gitGraph = NSButton()
+    var onGitGraphClick: (() -> Void)?
     let cursor = StatusBar.label("status-cursor")
     let language = StatusBar.label("status-language")
     let indent = StatusBar.label("status-indent")
@@ -51,7 +54,24 @@ final class StatusBar: NSView {
         git.target = self
         git.action = #selector(gitClicked(_:))
 
-        let left = NSStackView(views: [git, message, largeFileBadge])
+        gitGraph.image = NSImage(systemSymbolName: "point.3.connected.trianglepath.dotted",
+                                 accessibilityDescription: "Git Graph")?
+            .withSymbolConfiguration(.init(pointSize: 12, weight: .regular))
+        gitGraph.title = "Git Graph"
+        gitGraph.font = Theme.statusFont
+        gitGraph.imagePosition = .imageLeading
+        gitGraph.imageHugsTitle = true
+        gitGraph.alignment = .left
+        gitGraph.isBordered = false
+        gitGraph.contentTintColor = .secondaryLabelColor
+        gitGraph.toolTip = "Git Graph"
+        gitGraph.setAccessibilityLabel("Git Graph")
+        gitGraph.setAccessibilityIdentifier("status-git-graph")
+        gitGraph.target = self
+        gitGraph.action = #selector(gitGraphClicked(_:))
+        gitGraph.isHidden = true
+
+        let left = NSStackView(views: [git, gitGraph, message, largeFileBadge])
         left.spacing = 8
         let right = NSStackView(views: [cursor, language, indent, lineEnding, encoding, lsp])
         right.spacing = 14
@@ -66,16 +86,8 @@ final class StatusBar: NSView {
         right.setContentCompressionResistancePriority(.required, for: .horizontal)
         addSubview(row)
 
-        let separator = NSBox()
-        separator.boxType = .separator
-        separator.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(separator)
-
         NSLayoutConstraint.activate([
             heightAnchor.constraint(equalToConstant: Theme.statusHeight),
-            separator.topAnchor.constraint(equalTo: topAnchor),
-            separator.leadingAnchor.constraint(equalTo: leadingAnchor),
-            separator.trailingAnchor.constraint(equalTo: trailingAnchor),
             row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
             row.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -12),
             row.centerYAnchor.constraint(equalTo: centerYAnchor),
@@ -146,8 +158,10 @@ final class StatusBar: NSView {
             git.title = ""
             git.stringValue = ""
             git.image = nil
+            gitGraph.isHidden = true
             return
         }
+        gitGraph.isHidden = false
         git.image = NSImage(systemSymbolName: "arrow.triangle.branch", accessibilityDescription: "Git branch")?
             .withSymbolConfiguration(.init(pointSize: 12, weight: .regular))
         git.imagePosition = .imageLeading
@@ -161,6 +175,12 @@ final class StatusBar: NSView {
     }
 
     @objc private func gitClicked(_ sender: Any?) { onGitClick?() }
+    @objc private func gitGraphClicked(_ sender: Any?) { onGitGraphClick?() }
+
+    /// Brighter while the Git Graph tab is showing.
+    func setGitGraphVisible(_ visible: Bool) {
+        gitGraph.contentTintColor = visible ? .labelColor : .secondaryLabelColor
+    }
 
     /// Lightweight path detection for the status bar. Syntax parsers replace
     /// this in M3, but the label is useful before highlighting exists.
