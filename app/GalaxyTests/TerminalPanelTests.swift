@@ -25,6 +25,18 @@ final class TerminalPanelTests: XCTestCase {
         XCTAssertEqual(TerminalView.bytes(for: key(48, "\t", .shift), appCursor: false), "\u{1b}[Z")
     }
 
+    func testMouseReportsUseXtermEncoding() {
+        XCTAssertEqual(TerminalView.mouseReport(button: 0, column: 5, row: 7, sgr: true), "\u{1b}[<0;5;7M")
+        XCTAssertEqual(TerminalView.mouseReport(button: 0, column: 5, row: 7, release: true, sgr: true), "\u{1b}[<0;5;7m")
+        XCTAssertEqual(TerminalView.mouseReport(button: 64, column: 1, row: 1, sgr: true), "\u{1b}[<64;1;1M", "wheel up")
+        XCTAssertEqual(TerminalView.mouseReport(button: 65, column: 1, row: 1, sgr: true), "\u{1b}[<65;1;1M", "wheel down")
+        XCTAssertEqual(TerminalView.mouseReport(button: 0, column: 2, row: 3, motion: true, sgr: true), "\u{1b}[<32;2;3M", "drag")
+        XCTAssertEqual(TerminalView.mouseReport(button: 0, column: 2, row: 3, modifiers: .control, sgr: true), "\u{1b}[<16;2;3M")
+        XCTAssertEqual(TerminalView.mouseReport(button: 0, column: 1, row: 1, sgr: false), "\u{1b}[M !!")
+        XCTAssertEqual(TerminalView.mouseReport(button: 0, column: 1, row: 1, release: true, sgr: false), "\u{1b}[M#!!")
+        XCTAssertNil(TerminalView.mouseReport(button: 0, column: 200, row: 1, sgr: false), "X10 can't encode wide grids")
+    }
+
     func testFileLinksAreFoundInOutput() {
         let link = TerminalView.fileLink(in: "error: src/main.rs:12:5: expected `;`")
         XCTAssertEqual(link?.path, "src/main.rs")
@@ -55,16 +67,44 @@ final class TerminalPanelTests: XCTestCase {
         XCTAssertEqual(palette.colors(for: bold).foreground, palette.ansi[9], "bold uses the bright color")
     }
 
-    func testHeaderShowsTerminalActionsOnlyOnTheTerminalTab() {
+    func testHeaderShowsTheChipForOneTerminalOnly() {
         let header = BottomPanelHeader(frame: NSRect(x: 0, y: 0, width: 900, height: BottomPanelHeader.height))
-        header.setTerminals(names: ["zsh"], selected: 0)
-        XCTAssertFalse(header.terminalPicker.isHidden)
-        XCTAssertEqual(header.terminalPicker.titleOfSelectedItem, "zsh")
-        header.setTerminals(names: ["zsh", "zsh"], selected: 1)
-        XCTAssertEqual(header.terminalPicker.titleOfSelectedItem, "2: zsh")
+        let zsh = TerminalSummary(name: "zsh", icon: PanelTerminal.defaultIcon, tint: nil, group: 0)
+        header.setTerminals([zsh])
+        XCTAssertFalse(header.terminalChip.isHidden, "one terminal: the chip names it")
+        header.setTerminals([zsh, zsh])
+        XCTAssertTrue(header.terminalChip.isHidden, "two or more: the list takes over")
+        header.setTerminals([zsh])
         header.select(.problems)
-        XCTAssertTrue(header.terminalPicker.isHidden)
+        XCTAssertTrue(header.terminalChip.isHidden)
         XCTAssertEqual(header.selectedTab, .problems)
+    }
+
+    func testChipOpensTheTerminalMenu() {
+        let header = BottomPanelHeader(frame: NSRect(x: 0, y: 0, width: 900, height: BottomPanelHeader.height))
+        var asked = 0
+        header.chipMenuProvider = { asked += 1; return NSMenu() }
+        XCTAssertNotNil(header.terminalChip.menu(for: NSEvent.mouseEvent(
+            with: .rightMouseDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0,
+            context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!))
+        XCTAssertEqual(asked, 1)
+    }
+
+    func testListShowsFromTwoTerminalsAndFollowsContentWidth() {
+        let panel = TerminalPanelView(frame: NSRect(x: 0, y: 0, width: 800, height: 300))
+        let one = TerminalSummary(name: "zsh", icon: PanelTerminal.defaultIcon, tint: nil, group: 0)
+        panel.setList([one], selected: 0)
+        XCTAssertTrue(panel.list.isHidden, "a single terminal has no list")
+        panel.setList([one, one], selected: 1)
+        XCTAssertFalse(panel.list.isHidden)
+        XCTAssertEqual(panel.list.frame.width, TerminalListView.defaultWidth)
+        XCTAssertEqual(panel.list.frame.maxX, 800, accuracy: 0.5, "the list sits at the right edge")
+
+        panel.listFitsContent = true
+        defer { panel.listFitsContent = false }
+        panel.layoutSubtreeIfNeeded()
+        XCTAssertLessThan(panel.list.frame.width, TerminalListView.defaultWidth, "short names need less than the default")
+        XCTAssertGreaterThanOrEqual(panel.list.frame.width, TerminalListView.minimumWidth)
     }
 
     func testPanelOpensClosesAndMaximizesWithoutRemovingViews() {
@@ -220,7 +260,9 @@ final class TerminalPanelTests: XCTestCase {
 
     func testTerminalMenuHasItsOwnCommands() throws {
         let menu = try XCTUnwrap(MainMenu.build().items.compactMap(\.submenu).first { $0.title == "Terminal" })
-        for title in ["New Terminal", "Run Selected Text", "Run Active File", "Clear Terminal", "Kill Terminal"] {
+        for title in ["New Terminal", "Run Selected Text", "Run Active File", "Clear Terminal", "Kill Terminal",
+                      "Split Terminal", "Move Terminal into New Window", "Rename Terminal\u{2026}",
+                      "Change Terminal Color\u{2026}", "Change Terminal Icon\u{2026}"] {
             XCTAssertNotNil(menu.item(withTitle: title), title)
         }
         let view = try XCTUnwrap(MainMenu.build().items.compactMap(\.submenu).first { $0.title == "View" })
@@ -229,6 +271,85 @@ final class TerminalPanelTests: XCTestCase {
         let new = try XCTUnwrap(menu.item(withTitle: "New Terminal"))
         XCTAssertEqual(new.keyEquivalent, "`")
         XCTAssertEqual(new.keyEquivalentModifierMask, [.control, .shift])
+    }
+
+    private func workspaceController() throws -> (MainWindowController, URL) {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-term-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let c = MainWindowController(bridge: CoreBridge())
+        c.askSaveChoice = { _ in .discard }
+        c.showWindow(nil)
+        try c.openWorkspace(at: root)
+        return (c, root)
+    }
+
+    func testSplitTerminalsShareThePanelAndListThem() throws {
+        let (c, root) = try workspaceController()
+        defer { c.window?.orderOut(nil); try? FileManager.default.removeItem(at: root) }
+        c.toggleTerminal(nil)
+        XCTAssertEqual(c.panelTerminals.count, 1)
+
+        let item = NSMenuItem()
+        item.representedObject = c.panelTerminals[0]
+        c.splitTerminal(item)
+        XCTAssertEqual(c.panelTerminals.count, 2)
+        XCTAssertEqual(c.panelTerminals[0].group, c.panelTerminals[1].group, "a split joins its source's group")
+        XCTAssertEqual(c.terminalPanelForTesting.panes.count, 2, "both terminals are side by side")
+        XCTAssertFalse(c.terminalPanelForTesting.list.isHidden)
+        XCTAssertTrue(c.bottomPanelHeaderForTesting.terminalChip.isHidden)
+
+        c.createTerminal(nil)
+        XCTAssertEqual(c.panelTerminals.count, 3)
+        XCTAssertNotEqual(c.panelTerminals[2].group, c.panelTerminals[0].group, "a new terminal gets a pane of its own")
+        XCTAssertEqual(c.terminalPanelForTesting.panes.count, 1)
+
+        let kill = NSMenuItem()
+        kill.representedObject = c.panelTerminals[2]
+        c.killTerminal(kill)
+        XCTAssertEqual(c.panelTerminals.count, 2)
+        c.panelTerminals.forEach { $0.handle.kill() }
+    }
+
+    func testRenameColorAndIconStickToOneTerminal() throws {
+        let (c, root) = try workspaceController()
+        defer { c.window?.orderOut(nil); try? FileManager.default.removeItem(at: root) }
+        c.toggleTerminal(nil)
+        c.createTerminal(nil)
+        let first = c.panelTerminals[0], second = c.panelTerminals[1]
+        let shell = first.handle.shellName()
+
+        c.renameTerminal(first, to: "  server ")
+        XCTAssertEqual(first.displayName, "server")
+        XCTAssertEqual(second.displayName, shell, "other terminals keep their shell name")
+        c.renameTerminal(first, to: "")
+        XCTAssertEqual(first.displayName, shell, "empty brings the shell name back")
+
+        c.setTerminalColor(first, name: "Green")
+        XCTAssertEqual(first.tint, .systemGreen)
+        c.setTerminalColor(first, name: "Not a color")
+        XCTAssertNil(first.tint, "unknown colors are ignored")
+
+        c.setTerminalIcon(second, symbol: "hammer")
+        XCTAssertEqual(second.icon, "hammer")
+        XCTAssertEqual(first.icon, PanelTerminal.defaultIcon)
+        c.panelTerminals.forEach { $0.handle.kill() }
+    }
+
+    func testTerminalMenuListsTheVSCodeItems() throws {
+        let (c, root) = try workspaceController()
+        defer { c.window?.orderOut(nil); try? FileManager.default.removeItem(at: root) }
+        c.toggleTerminal(nil)
+        let menu = try XCTUnwrap(c.bottomPanelHeaderForTesting.terminalChip.menu(for: NSEvent.mouseEvent(
+            with: .rightMouseDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0,
+            context: nil, eventNumber: 0, clickCount: 1, pressure: 1)!))
+        XCTAssertEqual(menu.items.filter { !$0.isSeparatorItem }.map(\.title), [
+            "Split Terminal", "Move Terminal into Editor Area", "Move Terminal into New Window",
+            "Change Color\u{2026}", "Change Icon\u{2026}", "Rename\u{2026}",
+            "Toggle Size to Content Width", "Kill Terminal",
+        ])
+        XCTAssertEqual(menu.items.filter(\.isSeparatorItem).count, 2)
+        XCTAssertEqual(menu.item(withTitle: "Split Terminal")?.keyEquivalent, "\\")
+        c.panelTerminals.forEach { $0.handle.kill() }
     }
 
     func testRunSelectedTextAndKillTerminal() throws {

@@ -27,8 +27,13 @@ final class BottomPanelHeader: NSView {
 
     var onSelect: ((Tab) -> Void)?
     var onNewTerminal: (() -> Void)?
-    var onSelectTerminal: ((Int) -> Void)?
+    var onSplitTerminal: (() -> Void)?
     var onKillTerminal: (() -> Void)?
+    /// Menu for the lone terminal's chip (the same one as a right-click).
+    var chipMenuProvider: (() -> NSMenu?)? {
+        get { terminalChip.menuProvider }
+        set { terminalChip.menuProvider = newValue }
+    }
     var onToggleMaximize: (() -> Void)?
     var onClose: (() -> Void)?
     /// Dragging the top edge (VS Code's sash): called with the drag start
@@ -67,7 +72,10 @@ final class BottomPanelHeader: NSView {
     private var tabViews: [Tab: PanelTabView] = [:]
     private let tabStack = NSStackView()
     private let actionStack = NSStackView()
-    let terminalPicker = NSPopUpButton(frame: .zero, pullsDown: false)
+    /// Shown while there is a single terminal; from two on, the list at the
+    /// panel's right edge takes over.
+    let terminalChip = TerminalChipView()
+    private lazy var splitButton = Self.tool("square.split.2x1", "Split Terminal", #selector(splitTerminal(_:)), self)
     private lazy var newButton = Self.tool("plus", "New Terminal", #selector(newTerminal(_:)), self)
     private lazy var killButton = Self.tool("trash", "Kill Terminal", #selector(killTerminal(_:)), self)
     private lazy var maximizeButton = Self.tool("chevron.up", "Maximize Panel Size", #selector(toggleMaximize(_:)), self)
@@ -96,24 +104,19 @@ final class BottomPanelHeader: NSView {
             tabStack.addArrangedSubview(view)
         }
 
-        terminalPicker.isBordered = false
-        terminalPicker.font = .systemFont(ofSize: 12)
-        terminalPicker.controlSize = .small
-        terminalPicker.target = self
-        terminalPicker.action = #selector(pickTerminal(_:))
-        terminalPicker.toolTip = "Select Terminal"
-        terminalPicker.setAccessibilityLabel("Terminals")
-        terminalPicker.setAccessibilityIdentifier("terminal-picker")
+        terminalChip.setAccessibilityLabel("Terminal")
+        terminalChip.setAccessibilityIdentifier("terminal-chip")
         divider.boxType = .separator
 
         actionStack.orientation = .horizontal
         actionStack.spacing = 4
         actionStack.alignment = .centerY
         actionStack.translatesAutoresizingMaskIntoConstraints = false
-        for view in [terminalPicker, newButton, killButton, divider, maximizeButton, closeButton] as [NSView] {
+        for view in [terminalChip, newButton, splitButton, killButton, divider, maximizeButton, closeButton] as [NSView] {
             actionStack.addArrangedSubview(view)
         }
         actionStack.setCustomSpacing(10, after: killButton)
+        actionStack.setCustomSpacing(8, after: terminalChip)
         actionStack.setCustomSpacing(10, after: divider)
 
         addSubview(tabStack)
@@ -130,7 +133,7 @@ final class BottomPanelHeader: NSView {
             divider.heightAnchor.constraint(equalToConstant: 16),
         ])
         select(.terminal)
-        setTerminals(names: [], selected: 0)
+        setTerminals([])
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
@@ -140,10 +143,18 @@ final class BottomPanelHeader: NSView {
     func select(_ tab: Tab) {
         selectedTab = tab
         for (key, view) in tabViews { view.isSelected = key == tab }
-        let terminal = tab == .terminal
-        terminalPicker.isHidden = !terminal || terminalPicker.numberOfItems == 0
+        updateTerminalActions()
+    }
+
+    /// The chip names a lone terminal and the header carries its split and
+    /// kill buttons; from two terminals on, the list's rows carry them.
+    private func updateTerminalActions() {
+        let terminal = selectedTab == .terminal
+        let single = terminal && terminalCount <= 1
+        terminalChip.isHidden = !terminal || terminalCount != 1
         newButton.isHidden = !terminal
-        killButton.isHidden = !terminal
+        splitButton.isHidden = !single
+        killButton.isHidden = !single
         divider.isHidden = !terminal
     }
 
@@ -151,18 +162,17 @@ final class BottomPanelHeader: NSView {
         tabViews[.problems]?.badge = count
     }
 
-    /// One entry per terminal, VS Code style: just the shell name when there
-    /// is one, numbered when there are several.
-    func setTerminals(names: [String], selected: Int) {
-        terminalPicker.removeAllItems()
-        for (index, name) in names.enumerated() {
-            terminalPicker.addItem(withTitle: names.count > 1 ? "\(index + 1): \(name)" : name)
-            terminalPicker.lastItem?.image = NSImage(systemSymbolName: "apple.terminal",
-                                                     accessibilityDescription: nil)
+    private var terminalCount = 0
+
+    /// The chip names the only terminal; with more, the panel's list does.
+    func setTerminals(_ terminals: [TerminalSummary]) {
+        terminalCount = terminals.count
+        if let only = terminals.first, terminals.count == 1 {
+            terminalChip.configure(name: only.name, icon: only.icon, tint: only.tint)
         }
-        if names.indices.contains(selected) { terminalPicker.selectItem(at: selected) }
-        terminalPicker.isHidden = selectedTab != .terminal || names.isEmpty
-        killButton.isEnabled = !names.isEmpty
+        updateTerminalActions()
+        killButton.isEnabled = !terminals.isEmpty
+        splitButton.isEnabled = !terminals.isEmpty
     }
 
     func setMaximized(_ maximized: Bool) {
@@ -182,7 +192,7 @@ final class BottomPanelHeader: NSView {
         NSRect(x: 0, y: 0, width: bounds.width, height: 1).intersection(dirtyRect).fill()
     }
 
-    @objc private func pickTerminal(_ sender: NSPopUpButton) { onSelectTerminal?(sender.indexOfSelectedItem) }
+    @objc private func splitTerminal(_ sender: Any?) { onSplitTerminal?() }
     @objc private func newTerminal(_ sender: Any?) { onNewTerminal?() }
     @objc private func killTerminal(_ sender: Any?) { onKillTerminal?() }
     @objc private func toggleMaximize(_ sender: Any?) { onToggleMaximize?() }
@@ -203,6 +213,84 @@ final class BottomPanelHeader: NSView {
         b.widthAnchor.constraint(equalToConstant: 22).isActive = true
         b.heightAnchor.constraint(equalToConstant: 22).isActive = true
         return b
+    }
+}
+
+/// The lone terminal's name in the header: icon and shell name on a
+/// rounded background. Clicking it opens the terminal menu.
+@MainActor
+final class TerminalChipView: NSView {
+    var menuProvider: (() -> NSMenu?)?
+    private let iconView = NSImageView()
+    private let label = NSTextField(labelWithString: "")
+    private var isHovered = false { didSet { needsDisplay = true } }
+
+    override var isFlipped: Bool { true }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        translatesAutoresizingMaskIntoConstraints = false
+        label.font = .systemFont(ofSize: 12)
+        label.textColor = .labelColor
+        label.translatesAutoresizingMaskIntoConstraints = false
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(iconView)
+        addSubview(label)
+        NSLayoutConstraint.activate([
+            heightAnchor.constraint(equalToConstant: 26),
+            iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
+            iconView.widthAnchor.constraint(equalToConstant: 16),
+            iconView.heightAnchor.constraint(equalToConstant: 16),
+            label.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 5),
+            label.centerYAnchor.constraint(equalTo: centerYAnchor),
+            trailingAnchor.constraint(equalTo: label.trailingAnchor, constant: 10),
+        ])
+        setAccessibilityElement(true)
+        setAccessibilityRole(.menuButton)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    func configure(name: String, icon: String, tint: NSColor?) {
+        label.stringValue = name
+        iconView.image = TerminalChoices.symbol(icon)
+        iconView.contentTintColor = tint ?? .labelColor
+        setAccessibilityValue(name)
+        toolTip = name
+    }
+
+    /// The icon and label are not separate click targets.
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        super.hitTest(point) == nil ? nil : self
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.labelColor.withAlphaComponent(isHovered ? 0.14 : 0.08).setFill()
+        NSBezierPath(roundedRect: bounds, xRadius: 7, yRadius: 7).fill()
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+                                       owner: self))
+    }
+
+    override func mouseEntered(with event: NSEvent) { isHovered = true }
+    override func mouseExited(with event: NSEvent) { isHovered = false }
+
+    private func showMenu() {
+        guard let menu = menuProvider?() else { return }
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: bounds.height + 4), in: self)
+    }
+
+    override func mouseDown(with event: NSEvent) { showMenu() }
+    override func menu(for event: NSEvent) -> NSMenu? { menuProvider?() }
+
+    override func accessibilityPerformPress() -> Bool {
+        showMenu()
+        return true
     }
 }
 

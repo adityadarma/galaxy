@@ -169,6 +169,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func makeWindowController() -> MainWindowController {
         let controller = MainWindowController(bridge: bridge)
+        controller.openTerminalInNewWindow = { [weak self] terminal, root in
+            guard let self else { return }
+            let window = self.makeWindowController()
+            window.showWindow(nil)
+            try? window.openWorkspace(at: root)
+            window.adoptTerminal(terminal)
+            NSApp.activate(ignoringOtherApps: true)
+        }
         controller.onWindowClosed = { [weak self, weak controller] in
             guard let self, let controller else { return }
             self.windowControllers.removeAll { $0 === controller }

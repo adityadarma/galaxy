@@ -44,7 +44,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private let editorSplitView = NSSplitView()
     private let problemsPanel = ProblemsPanel()
     private let referencesPanel = ReferencesPanel()
-    private let terminalView = TerminalView()
+    private let terminalPanel = TerminalPanelView()
     /// Shows the active tab's terminal when that tab is a terminal (VS Code
     /// "Move Terminal into Editor Area"). Covers the path bar and editor.
     let editorTerminalView = TerminalView()
@@ -62,8 +62,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private(set) var isBottomPanelMaximized = false
     private let debugConsole = DebugConsolePanel()
     let debugger = DebugCoordinator()
-    private var terminalHandles: [TerminalHandle] = []
+    private var terminals: [PanelTerminal] = []
     private var activeTerminalIndex = 0
+    private var nextTerminalGroup = 0
+    /// Set by the app delegate: opens a window that takes over a terminal.
+    var openTerminalInNewWindow: ((PanelTerminal, URL) -> Void)?
     let hoverPopover = HoverPopover()
     let blamePopover = BlamePopover()
     /// `editor.gitBlame`, or the View > Toggle Git Blame override of it.
@@ -367,7 +370,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             isBottomPanelMaximized = false
             bottomPanelHeader.setMaximized(false)
             // Typing goes back to the editor, as in VS Code.
-            if window?.firstResponder === terminalView { window?.makeFirstResponder(editorView) }
+            if terminalPanel.owns(window?.firstResponder) { window?.makeFirstResponder(editorView) }
             outputPanel.stop()
             portsPanel.stop()
         }
@@ -423,72 +426,107 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private func showBottomPanel(tab: BottomPanelHeader.Tab) {
         bottomPanelTab = tab
         bottomPanelHeader.select(tab)
-        terminalView.isHidden = tab != .terminal
+        terminalPanel.isHidden = tab != .terminal
         problemsPanel.isHidden = tab != .problems
         outputPanel.isHidden = tab != .output
         portsPanel.isHidden = tab != .ports
         debugConsole.isHidden = tab != .debugConsole
         if tab == .terminal {
             ensureTerminal()
-            window?.makeFirstResponder(terminalView)
+            window?.makeFirstResponder(terminalPanel.activePane)
         }
         if tab == .output { outputPanel.start() } else { outputPanel.stop() }
         if tab == .ports { portsPanel.start() } else { portsPanel.stop() }
     }
 
     private func ensureTerminal() {
-        guard let workspace else {
-            bottomPanelHeader.setTerminals(names: [], selected: 0)
+        guard workspace != nil else {
+            terminals.removeAll()
+            refreshTerminalPicker()
+            terminalPanel.show(terminals: [], activeIndex: 0)
             return
         }
-        if terminalHandles.isEmpty,
-           let handle = bridge.terminal(workspace: workspace, cols: 100, rows: 24) {
-            terminalHandles = [handle]
+        if terminals.isEmpty, let terminal = makePanelTerminal() {
+            terminals = [terminal]
             activeTerminalIndex = 0
         }
         refreshTerminalPicker()
-        guard terminalHandles.indices.contains(activeTerminalIndex) else { return }
-        terminalView.start(handle: terminalHandles[activeTerminalIndex])
+        guard terminals.indices.contains(activeTerminalIndex) else { return }
+        terminalPanel.show(terminals: terminals, activeIndex: activeTerminalIndex)
     }
 
+    /// The header chip and the terminal list follow `terminals`.
     private func refreshTerminalPicker() {
-        bottomPanelHeader.setTerminals(names: terminalHandles.map { $0.shellName() }, selected: activeTerminalIndex)
+        bottomPanelHeader.setTerminals(terminals.map(\.summary))
+        terminalPanel.updateList(terminals, selected: activeTerminalIndex)
     }
 
-    private func newTerminal() {
-        guard let workspace,
-              let handle = bridge.terminal(workspace: workspace, cols: 100, rows: 24) else { return NSSound.beep() }
-        terminalHandles.append(handle)
-        activeTerminalIndex = terminalHandles.count - 1
+    private var activeTerminal: PanelTerminal? {
+        terminals.indices.contains(activeTerminalIndex) ? terminals[activeTerminalIndex] : nil
+    }
+
+    /// A new shell in the workspace. Without `group` it gets a pane of its own.
+    private func makePanelTerminal(group: Int? = nil) -> PanelTerminal? {
+        guard let workspace, let handle = bridge.terminal(workspace: workspace, cols: 100, rows: 24) else { return nil }
+        var target = group
+        if target == nil {
+            target = nextTerminalGroup
+            nextTerminalGroup += 1
+        }
+        return PanelTerminal(handle: handle, group: target ?? 0)
+    }
+
+    private func revealNewTerminal() {
         if !isBottomPanelVisible { setBottomPanelOpen(true) }
         showBottomPanel(tab: .terminal)
     }
 
-    /// Kills the active terminal; the panel closes with the last one.
-    private func killActiveTerminal() {
-        guard terminalHandles.indices.contains(activeTerminalIndex) else { return }
-        terminalHandles.remove(at: activeTerminalIndex).kill()
-        removedTerminal()
+    private func newTerminal() {
+        guard let terminal = makePanelTerminal() else { return NSSound.beep() }
+        terminals.append(terminal)
+        activeTerminalIndex = terminals.count - 1
+        revealNewTerminal()
     }
 
-    /// The shell in the active terminal exited (`exit`, ⌃D).
-    private func terminalExited() {
-        guard terminalHandles.indices.contains(activeTerminalIndex),
-              !terminalHandles[activeTerminalIndex].isRunning() else { return }
-        terminalHandles.remove(at: activeTerminalIndex)
+    /// Takes a terminal out of the panel; the others stay where they are.
+    private func takeTerminal(_ terminal: PanelTerminal) -> Bool {
+        guard let index = terminals.firstIndex(where: { $0 === terminal }) else { return false }
+        terminals.remove(at: index)
+        if index < activeTerminalIndex { activeTerminalIndex -= 1 }
         removedTerminal()
+        return true
+    }
+
+    /// Kills a terminal (the active one by default); the panel closes with the last one.
+    private func killPanelTerminal(_ terminal: PanelTerminal? = nil) {
+        guard let target = terminal ?? activeTerminal else { return }
+        target.handle.kill()
+        _ = takeTerminal(target)
+    }
+
+    /// A shell exited (`exit`, ⌃D).
+    private func terminalExited() {
+        let exited = terminals.filter { !$0.handle.isRunning() }
+        guard !exited.isEmpty else { return }
+        for terminal in exited { _ = takeTerminal(terminal) }
     }
 
     private func removedTerminal() {
-        terminalView.stop()
-        activeTerminalIndex = max(0, min(activeTerminalIndex, terminalHandles.count - 1))
-        if terminalHandles.isEmpty {
+        let hadFocus = terminalPanel.owns(window?.firstResponder)
+        terminalPanel.show(terminals: [], activeIndex: 0)
+        activeTerminalIndex = max(0, min(activeTerminalIndex, terminals.count - 1))
+        if terminals.isEmpty {
             refreshTerminalPicker()
             if bottomPanelTab == .terminal { setBottomPanelOpen(false) }
         } else {
             ensureTerminal()
+            if hadFocus { window?.makeFirstResponder(terminalPanel.activePane) }
         }
     }
+
+    /// Panel terminals, for tests.
+    var panelTerminals: [PanelTerminal] { terminals }
+    var terminalPanelForTesting: TerminalPanelView { terminalPanel }
 
     // MARK: Terminals in the editor area
 
@@ -499,10 +537,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// shell running. With no panel terminal, starts a new one there.
     @objc func moveTerminalToEditor(_ sender: Any?) {
         guard let workspace else { return NSSound.beep() }
-        if terminalHandles.indices.contains(activeTerminalIndex) {
-            let handle = terminalHandles.remove(at: activeTerminalIndex)
-            removedTerminal()
-            openTerminalTab(handle)
+        if let target = menuTerminal(sender) ?? activeTerminal {
+            let name = target.customName
+            _ = takeTerminal(target)
+            openTerminalTab(target.handle, name: name)
         } else if let handle = bridge.terminal(workspace: workspace, cols: 100, rows: 24) {
             openTerminalTab(handle)
         } else {
@@ -702,13 +740,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             statusLabel.stringValue = "No \(name) task found for this folder."
             return NSSound.beep()
         }
-        if terminalHandles.isEmpty {
+        if terminals.isEmpty {
             newTerminal()
         } else {
             revealBottomPanel(.terminal)
         }
-        guard terminalHandles.indices.contains(activeTerminalIndex) else { return NSSound.beep() }
-        try? terminalHandles[activeTerminalIndex].write(input: command + "\r")
+        guard let terminal = activeTerminal else { return NSSound.beep() }
+        try? terminal.handle.write(input: command + "\r")
         statusLabel.stringValue = "Running: \(command)"
     }
 
@@ -718,7 +756,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// panel's active terminal.
     private var activeTerminalHandle: TerminalHandle? {
         if let handle = activeTab?.terminal { return handle }
-        return terminalHandles.indices.contains(activeTerminalIndex) ? terminalHandles[activeTerminalIndex] : nil
+        return activeTerminal?.handle
     }
 
     /// Like `activeTerminalHandle`, but opens the panel terminal if there is none.
@@ -730,11 +768,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     @objc func createTerminal(_ sender: Any?) { newTerminal() }
 
     @objc func killTerminal(_ sender: Any?) {
-        if let index = activeIndex, tabs[index].terminal != nil {
+        if let target = menuTerminal(sender) {
+            killPanelTerminal(target)
+        } else if let index = activeIndex, tabs[index].terminal != nil {
             tabs[index].terminal?.kill()
             closeTab(at: index, keepTerminal: true)
         } else {
-            killActiveTerminal()
+            killPanelTerminal(menuTerminal(sender))
         }
     }
 
@@ -767,14 +807,20 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         guard let tab = target, let handle = tab.terminal,
               let index = tabs.firstIndex(where: { $0 === tab }) else { return NSSound.beep() }
         closeTab(at: index, keepTerminal: true)
-        terminalHandles.append(handle)
-        activeTerminalIndex = terminalHandles.count - 1
-        if !isBottomPanelVisible { setBottomPanelOpen(true) }
-        showBottomPanel(tab: .terminal)
+        adoptTerminal(PanelTerminal(handle: handle, group: 0))
     }
 
-    private func openTerminalTab(_ handle: TerminalHandle) {
-        let name = handle.shellName()
+    /// Takes a terminal over (moved from the editor area or another window).
+    func adoptTerminal(_ terminal: PanelTerminal) {
+        terminal.group = nextTerminalGroup
+        nextTerminalGroup += 1
+        terminals.append(terminal)
+        activeTerminalIndex = terminals.count - 1
+        revealNewTerminal()
+    }
+
+    private func openTerminalTab(_ handle: TerminalHandle, name customName: String? = nil) {
+        let name = customName ?? handle.shellName()
         let tab = EditorTab(doc: bridge.newDocument(), title: name, pathComponents: [name], windowTitle: name,
                             isPreview: false, status: "Terminal: \(name)", terminal: handle)
         add(tab, replacing: nil)
@@ -807,13 +853,130 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         return menu
     }
 
-    private func panelTerminalMenu() -> NSMenu {
+    /// A stand-in menu item carrying `terminal`, for calling menu actions from code.
+    private func terminalItem(_ terminal: PanelTerminal) -> NSMenuItem {
+        let item = NSMenuItem()
+        item.representedObject = terminal
+        return item
+    }
+
+    /// The terminal a context-menu item was made for, if the sender is one.
+    private func menuTerminal(_ sender: Any?) -> PanelTerminal? {
+        (sender as? NSMenuItem)?.representedObject as? PanelTerminal
+    }
+
+    /// The terminal menu (header chip, list rows and the terminal itself).
+    private func terminalMenu(for terminal: PanelTerminal) -> NSMenu {
         let menu = NSMenu()
-        menu.addItem(withTitle: "Move Terminal into Editor Area", action: #selector(moveTerminalToEditor(_:)), keyEquivalent: "")
-            .target = self
-        menu.addItem(withTitle: "New Terminal in Editor Area", action: #selector(createTerminalEditor(_:)), keyEquivalent: "")
-            .target = self
+        func add(_ title: String, _ action: Selector) {
+            let item = menu.addItem(withTitle: title, action: action, keyEquivalent: "")
+            item.target = self
+            item.representedObject = terminal
+        }
+        add("Split Terminal", #selector(splitTerminal(_:)))
+        add("Move Terminal into Editor Area", #selector(moveTerminalToEditor(_:)))
+        add("Move Terminal into New Window", #selector(moveTerminalToNewWindow(_:)))
+        menu.addItem(.separator())
+        add("Change Color\u{2026}", #selector(changeTerminalColor(_:)))
+        add("Change Icon\u{2026}", #selector(changeTerminalIcon(_:)))
+        add("Rename\u{2026}", #selector(renameTerminal(_:)))
+        add("Toggle Size to Content Width", #selector(toggleTerminalListSize(_:)))
+        menu.addItem(.separator())
+        add("Kill Terminal", #selector(killTerminal(_:)))
+        keybindings.apply(to: menu)
         return menu
+    }
+
+    @objc func splitTerminal(_ sender: Any?) {
+        guard let source = menuTerminal(sender) ?? activeTerminal else { return newTerminal() }
+        guard let terminal = makePanelTerminal(group: source.group) else { return NSSound.beep() }
+        // Next to the terminal it was split from, so a group stays together.
+        let last = terminals.lastIndex { $0.group == source.group } ?? terminals.count - 1
+        terminals.insert(terminal, at: last + 1)
+        activeTerminalIndex = last + 1
+        revealNewTerminal()
+    }
+
+    @objc func moveTerminalToNewWindow(_ sender: Any?) {
+        guard let workspace, let open = openTerminalInNewWindow,
+              let target = menuTerminal(sender) ?? activeTerminal else { return NSSound.beep() }
+        let root = URL(fileURLWithPath: workspace.root())
+        guard takeTerminal(target) else { return }
+        open(target, root)
+    }
+
+    @objc func renameTerminal(_ sender: Any?) {
+        guard let terminal = menuTerminal(sender) ?? activeTerminal else { return NSSound.beep() }
+        let alert = NSAlert()
+        alert.messageText = "Rename Terminal"
+        alert.informativeText = "Leave empty to use the shell's name."
+        let field = NSTextField(string: terminal.customName ?? "")
+        field.placeholderString = terminal.handle.shellName()
+        field.frame = NSRect(x: 0, y: 0, width: 280, height: 24)
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Rename")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        renameTerminal(terminal, to: field.stringValue)
+    }
+
+    func renameTerminal(_ terminal: PanelTerminal, to name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        terminal.customName = trimmed.isEmpty ? nil : trimmed
+        refreshTerminalPicker()
+    }
+
+    @objc func changeTerminalColor(_ sender: Any?) {
+        guard let terminal = menuTerminal(sender) ?? activeTerminal else { return NSSound.beep() }
+        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 220, height: 26), pullsDown: false)
+        popup.addItem(withTitle: "Default")
+        for choice in TerminalChoices.colors {
+            popup.addItem(withTitle: choice.name)
+            popup.lastItem?.image = TerminalChoices.swatch(choice.color)
+        }
+        if let current = terminal.colorName { popup.selectItem(withTitle: current) }
+        let alert = NSAlert()
+        alert.messageText = "Change Terminal Color"
+        alert.accessoryView = popup
+        alert.addButton(withTitle: "Change")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        setTerminalColor(terminal, name: popup.indexOfSelectedItem == 0 ? nil : popup.titleOfSelectedItem)
+    }
+
+    func setTerminalColor(_ terminal: PanelTerminal, name: String?) {
+        terminal.colorName = name.flatMap { TerminalChoices.color(named: $0) == nil ? nil : $0 }
+        refreshTerminalPicker()
+    }
+
+    @objc func changeTerminalIcon(_ sender: Any?) {
+        guard let terminal = menuTerminal(sender) ?? activeTerminal else { return NSSound.beep() }
+        let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 220, height: 26), pullsDown: false)
+        for choice in TerminalChoices.icons {
+            popup.addItem(withTitle: choice.title)
+            popup.lastItem?.image = TerminalChoices.symbol(choice.symbol)
+        }
+        if let index = TerminalChoices.icons.firstIndex(where: { $0.symbol == terminal.icon }) {
+            popup.selectItem(at: index)
+        }
+        let alert = NSAlert()
+        alert.messageText = "Change Terminal Icon"
+        alert.accessoryView = popup
+        alert.addButton(withTitle: "Change")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        setTerminalIcon(terminal, symbol: TerminalChoices.icons[popup.indexOfSelectedItem].symbol)
+    }
+
+    func setTerminalIcon(_ terminal: PanelTerminal, symbol: String) {
+        terminal.icon = symbol
+        refreshTerminalPicker()
+    }
+
+    /// Sizes the terminal list to its longest name, or back to the default width.
+    @objc func toggleTerminalListSize(_ sender: Any?) {
+        terminalPanel.listFitsContent.toggle()
     }
 
     init(bridge: CoreBridge) {
@@ -1100,7 +1263,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         // `BottomPanelContentView.layout()` sizes these (never below its
         // minimum). No autoresizing mask: one tied to the collapsed,
         // zero-height container conflicts with the panels' own constraints.
-        for panel in [terminalView, outputPanel, portsPanel, problemsPanel, debugConsole] as [NSView] {
+        for panel in [terminalPanel, outputPanel, portsPanel, problemsPanel, debugConsole] as [NSView] {
             panel.translatesAutoresizingMaskIntoConstraints = true
             panel.autoresizingMask = []
             // A zero frame would become a `height == 0` constraint before
@@ -1142,7 +1305,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         // Every panel is added once and switched with `isHidden`; see
         // `setBottomPanelOpen`.
         debugConsole.isHidden = true
-        for panel in [terminalView, problemsPanel, outputPanel, portsPanel, debugConsole] as [NSView] {
+        for panel in [terminalPanel, problemsPanel, outputPanel, portsPanel, debugConsole] as [NSView] {
             bottomPanelContent.addSubview(panel)
         }
         bottomPanelContent.isHidden = true
@@ -1206,7 +1369,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         portsPanel.isHidden = true
         gitGraphPanel.isHidden = true
         referencesPanel.removeFromSuperview()
-        terminalView.isHidden = true
+        terminalPanel.isHidden = true
         problemsPanel.isHidden = true
         bottomPanelHeader.onSelect = { [weak self] tab in
             guard let self else { return }
@@ -1214,25 +1377,47 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             self.showBottomPanel(tab: tab)
         }
         bottomPanelHeader.onNewTerminal = { [weak self] in self?.newTerminal() }
-        bottomPanelHeader.onKillTerminal = { [weak self] in self?.killActiveTerminal() }
+        bottomPanelHeader.onKillTerminal = { [weak self] in self?.killPanelTerminal() }
+        bottomPanelHeader.onSplitTerminal = { [weak self] in self?.splitTerminal(nil) }
+        bottomPanelHeader.chipMenuProvider = { [weak self] in
+            self?.activeTerminal.flatMap { self?.terminalMenu(for: $0) }
+        }
         bottomPanelHeader.onToggleMaximize = { [weak self] in self?.toggleBottomPanelMaximized() }
         bottomPanelHeader.onResize = { [weak self] began, delta in self?.resizeBottomPanel(began: began, deltaY: delta) }
         if let saved = UserDefaults.standard.object(forKey: "BottomPanelHeight") as? Double, saved >= Double(Self.minBottomPanelHeight) {
             bottomPanelOpenHeight = CGFloat(saved)
         }
         bottomPanelHeader.onClose = { [weak self] in self?.setBottomPanelOpen(false) }
-        bottomPanelHeader.onSelectTerminal = { [weak self] index in
-            guard let self, self.terminalHandles.indices.contains(index) else { return }
+        terminalPanel.list.onSelect = { [weak self] index in
+            guard let self, self.terminals.indices.contains(index) else { return }
             self.activeTerminalIndex = index
             self.ensureTerminal()
-            self.window?.makeFirstResponder(self.terminalView)
+            self.window?.makeFirstResponder(self.terminalPanel.activePane)
+        }
+        terminalPanel.list.onSplit = { [weak self] index in
+            guard let self, self.terminals.indices.contains(index) else { return }
+            self.splitTerminal(self.terminalItem(self.terminals[index]))
+        }
+        terminalPanel.list.onKill = { [weak self] index in
+            guard let self, self.terminals.indices.contains(index) else { return }
+            self.killPanelTerminal(self.terminals[index])
+        }
+        terminalPanel.list.menuProvider = { [weak self] index in
+            guard let self, self.terminals.indices.contains(index) else { return nil }
+            return self.terminalMenu(for: self.terminals[index])
+        }
+        terminalPanel.menuProvider = { [weak self] terminal in self?.terminalMenu(for: terminal) }
+        terminalPanel.onFocusTerminal = { [weak self] terminal in
+            guard let self, let index = self.terminals.firstIndex(where: { $0 === terminal }),
+                  index != self.activeTerminalIndex else { return }
+            self.activeTerminalIndex = index
+            self.refreshTerminalPicker()
         }
         stickyScopeView.isHidden = true
-        terminalView.onOpenLink = { [weak self] path, line, col in
+        terminalPanel.onOpenLink = { [weak self] path, line, col in
             self?.openTerminalLink(path: path, line: line, col: col)
         }
-        terminalView.onExit = { [weak self] in self?.terminalExited() }
-        terminalView.contextMenu = { [weak self] in self?.panelTerminalMenu() }
+        terminalPanel.onExit = { [weak self] in self?.terminalExited() }
         editorTerminalView.onOpenLink = { [weak self] path, line, col in
             self?.openTerminalLink(path: path, line: line, col: col)
         }
@@ -4907,6 +5092,11 @@ extension MainWindowController: NSMenuItemValidation {
         case #selector(moveTerminalToEditor(_:)), #selector(createTerminalEditor(_:)), #selector(createTerminal(_:)),
              #selector(runBuildTask(_:)), #selector(runTestTask(_:)):
             return workspace != nil
+        case #selector(splitTerminal(_:)):
+            return workspace != nil
+        case #selector(moveTerminalToNewWindow(_:)), #selector(renameTerminal(_:)), #selector(changeTerminalColor(_:)),
+             #selector(changeTerminalIcon(_:)), #selector(toggleTerminalListSize(_:)):
+            return (item.representedObject as? PanelTerminal ?? activeTerminal) != nil
         case #selector(killTerminal(_:)), #selector(clearActiveTerminal(_:)):
             return activeTerminalHandle != nil
         case #selector(runSelectedTextInTerminal(_:)), #selector(runActiveFileInTerminal(_:)):

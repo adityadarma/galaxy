@@ -2061,6 +2061,11 @@ pub struct TerminalScreenInfo {
     pub app_cursor: bool,
     pub bracketed_paste: bool,
     pub alt_screen: bool,
+    pub mouse_click: bool,
+    pub mouse_drag: bool,
+    pub mouse_motion: bool,
+    pub sgr_mouse: bool,
+    pub alternate_scroll: bool,
 }
 
 #[uniffi::export]
@@ -2110,6 +2115,11 @@ impl TerminalHandle {
             app_cursor: screen.app_cursor,
             bracketed_paste: screen.bracketed_paste,
             alt_screen: screen.alt_screen,
+            mouse_click: screen.mouse_click,
+            mouse_drag: screen.mouse_drag,
+            mouse_motion: screen.mouse_motion,
+            sgr_mouse: screen.sgr_mouse,
+            alternate_scroll: screen.alternate_scroll,
         }
     }
 

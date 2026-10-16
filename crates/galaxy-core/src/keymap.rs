@@ -218,6 +218,7 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("cmd+shift+m", "workbench.actions.view.problems"),
     ("cmd+shift+u", "workbench.action.output.toggleOutput"),
     ("ctrl+shift+`", "workbench.action.terminal.new"),
+    ("cmd+\\", "workbench.action.terminal.split"),
     ("cmd+shift+b", "workbench.action.tasks.build"),
     ("f5", "workbench.action.debug.start"),
     ("shift+f5", "workbench.action.debug.stop"),

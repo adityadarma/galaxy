@@ -425,6 +425,42 @@ const BUILTIN: &[(&str, &str, &str, &[&str])] = &[
         &["tab", "editor", "shell"],
     ),
     (
+        "workbench.action.terminal.split",
+        "Terminal",
+        "Split Terminal",
+        &["pane", "side", "shell"],
+    ),
+    (
+        "workbench.action.terminal.moveIntoNewWindow",
+        "Terminal",
+        "Move Terminal into New Window",
+        &["window", "shell"],
+    ),
+    (
+        "workbench.action.terminal.rename",
+        "Terminal",
+        "Rename Terminal",
+        &["name", "title", "shell"],
+    ),
+    (
+        "workbench.action.terminal.changeColor",
+        "Terminal",
+        "Change Terminal Color",
+        &["tint", "shell"],
+    ),
+    (
+        "workbench.action.terminal.changeIcon",
+        "Terminal",
+        "Change Terminal Icon",
+        &["symbol", "shell"],
+    ),
+    (
+        "workbench.action.terminal.sizeToContentWidth",
+        "Terminal",
+        "Toggle Terminal List Size to Content Width",
+        &["tabs", "width", "shell"],
+    ),
+    (
         "workbench.action.terminal.moveToTerminalPanel",
         "Terminal",
         "Move Terminal into Panel",

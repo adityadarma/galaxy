@@ -14,6 +14,10 @@ final class TerminalView: NSView {
     var onExit: (() -> Void)?
     /// Right-click menu (Move Terminal into Editor Area, …).
     var contextMenu: (() -> NSMenu?)?
+    /// The view took keyboard focus (split terminals track the active one).
+    var onFocus: (() -> Void)?
+    /// A rule on the left edge, between split terminals.
+    var showsLeadingDivider = false { didSet { needsDisplay = true } }
 
     override func menu(for event: NSEvent) -> NSMenu? {
         contextMenu?() ?? super.menu(for: event)
@@ -26,6 +30,9 @@ final class TerminalView: NSView {
     private var cursorVisible = true
     private var blinkTick = 0
     private var scrollRemainder: CGFloat = 0
+    /// Button held while a mouse-tracking program has the mouse, for drag reports.
+    private var heldMouseButton: Int?
+    private var lastMouseCell: (column: Int, row: Int)?
 
     static let padding = NSEdgeInsets(top: 4, left: 20, bottom: 4, right: 12)
 
@@ -171,6 +178,7 @@ final class TerminalView: NSView {
     override func becomeFirstResponder() -> Bool {
         cursorVisible = true
         needsDisplay = true
+        onFocus?()
         return true
     }
 
@@ -185,8 +193,90 @@ final class TerminalView: NSView {
 
     // MARK: Mouse
 
-    override func mouseDown(with event: NSEvent) {
+    /// Programs that enable mouse tracking (opencode, claude, vim, htop) get
+    /// clicks, drags and the wheel as escape sequences. Shift or Cmd keeps
+    /// the terminal's own handling (links, scrollback). Right-click always
+    /// opens the context menu.
+    private func forwardsMouse(_ event: NSEvent) -> Bool {
+        guard let screen, screen.mouseClick || screen.mouseDrag || screen.mouseMotion else { return false }
+        return event.modifierFlags.isDisjoint(with: [.shift, .command])
+    }
+
+    /// 1-based grid cell under the event, clamped to the screen.
+    private func gridCell(for event: NSEvent) -> (column: Int, row: Int) {
+        let point = convert(event.locationInWindow, from: nil)
+        let columns = Int(screen?.columns ?? 1)
+        let rows = screen?.lines.count ?? 1
+        let column = Int(((point.x - Self.padding.left) / cellWidth).rounded(.down))
+        let row = Int(((point.y - Self.padding.top) / lineHeight).rounded(.down))
+        return (min(max(column, 0), columns - 1) + 1, min(max(row, 0), rows - 1) + 1)
+    }
+
+    /// Mouse report for xterm modes 1000-1006, or nil when it can't be encoded.
+    /// `button` is 0 left, 1 middle, 2 right, 3 none (motion only), 64/65 wheel.
+    static func mouseReport(button: Int, column: Int, row: Int, release: Bool = false,
+                            motion: Bool = false, modifiers: NSEvent.ModifierFlags = [],
+                            sgr: Bool) -> String? {
+        var code = button
+        if modifiers.contains(.shift) { code |= 4 }
+        if modifiers.contains(.option) { code |= 8 }
+        if modifiers.contains(.control) { code |= 16 }
+        if motion { code |= 32 }
+        if sgr {
+            return "\u{1b}[<\(code);\(column);\(row)\(release ? "m" : "M")"
+        }
+        // Legacy X10 bytes must stay ASCII because the PTY input is UTF-8.
+        let legacy = release ? (code & ~3) | 3 : code
+        guard legacy + 32 < 128, column + 32 < 128, row + 32 < 128,
+              let b = Unicode.Scalar(legacy + 32), let x = Unicode.Scalar(column + 32),
+              let y = Unicode.Scalar(row + 32) else { return nil }
+        return "\u{1b}[M\(b)\(x)\(y)"
+    }
+
+    private func sendMouse(button: Int, event: NSEvent, release: Bool = false, motion: Bool = false) {
+        guard let handle, let screen else { return }
+        let cell = gridCell(for: event)
+        if motion, let last = lastMouseCell, last == cell { return }
+        lastMouseCell = cell
+        guard let report = Self.mouseReport(button: button, column: cell.column, row: cell.row,
+                                            release: release, motion: motion,
+                                            modifiers: event.modifierFlags, sgr: screen.sgrMouse) else { return }
+        try? handle.write(input: report)
+    }
+
+    private func mouseButton(for event: NSEvent) -> Int {
+        switch event.type {
+        case .otherMouseDown, .otherMouseUp, .otherMouseDragged: return 1
+        default: return 0
+        }
+    }
+
+    private func reportPress(_ event: NSEvent) -> Bool {
         window?.makeFirstResponder(self)
+        guard forwardsMouse(event) else { return false }
+        let button = mouseButton(for: event)
+        heldMouseButton = button
+        lastMouseCell = nil
+        sendMouse(button: button, event: event)
+        return true
+    }
+
+    private func reportRelease(_ event: NSEvent) -> Bool {
+        guard heldMouseButton != nil else { return false }
+        heldMouseButton = nil
+        guard forwardsMouse(event) else { return true }
+        sendMouse(button: mouseButton(for: event), event: event, release: true)
+        return true
+    }
+
+    private func reportDrag(_ event: NSEvent) {
+        guard let held = heldMouseButton, forwardsMouse(event),
+              screen?.mouseDrag == true || screen?.mouseMotion == true else { return }
+        sendMouse(button: held, event: event, motion: true)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        if reportPress(event) { return }
         let point = convert(event.locationInWindow, from: nil)
         let wantsLink = event.clickCount == 2 || event.modifierFlags.contains(.command)
         guard wantsLink, let screen else { return }
@@ -195,6 +285,29 @@ final class TerminalView: NSView {
         if let link = Self.fileLink(in: screen.lines[row].text) {
             onOpenLink?(link.path, link.line, link.column)
         }
+    }
+
+    override func mouseUp(with event: NSEvent) { _ = reportRelease(event) }
+    override func mouseDragged(with event: NSEvent) { reportDrag(event) }
+
+    override func otherMouseDown(with event: NSEvent) {
+        if !reportPress(event) { super.otherMouseDown(with: event) }
+    }
+    override func otherMouseUp(with event: NSEvent) {
+        if !reportRelease(event) { super.otherMouseUp(with: event) }
+    }
+    override func otherMouseDragged(with event: NSEvent) { reportDrag(event) }
+
+    override func mouseMoved(with event: NSEvent) {
+        guard screen?.mouseMotion == true, forwardsMouse(event) else { return }
+        sendMouse(button: 3, event: event, motion: true)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseMoved, .activeInKeyWindow, .inVisibleRect],
+                                       owner: self))
     }
 
     /// `path:line[:col]` in a line of output, e.g. compiler errors.
@@ -211,19 +324,30 @@ final class TerminalView: NSView {
 
     override func scrollWheel(with event: NSEvent) {
         guard let handle, let screen else { return }
-        if screen.altScreen {
-            // Full-screen programs scroll by arrow keys, as other terminals do.
-            let lines = Int(event.scrollingDeltaY / (event.hasPreciseScrollingDeltas ? lineHeight : 1))
-            guard lines != 0 else { return }
-            let key = lines > 0 ? (screen.appCursor ? "\u{1b}OA" : "\u{1b}[A") : (screen.appCursor ? "\u{1b}OB" : "\u{1b}[B")
-            try? handle.write(input: String(repeating: key, count: min(abs(lines), 20)))
-            return
-        }
         let delta = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY / lineHeight : event.scrollingDeltaY * 3
         scrollRemainder += delta
         let lines = Int(scrollRemainder)
         guard lines != 0 else { return }
         scrollRemainder -= CGFloat(lines)
+        let count = min(abs(lines), 20)
+        let up = lines > 0
+
+        if forwardsMouse(event) {
+            // Wheel is button 64 (up) / 65 (down) in the mouse protocol.
+            let cell = gridCell(for: event)
+            guard let report = Self.mouseReport(button: up ? 64 : 65, column: cell.column, row: cell.row,
+                                                modifiers: event.modifierFlags, sgr: screen.sgrMouse) else { return }
+            try? handle.write(input: String(repeating: report, count: count))
+            return
+        }
+        if screen.altScreen {
+            // No mouse tracking: full-screen programs scroll by arrow keys
+            // (xterm alternate scroll, mode 1007).
+            guard screen.alternateScroll else { return }
+            let key = up ? (screen.appCursor ? "\u{1b}OA" : "\u{1b}[A") : (screen.appCursor ? "\u{1b}OB" : "\u{1b}[B")
+            try? handle.write(input: String(repeating: key, count: count))
+            return
+        }
         handle.scroll(lines: Int32(lines))
         poll()
     }
@@ -345,6 +469,10 @@ final class TerminalView: NSView {
         let palette = TerminalPalette(appearance: effectiveAppearance)
         palette.background.setFill()
         dirtyRect.intersection(bounds).fill()
+        if showsLeadingDivider {
+            NSColor.separatorColor.setFill()
+            NSRect(x: 0, y: 0, width: 1, height: bounds.height).intersection(dirtyRect).fill()
+        }
         guard let screen, let context = NSGraphicsContext.current?.cgContext else { return }
 
         let firstRow = max(0, Int((dirtyRect.minY - Self.padding.top) / lineHeight))

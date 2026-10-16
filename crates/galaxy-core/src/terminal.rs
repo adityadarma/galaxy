@@ -107,6 +107,16 @@ pub struct TerminalScreen {
     pub app_cursor: bool,
     pub bracketed_paste: bool,
     pub alt_screen: bool,
+    /// The program asked for mouse reports (`?1000`): clicks and wheel.
+    pub mouse_click: bool,
+    /// Also report motion while a button is held (`?1002`).
+    pub mouse_drag: bool,
+    /// Also report motion with no button held (`?1003`).
+    pub mouse_motion: bool,
+    /// Reports use the SGR encoding (`?1006`) rather than legacy X10.
+    pub sgr_mouse: bool,
+    /// Wheel becomes arrow keys on the alternate screen (`?1007`).
+    pub alternate_scroll: bool,
 }
 
 struct TerminalSize {
@@ -462,6 +472,11 @@ impl TerminalSession {
             app_cursor: mode.contains(TermMode::APP_CURSOR),
             bracketed_paste: mode.contains(TermMode::BRACKETED_PASTE),
             alt_screen: mode.contains(TermMode::ALT_SCREEN),
+            mouse_click: mode.contains(TermMode::MOUSE_REPORT_CLICK),
+            mouse_drag: mode.contains(TermMode::MOUSE_DRAG),
+            mouse_motion: mode.contains(TermMode::MOUSE_MOTION),
+            sgr_mouse: mode.contains(TermMode::SGR_MOUSE),
+            alternate_scroll: mode.contains(TermMode::ALTERNATE_SCROLL),
         }
     }
 }
@@ -567,6 +582,29 @@ mod tests {
         let resized = session.screen();
         assert_eq!(resized.columns, 40);
         assert_eq!(resized.lines.len(), 10);
+    }
+
+    #[test]
+    fn mouse_modes_are_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = TerminalSession::spawn(dir.path(), 80, 24).unwrap();
+        let idle = session.screen();
+        assert!(!idle.mouse_click && !idle.mouse_drag && !idle.sgr_mouse);
+
+        session
+            .write(b"printf '\\033[?1049h\\033[?1002h\\033[?1006h'\n")
+            .unwrap();
+        let on = wait_for(&session, |s| s.mouse_drag);
+        assert!(on.alt_screen);
+        assert!(on.mouse_drag);
+        assert!(on.sgr_mouse);
+        assert!(!on.mouse_motion);
+
+        session
+            .write(b"printf '\\033[?1002l\\033[?1006l\\033[?1049l'\n")
+            .unwrap();
+        let off = wait_for(&session, |s| !s.mouse_drag);
+        assert!(!off.mouse_drag && !off.sgr_mouse && !off.alt_screen);
     }
 
     #[test]
