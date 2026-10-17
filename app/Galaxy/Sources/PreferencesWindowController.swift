@@ -19,10 +19,11 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
 
     init(onChange: @escaping () -> Void) {
         self.onChange = onChange
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 420, height: 420),
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 200),
                               styleMask: [.titled, .closable], backing: .buffered, defer: false)
         window.title = "Settings"
         window.isReleasedWhenClosed = false
+        window.toolbarStyle = .preference
         super.init(window: window)
         build()
     }
@@ -30,15 +31,47 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
+    /// One toolbar tab per group, the standard macOS Settings layout.
     private func build() {
-        guard let content = window?.contentView else { return }
-        let stack = NSStackView()
+        let tabs = SettingsTabViewController()
+        tabs.tabStyle = .toolbar
+        tabs.addTabViewItem(tab("General", symbol: "gearshape", pane: buildGeneralPane()))
+        tabs.addTabViewItem(tab("AI", symbol: "sparkles", pane: buildAIPane()))
+        window?.contentViewController = tabs
+        tabs.fitWindow(to: tabs.tabViewItems.first)
+        window?.center()
+        loadModels()
+    }
+
+    private func tab(_ title: String, symbol: String, pane: NSView) -> NSTabViewItem {
+        let controller = NSViewController()
+        controller.view = pane
+        controller.title = title
+        let item = NSTabViewItem(viewController: controller)
+        item.label = title
+        item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
+        return item
+    }
+
+    /// A pane holding `stack` with the usual Settings margins.
+    private func pane(_ stack: NSStackView) -> NSView {
+        let view = NSView()
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 14
         stack.translatesAutoresizingMaskIntoConstraints = false
-        content.addSubview(stack)
+        view.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: view.topAnchor, constant: 20),
+            stack.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -20),
+            stack.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            stack.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
+        ])
+        return view
+    }
 
+    private func buildGeneralPane() -> NSView {
+        let stack = NSStackView()
         appearance.addItems(withTitles: Theme.names)
         appearance.selectItem(withTitle: Theme.names.contains(Theme.selectedName) ? Theme.selectedName : Theme.systemName)
         appearance.target = self; appearance.action = #selector(saveAppearance(_:))
@@ -58,14 +91,11 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
         sizeRow.spacing = 12
         sizeRow.arrangedSubviews[0].widthAnchor.constraint(equalToConstant: 120).isActive = true
         stack.addArrangedSubview(sizeRow)
+        return pane(stack)
+    }
 
-        // Divider
-        let separator = NSBox()
-        separator.boxType = .separator
-        separator.translatesAutoresizingMaskIntoConstraints = false
-        stack.addArrangedSubview(separator)
-        separator.widthAnchor.constraint(equalToConstant: 370).isActive = true
-
+    private func buildAIPane() -> NSView {
+        let stack = NSStackView()
         // AI commit message: OpenAI-compatible endpoint
         let aiTitle = NSTextField(labelWithString: "AI Commit Message (OpenAI-compatible)")
         aiTitle.font = .systemFont(ofSize: 12, weight: .semibold)
@@ -109,13 +139,7 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
         hint.preferredMaxLayoutWidth = 370
         hint.widthAnchor.constraint(equalToConstant: 370).isActive = true
         stack.addArrangedSubview(hint)
-
-        NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
-            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 24),
-            stack.trailingAnchor.constraint(lessThanOrEqualTo: content.trailingAnchor, constant: -24),
-        ])
-        loadModels()
+        return pane(stack)
     }
 
     // MARK: AI model picker
@@ -231,5 +255,27 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
         NSFontManager.shared.availableFontFamilies
             .filter { $0 != ".AppleSystemUIFont" && $0 != ".SFNSDisplay" && NSFont(name: $0, size: 13) != nil }
             .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+}
+
+/// Toolbar tabs whose window grows or shrinks to the selected pane, keeping
+/// the title bar in place, like the system Settings windows.
+@MainActor
+final class SettingsTabViewController: NSTabViewController {
+    override func tabView(_ tabView: NSTabView, didSelect tabViewItem: NSTabViewItem?) {
+        super.tabView(tabView, didSelect: tabViewItem)
+        fitWindow(to: tabViewItem, animate: view.window?.isVisible ?? false)
+    }
+
+    func fitWindow(to item: NSTabViewItem?, animate: Bool = false) {
+        guard let window = view.window, let pane = item?.viewController?.view else { return }
+        let size = pane.fittingSize
+        let contentRect = window.contentRect(forFrameRect: window.frame)
+        // The toolbar sits outside the content view; keep the top edge fixed.
+        let chrome = window.frame.height - contentRect.height
+        var frame = window.frame
+        frame.size = NSSize(width: max(size.width, 440), height: size.height + chrome)
+        frame.origin.y = window.frame.maxY - frame.height
+        window.setFrame(frame, display: true, animate: animate)
     }
 }

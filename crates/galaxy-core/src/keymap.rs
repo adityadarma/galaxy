@@ -237,6 +237,17 @@ pub const DEFAULTS: &[(&str, &str)] = &[
         "workbench.action.openPreviousRecentlyUsedEditor",
     ),
     ("cmd+q", "workbench.action.quit"),
+    ("cmd+,", "galaxy.openSettings"),
+    ("shift+cmd+n", "workbench.action.newWindow"),
+    ("cmd+.", "editor.action.quickFix"),
+    ("shift+alt+f", "editor.action.formatDocument"),
+    ("shift+cmd+x", "workbench.view.extensions"),
+    // Second keys, as in VSCode. The first key of a command stays the
+    // one menus show.
+    ("f1", "workbench.action.showCommands"),
+    ("ctrl+`", "workbench.action.togglePanel"),
+    ("alt+cmd+right", "workbench.action.nextEditor"),
+    ("alt+cmd+left", "workbench.action.previousEditor"),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -448,7 +459,23 @@ mod tests {
     #[test]
     fn cmd_j_toggles_the_bottom_panel() {
         let map = Keymap::defaults();
-        assert_eq!(keys_of(&map, "workbench.action.togglePanel"), ["cmd+j"]);
+        assert_eq!(keys_of(&map, "workbench.action.togglePanel")[0], "cmd+j");
+    }
+
+    #[test]
+    fn vscode_second_keys_follow_the_primary_one() {
+        let map = Keymap::defaults();
+        let cases = [
+            ("workbench.action.showCommands", ["shift+cmd+p", "f1"]),
+            ("workbench.action.togglePanel", ["cmd+j", "ctrl+`"]),
+            ("workbench.action.nextEditor", ["shift+cmd+]", "alt+cmd+right"]),
+            ("workbench.action.previousEditor", ["shift+cmd+[", "alt+cmd+left"]),
+        ];
+        for (command, keys) in cases {
+            assert_eq!(keys_of(&map, command), keys, "{command}");
+        }
+        assert_eq!(keys_of(&map, "galaxy.openSettings"), ["cmd+,"]);
+        assert_eq!(keys_of(&map, "editor.action.formatDocument"), ["shift+alt+f"]);
     }
 
     #[test]
@@ -473,7 +500,7 @@ mod tests {
         );
         assert_eq!(
             keys_of(&map, "workbench.action.showCommands"),
-            ["cmd+p", "shift+cmd+p"]
+            ["cmd+p", "shift+cmd+p", "f1"]
         );
         assert!(keys_of(&map, "workbench.action.quickOpen").is_empty());
         assert!(keys_of(&map, "workbench.action.toggleSidebarVisibility").is_empty());

@@ -4646,6 +4646,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             guard confirmDiscardActive() else { return }
         }
         saveWorkspaceSession()
+        // Shells belong to the old folder; VSCode reloads the window here.
+        for tab in tabs { tab.terminal?.kill() }
         tabs.removeAll()
         activeIndex = nil
         snippetSession = nil
@@ -4670,9 +4672,27 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         if tabs.isEmpty { pathBar.show([]) }
         updateEditedState()
         statusLabel.stringValue = ""
+        resetBottomPanelForNewWorkspace()
         if let session = Session.load(from: Session.workspaceURL(for: ws.root())) {
             restoreTabs(from: session)
         }
+    }
+
+    /// The panel keeps its place (open, tab, height), but what it shows
+    /// starts over in the new folder: fresh shells there, no old debug run.
+    private func resetBottomPanelForNewWorkspace() {
+        let hadFocus = terminalPanel.owns(window?.firstResponder)
+        for terminal in terminals { terminal.handle.kill() }
+        terminals.removeAll()
+        activeTerminalIndex = 0
+        nextTerminalGroup = 0
+        terminalPanel.show(terminals: [], activeIndex: 0)
+        refreshTerminalPicker()
+        if debugger.state != .idle { debugger.stop() }
+        debugConsole.clear()
+        guard isBottomPanelVisible else { return }
+        showBottomPanel(tab: bottomPanelTab)
+        if !hadFocus, bottomPanelTab == .terminal { window?.makeFirstResponder(editorView) }
     }
 
     @objc func openRecentProject(_ sender: Any?) {

@@ -310,6 +310,30 @@ final class TerminalPanelTests: XCTestCase {
         c.panelTerminals.forEach { $0.handle.kill() }
     }
 
+    func testOpeningAnotherFolderStartsFreshTerminalsThere() throws {
+        let (c, root) = try workspaceController()
+        let other = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-ws-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+        defer {
+            c.panelTerminals.forEach { $0.handle.kill() }
+            c.window?.orderOut(nil)
+            try? FileManager.default.removeItem(at: root)
+            try? FileManager.default.removeItem(at: other)
+        }
+        c.toggleTerminal(nil)
+        c.createTerminal(nil)
+        let old = c.panelTerminals
+        XCTAssertEqual(old.count, 2)
+
+        try c.openWorkspace(at: other)
+        XCTAssertTrue(old.allSatisfy { !$0.handle.isRunning() }, "the old folder's shells are gone")
+        XCTAssertTrue(c.isBottomPanelVisible, "the panel stays open")
+        XCTAssertEqual(c.bottomPanelTab, .terminal)
+        XCTAssertEqual(c.panelTerminals.count, 1, "one new shell, in the new folder")
+        XCTAssertFalse(old.contains { $0 === c.panelTerminals[0] })
+        XCTAssertTrue(c.panelTerminals[0].handle.isRunning())
+    }
+
     func testRenameColorAndIconStickToOneTerminal() throws {
         let (c, root) = try workspaceController()
         defer { c.window?.orderOut(nil); try? FileManager.default.removeItem(at: root) }
