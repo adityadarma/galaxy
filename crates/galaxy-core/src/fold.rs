@@ -102,6 +102,128 @@ fn is_allman_brace(doc: &Document, line: usize) -> bool {
     is_lone_open_brace(doc, line) && prev_nonblank(doc, line).is_some_and(|(_, indent)| indent == base)
 }
 
+/// Lines examined while walking up for enclosing headers.
+const STICKY_SCAN: usize = 2000;
+
+fn starts_with_closer(doc: &Document, line: usize) -> bool {
+    let start = doc.line_to_char(line);
+    let end = doc.line_end_char(line);
+    doc.rope()
+        .slice(start..end)
+        .chars()
+        .find(|c| !c.is_whitespace())
+        .is_some_and(|c| matches!(c, ')' | ']' | '}'))
+}
+
+/// Lines that continue the one above: `) {`, `} else {`, or a `{` alone.
+fn continues_previous(doc: &Document, line: usize) -> bool {
+    starts_with_closer(doc, line) || is_lone_open_brace(doc, line)
+}
+
+fn edge_chars(doc: &Document, line: usize) -> Option<(char, char)> {
+    let start = doc.line_to_char(line);
+    let end = doc.line_end_char(line);
+    let mut chars = doc.rope().slice(start..end).chars().filter(|c| !c.is_whitespace());
+    let first = chars.next()?;
+    Some((first, chars.last().unwrap_or(first)))
+}
+
+/// A line that finishes the header above it rather than the block: a lone
+/// `{`, `) {`, `} else {`, or a `)` whose `{` comes on the next line.
+fn is_header_continuation(doc: &Document, line: usize) -> bool {
+    if is_lone_open_brace(doc, line) {
+        return true;
+    }
+    let Some((first, last)) = edge_chars(doc, line) else {
+        return false;
+    };
+    match first {
+        '}' => last == '{',
+        ')' | ']' => {
+            last == '{' || next_nonblank(doc, line).is_some_and(|(next, _)| is_lone_open_brace(doc, next))
+        }
+        _ => false,
+    }
+}
+
+/// The line a header really starts on: `) {`, `} else {` and a lone `{`
+/// belong to the line that opened them.
+fn header_start(doc: &Document, line: usize, budget: &mut usize) -> usize {
+    let mut header = line;
+    let Some(mut header_indent) = indent_of(doc, header) else {
+        return header;
+    };
+    while continues_previous(doc, header) {
+        let mut up = header;
+        let mut hit = None;
+        while up > 0 && *budget > 0 {
+            up -= 1;
+            *budget -= 1;
+            if let Some(i) = indent_of(doc, up).filter(|&i| i <= header_indent) {
+                hit = Some((up, i));
+                break;
+            }
+        }
+        match hit {
+            Some((l, i)) => (header, header_indent) = (l, i),
+            None => break,
+        }
+    }
+    header
+}
+
+/// Header lines of the blocks that contain `line`, outermost first, at most
+/// `max`. Found by indentation, like folds. A header split over several
+/// lines is reported at its first line.
+pub fn enclosing_headers(doc: &Document, line: usize, max: usize) -> Vec<usize> {
+    if line >= doc.line_count() || max == 0 {
+        return Vec::new();
+    }
+    // The tail of a header belongs to the header, so the header is pinned
+    // while its own `{` or `) {` line is the one just under the bar.
+    if is_header_continuation(doc, line) {
+        let mut budget = STICKY_SCAN;
+        let header = header_start(doc, line, &mut budget);
+        if header != line {
+            let mut out = enclosing_headers(doc, header, max);
+            out.push(header);
+            out.truncate(max);
+            return out;
+        }
+    }
+    let mut indent = match indent_of(doc, line) {
+        Some(indent) => indent,
+        None => match next_nonblank(doc, line) {
+            Some((_, indent)) => indent,
+            None => return Vec::new(),
+        },
+    };
+    let mut at = line;
+    let mut budget = STICKY_SCAN;
+    let mut out = Vec::new();
+    while indent > 0 && budget > 0 {
+        let mut found = None;
+        while at > 0 && budget > 0 {
+            at -= 1;
+            budget -= 1;
+            if let Some(i) = indent_of(doc, at).filter(|&i| i < indent) {
+                found = Some((at, i));
+                break;
+            }
+        }
+        let Some((candidate, _)) = found else {
+            break;
+        };
+        let header = header_start(doc, candidate, &mut budget);
+        out.push(header);
+        indent = indent_of(doc, header).unwrap_or(0);
+        at = header;
+    }
+    out.reverse();
+    out.truncate(max);
+    out
+}
+
 /// `true` when a fold marker belongs on `line`.
 pub fn is_foldable(doc: &Document, line: usize) -> bool {
     shape(doc, line).is_some() && !is_allman_brace(doc, line)
@@ -308,6 +430,43 @@ mod tests {
         assert!(is_foldable(&d, 0));
         assert!(!is_foldable(&d, 1), "the brace line has no marker of its own");
         assert_eq!(fold_end(&d, 0), Some(3));
+    }
+
+    #[test]
+    fn enclosing_headers_walk_out_of_nested_blocks() {
+        let d = doc("class A {\n    fn f() {\n        one;\n        two;\n    }\n    fn g() {\n        three;\n    }\n}\nafter;");
+        assert_eq!(enclosing_headers(&d, 2, 5), [0, 1]);
+        assert_eq!(enclosing_headers(&d, 6, 5), [0, 5]);
+        assert_eq!(enclosing_headers(&d, 4, 5), [0], "a closing line sits in the class");
+        assert_eq!(enclosing_headers(&d, 5, 5), [0]);
+        assert_eq!(enclosing_headers(&d, 0, 5), Vec::<usize>::new());
+        assert_eq!(enclosing_headers(&d, 9, 5), Vec::<usize>::new());
+        assert_eq!(enclosing_headers(&d, 2, 1), [0], "the outermost win the limit");
+    }
+
+    #[test]
+    fn enclosing_headers_join_wrapped_and_allman_headers() {
+        let d = doc("class A\n{\n    fn f(\n            a,\n        ) {\n        body;\n    }\n}");
+        assert_eq!(enclosing_headers(&d, 5, 5), [0, 2], "a closing paren line reports the line that opened it");
+        assert_eq!(enclosing_headers(&d, 3, 5), [0, 2], "inside the parameter list");
+        assert_eq!(enclosing_headers(&d, 2, 5), [0], "the brace line folds into its header");
+    }
+
+    #[test]
+    fn enclosing_headers_of_a_blank_line_use_the_next_text() {
+        let d = doc("fn a() {\n    one;\n\n    two;\n}");
+        assert_eq!(enclosing_headers(&d, 2, 5), [0]);
+    }
+
+    #[test]
+    fn a_header_tail_line_pins_its_own_header() {
+        let d = doc("class A\n{\n    public function f(int $a)\n    {\n        body;\n    }\n    public function g(\n        int $a,\n    ): int {\n        body;\n    }\n}");
+        assert_eq!(enclosing_headers(&d, 1, 5), [0], "the class brace pins the class");
+        assert_eq!(enclosing_headers(&d, 3, 5), [0, 2], "the function brace pins the function");
+        assert_eq!(enclosing_headers(&d, 7, 5), [0, 6], "a parameter line");
+        assert_eq!(enclosing_headers(&d, 8, 5), [0, 6], "the return type line");
+        assert_eq!(enclosing_headers(&d, 3, 1), [0], "the outermost win the limit");
+        assert_eq!(enclosing_headers(&d, 5, 5), [0], "a closing line is not a header tail");
     }
 
     #[test]

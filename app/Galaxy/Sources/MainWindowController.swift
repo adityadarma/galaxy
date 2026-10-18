@@ -527,6 +527,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// Panel terminals, for tests.
     var panelTerminals: [PanelTerminal] { terminals }
     var terminalPanelForTesting: TerminalPanelView { terminalPanel }
+    var stickyScopeViewForTesting: StickyScopeView { stickyScopeView }
+    var editorScrollViewForTesting: NSScrollView { scrollView }
 
     // MARK: Terminals in the editor area
 
@@ -643,7 +645,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             scrollView.postsFrameChangedNotifications = true
             let center = NotificationCenter.default
             center.addObserver(forName: NSView.boundsDidChangeNotification, object: scrollView.contentView, queue: .main) { [weak self] _ in
-                MainActor.assumeIsolated { self?.minimap.needsDisplay = true }
+                MainActor.assumeIsolated {
+                    self?.minimap.needsDisplay = true
+                    self?.updateStickyScope()
+                }
             }
             // The scroll view is created empty and sized by its split view
             // later, so the map follows every resize.
@@ -1220,9 +1225,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         } else {
             evictInactiveSyntax(now: .now)
         }
-        statusLabel.stringValue = event.contains(.critical)
-            ? "Memory pressure: released inactive editor caches."
-            : "Memory pressure: released editor caches."
     }
 
     @available(*, unavailable)
@@ -1396,6 +1398,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         breadcrumbBar.clear()
         findBarSlot.translatesAutoresizingMaskIntoConstraints = false
         stickyScopeView.translatesAutoresizingMaskIntoConstraints = false
+        stickyScopeView.editor = editorView
+        stickyScopeView.onSelect = { [weak self] line, pinned in self?.jumpToStickyLine(line, above: pinned) }
         // `BottomPanelContentView.layout()` sizes these (never below its
         // minimum). No autoresizing mask: one tied to the collapsed,
         // zero-height container conflicts with the panels' own constraints.
@@ -3944,20 +3948,59 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         outlinePicker.reset(symbols: symbols.map { OutlineSymbol(uri: $0.uri, name: $0.name, kind: $0.kind, line: $0.line, column: $0.column) })
     }
 
-    private func updateStickyScope() {
-        guard activeTab != nil, !documentSymbols.isEmpty else {
+    /// Pins the header lines of the blocks around the top of the view.
+    ///
+    /// With `n` rows pinned, the first line under the bar is the one `n`
+    /// rows below the top edge. The bar is right when that line sits in at
+    /// least `n` blocks and each of the first `n` headers has reached its
+    /// slot: header `i` pins once its own row is at the top plus `i` rows,
+    /// so its copy lands on it (nearly) without a jump. A header leaves
+    /// when its block ends under the bar. The largest such `n` wins.
+    func updateStickyScope() {
+        let top = scrollView.contentView.bounds.origin.y
+        guard stickyScopeView.isEnabled, activeTab?.isDocument == true, !isDiffPaneShown,
+              let document = editorView.document, top > 0 else {
             stickyScopeView.show([])
             return
         }
-        let firstVisible = editorView.line(atY: max(0, scrollView.contentView.bounds.origin.y)).line
-        guard firstVisible > 0 else {
-            stickyScopeView.show([])
-            return
+        let height = editorView.metrics.lineHeight
+        let topRow = top / height
+        var pinned: [UInt64] = []
+        for count in stride(from: Self.stickyLimit, through: 1, by: -1) {
+            let under = editorView.line(atY: top + CGFloat(count) * height).line
+            let chain = document.stickyScopes(line: under, max: UInt64(Self.stickyLimit))
+            guard chain.count >= count else { continue }
+            let headers = Array(chain.prefix(count))
+            let reached = headers.enumerated().allSatisfy { slot, line in
+                editorView.rowTop(of: line) / height <= topRow + CGFloat(slot)
+            }
+            if reached { pinned = headers; break }
         }
-        let scopes = documentSymbols
-            .filter { $0.line < firstVisible }
-            .sorted { $0.line == $1.line ? $0.column < $1.column : $0.line < $1.line }
-        stickyScopeView.show(Array(scopes.suffix(3)))
+        let rows = pinned.map { line -> StickyScopeView.Row in
+            let text = document.displayLine(line: line)
+            if let old = stickyScopeView.rows.first(where: { $0.line == line && $0.text == text }) { return old }
+            let styles = document.viewport(firstLine: line, count: 1).styles.filter { $0.line == line }
+            return StickyScopeView.Row(line: line, text: text, styles: styles)
+        }
+        stickyScopeView.show(rows)
+    }
+
+    /// Most pinned rows at once.
+    private static let stickyLimit = 3
+
+    /// A click on a pinned row: caret to its start, with the line scrolled
+    /// to just below the pinned rows that still enclose it.
+    private func jumpToStickyLine(_ line: UInt64, above pinned: Int) {
+        guard let document = editorView.document else { return }
+        document.setCaret(pos: TextPos(line: line, colUtf16: 0))
+        editorView.reloadDocument()
+        let clip = scrollView.contentView
+        let y = editorView.rowTop(of: line) - CGFloat(pinned) * editorView.metrics.lineHeight
+        let target = NSPoint(x: clip.bounds.origin.x, y: y - scrollView.contentInsets.top)
+        clip.scroll(to: clip.constrainBoundsRect(NSRect(origin: target, size: clip.bounds.size)).origin)
+        scrollView.reflectScrolledClipView(clip)
+        window?.makeFirstResponder(editorView)
+        updateStickyScope()
     }
 
     private func requestWorkspaceSymbols(query: String) {

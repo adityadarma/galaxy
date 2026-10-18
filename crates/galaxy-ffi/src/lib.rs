@@ -3988,6 +3988,16 @@ impl DocumentHandle {
         self.lock().folds.clear();
     }
 
+    /// Header lines of the blocks around `line`, outermost first: what a
+    /// sticky bar can pin while `line` is just below it.
+    pub fn sticky_scopes(&self, line: u64, max: u64) -> Vec<u64> {
+        let st = self.lock();
+        fold::enclosing_headers(&st.editor.doc, clamp_usize(line), clamp_usize(max))
+            .into_iter()
+            .map(|l| l as u64)
+            .collect()
+    }
+
     /// Fold marker state of `line`.
     pub fn fold_state(&self, line: u64) -> FoldState {
         let mut st = self.lock();
@@ -4720,6 +4730,15 @@ mod tests {
         assert!(doc.toggle_fold(0));
         assert_eq!(doc.total_rows(), 7);
         assert!(!doc.toggle_fold(1), "nothing to fold on a leaf line");
+    }
+
+    #[test]
+    fn sticky_scopes_name_the_headers_around_a_line() {
+        let doc = folding_doc();
+        assert_eq!(doc.sticky_scopes(1, 3), [0]);
+        assert_eq!(doc.sticky_scopes(5, 3), [4]);
+        assert!(doc.sticky_scopes(3, 3).is_empty());
+        assert!(doc.sticky_scopes(99, 3).is_empty());
     }
 
     #[test]
