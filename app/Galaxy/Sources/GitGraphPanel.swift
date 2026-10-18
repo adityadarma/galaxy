@@ -59,6 +59,13 @@ final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, N
             loadPinned()
             limit = pageSize
             hasMore = false
+            branchFilter = nil
+            authorFilter = nil
+            showRemotes = true
+            remoteCheckbox.state = .on
+            branchChoices = []
+            authorChoices = []
+            rebuildChoices()
         }
     }
     /// Size of one page of history. Tests use a small one.
@@ -76,6 +83,25 @@ final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, N
     private let scroll = NSScrollView()
     private let empty = NSTextField(labelWithString: "No commits")
     private let refreshButton = NSButton()
+    private let toolbar = NSStackView()
+    private let branchPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let authorPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let remoteCheckbox = NSButton(checkboxWithTitle: "Remote", target: nil, action: nil)
+    private let headButton = NSButton()
+    private let searchButton = NSButton()
+    private let searchField = NSSearchField()
+    /// Branch the graph starts from; nil shows every ref.
+    private(set) var branchFilter: String?
+    /// Author the graph is limited to; nil shows everyone.
+    private(set) var authorFilter: String?
+    /// Whether remote-tracking branches are shown.
+    private(set) var showRemotes = true
+    /// Names offered by the branch and author pop-ups.
+    private var branchChoices: [GitBranchInfo] = []
+    private var authorChoices: [String] = []
+    private var currentBranch: String?
+    /// Bumped by every filter change, so a read that started before it is redone.
+    private var generation = 0
     private(set) var rows: [GitGraphRow] = []
     private var timer: Timer?
     private var loading = false
@@ -169,6 +195,8 @@ final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, N
         refreshButton.setAccessibilityLabel("Refresh git graph")
         refreshButton.translatesAutoresizingMaskIntoConstraints = false
 
+        configureToolbar()
+
         scroll.documentView = table
         scroll.contentView.postsBoundsChangedNotifications = true
         NotificationCenter.default.addObserver(self, selector: #selector(scrolled(_:)),
@@ -182,19 +210,245 @@ final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, N
         empty.isHidden = true
         addSubview(scroll)
         addSubview(empty)
-        addSubview(refreshButton)
+        addSubview(toolbar)
         NSLayoutConstraint.activate([
-            scroll.topAnchor.constraint(equalTo: topAnchor),
+            toolbar.topAnchor.constraint(equalTo: topAnchor),
+            toolbar.leadingAnchor.constraint(equalTo: leadingAnchor),
+            toolbar.trailingAnchor.constraint(equalTo: trailingAnchor),
+            toolbar.heightAnchor.constraint(equalToConstant: Self.toolbarHeight),
+            scroll.topAnchor.constraint(equalTo: toolbar.bottomAnchor),
             scroll.leadingAnchor.constraint(equalTo: leadingAnchor),
             scroll.trailingAnchor.constraint(equalTo: trailingAnchor),
             scroll.bottomAnchor.constraint(equalTo: bottomAnchor),
             empty.centerXAnchor.constraint(equalTo: centerXAnchor),
             empty.centerYAnchor.constraint(equalTo: centerYAnchor),
-            refreshButton.topAnchor.constraint(equalTo: topAnchor, constant: 2),
-            refreshButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            refreshButton.widthAnchor.constraint(equalToConstant: 22),
-            refreshButton.heightAnchor.constraint(equalToConstant: 20),
         ])
+        rebuildChoices()
+    }
+
+    // MARK: Toolbar
+
+    static let toolbarHeight: CGFloat = 36
+
+    private func configureToolbar() {
+        func label(_ text: String) -> NSTextField {
+            let field = NSTextField(labelWithString: text)
+            field.font = .systemFont(ofSize: 12, weight: .semibold)
+            return field
+        }
+        func icon(_ button: NSButton, _ symbol: String, _ tip: String, _ action: Selector) {
+            button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: tip)?
+                .withSymbolConfiguration(.init(pointSize: 12, weight: .regular))
+            button.isBordered = false
+            button.imagePosition = .imageOnly
+            button.contentTintColor = .secondaryLabelColor
+            button.toolTip = tip
+            button.target = self
+            button.action = action
+            button.setAccessibilityLabel(tip)
+            button.widthAnchor.constraint(equalToConstant: 24).isActive = true
+        }
+        for popup in [branchPopup, authorPopup] {
+            popup.controlSize = .small
+            popup.font = .systemFont(ofSize: 12)
+            popup.target = self
+            popup.setContentHuggingPriority(.defaultLow, for: .horizontal)
+            popup.widthAnchor.constraint(lessThanOrEqualToConstant: 220).isActive = true
+            popup.widthAnchor.constraint(greaterThanOrEqualToConstant: 110).isActive = true
+        }
+        branchPopup.action = #selector(branchChosen(_:))
+        branchPopup.setAccessibilityLabel("Branches")
+        branchPopup.setAccessibilityIdentifier("git-graph-branches")
+        authorPopup.action = #selector(authorChosen(_:))
+        authorPopup.setAccessibilityLabel("Authors")
+        authorPopup.setAccessibilityIdentifier("git-graph-authors")
+
+        remoteCheckbox.state = .on
+        remoteCheckbox.target = self
+        remoteCheckbox.action = #selector(remoteToggled(_:))
+        remoteCheckbox.font = .systemFont(ofSize: 12, weight: .semibold)
+        remoteCheckbox.setAccessibilityIdentifier("git-graph-remote")
+
+        icon(headButton, "scope", "Scroll to HEAD", #selector(scrollToHeadClicked(_:)))
+        icon(searchButton, "magnifyingglass", "Find commit", #selector(searchClicked(_:)))
+        icon(refreshButton, "arrow.clockwise", "Refresh", #selector(refreshClicked(_:)))
+        refreshButton.setAccessibilityLabel("Refresh git graph")
+
+        searchField.placeholderString = "Subject, author, hash or ref"
+        searchField.controlSize = .small
+        searchField.target = self
+        searchField.action = #selector(searchSubmitted(_:))
+        searchField.sendsSearchStringImmediately = false
+        searchField.isHidden = true
+        searchField.setAccessibilityIdentifier("git-graph-search")
+        searchField.widthAnchor.constraint(equalToConstant: 200).isActive = true
+
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.init(1), for: .horizontal)
+        spacer.setContentCompressionResistancePriority(.init(1), for: .horizontal)
+
+        toolbar.orientation = .horizontal
+        toolbar.alignment = .centerY
+        toolbar.spacing = 8
+        toolbar.edgeInsets = NSEdgeInsets(top: 0, left: 12, bottom: 0, right: 10)
+        toolbar.translatesAutoresizingMaskIntoConstraints = false
+        toolbar.setAccessibilityRole(.toolbar)
+        for view in [label("Branches:"), branchPopup, label("Authors:"), authorPopup, remoteCheckbox,
+                     spacer, searchField, headButton, searchButton, refreshButton] {
+            toolbar.addArrangedSubview(view)
+        }
+    }
+
+    /// Fills both pop-ups from the loaded choices, keeping the selection.
+    /// A chosen branch or author that no longer exists falls back to "all".
+    private func rebuildChoices() {
+        if let branch = branchFilter, !branchChoices.isEmpty,
+           !branchChoices.contains(where: { $0.name == branch && (showRemotes || !$0.remote) }) {
+            branchFilter = nil
+        }
+        branchPopup.removeAllItems()
+        branchPopup.addItem(withTitle: "Show All")
+        branchPopup.menu?.addItem(.separator())
+        let locals = branchChoices.filter { !$0.remote }
+        let remotes = showRemotes ? branchChoices.filter(\.remote) : []
+        for branch in locals + remotes {
+            let item = NSMenuItem(title: branch.name, action: nil, keyEquivalent: "")
+            item.representedObject = branch.name
+            branchPopup.menu?.addItem(item)
+        }
+        if let branch = branchFilter, !branchChoices.contains(where: { $0.name == branch }) {
+            // Chosen before the list arrived; keep it visible.
+            let item = NSMenuItem(title: branch, action: nil, keyEquivalent: "")
+            item.representedObject = branch
+            branchPopup.menu?.addItem(item)
+        }
+        if let branch = branchFilter { branchPopup.selectItem(withTitle: branch) } else { branchPopup.selectItem(at: 0) }
+
+        authorPopup.removeAllItems()
+        authorPopup.addItem(withTitle: "All")
+        authorPopup.menu?.addItem(.separator())
+        var names = authorChoices
+        if let author = authorFilter, !names.contains(author) { names.append(author) }
+        for name in names {
+            let item = NSMenuItem(title: name, action: nil, keyEquivalent: "")
+            item.representedObject = name
+            authorPopup.menu?.addItem(item)
+        }
+        if let author = authorFilter { authorPopup.selectItem(withTitle: author) } else { authorPopup.selectItem(at: 0) }
+    }
+
+    /// Reads branch names (and author names when `authors`) off the main thread.
+    private func refreshChoices(authors: Bool) {
+        guard let workspace else { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let branches = try? workspace.gitBranches()
+            let names = authors ? (try? workspace.gitAuthors()) : nil
+            Task { @MainActor [weak self] in
+                guard let self, self.workspace === workspace else { return }
+                if let branches {
+                    self.branchChoices = branches
+                    self.currentBranch = branches.first { $0.current }?.name
+                }
+                if let names { self.authorChoices = names }
+                self.rebuildChoices()
+            }
+        }
+    }
+
+    /// Reloads after a filter changed, from the first page.
+    func filtersChanged() {
+        generation += 1
+        limit = pageSize
+        hasMore = false
+        refresh()
+    }
+
+    func setBranchFilter(_ name: String?) {
+        guard name != branchFilter else { return }
+        branchFilter = name
+        rebuildChoices()
+        filtersChanged()
+    }
+
+    func setAuthorFilter(_ name: String?) {
+        guard name != authorFilter else { return }
+        authorFilter = name
+        rebuildChoices()
+        filtersChanged()
+    }
+
+    func setShowRemotes(_ show: Bool) {
+        guard show != showRemotes else { return }
+        showRemotes = show
+        remoteCheckbox.state = show ? .on : .off
+        rebuildChoices()
+        filtersChanged()
+    }
+
+    @objc private func branchChosen(_ sender: NSPopUpButton) {
+        setBranchFilter(sender.selectedItem?.representedObject as? String)
+    }
+
+    @objc private func authorChosen(_ sender: NSPopUpButton) {
+        setAuthorFilter(sender.selectedItem?.representedObject as? String)
+    }
+
+    @objc private func remoteToggled(_ sender: NSButton) { setShowRemotes(sender.state == .on) }
+
+    @objc private func scrollToHeadClicked(_ sender: Any?) { scrollToHead() }
+
+    /// Selects and shows the checked-out commit, or says why it cannot.
+    func scrollToHead() {
+        guard let index = rows.firstIndex(where: { $0.commit?.refs.contains { $0.kind == .head } == true }) else {
+            onMessage?("Git: HEAD is not in the loaded commits")
+            return
+        }
+        table.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+        table.scrollRowToVisible(index)
+    }
+
+    // MARK: Find
+
+    @objc private func searchClicked(_ sender: Any?) {
+        searchField.isHidden.toggle()
+        if searchField.isHidden {
+            searchField.stringValue = ""
+            focus()
+        } else {
+            window?.makeFirstResponder(searchField)
+        }
+    }
+
+    @objc private func searchSubmitted(_ sender: NSSearchField) {
+        _ = findNext(sender.stringValue)
+    }
+
+    static func matches(_ row: GitGraphRow, _ query: String) -> Bool {
+        guard let commit = row.commit else { return false }
+        let needle = query.lowercased()
+        return commit.subject.lowercased().contains(needle)
+            || commit.author.lowercased().contains(needle)
+            || commit.hash.lowercased().hasPrefix(needle)
+            || commit.refs.contains { $0.name.lowercased().contains(needle) }
+    }
+
+    /// Selects the next row after the selection that matches `query`,
+    /// wrapping around. Returns whether one was found.
+    @discardableResult
+    func findNext(_ query: String) -> Bool {
+        let query = query.trimmingCharacters(in: .whitespaces)
+        guard !query.isEmpty, !rows.isEmpty else { return false }
+        let start = table.selectedRow
+        for offset in 1...rows.count {
+            let index = (max(start, -1) + offset) % rows.count
+            if Self.matches(rows[index], query) {
+                table.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
+                table.scrollRowToVisible(index)
+                return true
+            }
+        }
+        onMessage?("Git: no commit matches \"\(query)\"")
+        return false
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
@@ -236,16 +490,26 @@ final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, N
             rebuild()
             return
         }
-        if includeOrigin { refreshOriginTags(workspace) }
+        if includeOrigin {
+            refreshOriginTags(workspace)
+            refreshChoices(authors: true)
+        }
         guard !loading else { return }
         loading = true
         let limit = self.limit
+        let generation = self.generation
+        let branches = branchFilter.map { [$0] } ?? []
+        let authors = authorFilter.map { [$0] } ?? []
+        let remotes = showRemotes
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let commits = (try? workspace.gitLogGraph(limit: limit)) ?? []
+            let commits = (try? workspace.gitLogGraphFiltered(
+                limit: limit, branches: branches, authors: authors, includeRemotes: remotes)) ?? []
             let uncommitted = ((try? workspace.gitStatus())??.changes.count) ?? 0
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.loading = false
+                // A filter changed during the read; this result is for the old one.
+                if generation != self.generation { self.refresh(); return }
                 self.commits = commits
                 self.uncommitted = uncommitted
                 self.hasMore = commits.count >= Int(limit)
@@ -293,7 +557,10 @@ final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, N
     }
 
     private func rebuild() {
-        apply(GitGraphRows.make(commits: commits, uncommitted: uncommitted,
+        // The working tree hangs off the checked-out branch, so it is hidden
+        // when the view is limited to an author or to another branch.
+        let showsWorkingTree = authorFilter == nil && (branchFilter == nil || branchFilter == currentBranch)
+        apply(GitGraphRows.make(commits: commits, uncommitted: showsWorkingTree ? uncommitted : 0,
                                 originTags: originTags, pinned: pinned))
     }
 
@@ -540,6 +807,7 @@ final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, N
                 guard let self else { return }
                 self.onMessage?(failure.map { "Git: \($0)" } ?? success)
                 self.onRepositoryChanged?()
+                self.refreshChoices(authors: false)
                 self.refresh(includeOrigin: refreshOrigin)
             }
         }

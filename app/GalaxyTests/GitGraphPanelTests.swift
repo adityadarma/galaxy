@@ -365,4 +365,102 @@ final class GitGraphPanelTests: XCTestCase {
         XCTAssertEqual(window.files.map(\.path), ["a.txt"])
         XCTAssertEqual(window.files.first?.status, "M")
     }
+
+    // MARK: Toolbar filters
+
+    private func subjects(_ panel: GitGraphPanel) -> [String] { panel.rows.compactMap { $0.commit?.subject } }
+
+    func testAuthorFilterKeepsOnlyThatAuthorsCommits() throws {
+        let dir = try makeRepo()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try commitFile(dir, "a.txt", "1", "by T")
+        try git(dir, "config", "user.name", "Zed")
+        try commitFile(dir, "b.txt", "2", "by Zed")
+        let panel = try panel(for: dir)
+        XCTAssertEqual(subjects(panel).count, 2)
+
+        panel.setAuthorFilter("Zed")
+        XCTAssertTrue(waitUntil { self.subjects(panel) == ["by Zed"] }, "\(subjects(panel))")
+        XCTAssertEqual(panel.authorFilter, "Zed")
+
+        panel.setAuthorFilter(nil)
+        XCTAssertTrue(waitUntil { self.subjects(panel).count == 2 })
+    }
+
+    func testBranchFilterStartsFromThatBranch() throws {
+        let dir = try makeRepo()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try commitFile(dir, "a.txt", "1", "base")
+        try git(dir, "switch", "-c", "feature/x")
+        try commitFile(dir, "b.txt", "2", "on feature")
+        try git(dir, "switch", "main")
+        let panel = try panel(for: dir)
+        XCTAssertEqual(subjects(panel).count, 2)
+
+        panel.setBranchFilter("main")
+        XCTAssertTrue(waitUntil { self.subjects(panel) == ["base"] }, "\(subjects(panel))")
+
+        panel.setBranchFilter("feature/x")
+        XCTAssertTrue(waitUntil { self.subjects(panel) == ["on feature", "base"] }, "\(subjects(panel))")
+    }
+
+    func testRemoteCheckboxHidesRemoteBranches() throws {
+        let dir = try makeRepo()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try commitFile(dir, "a.txt", "1", "base")
+        try git(dir, "update-ref", "refs/remotes/origin/main", "main")
+        let panel = try panel(for: dir)
+        let hasRemote = { panel.rows.contains { $0.commit?.refs.contains { $0.kind == .remote } == true } }
+        XCTAssertTrue(waitUntil { hasRemote() })
+
+        panel.setShowRemotes(false)
+        XCTAssertTrue(waitUntil { !hasRemote() })
+        XCTAssertFalse(panel.showRemotes)
+
+        panel.setShowRemotes(true)
+        XCTAssertTrue(waitUntil { hasRemote() })
+    }
+
+    func testWorkingTreeRowHiddenWhenFilteringByAuthor() throws {
+        let dir = try makeRepo()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try commitFile(dir, "a.txt", "1", "one")
+        try "dirty".write(to: dir.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+        let panel = try panel(for: dir)
+        XCTAssertTrue(waitUntil { panel.rows.first?.commit == nil })
+
+        panel.setAuthorFilter("T")
+        XCTAssertTrue(waitUntil { panel.rows.first?.commit != nil })
+    }
+
+    // MARK: Find and HEAD
+
+    func testFindNextWrapsAndMatchesSubjectAuthorHashAndRef() throws {
+        let panel = GitGraphPanel()
+        var tagged = commit("abcdef0123456789")
+        tagged.refs = [GitRefInfo(name: "v2.0", kind: .tag)]
+        panel.apply(GitGraphRows.make(commits: [commit("1111111100"), tagged, commit("2222222200")], uncommitted: 0))
+
+        XCTAssertTrue(panel.findNext("v2"))
+        XCTAssertTrue(panel.findNext("abcdef"), "hash prefix")
+        XCTAssertTrue(panel.findNext("1111"), "wraps to the first row")
+        XCTAssertTrue(panel.findNext("A"), "author is 'A'")
+        XCTAssertFalse(panel.findNext("nothing like this"))
+        XCTAssertFalse(panel.findNext("   "), "blank query never matches")
+    }
+
+    func testScrollToHeadReportsWhenHeadIsNotLoaded() throws {
+        let panel = GitGraphPanel()
+        var messages: [String] = []
+        panel.onMessage = { messages.append($0) }
+        panel.apply(GitGraphRows.make(commits: [commit("aaaaaaaa1111")], uncommitted: 0))
+        panel.scrollToHead()
+        XCTAssertEqual(messages.count, 1)
+
+        var head = commit("bbbbbbbb2222")
+        head.refs = [GitRefInfo(name: "main", kind: .head)]
+        panel.apply(GitGraphRows.make(commits: [commit("aaaaaaaa1111"), head], uncommitted: 0))
+        panel.scrollToHead()
+        XCTAssertEqual(messages.count, 1, "found: no message")
+    }
 }

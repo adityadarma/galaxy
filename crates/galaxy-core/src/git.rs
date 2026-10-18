@@ -40,7 +40,7 @@ pub fn branches(root: &Path) -> io::Result<Vec<GitBranch>> {
             "-C",
             &root.to_string_lossy(),
             "for-each-ref",
-            "--format=%(refname:short)",
+            "--format=%(refname)",
             "refs/heads",
             "refs/remotes",
         ])
@@ -56,13 +56,17 @@ pub fn branches(root: &Path) -> io::Result<Vec<GitBranch>> {
     let mut result = String::from_utf8_lossy(&output.stdout)
         .lines()
         .filter(|name| !name.ends_with("/HEAD"))
-        .map(|name| {
-            let remote = name.starts_with("origin/") || name.contains('/');
-            GitBranch {
+        .filter_map(|full| {
+            // `refs/heads/a/b` is a local branch even though it has a slash.
+            let (name, remote) = match full.strip_prefix("refs/heads/") {
+                Some(name) => (name, false),
+                None => (full.strip_prefix("refs/remotes/")?, true),
+            };
+            Some(GitBranch {
                 name: name.to_owned(),
-                current: name == current,
+                current: !remote && name == current,
                 remote,
-            }
+            })
         })
         .collect::<Vec<_>>();
     result.sort_by_key(|branch| (!branch.current, branch.remote, branch.name.clone()));
@@ -1591,6 +1595,20 @@ mod tests {
         commit_file_as(dir.path(), "Ann", "b.txt", "two");
         commit_file_as(dir.path(), "Bob", "c.txt", "three");
         assert_eq!(authors(dir.path(), 50).unwrap(), ["Ann", "Bob"]);
+    }
+
+    #[test]
+    fn branches_with_a_slash_are_local() {
+        let dir = tempfile::tempdir().unwrap();
+        run(dir.path(), ["init", "-b", "main"]);
+        commit_file_as(dir.path(), "Ann", "a.txt", "one");
+        run(dir.path(), ["branch", "feature/x"]);
+        run(dir.path(), ["update-ref", "refs/remotes/origin/main", "main"]);
+        let list = branches(dir.path()).unwrap();
+        let find = |name: &str| list.iter().find(|b| b.name == name).unwrap().clone();
+        assert!(!find("feature/x").remote);
+        assert!(find("origin/main").remote);
+        assert!(find("main").current);
     }
 
     #[test]
