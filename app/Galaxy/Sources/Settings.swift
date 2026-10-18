@@ -115,4 +115,36 @@ extension GalaxySettings {
     static func workspaceURL(root: String) -> URL {
         URL(fileURLWithPath: root).appendingPathComponent(".galaxy/settings.json")
     }
+
+    /// Keys `load` also accepts at the top level instead of under `editor`.
+    private static let editorKeys: Set<String> = [
+        "insertSpaces", "tabSize", "renderWhitespace", "autoClosingTags", "linkedEditing", "gitBlame",
+    ]
+
+    /// Sets `section.key` in the settings file at `url` (the Settings window
+    /// writes here), keeping every other key. A file that does not parse is
+    /// left alone and the error is thrown, so a typo is never overwritten.
+    static func write(_ value: Any, key: String, section: String, to url: URL = globalURL) throws {
+        var root: [String: Any] = [:]
+        if let data = try? Data(contentsOf: url), !data.isEmpty {
+            guard let parsed = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            root = parsed
+        }
+        // `load` reads editor keys from the top level when there is no
+        // `editor` object; keep writing there so the file stays consistent.
+        let flatEditor = section == "editor" && root["editor"] == nil
+            && !editorKeys.isDisjoint(with: root.keys)
+        if flatEditor {
+            root[key] = value
+        } else {
+            var object = root[section] as? [String: Any] ?? [:]
+            object[key] = value
+            root[section] = object
+        }
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let data = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
+        try data.write(to: url, options: .atomic)
+    }
 }

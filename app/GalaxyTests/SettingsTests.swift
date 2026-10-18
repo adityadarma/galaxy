@@ -86,6 +86,65 @@ final class SettingsTests: XCTestCase {
         XCTAssertEqual(settings.effectiveAutoSaveDelay, 2.5, accuracy: 0.001)
     }
 
+    func testWritingAKeyKeepsTheRestOfTheFile() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-write-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try #"{"editor":{"tabSize":2},"files":{"autoSave":"afterDelay"},"custom":1}"#
+            .write(to: url, atomically: true, encoding: .utf8)
+        try GalaxySettings.write(false, key: "gitBlame", section: "editor", to: url)
+        try GalaxySettings.write("off", key: "autoSave", section: "files", to: url)
+        let settings = try GalaxySettings.load(from: url)
+        XCTAssertEqual(settings.effectiveTabSize, 2)
+        XCTAssertFalse(settings.effectiveGitBlame)
+        XCTAssertEqual(settings.effectiveAutoSave, .off)
+        let root = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        XCTAssertEqual(root["custom"] as? Int, 1, "unknown keys survive")
+    }
+
+    func testWritingCreatesTheFileAndKeepsFlatEditorKeysFlat() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-write-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let url = dir.appendingPathComponent("sub/settings.json")
+        try GalaxySettings.write(8, key: "tabSize", section: "editor", to: url)
+        XCTAssertEqual(try GalaxySettings.load(from: url).effectiveTabSize, 8)
+
+        let flat = dir.appendingPathComponent("flat.json")
+        try #"{"tabSize":2}"#.write(to: flat, atomically: true, encoding: .utf8)
+        try GalaxySettings.write(false, key: "insertSpaces", section: "editor", to: flat)
+        let settings = try GalaxySettings.load(from: flat)
+        XCTAssertEqual(settings.effectiveTabSize, 2, "a nested editor object would hide the flat keys")
+        XCTAssertTrue(settings.useTabs)
+    }
+
+    func testABrokenFileIsNotOverwritten() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-write-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try #"{"editor": {"#.write(to: url, atomically: true, encoding: .utf8)
+        XCTAssertThrowsError(try GalaxySettings.write(4, key: "tabSize", section: "editor", to: url))
+        XCTAssertEqual(try String(contentsOf: url, encoding: .utf8), #"{"editor": {"#)
+    }
+
+    func testSettingsWindowWritesTheEditorTab() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-prefs-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        var changes = 0
+        let controller = PreferencesWindowController(settingsURL: url) { changes += 1 }
+        func control<T>(_ name: String) throws -> T {
+            try XCTUnwrap(Mirror(reflecting: controller).children.first { $0.label == name }?.value as? T, name)
+        }
+        let blame: NSButton = try control("gitBlameBox")
+        XCTAssertEqual(blame.state, .on, "defaults show when there is no file")
+        blame.state = .off
+        _ = blame.target?.perform(blame.action, with: blame)
+        let tabSize: NSPopUpButton = try control("tabSizePopup")
+        tabSize.selectItem(withTitle: "2")
+        _ = tabSize.target?.perform(tabSize.action, with: tabSize)
+        let settings = try GalaxySettings.load(from: url)
+        XCTAssertFalse(settings.effectiveGitBlame)
+        XCTAssertEqual(settings.effectiveTabSize, 2)
+        XCTAssertGreaterThan(changes, 0, "open windows are told")
+    }
+
     func testAutoSaveDefaultsStayConservative() {
         XCTAssertEqual(GalaxySettings.empty.effectiveAutoSave, .off)
         XCTAssertEqual(GalaxySettings.empty.effectiveAutoSaveDelay, 1.0, accuracy: 0.001)

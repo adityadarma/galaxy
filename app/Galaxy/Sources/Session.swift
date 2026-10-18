@@ -14,6 +14,14 @@ struct Session: Codable, Equatable {
         var line: UInt64
         var col: UInt64
         var scrollY: Double?
+        /// Optional so sessions saved before pinning still decode.
+        var isPinned: Bool? = nil
+    }
+
+    /// A group after the first. Optional fields keep older sessions decoding.
+    struct Group: Codable, Equatable {
+        var tabs: [Tab] = []
+        var active: Int?
     }
 
     static let currentVersion = 1
@@ -24,6 +32,12 @@ struct Session: Codable, Equatable {
     /// Index into `tabs`.
     var active: Int?
     var sidebarVisible = true
+    /// Editor groups after the first (`tabs` and `active` are the first one).
+    var extraGroups: [Group]? = nil
+    /// Index of the group that had focus, among all groups.
+    var activeGroup: Int? = nil
+    /// Groups side by side (true) or stacked.
+    var groupsVertical: Bool? = nil
 
     /// `~/Library/Application Support/Galaxy/session.json`. Under XCTest
     /// a temp file, so tests never read or overwrite the user's session.

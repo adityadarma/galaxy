@@ -263,6 +263,192 @@ final class TabTests: XCTestCase {
         XCTAssertEqual(clip.bounds.origin.y, 2000, accuracy: 1)
     }
 
+    private func perform(_ menu: NSMenu, _ title: String) throws {
+        let item = try XCTUnwrap(menu.item(withTitle: title), title)
+        XCTAssertTrue(item.isEnabled, title)
+        _ = (item.target as? NSObject)?.perform(item.action, with: item)
+    }
+
+    func testTabMenuClosesRelativeToTheClickedTab() throws {
+        let c = makeController()
+        defer { c.window?.orderOut(nil) }
+        for name in ["a.txt", "b.txt", "c.txt"] { try c.openFile(at: file(name)) }
+        let menu = try XCTUnwrap(c.menu(forTab: 1))
+        XCTAssertEqual(menu.items.filter { !$0.isSeparatorItem }.map(\.title),
+                       ["Close", "Close Others", "Close to the Right", "Close Saved", "Close All", "Pin",
+                        "Copy Path", "Copy Relative Path", "Reveal in Finder", "Reveal in Explorer View",
+                        "Split Right", "Split Down"])
+        XCTAssertEqual(menu.item(withTitle: "Close Others")?.keyEquivalent, "t", "shortcut shown")
+        XCTAssertFalse(try XCTUnwrap(c.menu(forTab: 2)?.item(withTitle: "Close to the Right")).isEnabled,
+                       "nothing right of the last tab")
+
+        try perform(menu, "Close to the Right")
+        XCTAssertEqual(titles(c), ["a.txt", "b.txt"])
+        try perform(try XCTUnwrap(c.menu(forTab: 1)), "Close Others")
+        XCTAssertEqual(titles(c), ["b.txt"])
+        try perform(try XCTUnwrap(c.menu(forTab: 0)), "Close")
+        XCTAssertTrue(c.tabBar.items.isEmpty)
+    }
+
+    func testCloseSavedKeepsUnsavedTabsAndCloseAllStopsOnCancel() throws {
+        let c = makeController()
+        defer { c.window?.orderOut(nil) }
+        for name in ["a.txt", "b.txt", "c.txt"] { try c.openFile(at: file(name)) }
+        c.selectTab(1)
+        type(c, "edit")
+        try perform(try XCTUnwrap(c.menu(forTab: 0)), "Close Saved")
+        XCTAssertEqual(titles(c), ["b.txt"], "only the unsaved tab is left")
+
+        c.askSaveChoice = { _ in .cancel }
+        try perform(try XCTUnwrap(c.menu(forTab: 0)), "Close All")
+        XCTAssertEqual(titles(c), ["b.txt"], "cancel keeps it")
+        c.askSaveChoice = { _ in .discard }
+        c.closeAllTabs(nil)
+        XCTAssertTrue(c.tabBar.items.isEmpty)
+    }
+
+    func testTabMenuCopiesPathsAndRevealsInExplorer() throws {
+        let c = makeController()
+        defer { c.window?.orderOut(nil) }
+        try c.openWorkspace(at: root)
+        try c.openFile(at: file("a.txt"))
+        try c.openFile(at: file("b.txt"))
+        let menu = try XCTUnwrap(c.menu(forTab: 0))
+        let saved = NSPasteboard.general.string(forType: .string)
+        defer {
+            NSPasteboard.general.clearContents()
+            if let saved { NSPasteboard.general.setString(saved, forType: .string) }
+        }
+        try perform(menu, "Copy Path")
+        XCTAssertEqual(NSPasteboard.general.string(forType: .string).map { URL(fileURLWithPath: $0).resolvingSymlinksInPath() },
+                       file("a.txt").resolvingSymlinksInPath(), "the clicked tab, not the active one")
+        try perform(menu, "Copy Relative Path")
+        XCTAssertEqual(NSPasteboard.general.string(forType: .string), "a.txt")
+        try perform(menu, "Reveal in Explorer View")
+        XCTAssertEqual(c.explorer.selectedEntry?.relPath, "a.txt")
+
+        let untitled = MainWindowController(bridge: CoreBridge())
+        untitled.newDocument(nil)
+        let plain = try XCTUnwrap(untitled.menu(forTab: 0))
+        XCTAssertFalse(try XCTUnwrap(plain.item(withTitle: "Copy Path")).isEnabled, "an Untitled buffer has no path")
+        XCTAssertFalse(try XCTUnwrap(plain.item(withTitle: "Reveal in Finder")).isEnabled)
+    }
+
+    /// The menu a real right click on tab `index` gets, through the tab view.
+    private func rightClickMenu(_ c: MainWindowController, tab index: Int) throws -> NSMenu {
+        c.window?.contentView?.layoutSubtreeIfNeeded()
+        let view = c.tabBar.tabViews[index]
+        let point = view.convert(NSPoint(x: view.bounds.midX, y: view.bounds.midY), to: nil)
+        let event = try XCTUnwrap(NSEvent.mouseEvent(with: .rightMouseDown, location: point, modifierFlags: [],
+                                                     timestamp: 0, windowNumber: c.window?.windowNumber ?? 0,
+                                                     context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
+        return try XCTUnwrap(view.menu(for: event), "no menu on tab \(index)")
+    }
+
+    /// Picks an item the way AppKit does when it is clicked.
+    private func choose(_ menu: NSMenu, _ title: String) throws {
+        let index = menu.indexOfItem(withTitle: title)
+        XCTAssertGreaterThanOrEqual(index, 0, title)
+        XCTAssertTrue(menu.items[index].isEnabled, "\(title) is disabled")
+        menu.performActionForItem(at: index)
+    }
+
+    /// The tab bar sits in the transparent title bar; a click there must
+    /// still land on the tab view, not on the window frame.
+    func testRightClickOnATabHitsTheTabView() throws {
+        let c = makeController()
+        defer { c.window?.orderOut(nil) }
+        for name in ["a.txt", "b.txt"] { try c.openFile(at: file(name)) }
+        c.window?.contentView?.layoutSubtreeIfNeeded()
+        let frame = try XCTUnwrap(c.window?.contentView?.superview)
+        for (i, view) in c.tabBar.tabViews.enumerated() {
+            let point = view.convert(NSPoint(x: view.bounds.midX - 20, y: view.bounds.midY), to: nil)
+            let hit = frame.hitTest(frame.superview?.convert(point, from: nil) ?? point)
+            var v = hit
+            while let current = v, !(current is TabItemView) { v = current.superview }
+            XCTAssertTrue(v === view, "tab \(i): hit \(String(describing: hit))")
+        }
+    }
+
+    func testPinnedTabsMoveFirstAndOnlyCloseThemselves() throws {
+        let c = makeController()
+        defer { c.window?.orderOut(nil) }
+        for name in ["a.txt", "b.txt", "c.txt"] { try c.openFile(at: file(name)) }
+
+        try choose(try rightClickMenu(c, tab: 2), "Pin")
+        XCTAssertEqual(titles(c), ["c.txt", "a.txt", "b.txt"], "pinned tab moves first")
+        XCTAssertTrue(c.tabBar.items[0].isPinned)
+        XCTAssertEqual(try rightClickMenu(c, tab: 0).item(withTitle: "Unpin")?.title, "Unpin")
+
+        // Close Others/All from another tab skip the pinned one.
+        try choose(try rightClickMenu(c, tab: 1), "Close Others")
+        XCTAssertEqual(titles(c), ["c.txt", "a.txt"])
+        try choose(try rightClickMenu(c, tab: 1), "Close All")
+        XCTAssertEqual(titles(c), ["c.txt"])
+        XCTAssertFalse(try XCTUnwrap(try rightClickMenu(c, tab: 0).item(withTitle: "Close All")).isEnabled,
+                       "only pinned tabs left")
+
+        // New tabs open after the pinned ones; dragging cannot cross the boundary.
+        try c.openFile(at: file("a.txt"))
+        c.selectTab(0)
+        try c.openFile(at: file("b.txt"))
+        XCTAssertEqual(titles(c), ["c.txt", "b.txt", "a.txt"], "opened from the pinned tab: right after it")
+        c.moveTab(from: 2, to: 0)
+        XCTAssertEqual(titles(c), ["c.txt", "a.txt", "b.txt"], "stops at the pinned boundary")
+
+        // Its own Close still closes it.
+        try choose(try rightClickMenu(c, tab: 0), "Close")
+        XCTAssertEqual(titles(c), ["a.txt", "b.txt"])
+    }
+
+    func testClickingThePinUnpins() throws {
+        let c = makeController()
+        defer { c.window?.orderOut(nil) }
+        for name in ["a.txt", "b.txt"] { try c.openFile(at: file(name)) }
+        c.setPinned(true, tab: c.tabs[1])
+        XCTAssertEqual(titles(c), ["b.txt", "a.txt"])
+        let button = c.tabBar.tabViews[0].closeButton
+        XCTAssertFalse(button.isHidden, "the pin is always shown")
+        button.performClick(nil)
+        XCTAssertEqual(titles(c), ["b.txt", "a.txt"], "unpinned, not closed")
+        XCTAssertFalse(c.tabs[0].isPinned)
+    }
+
+    func testRightClickMenuItemsWorkThroughAppKit() throws {
+        let c = makeController()
+        defer { c.window?.orderOut(nil) }
+        try c.openWorkspace(at: root)
+        for name in ["a.txt", "b.txt", "c.txt"] { try c.openFile(at: file(name)) }
+        let saved = NSPasteboard.general.string(forType: .string)
+        defer {
+            NSPasteboard.general.clearContents()
+            if let saved { NSPasteboard.general.setString(saved, forType: .string) }
+        }
+
+        try choose(try rightClickMenu(c, tab: 0), "Copy Relative Path")
+        XCTAssertEqual(NSPasteboard.general.string(forType: .string), "a.txt")
+        try choose(try rightClickMenu(c, tab: 1), "Copy Path")
+        XCTAssertEqual(NSPasteboard.general.string(forType: .string).map { URL(fileURLWithPath: $0).lastPathComponent }, "b.txt")
+        try choose(try rightClickMenu(c, tab: 0), "Reveal in Explorer View")
+        XCTAssertEqual(c.explorer.selectedEntry?.relPath, "a.txt")
+        try choose(try rightClickMenu(c, tab: 1), "Split Right")
+        XCTAssertTrue(c.isEditorSplit)
+        c.closeEditorSplit(nil)
+
+        try choose(try rightClickMenu(c, tab: 1), "Close to the Right")
+        XCTAssertEqual(titles(c), ["a.txt", "b.txt"])
+        try choose(try rightClickMenu(c, tab: 1), "Close Others")
+        XCTAssertEqual(titles(c), ["b.txt"])
+        try c.openFile(at: file("c.txt"))
+        try choose(try rightClickMenu(c, tab: 0), "Close Saved")
+        XCTAssertTrue(c.tabBar.items.isEmpty)
+        for name in ["a.txt", "b.txt"] { try c.openFile(at: file(name)) }
+        try choose(try rightClickMenu(c, tab: 0), "Close")
+        XCTAssertEqual(titles(c), ["b.txt"])
+        try choose(try rightClickMenu(c, tab: 0), "Close All")
+        XCTAssertTrue(c.tabBar.items.isEmpty)
+    }
+
     func testTabMenuShortcuts() throws {
         let menus = MainMenu.build().items.compactMap(\.submenu)
         let file = try XCTUnwrap(menus.first { $0.title == "File" })

@@ -29,10 +29,31 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private var extensionsGeneration = 0
     private(set) var activeSidebarTab: ActivityBar.Item = .explorer
     let tabBar = TabBar()
-    /// Open documents, in tab order (M2-06).
-    private(set) var tabs: [EditorTab] = []
-    private(set) var activeIndex: Int?
+    /// Editor groups, left to right (or top to bottom). The tabs below are
+    /// those of the active group: each group keeps its own tab list.
+    private(set) var groups: [EditorGroup] = [EditorGroup()]
+    private(set) var activeGroupIndex = 0
+    var activeGroup: EditorGroup { groups[activeGroupIndex] }
+    /// Open documents of the active group, in tab order (M2-06).
+    private(set) var tabs: [EditorTab] {
+        get { activeGroup.tabs }
+        set { activeGroup.tabs = newValue }
+    }
+    private(set) var activeIndex: Int? {
+        get { activeGroup.activeIndex }
+        set { activeGroup.activeIndex = newValue }
+    }
     var activeTab: EditorTab? { activeIndex.map { tabs[$0] } }
+    /// Tabs of every group.
+    var allTabs: [EditorTab] { groups.flatMap(\.tabs) }
+    private let groupsSplitView = EditorGroupsSplitView()
+    /// The live editor stack (tab bar, path bar, editor, terminal...). It
+    /// is placed over the active group's slot; other groups show a pane.
+    private let groupChrome = NSView()
+    private var chromeSlotConstraints: [NSLayoutConstraint] = []
+    /// The tab the live editor currently shows (not necessarily `activeTab`
+    /// while groups are being switched).
+    private weak var shownTab: EditorTab?
     /// Left-hand message in the status bar.
     var statusLabel: NSTextField { statusBar.message }
     private let scrollView = DiagnosticScrollView()
@@ -185,9 +206,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private var tabOrderByUse: [ObjectIdentifier] = []
     let editorView = EditorView(frame: .zero)
     let secondaryEditorView = EditorView(frame: .zero)
-    private var isEditorSplit = false
-    /// Orientation of the user's own split, restored after a diff tab.
-    private var userSplitVertical = true
+    var isEditorSplit: Bool { groups.count > 1 }
     /// The left pane shows the committed file of a diff tab.
     private(set) var isDiffPaneShown = false
     private(set) var diffMap = DiffLineMap()
@@ -251,37 +270,19 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     var isSidebarVisible: Bool { !sidebar.isHidden }
 
-    @objc func splitEditorRight(_ sender: Any?) { setEditorSplit(vertical: true) }
-    @objc func splitEditorDown(_ sender: Any?) { setEditorSplit(vertical: false) }
-    @objc func closeEditorSplit(_ sender: Any?) {
-        isEditorSplit = false
-        updateWrapState()
-        guard !isDiffPaneShown else { return }
-        secondaryScrollView.removeFromSuperview()
-        editorSplitView.isVertical = true
-        editorSplitView.adjustSubviews()
-        secondaryEditorView.document = nil
+    @objc func splitEditorRight(_ sender: Any?) {
+        // From a tab's menu: split that tab, not the one showing.
+        guard let tab = menuTab(sender) ?? activeTab else { return NSSound.beep() }
+        splitEditor(tab, vertical: true)
     }
 
-    private func setEditorSplit(vertical: Bool) {
-        // The left pane belongs to the diff while a diff tab is shown.
-        guard !isDiffPaneShown else { return NSSound.beep() }
-        if isMarkdownPreviewShown {
-            isMarkdownPreviewOn = false
-            updateMarkdownPreview()
-        }
-        isEditorSplit = true
-        updateWrapState()
-        userSplitVertical = vertical
-        editorSplitView.isVertical = vertical
-        if secondaryScrollView.superview == nil {
-            editorSplitView.addSubview(secondaryScrollView)
-        }
-        secondaryEditorView.document = activeTab?.doc
-        editorSplitView.layoutSubtreeIfNeeded()
-        editorSplitView.adjustSubviews()
-        secondaryEditorView.requestDocumentRefresh(scrollCaret: false)
+    @objc func splitEditorDown(_ sender: Any?) {
+        guard let tab = menuTab(sender) ?? activeTab else { return NSSound.beep() }
+        splitEditor(tab, vertical: false)
     }
+
+    /// Joins every group into the active one (VS Code "Join All Editor Groups").
+    @objc func closeEditorSplit(_ sender: Any?) { joinAllGroups() }
 
     /// Shows or hides the rendered Markdown beside the editor (VS Code
     /// "Open Preview to the Side"). Only Markdown files can be previewed.
@@ -320,8 +321,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             if isDiffPaneShown {
                 editorSplitView.isVertical = true
             } else {
-                editorSplitView.isVertical = isEditorSplit ? userSplitVertical : true
-                if isEditorSplit { editorSplitView.addSubview(secondaryScrollView) }
+                editorSplitView.isVertical = true
             }
             editorSplitView.adjustSubviews()
         }
@@ -330,8 +330,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// Opens the Git Graph as an editor tab, or closes it when it is the
     /// tab showing. One graph tab at a time.
     @objc func toggleGitGraph(_ sender: Any?) {
-        if let i = tabs.firstIndex(where: \.isGitGraph) {
-            if activeIndex == i { closeTab(at: i) } else { selectTab(i) }
+        if let existing = allTabs.first(where: \.isGitGraph) {
+            if existing === activeTab, let i = activeIndex { closeTab(at: i) } else { focusTab(existing) }
             return
         }
         let tab = EditorTab(doc: bridge.newDocument(), title: "Git Graph", pathComponents: ["Git Graph"],
@@ -531,7 +531,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     // MARK: Terminals in the editor area
 
     /// Terminal tabs, in tab order.
-    var terminalTabs: [EditorTab] { tabs.filter { $0.terminal != nil } }
+    var terminalTabs: [EditorTab] { allTabs.filter { $0.terminal != nil } }
 
     /// Moves the panel's active terminal into a new editor tab, keeping the
     /// shell running. With no panel terminal, starts a new one there.
@@ -679,7 +679,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// Wrap needs one row table per document, so the split and diff panes,
     /// which show a document twice, keep one row per line.
     private func updateWrapState() {
-        let suspended = isDiffPaneShown || isEditorSplit
+        // Another group showing the same document would fight over its wrap width.
+        let shownElsewhere = groups.contains { group in
+            group !== activeGroup && group.activeTab.map { $0.isDocument && $0.doc === activeTab?.doc } == true
+        }
+        let suspended = isDiffPaneShown || shownElsewhere
         editorView.wrapEnabled = wordWrapEnabled
         editorView.wrapSuspended = suspended
         secondaryEditorView.wrapSuspended = true
@@ -803,7 +807,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// Moves a terminal tab (the clicked one from the tab menu, else the
     /// active one) back into the bottom panel.
     @objc func moveTerminalToPanel(_ sender: Any?) {
-        let target = ((sender as? NSMenuItem)?.representedObject as? EditorTab) ?? activeTab
+        let target = menuTab(sender) ?? activeTab
         guard let tab = target, let handle = tab.terminal,
               let index = tabs.firstIndex(where: { $0 === tab }) else { return NSSound.beep() }
         closeTab(at: index, keepTerminal: true)
@@ -844,13 +848,135 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         closeTab(at: index, keepTerminal: true)
     }
 
-    private func menu(forTab index: Int) -> NSMenu? {
-        guard tabs.indices.contains(index), tabs[index].terminal != nil else { return nil }
+    /// Right click on a tab, VSCode's editor tab menu. Items carry the tab,
+    /// so they act on it rather than on the active one.
+    func menu(forTab index: Int) -> NSMenu? { menu(forTab: index, in: activeGroup) }
+
+    func menu(forTab index: Int, in group: EditorGroup) -> NSMenu? {
+        let tabs = group.tabs
+        guard tabs.indices.contains(index) else { return nil }
+        let tab = tabs[index]
         let menu = NSMenu()
-        let move = menu.addItem(withTitle: "Move Terminal into Panel", action: #selector(moveTerminalToPanel(_:)), keyEquivalent: "")
-        move.target = self
-        move.representedObject = tabs[index]
+        menu.autoenablesItems = false
+        func add(_ title: String, _ action: Selector, enabled: Bool = true) {
+            let item = menu.addItem(withTitle: title, action: action, keyEquivalent: "")
+            item.target = self
+            item.representedObject = tab
+            item.isEnabled = enabled
+        }
+        let others = tabs.filter { $0 !== tab && !$0.isPinned }
+        let right = tabs[(index + 1)...].filter { !$0.isPinned }
+        add("Close", #selector(closeTab(_:)))
+        add("Close Others", #selector(closeOtherTabs(_:)), enabled: !others.isEmpty)
+        add("Close to the Right", #selector(closeTabsToTheRight(_:)), enabled: !right.isEmpty)
+        add("Close Saved", #selector(closeSavedTabs(_:)))
+        add("Close All", #selector(closeAllTabs(_:)), enabled: tabs.contains { !$0.isPinned })
+        menu.addItem(.separator())
+        add(tab.isPinned ? "Unpin" : "Pin", #selector(togglePinTab(_:)))
+        if tab.terminal != nil {
+            menu.addItem(.separator())
+            add("Move Terminal into Panel", #selector(moveTerminalToPanel(_:)))
+        }
+        if tab.isDocument {
+            let onDisk = tab.fileKey != nil
+            menu.addItem(.separator())
+            add("Copy Path", #selector(copyTabPath(_:)), enabled: onDisk)
+            add("Copy Relative Path", #selector(copyTabRelativePath(_:)), enabled: tab.relPath != nil)
+            menu.addItem(.separator())
+            add("Reveal in Finder", #selector(revealTabInFinder(_:)), enabled: onDisk && !tab.isDeletedOnDisk)
+            add("Reveal in Explorer View", #selector(revealTabInExplorer(_:)),
+                enabled: tab.relPath != nil && !tab.isDeletedOnDisk)
+            menu.addItem(.separator())
+            add("Split Right", #selector(splitEditorRight(_:)))
+            add("Split Down", #selector(splitEditorDown(_:)))
+        }
+        keybindings.apply(to: menu)
         return menu
+    }
+
+    /// The tab a tab-menu item was made for, if the sender is one.
+    private func menuTab(_ sender: Any?) -> EditorTab? {
+        guard let tab = (sender as? NSMenuItem)?.representedObject as? EditorTab else { return nil }
+        // The menu may belong to a tab of another group: that group takes focus.
+        if let group = groups.first(where: { $0.tabs.contains { $0 === tab } }), group !== activeGroup {
+            activateGroup(group)
+        }
+        return tab
+    }
+
+    @objc func togglePinTab(_ sender: Any?) {
+        guard let tab = menuTab(sender) ?? activeTab else { return }
+        setPinned(!tab.isPinned, tab: tab)
+    }
+
+    /// Pinning moves the tab to the end of the pinned ones, unpinning to
+    /// just after them, as in VSCode. A pinned tab is no longer a preview.
+    func setPinned(_ pinned: Bool, tab: EditorTab) {
+        guard tab.isPinned != pinned,
+              let group = groups.first(where: { $0.tabs.contains { $0 === tab } }),
+              let from = group.tabs.firstIndex(where: { $0 === tab }) else { return }
+        let active = group.activeTab
+        group.tabs.remove(at: from)
+        tab.isPinned = pinned
+        if pinned { tab.isPreview = false }
+        group.tabs.insert(tab, at: group.tabs.prefix { $0.isPinned }.count)
+        group.activeIndex = active.flatMap { a in group.tabs.firstIndex { $0 === a } }
+        refreshTabBar()
+    }
+
+    /// Closes `doomed` one by one, stopping if a save prompt is cancelled.
+    /// Pinned tabs are left alone: only their own Close closes them.
+    private func closeTabs(_ doomed: [EditorTab]) {
+        for tab in doomed where !tab.isPinned {
+            guard let i = tabs.firstIndex(where: { $0 === tab }) else { continue }
+            guard closeTab(at: i) else { return }
+        }
+    }
+
+    @objc func closeOtherTabs(_ sender: Any?) {
+        guard let keep = menuTab(sender) ?? activeTab else { return }
+        closeTabs(tabs.filter { $0 !== keep })
+    }
+
+    @objc func closeTabsToTheRight(_ sender: Any?) {
+        guard let pivot = menuTab(sender) ?? activeTab,
+              let i = tabs.firstIndex(where: { $0 === pivot }) else { return }
+        closeTabs(Array(tabs[(i + 1)...]))
+    }
+
+    /// Tabs without unsaved changes. Terminal tabs stay: closing one kills
+    /// a running shell, which is not what "saved" suggests.
+    @objc func closeSavedTabs(_ sender: Any?) {
+        editorView.flushPendingUpdates()
+        closeTabs(tabs.filter { $0.terminal == nil && !$0.doc.isModified() })
+    }
+
+    @objc func closeAllTabs(_ sender: Any?) {
+        closeTabs(tabs)
+    }
+
+    @objc func copyTabPath(_ sender: Any?) {
+        guard let tab = menuTab(sender) ?? activeTab, tab.fileKey != nil else { return NSSound.beep() }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(tab.doc.path(), forType: .string)
+    }
+
+    @objc func copyTabRelativePath(_ sender: Any?) {
+        guard let rel = (menuTab(sender) ?? activeTab)?.relPath else { return NSSound.beep() }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(rel, forType: .string)
+    }
+
+    @objc func revealTabInFinder(_ sender: Any?) {
+        guard let tab = menuTab(sender) ?? activeTab, tab.fileKey != nil else { return NSSound.beep() }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: tab.doc.path())])
+    }
+
+    @objc func revealTabInExplorer(_ sender: Any?) {
+        guard let rel = (menuTab(sender) ?? activeTab)?.relPath else { return NSSound.beep() }
+        if !(isSidebarVisible && activeSidebarTab == .explorer) { showExplorerTab() }
+        explorer.reveal(relPath: rel)
+        window?.makeFirstResponder(explorer.outlineView)
     }
 
     /// A stand-in menu item carrying `terminal`, for calling menu actions from code.
@@ -1005,6 +1131,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 self?.snippetSession = session
             }
             self?.updateEditedState()
+            if let document = self?.activeTab?.doc { self?.refreshPanes(showing: document) }
             self?.scheduleAutoSave()
             self?.refreshFindStatus()
             if let document = self?.activeTab?.doc { self?.bridge.syncLSP(document: document) }
@@ -1084,6 +1211,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private func handleMemoryPressure(_ event: DispatchSource.MemoryPressureEvent) {
         editorView.releaseNonEssentialCaches()
         secondaryEditorView.releaseNonEssentialCaches()
+        for group in groups { group.pane?.editorView.releaseNonEssentialCaches() }
         loadedQuickOpen?.finder = nil
         fileFinder = nil
         finderGeneration += 1
@@ -1203,7 +1331,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         tabBar.setContentCompressionResistancePriority(.required, for: .vertical)
         tabBar.onSelect = { [weak self] i in self?.selectTab(i, fromTabBar: true) }
         tabBar.onClose = { [weak self] i in self?.closeTab(at: i) }
+        tabBar.onUnpin = { [weak self] i in
+            guard let self, self.tabs.indices.contains(i) else { return }
+            self.setPinned(false, tab: self.tabs[i])
+        }
         tabBar.onMove = { [weak self] from, to in self?.moveTab(from: from, to: to) }
+        tabBar.onDropOutside = { [weak self] i, point in
+            guard let self else { return false }
+            return self.dropTab(from: self.activeGroup, at: i, windowPoint: point)
+        }
         tabBar.onTogglePreview = { [weak self] in self?.toggleMarkdownPreview(nil) }
         syntaxEvictionTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
             self?.evictInactiveSyntax(now: .now)
@@ -1285,17 +1421,23 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         signaturePopup.translatesAutoresizingMaskIntoConstraints = false
         findBarSlot.isHidden = true
         findBarHeight = findBarSlot.heightAnchor.constraint(equalToConstant: 0)
-        detailView.addSubview(tabBar)
-        detailView.addSubview(pathBar)
-        detailView.addSubview(breadcrumbBar)
-        detailView.addSubview(findBarSlot)
-        detailView.addSubview(editorSplitView)
-        detailView.addSubview(stickyScopeView)
+        groupsSplitView.translatesAutoresizingMaskIntoConstraints = false
+        groupsSplitView.addSubview(activeGroup.slot)
+        detailView.addSubview(groupsSplitView)
+        groupChrome.translatesAutoresizingMaskIntoConstraints = false
+        groupChrome.wantsLayer = true
+        detailView.addSubview(groupChrome)
+        groupChrome.addSubview(tabBar)
+        groupChrome.addSubview(pathBar)
+        groupChrome.addSubview(breadcrumbBar)
+        groupChrome.addSubview(findBarSlot)
+        groupChrome.addSubview(editorSplitView)
+        groupChrome.addSubview(stickyScopeView)
         editorTerminalView.translatesAutoresizingMaskIntoConstraints = false
         editorTerminalView.isHidden = true
-        detailView.addSubview(editorTerminalView)
+        groupChrome.addSubview(editorTerminalView)
         gitGraphPanel.translatesAutoresizingMaskIntoConstraints = false
-        detailView.addSubview(gitGraphPanel)
+        groupChrome.addSubview(gitGraphPanel)
         // `TerminalView` is layer-backed. Without a layer here, it was
         // composited above every non-layer sibling and blanked the tab bar
         // and path bar while a terminal tab was active.
@@ -1314,47 +1456,52 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         detailView.addSubview(completionPopup)
         detailView.addSubview(signaturePopup)
         NSLayoutConstraint.activate([
-            tabBar.topAnchor.constraint(equalTo: detailView.topAnchor),
-            tabBar.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
-            tabBar.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
+            groupsSplitView.topAnchor.constraint(equalTo: detailView.topAnchor),
+            groupsSplitView.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
+            groupsSplitView.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
+            // VS Code order: editor, panel title row, panel content.
+            groupsSplitView.bottomAnchor.constraint(equalTo: bottomPanelHeader.topAnchor),
+            tabBar.topAnchor.constraint(equalTo: groupChrome.topAnchor),
+            tabBar.leadingAnchor.constraint(equalTo: groupChrome.leadingAnchor),
+            tabBar.trailingAnchor.constraint(equalTo: groupChrome.trailingAnchor),
             tabBar.heightAnchor.constraint(equalToConstant: Theme.tabHeight),
             pathBar.topAnchor.constraint(equalTo: tabBar.bottomAnchor),
-            pathBar.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
-            pathBar.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
+            pathBar.leadingAnchor.constraint(equalTo: groupChrome.leadingAnchor),
+            pathBar.trailingAnchor.constraint(equalTo: groupChrome.trailingAnchor),
             breadcrumbBar.topAnchor.constraint(equalTo: pathBar.bottomAnchor),
-            breadcrumbBar.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
-            breadcrumbBar.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
+            breadcrumbBar.leadingAnchor.constraint(equalTo: groupChrome.leadingAnchor),
+            breadcrumbBar.trailingAnchor.constraint(equalTo: groupChrome.trailingAnchor),
             findBarSlot.topAnchor.constraint(equalTo: breadcrumbBar.bottomAnchor),
-            findBarSlot.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
-            findBarSlot.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
+            findBarSlot.leadingAnchor.constraint(equalTo: groupChrome.leadingAnchor),
+            findBarSlot.trailingAnchor.constraint(equalTo: groupChrome.trailingAnchor),
             findBarHeight,
-             editorSplitView.topAnchor.constraint(equalTo: findBarSlot.bottomAnchor),
-             editorSplitView.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
-             editorSplitView.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
-             stickyScopeView.topAnchor.constraint(equalTo: editorSplitView.topAnchor),
-             stickyScopeView.leadingAnchor.constraint(equalTo: editorSplitView.leadingAnchor),
-             stickyScopeView.trailingAnchor.constraint(equalTo: editorSplitView.trailingAnchor),
-             // VS Code order: editor, panel title row, panel content.
-             editorSplitView.bottomAnchor.constraint(equalTo: bottomPanelHeader.topAnchor),
-             // A terminal tab covers the path bar, breadcrumbs and editor.
-             editorTerminalView.topAnchor.constraint(equalTo: tabBar.bottomAnchor),
-             editorTerminalView.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
-             editorTerminalView.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
-             editorTerminalView.bottomAnchor.constraint(equalTo: bottomPanelHeader.topAnchor),
-             // The Git Graph tab covers the same area.
-             gitGraphPanel.topAnchor.constraint(equalTo: tabBar.bottomAnchor),
-             gitGraphPanel.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
-             gitGraphPanel.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
-             gitGraphPanel.bottomAnchor.constraint(equalTo: bottomPanelHeader.topAnchor),
-             bottomPanelHeader.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
-             bottomPanelHeader.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
-             bottomPanelHeaderHeight,
-             bottomPanelContent.topAnchor.constraint(equalTo: bottomPanelHeader.bottomAnchor),
-             bottomPanelContent.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
-             bottomPanelContent.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
-             bottomPanelContent.bottomAnchor.constraint(equalTo: detailView.bottomAnchor),
-             bottomPanelHeight,
-          ])
+            editorSplitView.topAnchor.constraint(equalTo: findBarSlot.bottomAnchor),
+            editorSplitView.leadingAnchor.constraint(equalTo: groupChrome.leadingAnchor),
+            editorSplitView.trailingAnchor.constraint(equalTo: groupChrome.trailingAnchor),
+            editorSplitView.bottomAnchor.constraint(equalTo: groupChrome.bottomAnchor),
+            stickyScopeView.topAnchor.constraint(equalTo: editorSplitView.topAnchor),
+            stickyScopeView.leadingAnchor.constraint(equalTo: editorSplitView.leadingAnchor),
+            stickyScopeView.trailingAnchor.constraint(equalTo: editorSplitView.trailingAnchor),
+            // A terminal tab covers the path bar, breadcrumbs and editor.
+            editorTerminalView.topAnchor.constraint(equalTo: tabBar.bottomAnchor),
+            editorTerminalView.leadingAnchor.constraint(equalTo: groupChrome.leadingAnchor),
+            editorTerminalView.trailingAnchor.constraint(equalTo: groupChrome.trailingAnchor),
+            editorTerminalView.bottomAnchor.constraint(equalTo: groupChrome.bottomAnchor),
+            // The Git Graph tab covers the same area.
+            gitGraphPanel.topAnchor.constraint(equalTo: tabBar.bottomAnchor),
+            gitGraphPanel.leadingAnchor.constraint(equalTo: groupChrome.leadingAnchor),
+            gitGraphPanel.trailingAnchor.constraint(equalTo: groupChrome.trailingAnchor),
+            gitGraphPanel.bottomAnchor.constraint(equalTo: groupChrome.bottomAnchor),
+            bottomPanelHeader.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
+            bottomPanelHeader.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
+            bottomPanelHeaderHeight,
+            bottomPanelContent.topAnchor.constraint(equalTo: bottomPanelHeader.bottomAnchor),
+            bottomPanelContent.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
+            bottomPanelContent.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
+            bottomPanelContent.bottomAnchor.constraint(equalTo: detailView.bottomAnchor),
+            bottomPanelHeight,
+        ])
+        placeChrome(over: activeGroup)
         problemsPanel.onSelect = { [weak self] problem in self?.showProblem(problem) }
         referencesPanel.onSelect = { [weak self] location in self?.showReference(location) }
         debugger.onOutput = { [weak self] category, text in self?.debugConsole.append(text, category: category) }
@@ -1479,8 +1626,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     private func showProblem(_ problem: ProblemInfo) {
         guard let path = URL(string: problem.uri)?.path else { return }
-        guard let index = tabs.firstIndex(where: { $0.doc.path() == path }) else { return }
-        if activeIndex != index { selectTab(index) }
+        guard let found = allTabs.first(where: { $0.doc.path() == path }) else { return }
+        focusTab(found)
         activeTab?.doc.goToLine(line: problem.line, col: problem.column)
         editorView.window?.makeFirstResponder(editorView)
     }
@@ -1731,7 +1878,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
         completionPopup.update(items, query: completionQuery)
         if completionPopup.isHidden { return }
-        completionPopup.frame = NSRect(x: editorView.textOriginX + 8, y: editorView.rect(forLine: completionPosition.line, column: completionPosition.colUtf16).maxY + 8, width: 420, height: 192)
+        completionPopup.frame = NSRect(x: editorOriginInDetail + editorView.textOriginX + 8, y: editorView.rect(forLine: completionPosition.line, column: completionPosition.colUtf16).maxY + 8, width: 420, height: 192)
     }
 
     private func closeCompletion() {
@@ -1753,7 +1900,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         guard let signature = bridge.signatureHelp(document: document) else { signaturePopup.isHidden = true; return }
         signaturePopup.show(signature)
         signaturePopup.isHidden = false
-        signaturePopup.frame = NSRect(x: editorView.textOriginX + 8, y: editorView.rect(forLine: completionPosition.line, column: completionPosition.colUtf16).maxY + 8, width: 520, height: signature.documentation == nil ? 48 : 78)
+        signaturePopup.frame = NSRect(x: editorOriginInDetail + editorView.textOriginX + 8, y: editorView.rect(forLine: completionPosition.line, column: completionPosition.colUtf16).maxY + 8, width: 520, height: signature.documentation == nil ? 48 : 78)
     }
 
     private func requestDefinition(at position: TextPos) -> Bool {
@@ -1849,8 +1996,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         for (uri, fileEdits) in grouped {
             guard let path = URL(string: uri)?.path else { continue }
             let target: DocumentHandle
-            let wasOpen = tabs.contains { $0.doc.path() == path }
-            if let tab = tabs.first(where: { $0.doc.path() == path }) { target = tab.doc }
+            let wasOpen = allTabs.contains { $0.doc.path() == path }
+            if let tab = allTabs.first(where: { $0.doc.path() == path }) { target = tab.doc }
             else { guard let opened = try? bridge.openDocument(path: path) else { continue }; target = opened }
             _ = bridge.applyRenameEdits(document: target, edits: fileEdits)
             if !wasOpen { try? bridge.save(document: target) }
@@ -1885,9 +2032,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         for edit in action.edits { grouped[edit.uri, default: []].append(edit) }
         for (uri, edits) in grouped {
             guard let path = URL(string: uri)?.path else { continue }
-            let wasOpen = tabs.contains { $0.doc.path() == path }
+            let wasOpen = allTabs.contains { $0.doc.path() == path }
             let target: DocumentHandle
-            if let tab = tabs.first(where: { $0.doc.path() == path }) {
+            if let tab = allTabs.first(where: { $0.doc.path() == path }) {
                 target = tab.doc
             } else {
                 guard let opened = try? bridge.openDocument(path: path) else { continue }
@@ -2195,6 +2342,35 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     func applyPreferences() {
         editorView.setFont(Theme.editorFont)
+        for group in groups { group.pane?.editorView.setFont(Theme.editorFont) }
+        applyViewToggles()
+        reloadSettings(force: true)
+    }
+
+    /// Follows the View toggles saved in UserDefaults, which the Settings
+    /// window writes as well as the View menu.
+    private func applyViewToggles() {
+        let defaults = UserDefaults.standard
+        let minimap = defaults.object(forKey: "Minimap") as? Bool ?? true
+        if minimap != minimapEnabled {
+            minimapEnabled = minimap
+            updateMinimap()
+        }
+        let wrap = defaults.bool(forKey: "WordWrap")
+        if wrap != wordWrapEnabled {
+            wordWrapEnabled = wrap
+            updateWrapState()
+        }
+        let breadcrumbs = defaults.object(forKey: "ShowBreadcrumbs") as? Bool ?? true
+        if breadcrumbs != breadcrumbBar.isEnabled {
+            breadcrumbBar.isEnabled = breadcrumbs
+            breadcrumbBar.show(symbols: documentSymbols, atLine: editorView.document?.primaryCursor().line ?? 0)
+        }
+        let sticky = defaults.object(forKey: "StickyScroll") as? Bool ?? true
+        if sticky != stickyScopeView.isEnabled {
+            stickyScopeView.isEnabled = sticky
+            updateStickyScope()
+        }
     }
 
     func reloadSettings(force: Bool = false) {
@@ -2220,11 +2396,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             autoSaveMode = settings.effectiveAutoSave
             autoSaveDelay = settings.effectiveAutoSaveDelay
             if autoSaveMode != .afterDelay { autoSaveWorkItem?.cancel(); autoSaveWorkItem = nil }
-            for tab in tabs {
+            for tab in allTabs {
                 bridge.setIndent(document: tab.doc, useTabs: settings.useTabs, tabSize: settings.effectiveTabSize)
                 applyTagEditing(to: tab)
             }
             editorView.renderWhitespace = settings.effectiveRenderWhitespace
+            for group in groups { group.pane?.editorView.renderWhitespace = settings.effectiveRenderWhitespace }
             secondaryEditorView.renderWhitespace = settings.effectiveRenderWhitespace
             statusBar.show(document: activeTab?.doc, path: activeTab?.doc.path())
         } catch {
@@ -2365,14 +2542,19 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private func searchSidebarReplaceAll(query: String, replacement: String, options: WorkspaceSearchOptions) {
         guard !query.isEmpty else { return }
         var totalReplaced = 0
-        for tab in tabs {
+        var seen: [DocumentHandle] = []
+        for tab in allTabs where tab.isDocument {
+            // A document shown in two groups is replaced once.
+            if seen.contains(where: { $0 === tab.doc }) { continue }
+            seen.append(tab.doc)
             _ = tab.doc.setFind(pattern: query, config: FindConfig(caseSensitive: options.caseSensitive, wholeWord: options.wholeWord, regex: options.regex))
             let count = tab.doc.replaceAll(replacement: replacement)
             if count > 0 {
                 totalReplaced += Int(count)
-                if tab === activeTab {
+                if tab === activeTab || tab.doc === activeTab?.doc {
                     editorView.didChangeDocument()
                 }
+                refreshPanes(showing: tab.doc)
             }
         }
         if totalReplaced > 0 {
@@ -2398,7 +2580,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             picker.onCreate = { [weak self] in self?.createGitBranch() }
             window?.contentView?.addSubview(picker)
             NSLayoutConstraint.activate([
-                picker.topAnchor.constraint(equalTo: tabBar.bottomAnchor, constant: 8),
+                picker.topAnchor.constraint(equalTo: detailView.topAnchor, constant: Theme.tabHeight + 8),
                 picker.centerXAnchor.constraint(equalTo: detailView.centerXAnchor),
                 picker.widthAnchor.constraint(equalToConstant: 620),
             ])
@@ -2489,7 +2671,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             return
         }
         do {
-            let doc = try workspace.openFile(relPath: relPath)
+            let doc = try sharedDocument(forFileKey: Self.fileKey(path) ?? "") ?? workspace.openFile(relPath: relPath)
             let tab = EditorTab(
                 doc: doc, title: name,
                 pathComponents: relPath.split(separator: "/").map(String.init),
@@ -2511,7 +2693,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         secondaryEditorView.lineTints = [:]
         guard let base = tab.diffBase else {
             if isDiffPaneShown { leaveDiffPane() }
-            secondaryEditorView.document = isEditorSplit ? tab.doc : nil
+            secondaryEditorView.document = nil
             return
         }
         if !isDiffPaneShown {
@@ -2543,8 +2725,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         secondaryEditorView.lineTints = [:]
         editorView.lineTints = [:]
         secondaryScrollView.removeFromSuperview()
-        editorSplitView.isVertical = isEditorSplit ? userSplitVertical : true
-        if isEditorSplit { editorSplitView.addSubview(secondaryScrollView) }
+        editorSplitView.isVertical = true
         editorSplitView.adjustSubviews()
     }
 
@@ -2667,17 +2848,18 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             snippetSession = nil
             snippetDocumentKey = nil
         }
-        if let old = activeTab, old !== tabs[index] {
+        if let old = activeTab, old === shownTab, old !== tabs[index] {
             recordFindOrigin()
             noteLeaving(old)
             if autoSaveMode == .onFocusChange { autoSave(tab: old) }
         }
-        if let old = activeTab {
+        if let old = activeTab, old === shownTab {
             old.scrollY = scrollView.contentView.bounds.origin.y
             old.status = statusLabel.stringValue
         }
         activeIndex = index
         let tab = tabs[index]
+        shownTab = tab
         refreshGitDiff()
         refreshBlame()
         tab.lastActiveAt = .now
@@ -2731,7 +2913,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func evictInactiveSyntax(now: Date, includeRecentlyInactive: Bool) {
-        for tab in tabs where tab !== activeTab && (includeRecentlyInactive || now.timeIntervalSince(tab.lastActiveAt) >= Self.syntaxEvictionInterval) {
+        let visible = groups.compactMap(\.activeTab).map(\.doc)
+        for tab in allTabs where !visible.contains(where: { $0 === tab.doc }) && (includeRecentlyInactive || now.timeIntervalSince(tab.lastActiveAt) >= Self.syntaxEvictionInterval) {
             _ = tab.doc.suspendSyntax()
         }
     }
@@ -2749,7 +2932,18 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             return changed.contains { rel == $0 || rel.hasPrefix($0 + "/") }
         }
         var tabBarChanged = false
-        for tab in tabs where tab.fileKey != nil && touched(tab) {
+        var checked: [DocumentHandle] = []
+        for tab in allTabs where tab.fileKey != nil && touched(tab) {
+            // Tabs sharing a document share its state on disk: look once.
+            if checked.contains(where: { $0 === tab.doc }) { continue }
+            checked.append(tab.doc)
+            defer {
+                for other in allTabs where other !== tab && other.doc === tab.doc {
+                    other.isDeletedOnDisk = tab.isDeletedOnDisk
+                    other.hasDiskConflict = tab.hasDiskConflict
+                    other.isEdited = tab.doc.isModified()
+                }
+            }
             let wasDeleted = tab.isDeletedOnDisk
             switch tab.doc.checkDisk() {
             case .unchanged:
@@ -2759,7 +2953,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 tab.hasDiskConflict = false
             case .changed:
                 tab.isDeletedOnDisk = false
-                if tab === activeTab { editorView.flushPendingUpdates() }
+                if tab.doc === activeTab?.doc { editorView.flushPendingUpdates() }
                 if tab.doc.isModified() {
                     tab.hasDiskConflict = true
                 } else {
@@ -2802,6 +2996,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         tab.isDeletedOnDisk = false
         tab.isEdited = tab.doc.isModified()
         let message = "\(tab.title): reloaded from disk. ⌘Z restores the previous text."
+        refreshPanes(showing: tab.doc)
         if tab === activeTab {
             editorView.requestDocumentRefresh(scrollCaret: false)
             editorView.scheduleChangeNotification()
@@ -2869,11 +3064,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private func autoSaveModifiedDocuments() {
         autoSaveWorkItem = nil
         editorView.flushPendingUpdates()
-        let selected = activeIndex
-        for index in tabs.indices where tabs[index].doc.isModified() && !tabs[index].doc.path().isEmpty {
-            autoSave(tab: tabs[index])
+        for tab in allTabs where tab.isDocument && tab.doc.isModified() && !tab.doc.path().isEmpty {
+            autoSave(tab: tab)
         }
-        if let selected, tabs.indices.contains(selected), activeIndex != selected { selectTab(selected) }
+        updateEditedState()
     }
 
     private func autoSave(tab: EditorTab) {
@@ -2889,7 +3083,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     /// ⌃Tab: the tab shown before this one. Pressed again, it goes back.
     @objc func selectLastUsedTab(_ sender: Any?) {
-        let live = Set(tabs.map(ObjectIdentifier.init))
+        let live = Set(allTabs.map(ObjectIdentifier.init))
         tabOrderByUse.removeAll { !live.contains($0) }
         guard tabOrderByUse.count > 1,
               let i = tabs.firstIndex(where: { ObjectIdentifier($0) == tabOrderByUse[1] }) else {
@@ -2910,7 +3104,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     /// ⌘W: closes the active tab, or the window when no tab is left.
     @objc func closeTab(_ sender: Any?) {
-        if let i = activeIndex { closeTab(at: i) } else { window?.performClose(nil) }
+        if let tab = menuTab(sender) {
+            if let i = tabs.firstIndex(where: { $0 === tab }) { closeTab(at: i) }
+        } else if let i = activeIndex {
+            closeTab(at: i)
+        } else {
+            window?.performClose(nil)
+        }
     }
 
     /// Closes tab `index`, asking first if it has unsaved changes. `false`
@@ -2926,23 +3126,27 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
         if tabs[index].isGitGraph, activeIndex == index { showEditorGitGraph(for: nil) }
         editorView.flushPendingUpdates()
-        if tabs[index].doc.isModified() {
+        // A document that another tab still shows is not closed: no prompt.
+        let shared = isDocumentShared(tabs[index])
+        if tabs[index].doc.isModified(), !shared {
             if activeIndex != index { selectTab(index) }
             guard confirmDiscardActive() else { return false }
         }
         let wasActive = activeIndex == index
         // A closed file can be reopened by Back; an Untitled buffer cannot.
         if tabs[index].fileKey == nil {
-            navHistory.forget(key: tabs[index].navKey)
+            if !shared { navHistory.forget(key: tabs[index].navKey) }
         } else if wasActive {
             noteLeaving(tabs[index])
         }
         tabs.remove(at: index)
+        if wasActive { shownTab = nil }
         if let a = activeIndex {
             activeIndex = a > index ? a - 1 : (a == index ? nil : a)
         }
         if tabs.isEmpty {
-            showNoDocument()
+            // An empty group closes, unless it is the last one.
+            if groups.count > 1 { removeGroup(activeGroup) } else { showNoDocument() }
         } else if wasActive {
             selectTab(min(index, tabs.count - 1), fromTabBar: true)
         } else {
@@ -2952,19 +3156,25 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         return true
     }
 
+    /// Pinned tabs are always the first ones.
+    private var pinnedCount: Int { tabs.prefix { $0.isPinned }.count }
+
     func moveTab(from: Int, to: Int) {
-        guard tabs.indices.contains(from), tabs.indices.contains(to), from != to else { return }
+        guard tabs.indices.contains(from), tabs.indices.contains(to) else { return }
+        // A tab stays on its side of the pinned boundary.
+        let pinned = pinnedCount
+        let to = tabs[from].isPinned ? min(to, pinned - 1) : max(to, pinned)
+        guard from != to else { return }
         let active = activeTab
         tabs.insert(tabs.remove(at: from), at: to)
         activeIndex = active.flatMap { a in tabs.firstIndex { $0 === a } }
         refreshTabBar()
     }
 
-    private func refreshTabBar() {
-        tabBar.setPreviewButton(visible: canPreviewMarkdown, active: isMarkdownPreviewShown)
+    private func tabItems(for list: [EditorTab]) -> [TabBar.Item] {
         let statusMap = explorer.gitStatusMap
         let gitPaths = explorer.gitChangedPaths
-        tabBar.set(items: tabs.map { tab in
+        return list.map { tab in
             let rel = tab.relPath
             var status = rel.flatMap { statusMap[$0] } ?? .none
             if status == .none && tab.isDeletedOnDisk {
@@ -2979,11 +3189,17 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 gitStatus: status,
                 isTerminal: tab.terminal != nil,
                 glyphName: tab.diffBase == nil ? nil : tab.title,
-                isGitGraph: tab.isGitGraph
+                isGitGraph: tab.isGitGraph,
+                isPinned: tab.isPinned
             )
-        },
-                   selected: activeIndex)
+        }
+    }
+
+    private func refreshTabBar() {
+        tabBar.setPreviewButton(visible: canPreviewMarkdown, active: isMarkdownPreviewShown)
+        tabBar.set(items: tabItems(for: tabs), selected: activeIndex)
         statusBar.setGitGraphVisible(isGitGraphTabShown)
+        refreshGroupPanes()
     }
 
     /// Adds `tab` after the active one, or puts it in place of tab
@@ -3002,7 +3218,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             tabs[r] = tab
             selectTab(r)
         } else {
-            let at = activeIndex.map { $0 + 1 } ?? tabs.count
+            // After the active tab, but never among the pinned ones.
+            let at = max(activeIndex.map { $0 + 1 } ?? tabs.count, pinnedCount)
             tabs.insert(tab, at: at)
             if let a = activeIndex, a >= at { activeIndex = a + 1 }
             selectTab(at)
@@ -3031,6 +3248,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// Editor with no document: after the last tab is closed.
     private func showNoDocument() {
         activeIndex = nil
+        shownTab = nil
         if isFindVisible { closeFind(nil) }
         showEditorTerminal(for: nil)
         showEditorGitGraph(for: nil)
@@ -3426,13 +3644,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         let under = { (tab: EditorTab) in
             tab.relPath.map { $0 == entry.relPath || $0.hasPrefix(entry.relPath + "/") } ?? false
         }
-        for tab in tabs.reversed() where under(tab) {
-            guard let i = tabs.firstIndex(where: { $0 === tab }) else { continue }
+        for tab in allTabs.reversed() where under(tab) {
             if tab.doc.isModified() {
                 tab.isDeletedOnDisk = true
                 _ = tab.doc.checkDisk()
             } else {
-                closeTab(at: i)
+                closeTabAnywhere(tab)
             }
         }
         recentFiles.removeAll { $0 == entry.relPath || $0.hasPrefix(entry.relPath + "/") }
@@ -3459,7 +3676,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             if rel.hasPrefix(entry.relPath + "/") { return newRel + rel.dropFirst(entry.relPath.count) }
             return nil
         }
-        for tab in tabs {
+        for tab in allTabs {
             guard let old = tab.relPath, let rel = moved(old) else { continue }
             let path = root.appendingPathComponent(rel).path
             navHistory.forget(key: tab.navKey)
@@ -3554,7 +3771,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         let preferred = panel.widthAnchor.constraint(equalToConstant: GoToLine.width)
         preferred.priority = .defaultHigh
         NSLayoutConstraint.activate([
-            panel.topAnchor.constraint(equalTo: tabBar.topAnchor, constant: 6),
+            panel.topAnchor.constraint(equalTo: detailView.topAnchor, constant: 6),
             panel.centerXAnchor.constraint(equalTo: detailView.centerXAnchor),
             panel.widthAnchor.constraint(lessThanOrEqualTo: detailView.widthAnchor, constant: -24),
             preferred,
@@ -3615,8 +3832,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private func show(_ loc: NavLocation) -> Bool {
         isNavigating = true
         defer { isNavigating = false }
-        if let i = tabs.firstIndex(where: { $0.navKey == loc.key }) {
-            if i != activeIndex { selectTab(i) }
+        if let found = allTabs.first(where: { $0.navKey == loc.key }) {
+            focusTab(found)
         } else {
             guard !loc.key.hasPrefix("untitled:"), FileManager.default.fileExists(atPath: loc.key) else { return false }
             if let workspace, let rel = relativePath(loc.key) {
@@ -3654,7 +3871,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         let preferred = panel.widthAnchor.constraint(equalToConstant: OutlinePicker.width)
         preferred.priority = .defaultHigh
         NSLayoutConstraint.activate([
-            panel.topAnchor.constraint(equalTo: tabBar.topAnchor, constant: 6),
+            panel.topAnchor.constraint(equalTo: detailView.topAnchor, constant: 6),
             panel.centerXAnchor.constraint(equalTo: detailView.centerXAnchor),
             panel.widthAnchor.constraint(lessThanOrEqualTo: detailView.widthAnchor, constant: -24),
             preferred,
@@ -3924,7 +4141,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         panel.onOpen = { [weak self] match in self?.openWorkspaceSearchMatch(match) }
         window?.contentView?.addSubview(panel)
         NSLayoutConstraint.activate([
-            panel.topAnchor.constraint(equalTo: tabBar.topAnchor, constant: 6),
+            panel.topAnchor.constraint(equalTo: detailView.topAnchor, constant: 6),
             panel.centerXAnchor.constraint(equalTo: detailView.centerXAnchor),
             panel.widthAnchor.constraint(equalToConstant: WorkspaceSearch.width),
             panel.widthAnchor.constraint(lessThanOrEqualTo: detailView.widthAnchor, constant: -24),
@@ -4365,8 +4582,18 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         } else {
             pathBar.setEdited(false)
         }
-        window?.isDocumentEdited = tabs.contains { $0.isEdited }
-        explorer.dirtyPaths = Set(tabs.compactMap { $0.isEdited ? $0.relPath : nil })
+        // A document shown in several groups is edited in all of them.
+        var changed = false
+        if let i = activeIndex {
+            let tab = tabs[i]
+            for other in allTabs where other !== tab && other.isDocument && other.doc === tab.doc && other.isEdited != tab.isEdited {
+                other.isEdited = tab.isEdited
+                changed = true
+            }
+        }
+        if changed { refreshTabBar() }
+        window?.isDocumentEdited = allTabs.contains { $0.isEdited }
+        explorer.dirtyPaths = Set(allTabs.compactMap { $0.isEdited ? $0.relPath : nil })
     }
 
     private var documentName: String {
@@ -4453,15 +4680,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// unsaved changes was saved or discarded. Stops at the first Cancel,
     /// with that tab shown.
     func confirmDiscardChanges() -> Bool {
-        editorView.flushPendingUpdates()
-        for i in tabs.indices where tabs[i].doc.isModified() {
-            if activeIndex != i { selectTab(i) }
-            guard confirmDiscardActive() else { return false }
-        }
-        return true
+        confirmDiscardAllGroups()
     }
 
     /// Asks about the active tab only.
+    func confirmDiscardActiveTab() -> Bool { confirmDiscardActive() }
+
     private func confirmDiscardActive() -> Bool {
         guard let doc = editorView.document, doc.isModified() else { return true }
         switch askSaveChoice(documentName) {
@@ -4488,14 +4712,27 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         var session = Session()
         session.workspace = workspace?.root()
         session.sidebarVisible = isSidebarVisible
-        for tab in tabs {
-            let path = tab.doc.path()
-            guard !path.isEmpty, !tab.isDeletedOnDisk else { continue }
-            let loc = location(of: tab)
-            let y = tab === activeTab ? scrollView.contentView.bounds.origin.y : tab.scrollY
-            if tab === activeTab { session.active = session.tabs.count }
-            session.tabs.append(Session.Tab(path: path, isPreview: tab.isPreview, line: loc.line, col: loc.col,
-                                            scrollY: y.map(Double.init)))
+        var saved: [Session.Group] = []
+        for group in groups {
+            var out = Session.Group()
+            for tab in group.tabs where tab.isDocument {
+                let path = tab.doc.path()
+                guard !path.isEmpty, !tab.isDeletedOnDisk else { continue }
+                let loc = location(of: tab)
+                let live = group === activeGroup && tab === shownTab
+                let y = live ? scrollView.contentView.bounds.origin.y : tab.scrollY
+                if tab === group.activeTab { out.active = out.tabs.count }
+                out.tabs.append(Session.Tab(path: path, isPreview: tab.isPreview, line: loc.line, col: loc.col,
+                                            scrollY: y.map(Double.init), isPinned: tab.isPinned ? true : nil))
+            }
+            saved.append(out)
+        }
+        session.tabs = saved[0].tabs
+        session.active = saved[0].active
+        if saved.count > 1 {
+            session.extraGroups = Array(saved.dropFirst())
+            session.activeGroup = activeGroupIndex
+            session.groupsVertical = groupsSplitView.isVertical
         }
         return session
     }
@@ -4521,9 +4758,73 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     func saveWorkspaceSessionForQuit() { saveWorkspaceSession() }
 
     private func restoreTabs(from session: Session) {
+        restoreTabs(session.tabs, active: session.active)
+        guard let extra = session.extraGroups, !extra.isEmpty else { return }
+        let first = activeGroup
+        if let vertical = session.groupsVertical { groupsSplitView.isVertical = vertical }
+        for saved in extra where !saved.tabs.isEmpty {
+            let group = makeGroup(at: groups.count)
+            // The new group needs a tab before it can take focus.
+            guard let tab = openRestoredTab(saved.tabs[0]) else { groupsSplitView.equalize(); removeEmptyGroup(group); continue }
+            group.tabs = [tab]
+            group.activeIndex = 0
+            groupsSplitView.equalize()
+            activateGroup(group)
+            restoreTabs(Array(saved.tabs.dropFirst()), active: saved.active.map { max(0, $0 - 1) }, firstRestored: tab, firstSaved: saved.tabs[0], activeIsFirst: saved.active == 0)
+        }
+        let wanted = session.activeGroup ?? 0
+        if groups.indices.contains(wanted) { activateGroup(groups[wanted]) } else { activateGroup(first) }
+    }
+
+    private func removeEmptyGroup(_ group: EditorGroup) {
+        guard let i = groups.firstIndex(where: { $0 === group }), groups.count > 1, group !== activeGroup else { return }
+        group.slot.removeFromSuperview()
+        groups.remove(at: i)
+        if i <= activeGroupIndex { activeGroupIndex = max(0, activeGroupIndex - 1) }
+    }
+
+    /// A tab for a saved file, not yet in any group. It shares the buffer
+    /// of the same file in another group.
+    private func openRestoredTab(_ saved: Session.Tab) -> EditorTab? {
+        guard FileManager.default.fileExists(atPath: saved.path) else { return nil }
+        let key = Self.fileKey(saved.path)
+        let name = (saved.path as NSString).lastPathComponent
+        do {
+            let doc: DocumentHandle
+            var components = [name]
+            var relPath: String?
+            if let key, let existing = sharedDocument(forFileKey: key) {
+                doc = existing
+            } else if let workspace, let rel = relativePath(saved.path) {
+                doc = try workspace.openFile(relPath: rel)
+            } else {
+                doc = try bridge.openDocument(path: saved.path)
+            }
+            if workspace != nil, let rel = relativePath(saved.path) {
+                relPath = rel
+                components = rel.split(separator: "/").map(String.init)
+            }
+            let tab = EditorTab(doc: doc, title: name, pathComponents: components, windowTitle: name,
+                                isPreview: false, status: "")
+            tab.fileKey = key
+            tab.relPath = relPath
+            tab.isPinned = saved.isPinned == true
+            tab.scrollY = saved.scrollY.map { CGFloat($0) }
+            tab.isEdited = doc.isModified()
+            applyTagEditing(to: tab)
+            doc.goToLine(line: saved.line, col: saved.col)
+            return tab
+        } catch {
+            return nil
+        }
+    }
+
+    private func restoreTabs(_ savedTabs: [Session.Tab], active: Int?,
+                             firstRestored: EditorTab? = nil, firstSaved: Session.Tab? = nil,
+                             activeIsFirst: Bool = false) {
         var restored: [(EditorTab, CGFloat?)] = []
-        var target: EditorTab?
-        for (i, saved) in session.tabs.enumerated() {
+        var target: EditorTab? = activeIsFirst ? firstRestored : nil
+        for (i, saved) in savedTabs.enumerated() {
             guard FileManager.default.fileExists(atPath: saved.path) else { continue }
             if let workspace, let rel = relativePath(saved.path) {
                 let entry = FileEntry(name: (rel as NSString).lastPathComponent, relPath: rel, isDir: false)
@@ -4534,8 +4835,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             guard let index = tabIndex(forPath: saved.path) else { continue }
             let tab = tabs[index]
             tab.doc.goToLine(line: saved.line, col: saved.col)
+            if saved.isPinned == true { setPinned(true, tab: tab) }
             restored.append((tab, saved.scrollY.map { CGFloat($0) }))
-            if i == session.active { target = tab }
+            if i == active { target = tab }
         }
         for (tab, y) in restored { tab.scrollY = y }
         if let current = activeTab {
@@ -4578,8 +4880,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
         restoreTabs(from: session)
         if restoredWorkspace { setSidebarVisible(session.sidebarVisible) }
-        Log.app.info("restored session: workspace \(restoredWorkspace), \(self.tabs.count) of \(session.tabs.count) tabs")
-        return restoredWorkspace || !tabs.isEmpty
+        Log.app.info("restored session: workspace \(restoredWorkspace), \(self.allTabs.count) tabs")
+        return restoredWorkspace || !allTabs.isEmpty
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -4640,16 +4942,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     func openWorkspace(at url: URL) throws {
         // A new folder is a new project session. Do not carry files from the
         // previous workspace into the new tab bar.
-        editorView.flushPendingUpdates()
-        for tab in tabs where tab.doc.isModified() {
-            if activeTab !== tab { selectTab(tabs.firstIndex { $0 === tab } ?? 0) }
-            guard confirmDiscardActive() else { return }
-        }
+        guard confirmDiscardAllGroups() else { return }
         saveWorkspaceSession()
         // Shells belong to the old folder; VSCode reloads the window here.
-        for tab in tabs { tab.terminal?.kill() }
-        tabs.removeAll()
-        activeIndex = nil
+        resetGroups()
         snippetSession = nil
         snippetDocumentKey = nil
         showNoDocument()
@@ -4723,7 +5019,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             tabs[i].isPreview = false
             return selectTab(i)
         }
-        let doc = try bridge.openDocument(path: url.path)
+        let doc = try sharedDocument(forFileKey: Self.fileKey(url.path) ?? "") ?? bridge.openDocument(path: url.path)
         let name = url.lastPathComponent
         let branch = workspace.flatMap { bridge.gitStatus(workspace: $0)?.branch }
         let tab = EditorTab(doc: doc, title: name, pathComponents: [name], windowTitle: name,
@@ -4744,7 +5040,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             return
         }
         do {
-            let doc = try workspace.openFile(relPath: entry.relPath)
+            let doc = try sharedDocument(forFileKey: Self.fileKey(path) ?? "") ?? workspace.openFile(relPath: entry.relPath)
             let branch = bridge.gitStatus(workspace: workspace)?.branch
             let tab = EditorTab(
                 doc: doc, title: entry.name,
@@ -5105,10 +5401,35 @@ extension MainWindowController: NSMenuItemValidation {
              #selector(revealInFinder(_:)), #selector(copyExplorerPath(_:)),
              #selector(copyExplorerRelativePath(_:)):
             return workspace != nil
+        // From a key or the palette (a tab menu sets its own state).
+        case #selector(closeOtherTabs(_:)):
+            return tabs.contains { $0 !== activeTab && !$0.isPinned }
+        case #selector(closeTabsToTheRight(_:)):
+            return activeIndex.map { i in tabs[(i + 1)...].contains { !$0.isPinned } } ?? false
+        case #selector(closeAllTabs(_:)):
+            return tabs.contains { !$0.isPinned }
+        case #selector(closeSavedTabs(_:)):
+            return !tabs.isEmpty
+        case #selector(copyTabPath(_:)), #selector(revealTabInFinder(_:)):
+            return activeTab?.isDocument == true && activeTab?.fileKey != nil
+        case #selector(copyTabRelativePath(_:)), #selector(revealTabInExplorer(_:)):
+            return activeTab?.isDocument == true && activeTab?.relPath != nil
         case #selector(renameExplorerItem(_:)), #selector(deleteExplorerItem(_:)):
             return workspace != nil && explorer.selectedEntry != nil
         case #selector(closeTab(_:)):
             return true
+        case #selector(closeEditorSplit(_:)):
+            return groups.count > 1
+        case #selector(focusFirstEditorGroup(_:)):
+            return groups.count > 1
+        case #selector(focusSecondEditorGroup(_:)):
+            return groups.count > 1
+        case #selector(focusThirdEditorGroup(_:)):
+            return groups.count > 2
+        case #selector(moveEditorToNextGroup(_:)), #selector(moveEditorToPreviousGroup(_:)):
+            return activeTab != nil
+        case #selector(splitEditorRight(_:)), #selector(splitEditorDown(_:)):
+            return activeTab?.isDocument == true
         case #selector(moveTerminalToEditor(_:)), #selector(createTerminalEditor(_:)), #selector(createTerminal(_:)),
              #selector(runBuildTask(_:)), #selector(runTestTask(_:)):
             return workspace != nil
@@ -5177,5 +5498,420 @@ private final class WatchSink: WorkspaceListener, @unchecked Sendable {
         Task { @MainActor [weak controller] in
             controller?.workspaceChanged(batch, generation: generation)
         }
+    }
+}
+
+// MARK: - Editor groups
+
+extension MainWindowController {
+    /// Another tab, in any group, shows the same document.
+    func isDocumentShared(_ tab: EditorTab) -> Bool {
+        guard tab.isDocument else { return false }
+        return allTabs.contains { $0 !== tab && $0.isDocument && $0.doc === tab.doc }
+    }
+
+    func group(containing tab: EditorTab) -> EditorGroup? {
+        groups.first { $0.tabs.contains { $0 === tab } }
+    }
+
+    /// An open tab for the same file, in any group, so a second tab shares
+    /// its buffer instead of reading the file again (two buffers of one file
+    /// would overwrite each other's edits).
+    func sharedDocument(forFileKey key: String) -> DocumentHandle? {
+        allTabs.first { $0.isDocument && $0.fileKey == key }?.doc
+    }
+
+    /// Pins the live editor stack over `group`'s slot.
+    func placeChrome(over group: EditorGroup) {
+        NSLayoutConstraint.deactivate(chromeSlotConstraints)
+        chromeSlotConstraints = [
+            groupChrome.topAnchor.constraint(equalTo: group.slot.topAnchor),
+            groupChrome.leadingAnchor.constraint(equalTo: group.slot.leadingAnchor),
+            groupChrome.trailingAnchor.constraint(equalTo: group.slot.trailingAnchor),
+            groupChrome.bottomAnchor.constraint(equalTo: group.slot.bottomAnchor),
+        ]
+        NSLayoutConstraint.activate(chromeSlotConstraints)
+    }
+
+    /// The pane shown in `group`'s slot while the group is not the active one.
+    func pane(for group: EditorGroup) -> EditorGroupPane {
+        if let pane = group.pane { return pane }
+        let pane = EditorGroupPane()
+        pane.translatesAutoresizingMaskIntoConstraints = false
+        group.slot.addSubview(pane)
+        NSLayoutConstraint.activate([
+            pane.topAnchor.constraint(equalTo: group.slot.topAnchor),
+            pane.leadingAnchor.constraint(equalTo: group.slot.leadingAnchor),
+            pane.trailingAnchor.constraint(equalTo: group.slot.trailingAnchor),
+            pane.bottomAnchor.constraint(equalTo: group.slot.bottomAnchor),
+        ])
+        pane.editorView.setFont(Theme.editorFont)
+        pane.editorView.renderWhitespace = secondaryEditorView.renderWhitespace
+        pane.tabBar.titleBar = titleBar
+        pane.tabBar.onSelect = { [weak self, weak group] i in
+            guard let self, let group else { return }
+            self.activateGroup(group)
+            self.selectTab(i, fromTabBar: true)
+        }
+        pane.tabBar.onClose = { [weak self, weak group] i in
+            guard let self, let group else { return }
+            self.activateGroup(group)
+            self.closeTab(at: i)
+        }
+        pane.tabBar.onUnpin = { [weak self, weak group] i in
+            guard let self, let group, group.tabs.indices.contains(i) else { return }
+            self.setPinned(false, tab: group.tabs[i])
+        }
+        pane.tabBar.onMove = { [weak self, weak group] from, to in
+            guard let self, let group else { return }
+            self.activateGroup(group)
+            self.moveTab(from: from, to: to)
+        }
+        pane.tabBar.onDropOutside = { [weak self, weak group] i, point in
+            guard let self, let group else { return false }
+            return self.dropTab(from: group, at: i, windowPoint: point)
+        }
+        pane.tabBar.menuForTab = { [weak self, weak group] i in
+            guard let self, let group else { return nil }
+            return self.menu(forTab: i, in: group)
+        }
+        pane.onActivate = { [weak self, weak group] event in
+            guard let self, let group else { return }
+            self.paneClicked(group, event: event)
+        }
+        group.pane = pane
+        return pane
+    }
+
+    /// Brings `group`'s pane up to date (or hides it for the active group).
+    func refreshPane(of group: EditorGroup) {
+        if group === activeGroup {
+            group.pane?.isHidden = true
+            group.pane?.clear()
+            return
+        }
+        let pane = pane(for: group)
+        pane.isHidden = false
+        pane.show(items: tabItems(for: group.tabs), selected: group.activeIndex, tab: group.activeTab,
+                  breadcrumbHeight: breadcrumbBar.isHidden ? 0 : 24)
+    }
+
+    func refreshGroupPanes() {
+        for group in groups where group !== activeGroup { refreshPane(of: group) }
+    }
+
+    /// Edits made in the live editor show up in other groups' panes.
+    func refreshPanes(showing document: DocumentHandle) {
+        for group in groups where group !== activeGroup {
+            if let pane = group.pane, pane.shownTab?.doc === document {
+                pane.editorView.requestDocumentRefresh(scrollCaret: false)
+            }
+        }
+    }
+
+    // MARK: Switching
+
+    /// Saves what the live editor knows about the tab it shows and clears
+    /// what only makes sense for that tab (find, popups, terminal).
+    func leaveActiveGroup() {
+        if isFindVisible { closeFind(nil) }
+        snippetSession = nil
+        snippetDocumentKey = nil
+        hoverPopover.isHidden = true
+        hideBlamePopover()
+        completionPopup.isHidden = true
+        signaturePopup.isHidden = true
+        editorView.flushPendingUpdates()
+        if let tab = shownTab, tab === activeTab || group(containing: tab) === activeGroup {
+            noteLeaving(tab)
+            if tab.isDocument { tab.scrollY = scrollView.contentView.bounds.origin.y }
+            tab.status = statusLabel.stringValue
+            if autoSaveMode == .onFocusChange { autoSave(tab: tab) }
+        }
+        showEditorTerminal(for: nil)
+        showEditorGitGraph(for: nil)
+        shownTab = nil
+    }
+
+    /// Makes `group` the one the live editor works on.
+    func activateGroup(_ group: EditorGroup) {
+        guard group !== activeGroup, let newIndex = groups.firstIndex(where: { $0 === group }) else { return }
+        // What the user scrolled in the pane counts as the tab's position.
+        if let pane = group.pane, let tab = pane.shownTab, tab === group.activeTab { tab.scrollY = pane.scrollY }
+        leaveActiveGroup()
+        let old = activeGroup
+        activeGroupIndex = newIndex
+        placeChrome(over: group)
+        if !old.tabs.isEmpty { refreshPane(of: old) }
+        refreshPane(of: group)
+        groupsSplitView.layoutSubtreeIfNeeded()
+        detailView.layoutSubtreeIfNeeded()
+        if let index = group.activeIndex ?? (group.tabs.isEmpty ? nil : 0) {
+            selectTab(index, fromTabBar: true)
+        } else {
+            showNoDocument()
+        }
+        updateWrapState()
+        refreshTabBar()
+    }
+
+    func focusGroup(at index: Int) {
+        guard groups.indices.contains(index) else { return NSSound.beep() }
+        activateGroup(groups[index])
+    }
+
+    @objc func focusFirstEditorGroup(_ sender: Any?) { focusGroup(at: 0) }
+    @objc func focusSecondEditorGroup(_ sender: Any?) { focusGroup(at: 1) }
+    @objc func focusThirdEditorGroup(_ sender: Any?) { focusGroup(at: 2) }
+
+    /// A click in a pane below its tab bar: that group takes over, and the
+    /// click lands where it was aimed.
+    func paneClicked(_ group: EditorGroup, event: NSEvent) {
+        activateGroup(group)
+        guard event.type == .leftMouseDown, activeTab?.isDocument == true else { return }
+        detailView.layoutSubtreeIfNeeded()
+        if scrollView.bounds.contains(scrollView.convert(event.locationInWindow, from: nil)) {
+            editorView.mouseDown(with: event)
+        }
+    }
+
+    // MARK: Creating and removing
+
+    /// Adds an empty group at `index`; the caller fills it and activates it.
+    @discardableResult
+    func makeGroup(at index: Int) -> EditorGroup {
+        let active = activeGroup
+        let group = EditorGroup()
+        if groups.isEmpty || index >= groups.count {
+            groupsSplitView.addSubview(group.slot, positioned: .above, relativeTo: groups.last?.slot)
+            groups.append(group)
+        } else if index <= 0 {
+            groupsSplitView.addSubview(group.slot, positioned: .below, relativeTo: groups[0].slot)
+            groups.insert(group, at: 0)
+        } else {
+            groupsSplitView.addSubview(group.slot, positioned: .above, relativeTo: groups[index - 1].slot)
+            groups.insert(group, at: index)
+        }
+        activeGroupIndex = groups.firstIndex { $0 === active } ?? 0
+        return group
+    }
+
+    func removeGroup(_ group: EditorGroup) {
+        guard groups.count > 1, let index = groups.firstIndex(where: { $0 === group }) else { return }
+        if group === activeGroup {
+            activateGroup(groups[index > 0 ? index - 1 : index + 1])
+        }
+        let active = activeGroup
+        group.pane?.clear()
+        group.slot.removeFromSuperview()
+        groups.remove(at: index)
+        activeGroupIndex = groups.firstIndex { $0 === active } ?? 0
+        if groups.count == 1 { groupsSplitView.isVertical = true }
+        groupsSplitView.adjustSubviews()
+        updateWrapState()
+        refreshTabBar()
+        updateEditedState()
+    }
+
+    /// Opens a copy of `tab` in a new group beside its own (VS Code "Split Right/Down").
+    func splitEditor(_ tab: EditorTab, vertical: Bool) {
+        guard tab.isDocument, let source = group(containing: tab) else { return NSSound.beep() }
+        if isMarkdownPreviewShown {
+            isMarkdownPreviewOn = false
+            updateMarkdownPreview()
+        }
+        if source !== activeGroup { activateGroup(source) }
+        editorView.flushPendingUpdates()
+        if groups.count == 1 { groupsSplitView.isVertical = vertical }
+        let copy = EditorTab(doc: tab.doc, title: tab.title, pathComponents: tab.pathComponents,
+                             windowTitle: tab.windowTitle, isPreview: false, status: tab.status)
+        copy.fileKey = tab.fileKey
+        copy.relPath = tab.relPath
+        copy.isEdited = tab.isEdited
+        copy.isDeletedOnDisk = tab.isDeletedOnDisk
+        copy.scrollY = tab === shownTab ? scrollView.contentView.bounds.origin.y : tab.scrollY
+        let group = makeGroup(at: activeGroupIndex + 1)
+        group.tabs = [copy]
+        group.activeIndex = 0
+        groupsSplitView.layoutSubtreeIfNeeded()
+        groupsSplitView.equalize()
+        activateGroup(group)
+    }
+
+    /// Puts every group's tabs in the active group, in group order.
+    func joinAllGroups() {
+        guard groups.count > 1 else { return }
+        let target = activeGroup
+        let active = target.activeTab
+        var joined: [EditorTab] = []
+        for group in groups {
+            for tab in group.tabs {
+                // The same document is already open here: one tab is enough.
+                if tab.isDocument, joined.contains(where: { $0.isDocument && $0.doc === tab.doc }) { continue }
+                joined.append(tab)
+            }
+            if group !== target {
+                group.pane?.clear()
+                group.slot.removeFromSuperview()
+            }
+        }
+        // Pinned tabs stay first (the sort is stable).
+        target.tabs = joined.filter(\.isPinned) + joined.filter { !$0.isPinned }
+        groups = [target]
+        activeGroupIndex = 0
+        target.activeIndex = active.flatMap { a in
+            target.tabs.firstIndex { $0 === a || ($0.isDocument && a.isDocument && $0.doc === a.doc) }
+        }
+        shownTab = target.activeTab
+        groupsSplitView.isVertical = true
+        groupsSplitView.adjustSubviews()
+        updateWrapState()
+        refreshTabBar()
+        updateEditedState()
+    }
+
+    // MARK: Moving tabs between groups
+
+    /// Insertion index in `bar` for a drop at `windowPoint`.
+    private func insertionIndex(in bar: TabBar, windowPoint: NSPoint) -> Int {
+        let x = bar.convert(windowPoint, from: nil).x
+        for (i, view) in bar.tabViews.enumerated() where x < bar.convert(view.bounds, from: view).midX { return i }
+        return bar.tabViews.count
+    }
+
+    /// A tab of `source` was dropped on the window: takes it if another
+    /// group's area is under the point.
+    func dropTab(from source: EditorGroup, at index: Int, windowPoint: NSPoint) -> Bool {
+        guard source.tabs.indices.contains(index) else { return false }
+        let point = groupsSplitView.convert(windowPoint, from: nil)
+        guard let target = groups.first(where: { $0 !== source && $0.slot.frame.contains(point) }) else { return false }
+        let bar = target === activeGroup ? tabBar : pane(for: target).tabBar
+        moveTab(from: source, at: index, to: target, at: insertionIndex(in: bar, windowPoint: windowPoint))
+        return true
+    }
+
+    /// Moves a tab to another group and shows it there. The source group
+    /// closes if that was its last tab.
+    func moveTab(from source: EditorGroup, at index: Int, to target: EditorGroup, at position: Int?) {
+        guard source !== target, source.tabs.indices.contains(index) else { return }
+        let tab = source.tabs[index]
+        if source === activeGroup { leaveActiveGroup() }
+        source.tabs.remove(at: index)
+        if let a = source.activeIndex {
+            source.activeIndex = a > index ? a - 1 : (a == index ? nil : a)
+        }
+        if source.activeIndex == nil, !source.tabs.isEmpty { source.activeIndex = min(index, source.tabs.count - 1) }
+
+        let targetIndex: Int
+        if tab.isDocument, let existing = target.tabs.firstIndex(where: { $0.isDocument && $0.doc === tab.doc }) {
+            // Same document already open there: show that tab, drop this one.
+            targetIndex = existing
+        } else {
+            let pinned = target.tabs.prefix { $0.isPinned }.count
+            let wanted = position ?? target.tabs.count
+            let at = tab.isPinned ? min(wanted, pinned) : max(wanted, pinned)
+            target.tabs.insert(tab, at: at)
+            if let a = target.activeIndex, a >= at { target.activeIndex = a + 1 }
+            targetIndex = at
+        }
+        target.activeIndex = targetIndex
+        if target === activeGroup {
+            selectTab(targetIndex, fromTabBar: true)
+        } else {
+            activateGroup(target)
+        }
+        if source.tabs.isEmpty { removeGroup(source) } else { refreshPane(of: source) }
+    }
+
+    /// Moves the active tab one group to the left or right, opening a new
+    /// group when there is none on that side.
+    func moveActiveTab(by delta: Int) {
+        guard let index = activeIndex else { return NSSound.beep() }
+        let next = activeGroupIndex + delta
+        if groups.indices.contains(next) {
+            moveTab(from: activeGroup, at: index, to: groups[next], at: nil)
+        } else if tabs.count > 1 {
+            if groups.count == 1 { groupsSplitView.isVertical = true }
+            let group = makeGroup(at: delta > 0 ? groups.count : 0)
+            let source = activeGroup
+            // Placed first so the group has a tab when it becomes active.
+            moveTab(from: source, at: index, to: group, at: nil)
+            groupsSplitView.equalize()
+        } else {
+            NSSound.beep()
+        }
+    }
+
+    @objc func moveEditorToNextGroup(_ sender: Any?) { moveActiveTab(by: 1) }
+    @objc func moveEditorToPreviousGroup(_ sender: Any?) { moveActiveTab(by: -1) }
+}
+
+extension MainWindowController {
+    /// Shows `tab`, in whichever group holds it.
+    func focusTab(_ tab: EditorTab) {
+        guard let group = group(containing: tab), let index = group.tabs.firstIndex(where: { $0 === tab }) else { return }
+        if group !== activeGroup { activateGroup(group) }
+        if activeIndex != index { selectTab(index) }
+    }
+
+    /// Closes a clean tab wherever it is, without asking.
+    func closeTabAnywhere(_ tab: EditorTab, keepTerminal: Bool = false) {
+        guard let group = group(containing: tab) else { return }
+        if group === activeGroup {
+            if let i = tabs.firstIndex(where: { $0 === tab }) { closeTab(at: i, keepTerminal: keepTerminal) }
+            return
+        }
+        guard let i = group.tabs.firstIndex(where: { $0 === tab }) else { return }
+        if tab.terminal != nil, !keepTerminal { tab.terminal?.kill() }
+        group.tabs.remove(at: i)
+        if let a = group.activeIndex {
+            group.activeIndex = a > i ? a - 1 : (a == i ? nil : a)
+        }
+        if group.tabs.isEmpty {
+            removeGroup(group)
+        } else {
+            if group.activeIndex == nil { group.activeIndex = min(i, group.tabs.count - 1) }
+            refreshPane(of: group)
+        }
+        refreshTabBar()
+        updateEditedState()
+    }
+
+    /// Prompts for every group's unsaved documents, one document at a time.
+    func confirmDiscardAllGroups() -> Bool {
+        editorView.flushPendingUpdates()
+        var asked: [DocumentHandle] = []
+        for group in groups {
+            for tab in group.tabs where tab.isDocument && tab.doc.isModified() {
+                if asked.contains(where: { $0 === tab.doc }) { continue }
+                asked.append(tab.doc)
+                focusTab(tab)
+                guard confirmDiscardActiveTab() else { return false }
+            }
+        }
+        return true
+    }
+
+    /// Back to one empty group (new folder). Kills terminal tabs.
+    func resetGroups() {
+        for tab in allTabs { tab.terminal?.kill() }
+        let keep = activeGroup
+        for group in groups where group !== keep {
+            group.pane?.clear()
+            group.slot.removeFromSuperview()
+        }
+        groups = [keep]
+        activeGroupIndex = 0
+        keep.tabs = []
+        keep.activeIndex = nil
+        groupsSplitView.isVertical = true
+        groupsSplitView.adjustSubviews()
+    }
+}
+
+extension MainWindowController {
+    /// Left edge of the live editor in `detailView`, for popups placed there.
+    var editorOriginInDetail: CGFloat {
+        detailView.convert(NSPoint.zero, from: editorView).x
     }
 }

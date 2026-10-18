@@ -23,6 +23,9 @@ final class EditorTab {
     /// A preview tab is replaced by the next file opened from the explorer,
     /// until it is edited or double-clicked.
     var isPreview: Bool
+    /// Pinned tabs sit first and are skipped by Close Others, Close to the
+    /// Right, Close Saved and Close All. Only closing the tab itself closes it.
+    var isPinned = false
     /// Status bar message for this document.
     var status: String
     /// Scroll position to restore when the tab is shown again.
@@ -114,9 +117,12 @@ final class TabBar: NSView {
         var isGitGraph = false
         /// File name the glyph is chosen from, when the title has a suffix.
         var glyphName: String?
+        /// Pinned: a pin replaces the close button; clicking it unpins.
+        var isPinned = false
 
         init(title: String, isPreview: Bool, isEdited: Bool, isGitChanged: Bool, gitStatus: GitFileStatus = .none,
-             isTerminal: Bool = false, glyphName: String? = nil, isGitGraph: Bool = false) {
+             isTerminal: Bool = false, glyphName: String? = nil, isGitGraph: Bool = false, isPinned: Bool = false) {
+            self.isPinned = isPinned
             self.isTerminal = isTerminal
             self.isGitGraph = isGitGraph
             self.glyphName = glyphName
@@ -137,8 +143,13 @@ final class TabBar: NSView {
 
     var onSelect: ((Int) -> Void)?
     var onClose: ((Int) -> Void)?
+    /// The pin on a pinned tab was clicked.
+    var onUnpin: ((Int) -> Void)?
     /// `(from, to)`: `to` is the tab's final index.
     var onMove: ((Int, Int) -> Void)?
+    /// Tab `index` was dropped at a window point away from this bar. Returns
+    /// whether another editor group took it; if not, the bar reorders as usual.
+    var onDropOutside: ((Int, NSPoint) -> Bool)?
     /// Context menu for tab `index`, if any.
     var menuForTab: ((Int) -> NSMenu?)?
     /// The preview button (shown for Markdown files) was clicked.
@@ -333,6 +344,11 @@ final class TabBar: NSView {
             let point = convert(next.locationInWindow, from: nil)
             if next.type == .leftMouseUp {
                 if dragging {
+                    // Dropped away from the strip: another group may take it.
+                    let outside = point.y < -4 || point.y > bounds.height + 4 || point.x < 0 || point.x > bounds.width
+                    if outside || onDropOutside != nil && !bounds.contains(point) {
+                        if onDropOutside?(index, next.locationInWindow) == true { return }
+                    }
                     let to = dropIndex(forX: point.x, from: index)
                     if to != index { onMove?(index, to) }
                 }
@@ -492,8 +508,15 @@ final class TabItemView: NSView {
         icon.alphaValue = isSelected ? 1 : 0.8
         editedDot.isHidden = !showsEditedDot
         gitDot.isHidden = true
-        // Without room, the button only appears on hover so the title is not cut for it.
-        closeButton.isHidden = showsEditedDot || !(isHovered || (isSelected && closeIsInline))
+        if item.isPinned {
+            // The pin stays visible, so a pinned tab is recognisable at a glance.
+            closeButton.image = NSImage(systemSymbolName: "pin.fill", accessibilityDescription: "Unpin")
+            closeButton.isHidden = showsEditedDot
+        } else {
+            closeButton.image = NSImage(systemSymbolName: "xmark", accessibilityDescription: "Close")
+            // Without room, the button only appears on hover so the title is not cut for it.
+            closeButton.isHidden = showsEditedDot || !(isHovered || (isSelected && closeIsInline))
+        }
         // Over the title, the button and dot carry the tab's own background.
         let behind = closeIsInline ? NSColor.clear : backgroundColorBehind
         effectiveAppearance.performAsCurrentDrawingAppearance {
@@ -501,10 +524,12 @@ final class TabItemView: NSView {
             editedDot.layer?.backgroundColor = behind.cgColor
         }
         invalidateIntrinsicContentSize()
-        closeButton.setAccessibilityLabel("Close \(item.title)")
+        closeButton.setAccessibilityLabel(item.isPinned ? "Unpin \(item.title)" : "Close \(item.title)")
+        closeButton.toolTip = item.isPinned ? "Unpin" : nil
         toolTip = item.isPreview ? "\(item.title) (preview: double-click the file to keep it open)" : item.title
 
         var label = item.title
+        if item.isPinned { label += ", pinned" }
         if item.isEdited { label += ", edited" }
         if item.isPreview { label += ", preview" }
         setAccessibilityLabel(label)
@@ -557,6 +582,6 @@ final class TabItemView: NSView {
     }
 
     @objc private func closeClicked(_ sender: Any?) {
-        bar?.onClose?(index)
+        if item.isPinned { bar?.onUnpin?(index) } else { bar?.onClose?(index) }
     }
 }

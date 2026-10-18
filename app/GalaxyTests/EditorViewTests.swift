@@ -185,7 +185,7 @@ final class EditorViewTests: XCTestCase {
         // Minimum of three digits, then one digit width per extra digit.
         XCTAssertEqual(small.gutterWidth, ceil(3 * small.metrics.digitWidth) + 2 * EditorView.gutterPadding)
         XCTAssertGreaterThan(large.gutterWidth, small.gutterWidth)
-        XCTAssertGreaterThan(large.textOriginX, large.gutterWidth)
+        XCTAssertGreaterThanOrEqual(large.textOriginX, large.gutterWidth)
     }
 
     func testCaretIsDrawnOnlyWhenVisible() throws {

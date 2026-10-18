@@ -17,7 +17,43 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
     private var modelLoadTask: Task<Void, Never>?
     private var modelReloadWork: DispatchWorkItem?
 
-    init(onChange: @escaping () -> Void) {
+    // Editor tab: written to settings.json (a workspace's own file still wins).
+    private let settingsURL: URL
+    private let tabSizePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let insertSpacesBox = NSButton(checkboxWithTitle: "Insert spaces when pressing Tab", target: nil, action: nil)
+    private let whitespacePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let autoClosingTagsBox = NSButton(checkboxWithTitle: "Auto close tags (HTML, PHP, JSX)", target: nil, action: nil)
+    private let linkedEditingBox = NSButton(checkboxWithTitle: "Rename matching tag while editing", target: nil, action: nil)
+    private let autoSavePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let autoSaveDelay = NSStepper(frame: .zero)
+    private let autoSaveDelayLabel = NSTextField(labelWithString: "")
+    private let settingsStatus = NSTextField(wrappingLabelWithString: "")
+    private var editorControls: [NSControl] {
+        [tabSizePopup, insertSpacesBox, whitespacePopup, autoClosingTagsBox, linkedEditingBox,
+         autoSavePopup, autoSaveDelay, gitBlameBox]
+    }
+
+    // View tab: the same switches as the View menu.
+    private let minimapBox = NSButton(checkboxWithTitle: "Minimap", target: nil, action: nil)
+    private let wordWrapBox = NSButton(checkboxWithTitle: "Word wrap", target: nil, action: nil)
+    private let breadcrumbsBox = NSButton(checkboxWithTitle: "Breadcrumbs", target: nil, action: nil)
+    private let stickyScrollBox = NSButton(checkboxWithTitle: "Sticky scroll", target: nil, action: nil)
+    private let gitBlameBox = NSButton(checkboxWithTitle: "Inline Git blame on the caret line", target: nil, action: nil)
+
+    private static let tabSizes = [2, 4, 8]
+    private static let whitespaceModes: [(title: String, value: WhitespaceRendering)] = [
+        ("None", .none), ("Boundary", .boundary), ("All", .all),
+    ]
+    private static let autoSaveModes: [(title: String, value: AutoSaveMode)] = [
+        ("Off", .off), ("After Delay", .afterDelay), ("On Focus Change", .onFocusChange),
+    ]
+    /// UserDefaults keys of the View toggles, with their defaults.
+    private static let viewDefaults: [(key: String, fallback: Bool)] = [
+        ("Minimap", true), ("WordWrap", false), ("ShowBreadcrumbs", true), ("StickyScroll", true),
+    ]
+
+    init(settingsURL: URL = GalaxySettings.globalURL, onChange: @escaping () -> Void) {
+        self.settingsURL = settingsURL
         self.onChange = onChange
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 440, height: 200),
                               styleMask: [.titled, .closable], backing: .buffered, defer: false)
@@ -36,11 +72,170 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
         let tabs = SettingsTabViewController()
         tabs.tabStyle = .toolbar
         tabs.addTabViewItem(tab("General", symbol: "gearshape", pane: buildGeneralPane()))
+        tabs.addTabViewItem(tab("Editor", symbol: "text.cursor", pane: buildEditorPane()))
+        tabs.addTabViewItem(tab("View", symbol: "rectangle.split.3x1", pane: buildViewPane()))
         tabs.addTabViewItem(tab("AI", symbol: "sparkles", pane: buildAIPane()))
         window?.contentViewController = tabs
         tabs.fitWindow(to: tabs.tabViewItems.first)
         window?.center()
+        window?.delegate = self
+        syncControls()
         loadModels()
+    }
+
+    // MARK: Editor and View tabs
+
+    private func buildEditorPane() -> NSView {
+        let stack = NSStackView()
+        stack.addArrangedSubview(section("Indentation"))
+        tabSizePopup.addItems(withTitles: Self.tabSizes.map(String.init))
+        tabSizePopup.setAccessibilityLabel("Tab size")
+        tabSizePopup.target = self; tabSizePopup.action = #selector(saveTabSize(_:))
+        stack.addArrangedSubview(row("Tab size", tabSizePopup))
+        insertSpacesBox.target = self; insertSpacesBox.action = #selector(saveInsertSpaces(_:))
+        stack.addArrangedSubview(row("", insertSpacesBox))
+
+        stack.addArrangedSubview(section("Rendering"))
+        whitespacePopup.addItems(withTitles: Self.whitespaceModes.map(\.title))
+        whitespacePopup.setAccessibilityLabel("Render whitespace")
+        whitespacePopup.target = self; whitespacePopup.action = #selector(saveWhitespace(_:))
+        stack.addArrangedSubview(row("Whitespace", whitespacePopup))
+
+        stack.addArrangedSubview(section("Tags"))
+        autoClosingTagsBox.target = self; autoClosingTagsBox.action = #selector(saveAutoClosingTags(_:))
+        linkedEditingBox.target = self; linkedEditingBox.action = #selector(saveLinkedEditing(_:))
+        stack.addArrangedSubview(row("", autoClosingTagsBox))
+        stack.addArrangedSubview(row("", linkedEditingBox))
+
+        stack.addArrangedSubview(section("Files"))
+        autoSavePopup.addItems(withTitles: Self.autoSaveModes.map(\.title))
+        autoSavePopup.setAccessibilityLabel("Auto save")
+        autoSavePopup.target = self; autoSavePopup.action = #selector(saveAutoSave(_:))
+        stack.addArrangedSubview(row("Auto save", autoSavePopup))
+        autoSaveDelay.minValue = 250; autoSaveDelay.maxValue = 10_000; autoSaveDelay.increment = 250
+        autoSaveDelay.setAccessibilityLabel("Auto save delay")
+        autoSaveDelay.target = self; autoSaveDelay.action = #selector(saveAutoSaveDelay(_:))
+        let delayControls = NSStackView(views: [autoSaveDelay, autoSaveDelayLabel])
+        delayControls.spacing = 8
+        stack.addArrangedSubview(row("Delay", delayControls))
+
+        settingsStatus.font = .systemFont(ofSize: 11)
+        settingsStatus.textColor = .secondaryLabelColor
+        settingsStatus.preferredMaxLayoutWidth = 370
+        settingsStatus.widthAnchor.constraint(equalToConstant: 370).isActive = true
+        settingsStatus.stringValue = "Saved to settings.json. A folder's .galaxy/settings.json overrides these."
+        stack.addArrangedSubview(settingsStatus)
+        return pane(stack)
+    }
+
+    private func buildViewPane() -> NSView {
+        let stack = NSStackView()
+        stack.addArrangedSubview(section("Editor"))
+        for box in [minimapBox, wordWrapBox, breadcrumbsBox, stickyScrollBox] {
+            box.target = self; box.action = #selector(saveViewToggle(_:))
+            stack.addArrangedSubview(row("", box))
+        }
+        stack.addArrangedSubview(section("Git"))
+        gitBlameBox.target = self; gitBlameBox.action = #selector(saveGitBlame(_:))
+        stack.addArrangedSubview(row("", gitBlameBox))
+        let hint = NSTextField(wrappingLabelWithString: "The View menu toggles the same switches.")
+        hint.font = .systemFont(ofSize: 11)
+        hint.textColor = .secondaryLabelColor
+        stack.addArrangedSubview(hint)
+        return pane(stack)
+    }
+
+    private func section(_ title: String) -> NSTextField {
+        let label = NSTextField(labelWithString: title)
+        label.font = .systemFont(ofSize: 12, weight: .semibold)
+        return label
+    }
+
+    /// Shows the saved values; run again when the window comes back, since
+    /// the View menu and settings.json can change them meanwhile.
+    private func syncControls() {
+        let defaults = UserDefaults.standard
+        for (box, entry) in zip([minimapBox, wordWrapBox, breadcrumbsBox, stickyScrollBox], Self.viewDefaults) {
+            box.state = (defaults.object(forKey: entry.key) as? Bool ?? entry.fallback) ? .on : .off
+        }
+        let settings: GalaxySettings
+        do {
+            settings = FileManager.default.fileExists(atPath: settingsURL.path)
+                ? try GalaxySettings.load(from: settingsURL) : .empty
+        } catch {
+            // Leave a broken file for the user to fix rather than overwrite it.
+            editorControls.forEach { $0.isEnabled = false }
+            showSettingsError("settings.json could not be read, so these are locked. Fix the file to edit them here.")
+            return
+        }
+        editorControls.forEach { $0.isEnabled = true }
+        let size = Int(settings.effectiveTabSize)
+        if !Self.tabSizes.contains(size), tabSizePopup.item(withTitle: String(size)) == nil {
+            tabSizePopup.addItem(withTitle: String(size))
+        }
+        tabSizePopup.selectItem(withTitle: String(size))
+        insertSpacesBox.state = settings.useTabs ? .off : .on
+        whitespacePopup.selectItem(at: Self.whitespaceModes.firstIndex { $0.value == settings.effectiveRenderWhitespace } ?? 2)
+        autoClosingTagsBox.state = settings.effectiveAutoClosingTags ? .on : .off
+        linkedEditingBox.state = settings.effectiveLinkedEditing ? .on : .off
+        gitBlameBox.state = settings.effectiveGitBlame ? .on : .off
+        autoSavePopup.selectItem(at: Self.autoSaveModes.firstIndex { $0.value == settings.effectiveAutoSave } ?? 0)
+        autoSaveDelay.doubleValue = settings.effectiveAutoSaveDelay * 1000
+        updateAutoSaveDelay()
+    }
+
+    private func updateAutoSaveDelay() {
+        autoSaveDelayLabel.stringValue = "\(Int(autoSaveDelay.doubleValue)) ms"
+        let afterDelay = Self.autoSaveModes[max(autoSavePopup.indexOfSelectedItem, 0)].value == .afterDelay
+        autoSaveDelay.isEnabled = afterDelay && autoSavePopup.isEnabled
+        autoSaveDelayLabel.textColor = autoSaveDelay.isEnabled ? .labelColor : .tertiaryLabelColor
+    }
+
+    private func showSettingsError(_ message: String) {
+        settingsStatus.textColor = .systemRed
+        settingsStatus.stringValue = message
+    }
+
+    /// Writes one key to settings.json and lets open windows pick it up.
+    private func store(_ value: Any, _ key: String, in section: String = "editor") {
+        do {
+            try GalaxySettings.write(value, key: key, section: section, to: settingsURL)
+            onChange()
+        } catch {
+            showSettingsError("Could not save \(section).\(key): \(error.localizedDescription)")
+            syncControls()
+        }
+    }
+
+    @objc private func saveTabSize(_ sender: Any?) {
+        guard let size = tabSizePopup.titleOfSelectedItem.flatMap(Int.init) else { return }
+        store(size, "tabSize")
+    }
+
+    @objc private func saveInsertSpaces(_ sender: Any?) { store(insertSpacesBox.state == .on, "insertSpaces") }
+    @objc private func saveAutoClosingTags(_ sender: Any?) { store(autoClosingTagsBox.state == .on, "autoClosingTags") }
+    @objc private func saveLinkedEditing(_ sender: Any?) { store(linkedEditingBox.state == .on, "linkedEditing") }
+    @objc private func saveGitBlame(_ sender: Any?) { store(gitBlameBox.state == .on, "gitBlame") }
+
+    @objc private func saveWhitespace(_ sender: Any?) {
+        store(Self.whitespaceModes[max(whitespacePopup.indexOfSelectedItem, 0)].value.rawValue, "renderWhitespace")
+    }
+
+    @objc private func saveAutoSave(_ sender: Any?) {
+        updateAutoSaveDelay()
+        store(Self.autoSaveModes[max(autoSavePopup.indexOfSelectedItem, 0)].value.rawValue, "autoSave", in: "files")
+    }
+
+    @objc private func saveAutoSaveDelay(_ sender: Any?) {
+        updateAutoSaveDelay()
+        store(Int(autoSaveDelay.doubleValue), "autoSaveDelay", in: "files")
+    }
+
+    @objc private func saveViewToggle(_ sender: Any?) {
+        guard let box = sender as? NSButton,
+              let index = [minimapBox, wordWrapBox, breadcrumbsBox, stickyScrollBox].firstIndex(of: box) else { return }
+        UserDefaults.standard.set(box.state == .on, forKey: Self.viewDefaults[index].key)
+        onChange()
     }
 
     private func tab(_ title: String, symbol: String, pane: NSView) -> NSTabViewItem {
@@ -256,6 +451,10 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
             .filter { $0 != ".AppleSystemUIFont" && $0 != ".SFNSDisplay" && NSFont(name: $0, size: 13) != nil }
             .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
     }
+}
+
+extension PreferencesWindowController: NSWindowDelegate {
+    func windowDidBecomeKey(_ notification: Notification) { syncControls() }
 }
 
 /// Toolbar tabs whose window grows or shrinks to the selected pane, keeping

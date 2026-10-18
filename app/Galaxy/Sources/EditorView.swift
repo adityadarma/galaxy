@@ -28,7 +28,9 @@ final class EditorView: NSView {
             ascent = CTFontGetAscent(ctFont)
             descent = CTFontGetDescent(ctFont)
             leading = CTFontGetLeading(ctFont)
-            lineHeight = ceil(ascent + descent + leading)
+            // Font metrics carry float noise (16.00006 for Fira Code 13), which
+            // a bare `ceil` turned into a whole extra point of space per line.
+            lineHeight = ceil(ascent + descent + leading - 0.01)
             digitWidth = ("0" as NSString).size(withAttributes: [.font: font]).width
             spaceWidth = (" " as NSString).size(withAttributes: [.font: font]).width
         }
@@ -37,7 +39,7 @@ final class EditorView: NSView {
     /// Padding on each side of the line numbers.
     static let gutterPadding: CGFloat = 10
     /// Space between the gutter and the first column.
-    static let textInset: CGFloat = 8
+    static let textInset: CGFloat = 0
     static let caretWidth: CGFloat = 2
     static let blinkInterval: TimeInterval = 0.53
     static let matchColor = Theme.findMatch
@@ -731,9 +733,13 @@ final class EditorView: NSView {
                 context.fill(CGRect(x: 0, y: top, width: bounds.width, height: block))
             }
 
-            // Subtle divider between line numbers and source text.
-            context.setFillColor(NSColor.separatorColor.withAlphaComponent(0.28).cgColor)
-            context.fill(CGRect(x: gutterWidth - 1, y: top, width: 1, height: block))
+            // Subtle divider between line numbers and source text. Lines whose
+            // text starts at column 0 touch it, so the divider skips them.
+            let startsAtDivider = line.text.first.map { $0 != " " && $0 != "\t" } ?? false
+            if !startsAtDivider {
+                context.setFillColor(NSColor.separatorColor.withAlphaComponent(0.28).cgColor)
+                context.fill(CGRect(x: gutterWidth - 1, y: top, width: 1, height: block))
+            }
 
             // Indent guides sit behind text and whitespace markers. Draw one
             // guide for each complete four-space indentation level.

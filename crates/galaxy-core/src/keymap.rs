@@ -176,6 +176,10 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("cmd+shift+s", "workbench.action.files.saveAs"),
     ("cmd+w", "workbench.action.closeActiveEditor"),
     ("cmd+shift+w", "workbench.action.closeWindow"),
+    ("alt+cmd+t", "workbench.action.closeOtherEditors"),
+    ("alt+cmd+c", "workbench.action.files.copyPathOfActiveFile"),
+    ("shift+alt+cmd+c", "workbench.action.files.copyRelativePathOfActiveFile"),
+    ("alt+cmd+r", "workbench.action.files.revealActiveFileInWindows"),
     ("cmd+z", "undo"),
     ("cmd+shift+z", "redo"),
     ("cmd+x", "editor.action.clipboardCutAction"),
@@ -248,6 +252,11 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("ctrl+`", "workbench.action.togglePanel"),
     ("alt+cmd+right", "workbench.action.nextEditor"),
     ("alt+cmd+left", "workbench.action.previousEditor"),
+    ("cmd+1", "workbench.action.focusFirstEditorGroup"),
+    ("cmd+2", "workbench.action.focusSecondEditorGroup"),
+    ("cmd+3", "workbench.action.focusThirdEditorGroup"),
+    ("ctrl+cmd+right", "workbench.action.moveEditorToNextGroup"),
+    ("ctrl+cmd+left", "workbench.action.moveEditorToPreviousGroup"),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
