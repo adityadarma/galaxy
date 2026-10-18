@@ -183,9 +183,82 @@ final class EditorViewTests: XCTestCase {
         let (large, _, u2) = try makeView(text: (0..<12_000).map { "l\($0)" }.joined(separator: "\n"))
         defer { [u1, u2].forEach { try? FileManager.default.removeItem(at: $0) } }
         // Minimum of three digits, then one digit width per extra digit.
-        XCTAssertEqual(small.gutterWidth, ceil(3 * small.metrics.digitWidth) + 2 * EditorView.gutterPadding)
+        XCTAssertEqual(small.gutterWidth, ceil(3 * small.metrics.digitWidth) + EditorView.gutterPadding + EditorView.gutterTrailingPadding)
         XCTAssertGreaterThan(large.gutterWidth, small.gutterWidth)
         XCTAssertGreaterThanOrEqual(large.textOriginX, large.gutterWidth)
+    }
+
+    func testFoldingRemovesRowsAndHitTestingSkipsThem() throws {
+        let (view, doc, url) = try makeView(text: "fn a() {\n    one;\n    two;\n}\nfn b() {\n    three;\n}")
+        defer { try? FileManager.default.removeItem(at: url) }
+        XCTAssertEqual(view.rowCount, 7)
+
+        view.toggleFold(line: 0)
+        XCTAssertTrue(view.hasFolds)
+        XCTAssertEqual(view.rowCount, 5)
+        XCTAssertEqual(view.rowTop(of: 3), view.metrics.lineHeight, "the closing brace follows the header")
+        XCTAssertEqual(view.line(atY: view.metrics.lineHeight * 1.5).line, 3)
+
+        view.toggleFold(line: 0)
+        XCTAssertFalse(view.hasFolds)
+        XCTAssertEqual(view.rowCount, 7)
+        XCTAssertEqual(view.rowTop(of: 3), 3 * view.metrics.lineHeight)
+        XCTAssertEqual(doc.foldState(line: 0), .expanded)
+    }
+
+    func testClickingTheChevronFoldsAndTheDotsUnfold() throws {
+        let (view, doc, url) = try makeView(text: "fn a() {\n    one;\n    two;\n}\nfn b() {\n    three;\n}")
+        defer { try? FileManager.default.removeItem(at: url) }
+        var breakpoints: [UInt64] = []
+        view.onToggleBreakpoint = { breakpoints.append($0) }
+        func click(_ point: NSPoint) throws {
+            let event = try XCTUnwrap(NSEvent.mouseEvent(
+                with: .leftMouseDown, location: view.convert(point, to: nil), modifierFlags: [], timestamp: 0,
+                windowNumber: 0, context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
+            view.mouseDown(with: event)
+        }
+        let y = view.metrics.lineHeight / 2
+
+        try click(NSPoint(x: view.foldZoneMinX + 3, y: y))
+        XCTAssertEqual(doc.foldState(line: 0), .folded)
+        XCTAssertTrue(breakpoints.isEmpty, "the chevron column does not set a breakpoint")
+
+        try click(NSPoint(x: 4, y: y))
+        XCTAssertEqual(breakpoints, [0], "the line numbers still do")
+        XCTAssertEqual(doc.foldState(line: 0), .folded)
+
+        view.display()
+        let pill = try XCTUnwrap(view.foldPillRects[0], "a folded line draws its dots")
+        try click(NSPoint(x: pill.midX, y: pill.midY))
+        XCTAssertEqual(doc.foldState(line: 0), .expanded)
+
+        // Leaf lines have no chevron, so the same spot is a breakpoint click.
+        try click(NSPoint(x: view.foldZoneMinX + 3, y: view.metrics.lineHeight * 1.5))
+        XCTAssertEqual(breakpoints, [0, 1])
+    }
+
+    func testChevronToolTipFollowsTheFoldState() throws {
+        let (view, doc, url) = try makeView(text: "fn a() {\n    one;\n}")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let point = NSPoint(x: view.foldZoneMinX + 3, y: view.metrics.lineHeight / 2)
+        XCTAssertEqual(view.view(view, stringForToolTip: 0, point: point, userData: nil), "Click to collapse the range.")
+        _ = doc.toggleFold(line: 0)
+        view.reloadDocument()
+        XCTAssertEqual(view.view(view, stringForToolTip: 0, point: point, userData: nil), "Click to expand the range.")
+        let leaf = NSPoint(x: point.x, y: view.metrics.lineHeight * 1.5)
+        XCTAssertEqual(view.view(view, stringForToolTip: 0, point: leaf, userData: nil), "")
+    }
+
+    func testDiffPanesKeepOneRowPerLine() throws {
+        let (view, doc, url) = try makeView(text: "fn a() {\n    one;\n}")
+        defer { try? FileManager.default.removeItem(at: url) }
+        view.toggleFold(line: 0)
+        XCTAssertEqual(view.rowCount, 2)
+        view.wrapSuspended = true
+        XCTAssertEqual(view.rowCount, 3)
+        XCTAssertFalse(doc.hasFolds())
+        view.toggleFold(line: 0)
+        XCTAssertFalse(doc.hasFolds(), "a suspended view does not fold")
     }
 
     func testDividerShowsOnlyBesideIndentedText() throws {

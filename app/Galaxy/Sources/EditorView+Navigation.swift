@@ -107,10 +107,21 @@ extension EditorView {
         if document.hasMarkedText() { inputContext?.discardMarkedText() }
         let local = convert(event.locationInWindow, from: nil)
         let pos = textPosition(at: local)
-        // Clicking the line numbers sets or clears a breakpoint.
-        if local.x < gutterWidth, event.clickCount == 1, let onToggleBreakpoint {
-            onToggleBreakpoint(pos.line)
+        // The "..." after a folded line opens it again.
+        if event.clickCount == 1, let hit = foldPillRects.first(where: { $0.value.contains(local) }) {
+            toggleFold(line: UInt64(hit.key))
             return
+        }
+        if local.x < gutterWidth, event.clickCount == 1 {
+            // The chevron column folds; the line numbers set or clear a breakpoint.
+            if local.x >= foldZoneMinX, !wrapSuspended, document.foldState(line: pos.line) != .plain {
+                toggleFold(line: pos.line)
+                return
+            }
+            if let onToggleBreakpoint {
+                onToggleBreakpoint(pos.line)
+                return
+            }
         }
         let flags = event.modifierFlags
         // ⌘+click on a keyword or comment is a plain click, not a lookup.
@@ -175,8 +186,14 @@ extension EditorView {
         return pos
     }
 
+    /// Arrow over the line numbers, I-beam (or link hand) over the text.
     override func resetCursorRects() {
-        addCursorRect(visibleRect, cursor: definitionLink == nil ? .iBeam : .pointingHand)
+        let gutter = NSRect(x: 0, y: visibleRect.minY, width: gutterWidth, height: visibleRect.height)
+            .intersection(visibleRect)
+        let text = NSRect(x: gutterWidth, y: visibleRect.minY,
+                          width: max(0, visibleRect.maxX - gutterWidth), height: visibleRect.height)
+        addCursorRect(gutter, cursor: .arrow)
+        addCursorRect(text, cursor: definitionLink == nil ? .iBeam : .pointingHand)
     }
 
     /// Shows or clears the Cmd-hover link for the word under the mouse.

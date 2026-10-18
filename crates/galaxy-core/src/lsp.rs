@@ -50,6 +50,9 @@ pub struct Diagnostic {
     pub message: String,
     pub source: Option<String>,
     pub code: Option<String>,
+    /// LSP `DiagnosticTag.Unnecessary` (1): unused code, shown faded rather
+    /// than underlined.
+    pub unnecessary: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,6 +255,10 @@ fn parse_diagnostic(uri: &str, value: &Value) -> Result<Diagnostic, String> {
             .and_then(Value::as_str)
             .map(str::to_owned),
         code,
+        unnecessary: value
+            .get("tags")
+            .and_then(Value::as_array)
+            .is_some_and(|tags| tags.iter().any(|tag| tag.as_u64() == Some(1))),
     })
 }
 
@@ -857,7 +864,12 @@ impl LspManager {
             "params": {
                 "processId": std::process::id(),
                 "rootUri": format!("file://{}", key.root.to_string_lossy()),
-                "capabilities": {},
+                "capabilities": {
+                    "textDocument": {
+                        // Servers send DiagnosticTag.Unnecessary only when asked.
+                        "publishDiagnostics": { "tagSupport": { "valueSet": [1] } }
+                    }
+                },
                 "initializationOptions": config.initialization_options
             }
         }))?;
@@ -4044,6 +4056,23 @@ mod tests {
     }
 
     #[test]
+    fn unnecessary_tag_is_parsed() {
+        let mut manager = LspManager::default();
+        let message = serde_json::json!({"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file:///c.php","diagnostics":[
+            {"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":3}},"severity":4,"tags":[1],"message":"unused"},
+            {"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":3}},"severity":4,"tags":[2],"message":"deprecated"},
+            {"range":{"start":{"line":2,"character":0},"end":{"line":2,"character":3}},"severity":3,"message":"info"}
+        ]}});
+        assert!(manager.publish_diagnostics(&message).unwrap());
+        let flags: Vec<bool> = manager
+            .diagnostics("file:///c.php")
+            .iter()
+            .map(|d| d.unnecessary)
+            .collect();
+        assert_eq!(flags, [true, false, false]);
+    }
+
+    #[test]
     fn publish_diagnostics_replaces_a_uri_and_orders_problems() {
         let mut manager = LspManager::default();
         let first = serde_json::json!({"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file:///b.rs","diagnostics":[
@@ -4060,6 +4089,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["error", "warn"]
         );
+        assert!(manager.problems().iter().all(|d| !d.unnecessary));
         let replacement = serde_json::json!({"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file:///b.rs","diagnostics":[]}});
         assert!(manager.publish_diagnostics(&replacement).unwrap());
         assert!(manager.diagnostics("file:///b.rs").is_empty());

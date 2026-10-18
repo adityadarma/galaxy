@@ -105,34 +105,53 @@ pub fn breaks_for_line(doc: &Document, line: usize, columns: usize) -> Vec<usize
     line_breaks(&display_text(doc, line), columns)
 }
 
-/// First visual row of every line, for one document revision and width.
+/// First visual row of every line, for one document revision, width and set
+/// of folded ranges. Folded lines take no rows; with `columns == None` every
+/// other line takes exactly one.
 #[derive(Debug, Clone)]
 pub struct WrapMap {
-    columns: usize,
+    columns: Option<usize>,
     revision: u64,
+    hidden: Vec<(usize, usize)>,
     /// `first_row[line]`; one extra entry holds the total.
     first_row: Vec<u64>,
 }
 
 impl WrapMap {
     pub fn build(doc: &Document, columns: usize) -> Self {
+        Self::build_with(doc, Some(columns), Vec::new())
+    }
+
+    /// `hidden` holds sorted, disjoint `(first, last)` folded line ranges.
+    pub fn build_with(doc: &Document, columns: Option<usize>, hidden: Vec<(usize, usize)>) -> Self {
         let lines = doc.line_count();
         let mut first_row = Vec::with_capacity(lines + 1);
         let mut total = 0u64;
+        let mut next = 0;
         for line in 0..lines {
             first_row.push(total);
-            total += rows_in_line(doc, line, columns) as u64;
+            while next < hidden.len() && hidden[next].1 < line {
+                next += 1;
+            }
+            if hidden.get(next).is_some_and(|&(a, b)| a <= line && line <= b) {
+                continue;
+            }
+            total += match columns {
+                Some(columns) => rows_in_line(doc, line, columns) as u64,
+                None => 1,
+            };
         }
         first_row.push(total);
         Self {
             columns,
             revision: doc.revision(),
+            hidden,
             first_row,
         }
     }
 
-    pub fn is_current(&self, doc: &Document, columns: usize) -> bool {
-        self.columns == columns && self.revision == doc.revision()
+    pub fn is_current(&self, doc: &Document, columns: Option<usize>, hidden: &[(usize, usize)]) -> bool {
+        self.columns == columns && self.revision == doc.revision() && self.hidden == hidden
     }
 
     pub fn total_rows(&self) -> u64 {
@@ -254,10 +273,34 @@ mod tests {
     fn map_follows_the_document_and_the_width() {
         let d = doc("abcdefgh");
         let map = WrapMap::build(&d, 4);
-        assert!(map.is_current(&d, 4));
-        assert!(!map.is_current(&d, 5));
+        assert!(map.is_current(&d, Some(4), &[]));
+        assert!(!map.is_current(&d, Some(5), &[]));
+        assert!(!map.is_current(&d, Some(4), &[(0, 0)]));
         assert_eq!(map.total_rows(), 2);
         assert_eq!(WrapMap::build(&d, 8).total_rows(), 1);
+    }
+
+    #[test]
+    fn folded_lines_take_no_rows() {
+        let d = doc("a\nb\nc\nd\ne");
+        let map = WrapMap::build_with(&d, None, vec![(1, 2)]);
+        assert_eq!(map.total_rows(), 3);
+        assert_eq!(map.row_of_line(0), 0);
+        assert_eq!(map.rows_of_line(1), 0);
+        assert_eq!(map.rows_of_line(2), 0);
+        assert_eq!(map.row_of_line(3), 1, "the line after a fold follows its header");
+        assert_eq!(map.row_of_line(4), 2);
+        assert_eq!(map.line_at_row(0), (0, 0));
+        assert_eq!(map.line_at_row(1), (3, 0), "a row never lands on a hidden line");
+        assert_eq!(map.line_at_row(2), (4, 0));
+    }
+
+    #[test]
+    fn folds_and_wrap_combine() {
+        let d = doc("abcdefgh\nhidden\nxy");
+        let map = WrapMap::build_with(&d, Some(4), vec![(1, 1)]);
+        assert_eq!(map.total_rows(), 2 + 0 + 1);
+        assert_eq!(map.row_of_line(2), 2);
     }
 
     #[test]

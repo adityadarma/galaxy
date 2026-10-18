@@ -15,6 +15,7 @@ pub mod document;
 pub mod edit;
 pub mod file_finder;
 pub mod find;
+pub mod fold;
 pub mod git;
 pub mod grapheme;
 pub mod history;

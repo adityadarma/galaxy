@@ -177,8 +177,13 @@ final class ExtensionsController: NSObject, NSTableViewDataSource, NSTableViewDe
         if plugin.installable {
             buttons.append(button("arrow.down.to.line", "Install locally", row, #selector(installBuiltinClicked(_:)), id: "install-builtin"))
         }
-        buttons.append(button(plugin.enabled ? "checkmark.circle.fill" : "circle",
-                              plugin.enabled ? "Disable" : "Enable", row, #selector(toggleClicked(_:)), id: "toggle"))
+        // Nothing to switch off before the server exists. A plugin already
+        // disabled keeps its toggle so it can be re-enabled.
+        let needsInstall = plugin.installable && !plugin.available
+        if !plugin.enabled || !needsInstall {
+            buttons.append(button(plugin.enabled ? "checkmark.circle.fill" : "circle",
+                                  plugin.enabled ? "Disable" : "Enable", row, #selector(toggleClicked(_:)), id: "toggle"))
+        }
         if !plugin.builtin {
             buttons.append(button("trash", "Uninstall", row, #selector(uninstallClicked(_:)), id: "uninstall"))
         }

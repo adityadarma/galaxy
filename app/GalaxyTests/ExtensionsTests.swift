@@ -20,10 +20,33 @@ final class ExtensionsTests: XCTestCase {
         super.tearDown()
     }
 
-    private func plugin(_ id: String, builtin: Bool, enabled: Bool = true) -> PluginInfo {
+    private func plugin(_ id: String, builtin: Bool, enabled: Bool = true,
+                        available: Bool = true, installable: Bool = false) -> PluginInfo {
         PluginInfo(id: id, name: id, version: "1.0.0", description: "", languages: ["php"],
-                   builtin: builtin, enabled: enabled, available: true, installable: false, source: builtin ? nil : "https://x/y.git",
-                   commit: nil)
+                   builtin: builtin, enabled: enabled, available: available, installable: installable,
+                   source: builtin ? nil : "https://x/y.git", commit: nil)
+    }
+
+    private func identifiers(of view: NSView?) -> [String] {
+        guard let view else { return [] }
+        return ([view] + view.subviews.flatMap { [$0] + $0.subviews }).map { $0.accessibilityIdentifier() }
+    }
+
+    func testNotInstalledPluginHasInstallButNoToggle() {
+        let controller = ExtensionsController()
+        controller.show(plugins: [plugin("missing", builtin: true, available: false, installable: true),
+                                  plugin("disabled-missing", builtin: true, enabled: false, available: false, installable: true),
+                                  plugin("ready", builtin: true)],
+                        available: [], registryErrors: [], hasRegistries: false, updates: [:])
+        func ids(_ id: String) -> [String] {
+            let row = controller.rows.firstIndex { if case .plugin(let p) = $0 { p.id == id } else { false } }!
+            return identifiers(of: controller.tableView(NSTableView(), viewFor: nil, row: row))
+        }
+        let missing = ids("missing")
+        XCTAssertTrue(missing.contains { $0.hasPrefix("extensions-install-builtin-") })
+        XCTAssertFalse(missing.contains { $0.hasPrefix("extensions-toggle-") }, "nothing to disable before install")
+        XCTAssertTrue(ids("disabled-missing").contains { $0.hasPrefix("extensions-toggle-") }, "already disabled stays re-enable-able")
+        XCTAssertTrue(ids("ready").contains { $0.hasPrefix("extensions-toggle-") })
     }
 
     func testListGroupsInstalledBuiltInAndAvailable() {

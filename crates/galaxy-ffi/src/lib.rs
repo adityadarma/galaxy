@@ -17,6 +17,7 @@ use galaxy_core::document::{Document, Encoding, LineEnding};
 use galaxy_core::edit::{self, IndentConfig};
 use galaxy_core::file_finder::FileFinder as CoreFileFinder;
 use galaxy_core::find::{FindError, FindOptions, Finder};
+use galaxy_core::fold::{self, FoldSet};
 use galaxy_core::history::{EditKind, Editor};
 use galaxy_core::keymap::{self, Keymap};
 use galaxy_core::lsp::{
@@ -736,6 +737,7 @@ impl Core {
                         galaxy_core::lsp::DiagnosticSeverity::Hint => 4,
                     },
                     message: diagnostic.message.clone(),
+                    unnecessary: diagnostic.unnecessary,
                 })
                 .collect();
             if let Some(document) = documents.get(uri) {
@@ -2293,9 +2295,26 @@ impl Workspace {
     }
 
     pub fn git_log_graph(&self, limit: u32) -> Result<Vec<GitCommitInfo>, CoreError> {
-        use galaxy_core::git::GitRefKind;
+        self.git_log_graph_filtered(limit, Vec::new(), Vec::new(), true)
+    }
+
+    /// The graph limited to `branches` (empty: all refs) and `authors`
+    /// (empty: everyone); `include_remotes` false hides remote branches.
+    pub fn git_log_graph_filtered(
+        &self,
+        limit: u32,
+        branches: Vec<String>,
+        authors: Vec<String>,
+        include_remotes: bool,
+    ) -> Result<Vec<GitCommitInfo>, CoreError> {
+        use galaxy_core::git::{GitRefKind, LogFilter};
+        let filter = LogFilter {
+            branches,
+            authors,
+            include_remotes,
+        };
         Ok(
-            galaxy_core::git::log_graph(self.inner.root(), limit as usize)?
+            galaxy_core::git::log_graph_filtered(self.inner.root(), limit as usize, &filter)?
                 .into_iter()
                 .map(|commit| GitCommitInfo {
                     hash: commit.hash,
@@ -2322,6 +2341,11 @@ impl Workspace {
                 })
                 .collect(),
         )
+    }
+
+    /// Distinct commit authors, sorted, for the graph's author filter.
+    pub fn git_authors(&self) -> Result<Vec<String>, CoreError> {
+        Ok(galaxy_core::git::authors(self.inner.root(), 5000)?)
     }
 
     /// Tags on `origin`; `None` when there is no `origin`. Contacts the
@@ -2892,6 +2916,8 @@ pub struct DiagnosticInfo {
     /// LSP severity: 1 error, 2 warning, 3 information, 4 hint.
     pub severity: u8,
     pub message: String,
+    /// LSP `Unnecessary` tag: unused code, drawn faded.
+    pub unnecessary: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -2899,6 +2925,7 @@ pub struct DiagnosticSpan {
     pub start: u64,
     pub end: u64,
     pub severity: u8,
+    pub unnecessary: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -2918,6 +2945,21 @@ pub struct ViewportLine {
     /// Matching bracket cells on this line, when the primary caret is beside one.
     pub brackets: Vec<LineSpan>,
     pub diagnostics: Vec<DiagnosticSpan>,
+    /// A fold marker belongs in the gutter (set for folded lines too).
+    pub foldable: bool,
+    /// The lines below are folded away.
+    pub folded: bool,
+}
+
+/// What the gutter shows for a line's fold marker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum FoldState {
+    /// Nothing to fold here.
+    Plain,
+    /// Can be folded; currently open.
+    Expanded,
+    /// Folded; its body is hidden.
+    Folded,
 }
 
 /// Indentation used by Tab, Enter and Outdent.
@@ -3111,8 +3153,11 @@ impl From<viewport::ViewportSnapshot> for ViewportSnapshot {
                             start: span.start as u64,
                             end: span.end as u64,
                             severity: span.severity,
+                            unnecessary: span.unnecessary,
                         })
                         .collect(),
+                    foldable: false,
+                    folded: false,
                 })
                 .collect(),
             primary: cursor_info(s.primary),
@@ -3157,6 +3202,8 @@ struct State {
     wrap_columns: Option<usize>,
     /// Row table for `wrap_columns`, rebuilt when the text or width changes.
     wrap_map: Option<galaxy_core::wrap::WrapMap>,
+    /// Folded line ranges; their lines take no rows.
+    folds: FoldSet,
 }
 
 struct SyntaxState {
@@ -3219,15 +3266,45 @@ impl SyntaxState {
 }
 
 impl State {
-    /// The row table for the current text and wrap width, rebuilt if stale.
+    /// Moves folds along with edits and unfolds any that hides a caret.
+    fn fold_sync(&mut self) {
+        self.folds.sync(&self.editor.doc);
+        if self.folds.is_empty() {
+            return;
+        }
+        let doc = &self.editor.doc;
+        let stuck: Vec<usize> = self
+            .editor
+            .sel
+            .iter()
+            .map(|sel| doc.char_to_line(sel.head))
+            .filter(|&line| self.folds.is_hidden(line))
+            .collect();
+        for line in stuck {
+            self.folds.reveal(line);
+        }
+    }
+
+    /// The row table for the current text, wrap width and folds, rebuilt if
+    /// stale. `None` while lines are neither wrapped nor folded.
     fn wrap(&mut self) -> Option<&galaxy_core::wrap::WrapMap> {
-        let columns = self.wrap_columns?;
+        self.fold_sync();
+        let columns = self.wrap_columns;
+        if columns.is_none() && self.folds.is_empty() {
+            self.wrap_map = None;
+            return None;
+        }
         let stale = self
             .wrap_map
             .as_ref()
-            .is_none_or(|m| !m.is_current(&self.editor.doc, columns));
+            .is_none_or(|m| !m.is_current(&self.editor.doc, columns, self.folds.hidden_ranges()));
         if stale {
-            self.wrap_map = Some(galaxy_core::wrap::WrapMap::build(&self.editor.doc, columns));
+            let map = galaxy_core::wrap::WrapMap::build_with(
+                &self.editor.doc,
+                columns,
+                self.folds.hidden_ranges().to_vec(),
+            );
+            self.wrap_map = Some(map);
         }
         self.wrap_map.as_ref()
     }
@@ -3430,6 +3507,7 @@ impl DocumentHandle {
     /// One snapshot per frame: visible lines, selections, carets, cursor.
     pub fn viewport(&self, first_line: u64, count: u64) -> ViewportSnapshot {
         let st = &mut *self.lock();
+        st.fold_sync();
         let first_line = clamp_usize(first_line);
         let count = clamp_usize(count);
         // A tree one edit behind is fine for colors: offsets are clipped to
@@ -3440,13 +3518,44 @@ impl DocumentHandle {
                 .latest(&st.editor.doc)
                 .map(|snapshot| (language, snapshot.tree().clone()))
         });
-        let mut snap: ViewportSnapshot = if let Some((language, tree)) = syntax {
-            st.editor
-                .viewport_with_syntax(first_line, count, &tree, language)
-                .into()
-        } else {
-            st.editor.viewport(first_line, count).into()
-        };
+        // Folded lines are skipped, not built and thrown away: a folded class
+        // can hide thousands of lines between two visible rows.
+        let end = first_line.saturating_add(count);
+        let mut segments: Vec<(usize, usize)> = Vec::new();
+        let mut at = first_line;
+        for &(hidden_first, hidden_last) in st.folds.hidden_ranges() {
+            if hidden_last < at {
+                continue;
+            }
+            if hidden_first >= end {
+                break;
+            }
+            if hidden_first > at {
+                segments.push((at, hidden_first - at));
+            }
+            at = hidden_last + 1;
+        }
+        if at < end {
+            segments.push((at, end - at));
+        }
+        let mut merged: Option<ViewportSnapshot> = None;
+        for (start, len) in segments {
+            let part: ViewportSnapshot = match &syntax {
+                Some((language, tree)) => st
+                    .editor
+                    .viewport_with_syntax(start, len, tree, *language)
+                    .into(),
+                None => st.editor.viewport(start, len).into(),
+            };
+            match merged.as_mut() {
+                None => merged = Some(part),
+                Some(all) => {
+                    all.lines.extend(part.lines);
+                    all.styles.extend(part.styles);
+                }
+            }
+        }
+        let mut snap = merged.unwrap_or_else(|| st.editor.viewport(first_line, 0).into());
         if let Some(finder) = &st.finder {
             for line in &mut snap.lines {
                 // Only the displayed part, so a minified line stays cheap.
@@ -3481,9 +3590,17 @@ impl DocumentHandle {
                         start,
                         end,
                         severity: diagnostic.severity,
+                        unnecessary: diagnostic.unnecessary,
                     });
                 }
             }
+        }
+        let doc = &st.editor.doc;
+        let folds = &st.folds;
+        for line in &mut snap.lines {
+            let at = line.line as usize;
+            line.folded = folds.is_folded(at);
+            line.foldable = line.folded || fold::is_foldable(doc, at);
         }
         snap
     }
@@ -3727,14 +3844,37 @@ impl DocumentHandle {
     /// Arrow keys, Home/End, Page Up/Down. `extend` is the Shift key.
     pub fn move_cursors(&self, motion: CursorMotion, extend: bool) {
         let mut st = self.lock();
+        st.fold_sync();
         let columns = st.wrap_columns;
+        let st = &mut *st;
         let ed = &mut st.editor;
-        let next = match columns {
+        let mut next = match columns {
             Some(columns) => {
                 movement::move_selections_wrapped(&ed.doc, &ed.sel, motion.into(), extend, columns)
             }
             None => movement::move_selections(&ed.doc, &ed.sel, motion.into(), extend),
         };
+        if !st.folds.is_empty() {
+            // Up and Down step over folded lines instead of opening them.
+            let doc = &ed.doc;
+            let folds = &st.folds;
+            let down = matches!(motion, CursorMotion::Down | CursorMotion::PageDown { .. });
+            next.transform(doc, |sel| {
+                let line = doc.char_to_line(sel.head);
+                let Some((first, last)) = folds.hidden_at(line) else {
+                    return sel;
+                };
+                let target = if down {
+                    (last + 1 < doc.line_count()).then_some(last + 1)
+                } else {
+                    first.checked_sub(1)
+                };
+                let Some(target) = target else { return sel };
+                let column = sel.head - doc.line_to_char(line);
+                let head = (doc.line_to_char(target) + column).min(doc.line_end_char(target));
+                if extend { sel.extend_to(head) } else { Selection::caret(head) }
+            });
+        }
         ed.set_selections(next);
         ed.history.break_group();
     }
@@ -3805,6 +3945,68 @@ impl DocumentHandle {
             .into_iter()
             .map(|at| (doc.char_to_utf16_offset(start + at) - base) as u64)
             .collect()
+    }
+
+    /// Folds `line`, or unfolds it if it is folded. `false` when the line
+    /// has nothing to fold. A caret inside the folded lines moves to the
+    /// header.
+    pub fn toggle_fold(&self, line: u64) -> bool {
+        let mut st = self.lock();
+        let st = &mut *st;
+        let line = clamp_usize(line);
+        if !st.folds.toggle(&st.editor.doc, line) {
+            return false;
+        }
+        let doc = &st.editor.doc;
+        let folds = &st.folds;
+        if folds.is_empty() {
+            return true;
+        }
+        let header_end = |at: usize| doc.line_end_char(at);
+        let mut next = st.editor.sel.clone();
+        next.transform(doc, |sel| {
+            let moved = |pos: usize| {
+                let at = doc.char_to_line(pos);
+                match folds.hidden_at(at) {
+                    Some((first, _)) => header_end(first - 1),
+                    None => pos,
+                }
+            };
+            let (anchor, head) = (moved(sel.anchor), moved(sel.head));
+            if (anchor, head) == (sel.anchor, sel.head) {
+                sel
+            } else {
+                Selection::new(anchor, head)
+            }
+        });
+        st.editor.set_selections(next);
+        true
+    }
+
+    /// Unfolds everything, for views that need one row per line.
+    pub fn unfold_all(&self) {
+        self.lock().folds.clear();
+    }
+
+    /// Fold marker state of `line`.
+    pub fn fold_state(&self, line: u64) -> FoldState {
+        let mut st = self.lock();
+        st.fold_sync();
+        let line = clamp_usize(line);
+        if st.folds.is_folded(line) {
+            FoldState::Folded
+        } else if fold::is_foldable(&st.editor.doc, line) {
+            FoldState::Expanded
+        } else {
+            FoldState::Plain
+        }
+    }
+
+    /// Any folded range exists. Row geometry differs from plain lines then.
+    pub fn has_folds(&self) -> bool {
+        let mut st = self.lock();
+        st.fold_sync();
+        !st.folds.is_empty()
     }
 
     pub fn select_all(&self) {
@@ -4295,6 +4497,7 @@ impl DocumentHandle {
                 diagnostics_revision: 0,
                 wrap_columns: None,
                 wrap_map: None,
+                folds: FoldSet::default(),
             }),
         }
     }
@@ -4474,12 +4677,102 @@ mod tests {
             end_character: 2,
             severity: 1,
             message: "bad".into(),
+            unnecessary: false,
         }]);
         let snap = doc.viewport(0, 2);
         assert_eq!(snap.lines[0].diagnostics[0].start, 1);
         assert_eq!(snap.lines[0].diagnostics[0].end, 3);
         assert_eq!(snap.lines[1].diagnostics[0].start, 0);
         assert_eq!(snap.lines[1].diagnostics[0].end, 2);
+    }
+
+    fn folding_doc() -> Arc<DocumentHandle> {
+        let doc = Core::new().new_document();
+        doc.edit(EditCommand::InsertText {
+            text: "fn a() {\n    one;\n    two;\n}\nfn b() {\n    three;\n}".into(),
+        });
+        doc
+    }
+
+    #[test]
+    fn folding_hides_lines_and_shrinks_the_row_map() {
+        let doc = folding_doc();
+        assert_eq!(doc.total_rows(), 7);
+        assert_eq!(doc.fold_state(0), FoldState::Expanded);
+        assert_eq!(doc.fold_state(1), FoldState::Plain);
+        assert!(doc.toggle_fold(0));
+        assert_eq!(doc.fold_state(0), FoldState::Folded);
+        assert_eq!(doc.total_rows(), 5);
+        assert_eq!(doc.row_of_line(3), 1, "the closing brace follows the header");
+        assert_eq!(doc.line_at_row(1).line, 3);
+
+        let snap = doc.viewport(0, 7);
+        let shown: Vec<u64> = snap.lines.iter().map(|l| l.line).collect();
+        assert_eq!(shown, [0, 3, 4, 5, 6]);
+        assert!(snap.lines[0].folded && snap.lines[0].foldable);
+        assert!(!snap.lines[2].folded && snap.lines[2].foldable);
+
+        doc.toggle_fold(4);
+        doc.unfold_all();
+        assert_eq!(doc.total_rows(), 7);
+        assert!(!doc.has_folds());
+        assert!(doc.toggle_fold(0));
+        assert!(doc.toggle_fold(0));
+        assert_eq!(doc.total_rows(), 7);
+        assert!(!doc.toggle_fold(1), "nothing to fold on a leaf line");
+    }
+
+    #[test]
+    fn folding_moves_a_hidden_caret_to_the_header() {
+        let doc = folding_doc();
+        doc.set_caret(TextPos { line: 2, col_utf16: 2 });
+        doc.toggle_fold(0);
+        assert_eq!(doc.primary_cursor().line, 0);
+    }
+
+    #[test]
+    fn arrows_step_over_folded_lines() {
+        let doc = folding_doc();
+        doc.toggle_fold(0);
+        doc.set_caret(TextPos { line: 0, col_utf16: 0 });
+        doc.move_cursors(CursorMotion::Down, false);
+        assert_eq!(doc.primary_cursor().line, 3);
+        doc.move_cursors(CursorMotion::Up, false);
+        assert_eq!(doc.primary_cursor().line, 0);
+    }
+
+    #[test]
+    fn typing_in_a_folded_range_opens_it() {
+        let doc = folding_doc();
+        doc.toggle_fold(4);
+        assert!(doc.has_folds());
+        doc.set_caret(TextPos { line: 4, col_utf16: 0 });
+        doc.edit(EditCommand::InsertText { text: "// ".into() });
+        assert!(doc.has_folds(), "typing on the header keeps its fold");
+        doc.set_caret(TextPos { line: 0, col_utf16: 0 });
+        doc.edit(EditCommand::InsertText { text: "x\n".into() });
+        assert!(doc.has_folds());
+        assert_eq!(doc.fold_state(5), FoldState::Folded, "the fold moved down a line");
+    }
+
+    #[test]
+    fn unnecessary_flag_reaches_the_viewport() {
+        let doc = Core::new().new_document();
+        doc.edit(EditCommand::InsertText {
+            text: "use Foo;".into(),
+        });
+        doc.set_diagnostics(vec![DiagnosticInfo {
+            start_line: 0,
+            start_character: 0,
+            end_line: 0,
+            end_character: 8,
+            severity: 4,
+            message: "unused".into(),
+            unnecessary: true,
+        }]);
+        let span = doc.viewport(0, 1).lines[0].diagnostics[0].clone();
+        assert!(span.unnecessary);
+        assert_eq!(span.severity, 4);
     }
 
     #[test]

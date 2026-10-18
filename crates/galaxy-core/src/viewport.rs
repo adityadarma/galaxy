@@ -68,6 +68,8 @@ pub struct DiagnosticSpan {
     pub start: usize,
     pub end: usize,
     pub severity: u8,
+    /// Unused code: drawn faded, not underlined.
+    pub unnecessary: bool,
 }
 
 /// Primary cursor position for the status bar and scroll-into-view.

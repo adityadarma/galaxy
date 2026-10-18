@@ -105,21 +105,63 @@ pub struct GitCommit {
     pub outgoing: Vec<u32>,
 }
 
+/// Which commits the graph shows. The default shows every ref.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LogFilter {
+    /// Branch or tag names to start from; empty means every ref.
+    pub branches: Vec<String>,
+    /// Author names to keep, matched exactly; empty means everyone.
+    pub authors: Vec<String>,
+    /// Show remote-tracking branches and the commits only they reach.
+    pub include_remotes: bool,
+}
+
+impl Default for LogFilter {
+    fn default() -> Self {
+        Self {
+            branches: Vec::new(),
+            authors: Vec::new(),
+            include_remotes: true,
+        }
+    }
+}
+
 /// Newest `limit` commits of every ref, in date order, with the lane
 /// layout for drawing them (the Git Graph panel).
 pub fn log_graph(root: &Path, limit: usize) -> io::Result<Vec<GitCommit>> {
-    let output = Command::new("git")
-        .args([
-            "-C",
-            &root.to_string_lossy(),
-            "log",
-            "--all",
-            "--date-order",
-            "-n",
-            &limit.to_string(),
-            "--format=%H%x1f%P%x1f%an%x1f%at%x1f%D%x1f%s%x1e",
-        ])
-        .output()?;
+    log_graph_filtered(root, limit, &LogFilter::default())
+}
+
+/// `log_graph` limited by `filter`. With an author filter, parents that
+/// were filtered out are dropped so no line is left hanging.
+pub fn log_graph_filtered(
+    root: &Path,
+    limit: usize,
+    filter: &LogFilter,
+) -> io::Result<Vec<GitCommit>> {
+    if let Some(bad) = filter.branches.iter().find(|name| !valid_ref_name(name)) {
+        return Err(io::Error::other(format!("invalid branch name: {bad}")));
+    }
+    let mut cmd = Command::new("git");
+    cmd.args(["-C", &root.to_string_lossy(), "log"]);
+    cmd.args(["--date-order", "-n", &limit.to_string()]);
+    if !filter.authors.is_empty() {
+        // The header reads `Name <email>`; anchor so "Bob" skips "Rob Bob".
+        for author in &filter.authors {
+            cmd.arg(format!("--author=^{} <", escape_regex(author)));
+        }
+    }
+    cmd.arg("--format=%H%x1f%P%x1f%an%x1f%at%x1f%D%x1f%s%x1e");
+    if !filter.branches.is_empty() {
+        cmd.args(&filter.branches);
+    } else if filter.include_remotes {
+        cmd.arg("--all");
+    } else {
+        cmd.args(["--branches", "--tags", "HEAD"]);
+    }
+    // Names were checked above, but keep them from ever reading as paths.
+    cmd.arg("--");
+    let output = output_within(cmd, LOCAL_TIMEOUT)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if stderr.contains("does not have any commits") {
@@ -128,8 +170,60 @@ pub fn log_graph(root: &Path, limit: usize) -> io::Result<Vec<GitCommit>> {
         return Err(io::Error::other(stderr.to_string()));
     }
     let mut commits = parse_log(&String::from_utf8_lossy(&output.stdout));
+    if !filter.include_remotes {
+        for commit in &mut commits {
+            commit.refs.retain(|r| r.kind != GitRefKind::Remote);
+        }
+    }
+    if !filter.authors.is_empty() {
+        let kept: BTreeSet<String> = commits.iter().map(|c| c.hash.clone()).collect();
+        for commit in &mut commits {
+            commit.parents.retain(|p| kept.contains(p));
+        }
+    }
     layout_lanes(&mut commits);
     Ok(commits)
+}
+
+/// Escapes `text` for git's basic regular expressions.
+fn escape_regex(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if matches!(ch, '\\' | '.' | '[' | ']' | '*' | '^' | '$') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Distinct author names in the newest `limit` commits of every ref,
+/// sorted.
+pub fn authors(root: &Path, limit: usize) -> io::Result<Vec<String>> {
+    let mut cmd = Command::new("git");
+    cmd.args([
+        "-C",
+        &root.to_string_lossy(),
+        "log",
+        "--all",
+        "-n",
+        &limit.to_string(),
+        "--format=%an",
+    ]);
+    let output = output_within(cmd, LOCAL_TIMEOUT)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("does not have any commits") {
+            return Ok(Vec::new());
+        }
+        return Err(io::Error::other(stderr.to_string()));
+    }
+    let names: BTreeSet<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+        .collect();
+    Ok(names.into_iter().collect())
 }
 
 fn parse_log(text: &str) -> Vec<GitCommit> {
@@ -1412,6 +1506,91 @@ mod tests {
         assert_eq!(base.lane, 0);
         assert_eq!(base.incoming, [0, 1], "both lines end at the root commit");
         assert!(base.outgoing.is_empty());
+    }
+
+    fn commit_file_as(dir: &Path, author: &str, file: &str, message: &str) {
+        fs::write(dir.join(file), message).unwrap();
+        run(dir, ["add", file]);
+        let name = format!("user.name={author}");
+        run(
+            dir,
+            [
+                "-c",
+                name.as_str(),
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-m",
+                message,
+            ],
+        );
+    }
+
+    #[test]
+    fn log_graph_filters_by_branch_author_and_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        run(dir.path(), ["init", "-b", "main"]);
+        commit_file_as(dir.path(), "Ann", "a.txt", "one");
+        run(dir.path(), ["switch", "-c", "feature"]);
+        commit_file_as(dir.path(), "Bob", "b.txt", "two");
+        run(dir.path(), ["switch", "main"]);
+        commit_file_as(dir.path(), "Ann", "c.txt", "three");
+        // A remote-tracking ref without a remote.
+        run(dir.path(), ["update-ref", "refs/remotes/origin/feature", "feature"]);
+
+        let all = log_graph_filtered(dir.path(), 50, &LogFilter::default()).unwrap();
+        assert_eq!(all.len(), 3);
+        assert!(all.iter().flat_map(|c| &c.refs).any(|r| r.kind == GitRefKind::Remote));
+
+        let main_only = LogFilter {
+            branches: vec!["main".into()],
+            ..LogFilter::default()
+        };
+        let subjects: Vec<_> = log_graph_filtered(dir.path(), 50, &main_only)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.subject)
+            .collect();
+        assert_eq!(subjects, ["three", "one"]);
+
+        let bob = LogFilter {
+            authors: vec!["Bob".into()],
+            ..LogFilter::default()
+        };
+        let commits = log_graph_filtered(dir.path(), 50, &bob).unwrap();
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].subject, "two");
+        assert!(commits[0].parents.is_empty(), "filtered parent is dropped");
+        assert!(commits[0].outgoing.is_empty());
+
+        let no_remotes = LogFilter {
+            include_remotes: false,
+            ..LogFilter::default()
+        };
+        let commits = log_graph_filtered(dir.path(), 50, &no_remotes).unwrap();
+        assert_eq!(commits.len(), 3);
+        assert!(!commits.iter().flat_map(|c| &c.refs).any(|r| r.kind == GitRefKind::Remote));
+    }
+
+    #[test]
+    fn log_graph_rejects_option_like_branch_names() {
+        let dir = tempfile::tempdir().unwrap();
+        run(dir.path(), ["init", "-b", "main"]);
+        let filter = LogFilter {
+            branches: vec!["--output=/tmp/x".into()],
+            ..LogFilter::default()
+        };
+        assert!(log_graph_filtered(dir.path(), 5, &filter).is_err());
+    }
+
+    #[test]
+    fn authors_lists_distinct_names_sorted() {
+        let dir = tempfile::tempdir().unwrap();
+        run(dir.path(), ["init", "-b", "main"]);
+        commit_file_as(dir.path(), "Bob", "a.txt", "one");
+        commit_file_as(dir.path(), "Ann", "b.txt", "two");
+        commit_file_as(dir.path(), "Bob", "c.txt", "three");
+        assert_eq!(authors(dir.path(), 50).unwrap(), ["Ann", "Bob"]);
     }
 
     #[test]

@@ -38,6 +38,9 @@ final class EditorView: NSView {
 
     /// Padding on each side of the line numbers.
     static let gutterPadding: CGFloat = 10
+    /// Space between the line numbers and the gutter divider: the diagnostic
+    /// dot first, then the fold chevron.
+    static let gutterTrailingPadding: CGFloat = 26
     /// Space between the gutter and the first column.
     static let textInset: CGFloat = 0
     static let caretWidth: CGFloat = 2
@@ -56,12 +59,26 @@ final class EditorView: NSView {
     /// Wrap is off while this is set, e.g. in a side-by-side diff where both
     /// panes must keep one row per line.
     var wrapSuspended = false {
-        didSet { if wrapSuspended != oldValue { wrapSettingsChanged() } }
+        didSet {
+            guard wrapSuspended != oldValue else { return }
+            // One row per line is also what folds would break.
+            if wrapSuspended { document?.unfoldAll() }
+            wrapSettingsChanged()
+        }
     }
     /// Columns the core wraps at, or `nil` while wrap is not in effect.
     private(set) var appliedWrapColumns: Int?
     private var lastWrapWidth: CGFloat = 0
     var wrapActive: Bool { appliedWrapColumns != nil }
+    /// Some lines are folded away, so rows no longer match lines one to one.
+    private(set) var hasFolds = false
+    /// Rows come from the core's row map instead of `line * lineHeight`.
+    var rowMapped: Bool { wrapActive || hasFolds }
+    /// The mouse is over the line numbers; fold chevrons show then.
+    private var pointerInGutter = false
+    /// Where the "..." after each folded line was drawn, by line.
+    var foldPillRects: [Int: NSRect] = [:]
+    private var foldToolTipRect: NSRect = .zero
     /// 0-based lines with a breakpoint, drawn on their line numbers.
     var breakpointLines: Set<UInt64> = [] {
         didSet { if breakpointLines != oldValue { needsDisplay = true } }
@@ -195,7 +212,8 @@ final class EditorView: NSView {
             }
             // Cursor rects would reset a bare `set()` on the next move.
             window?.invalidateCursorRects(for: self)
-            (definitionLink == nil ? NSCursor.iBeam : NSCursor.pointingHand).set()
+            let inGutter = (lastMousePoint?.x ?? .infinity) < gutterWidth
+            (inGutter ? NSCursor.arrow : definitionLink == nil ? NSCursor.iBeam : NSCursor.pointingHand).set()
         }
     }
     /// Last mouse location in view coordinates, for Cmd presses without movement.
@@ -259,6 +277,7 @@ final class EditorView: NSView {
     override func mouseMoved(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         lastMousePoint = point
+        setPointerInGutter(point.x < gutterWidth)
         updateDefinitionLink(commandHeld: event.modifierFlags.contains(.command))
         onHover?(textPosition(at: point), point)
     }
@@ -269,7 +288,14 @@ final class EditorView: NSView {
     override func mouseExited(with event: NSEvent) {
         lastMousePoint = nil
         definitionLink = nil
+        setPointerInGutter(false)
         onMouseExit?()
+    }
+
+    private func setPointerInGutter(_ inside: Bool) {
+        guard inside != pointerInGutter else { return }
+        pointerInGutter = inside
+        setNeedsDisplay(NSRect(x: 0, y: visibleRect.minY, width: gutterWidth, height: visibleRect.height))
     }
 
     override func flagsChanged(with event: NSEvent) {
@@ -299,8 +325,14 @@ final class EditorView: NSView {
     /// Width of the line-number column; grows with the number of digits.
     var gutterWidth: CGFloat {
         let digits = max(3, String(max(lineCount, 1)).count)
-        return ceil(CGFloat(digits) * metrics.digitWidth) + 2 * Self.gutterPadding
+        return ceil(CGFloat(digits) * metrics.digitWidth) + Self.gutterPadding + Self.gutterTrailingPadding
     }
+
+    /// Right edge of the line numbers.
+    var gutterRight: CGFloat { gutterWidth - Self.gutterTrailingPadding }
+
+    /// Left edge of the fold chevron's column; clicks right of it fold.
+    var foldZoneMinX: CGFloat { gutterRight + 9 }
 
     /// X of column 0 of the text.
     var textOriginX: CGFloat { gutterWidth + Self.textInset }
@@ -313,7 +345,7 @@ final class EditorView: NSView {
         let visible = rect.intersection(bounds)
         guard !visible.isNull, !visible.isEmpty, lineCount > 0 else { return 0..<0 }
         let height = metrics.lineHeight
-        if wrapActive, let document {
+        if rowMapped, let document {
             let firstRow = UInt64(max(0, floor(visible.minY / height)))
             let lastRow = UInt64(max(0, ceil(visible.maxY / height) - 1))
             let first = min(lineCount, Int(document.lineAtRow(row: firstRow).line))
@@ -358,10 +390,32 @@ final class EditorView: NSView {
 
     private func applyDocumentMetadata(lineCount newCount: UInt64?) {
         lineCount = Int(newCount ?? 0)
-        rowCount = wrapActive ? Int(document?.totalRows() ?? 0) : lineCount
+        hasFolds = !wrapSuspended && (document?.hasFolds() ?? false)
+        rowCount = rowMapped ? Int(document?.totalRows() ?? 0) : lineCount
         let virtual = CGFloat(rowCount) * metrics.lineHeight
         let visible = enclosingScrollView?.contentSize.height ?? 0
         setFrameSize(NSSize(width: frame.width, height: max(virtual, visible)))
+        updateFoldToolTip()
+    }
+
+    // MARK: Folding
+
+    /// Folds or unfolds the range under `line`. Does nothing where lines
+    /// must stay one row each (diff panes).
+    func toggleFold(line: UInt64) {
+        guard let document, !wrapSuspended, document.toggleFold(line: line) else { return }
+        reloadDocument()
+    }
+
+    /// Hover text over the chevron column, kept in step with the gutter width.
+    private func updateFoldToolTip() {
+        let rect = NSRect(x: foldZoneMinX, y: 0, width: gutterWidth - foldZoneMinX, height: frame.height)
+        guard rect != foldToolTipRect else { return }
+        foldToolTipRect = rect
+        // The gutter edge moved too (more digits), and the cursor rects follow it.
+        window?.invalidateCursorRects(for: self)
+        removeAllToolTips()
+        addToolTip(rect, owner: self, userData: nil)
     }
 
     // MARK: Soft wrap
@@ -390,6 +444,7 @@ final class EditorView: NSView {
 
     override func setFrameSize(_ newSize: NSSize) {
         super.setFrameSize(newSize)
+        updateFoldToolTip()
         onLayoutChange?()
         guard newSize.width != lastWrapWidth else { return }
         lastWrapWidth = newSize.width
@@ -424,14 +479,14 @@ final class EditorView: NSView {
 
     /// Y of the first row of `line`.
     func rowTop(of line: UInt64) -> CGFloat {
-        guard wrapActive, let document else { return CGFloat(line) * metrics.lineHeight }
+        guard rowMapped, let document else { return CGFloat(line) * metrics.lineHeight }
         return CGFloat(document.rowOfLine(line: line)) * metrics.lineHeight
     }
 
     /// The line (and row within it) drawn at document-space `y`.
     func line(atY y: CGFloat) -> (line: UInt64, row: Int) {
         let row = y.isFinite ? max(0, floor(y / metrics.lineHeight)) : 0
-        guard wrapActive, let document else { return (UInt64(min(row, CGFloat(max(lineCount - 1, 0)))), 0) }
+        guard rowMapped, let document else { return (UInt64(min(row, CGFloat(max(lineCount - 1, 0)))), 0) }
         let position = document.lineAtRow(row: UInt64(row))
         return (position.line, Int(position.row))
     }
@@ -439,7 +494,7 @@ final class EditorView: NSView {
     /// Source line at `y` with the fraction of the way through it, for
     /// scroll sync with the Markdown preview.
     func fractionalLine(atY y: CGFloat) -> Double {
-        guard wrapActive, let document else { return Double(y / metrics.lineHeight) }
+        guard rowMapped, let document else { return Double(y / metrics.lineHeight) }
         let rowFloat = max(0, y / metrics.lineHeight)
         if UInt64(rowFloat) >= document.totalRows() { return Double(lineCount) }
         let position = document.lineAtRow(row: UInt64(rowFloat))
@@ -448,7 +503,7 @@ final class EditorView: NSView {
     }
 
     func y(forFractionalLine line: Double) -> CGFloat {
-        guard wrapActive, let document else { return CGFloat(line) * metrics.lineHeight }
+        guard rowMapped, let document else { return CGFloat(line) * metrics.lineHeight }
         let whole = UInt64(max(0, floor(line)))
         let rows = Double(document.rowsOfLine(line: whole))
         let row = CGFloat(document.rowOfLine(line: whole)) + CGFloat((line - floor(line)) * rows)
@@ -687,10 +742,13 @@ final class EditorView: NSView {
                 }
             }
         }
-        for line in range { caretRects[line] = nil }
+        for line in range {
+            caretRects[line] = nil
+            foldPillRects[line] = nil
+        }
 
         let originX = textOriginX
-        let gutterRight = gutterWidth - Self.gutterPadding
+        let gutterRight = self.gutterRight
         let lineHeight = metrics.lineHeight
         let drawCarets = showsCaret
         let selectionColor = (isActive || forcedCaretVisible != nil)
@@ -826,7 +884,11 @@ final class EditorView: NSView {
                 context.setFillColor(Theme.editorForeground.resolved(for: effectiveAppearance).cgColor)
                 // Semantic runs come last so they win over Tree-sitter's.
                 let styles = (stylesByLine[line.line] ?? []) + (semanticStylesByLine[line.line] ?? [])
-                let ctLine = styles.isEmpty ? layout(for: line.text) : syntaxLayout(for: line.text, styles: styles)
+                // Unused code (LSP `Unnecessary`) is faded, not underlined.
+                let faded = line.diagnostics.filter(\.unnecessary).map { Int($0.start)..<Int($0.end) }
+                let ctLine = styles.isEmpty && faded.isEmpty
+                    ? layout(for: line.text)
+                    : syntaxLayout(for: line.text, styles: styles, faded: faded)
                 for row in 0..<rows.count {
                     let rowTopY = top + CGFloat(row) * lineHeight
                     let shift = row == 0 ? 0 : xOffset(in: line.text, column: UInt64(rows.start(of: row)))
@@ -838,6 +900,20 @@ final class EditorView: NSView {
                     context.textPosition = CGPoint(x: originX - shift, y: rowTopY + metrics.ascent)
                     CTLineDraw(ctLine, context)
                     if rows.count > 1 { context.restoreGState() }
+                }
+            }
+
+            // A folded range is stood in for by a small "..." after its header.
+            if line.folded, !wrapSuspended {
+                let end = point(column: line.text.utf16.count, text: line.text, rows: rows, top: top, originX: originX)
+                let pill = CGRect(x: end.x + 6, y: end.y + 3, width: 26, height: lineHeight - 6)
+                foldPillRects[Int(line.line)] = pill
+                context.addPath(CGPath(roundedRect: pill, cornerWidth: 3, cornerHeight: 3, transform: nil))
+                context.setFillColor(NSColor.separatorColor.withAlphaComponent(0.35).cgColor)
+                context.fillPath()
+                context.setFillColor(Theme.gutterText.cgColor)
+                for dot in -1...1 {
+                    context.fillEllipse(in: CGRect(x: pill.midX + CGFloat(dot) * 6 - 1.5, y: pill.midY - 1.5, width: 3, height: 3))
                 }
             }
 
@@ -860,7 +936,9 @@ final class EditorView: NSView {
                     context.fill(CGRect(x: rect.minX, y: rect.minY + metrics.ascent + 2, width: rect.width, height: 1))
                 }
             }
-            for diagnostic in line.diagnostics {
+            // Only errors and warnings are underlined. Information and hints
+            // stay as the gutter dot so missing type hints do not clutter text.
+            for diagnostic in line.diagnostics where !diagnostic.unnecessary && diagnostic.severity <= 2 {
                 context.setFillColor(Theme.diagnostic(diagnostic.severity).cgColor)
                 for rect in span(diagnostic.start, diagnostic.end, 1, 0) {
                     context.fill(CGRect(x: rect.minX, y: rect.maxY - 2, width: rect.width, height: 1))
@@ -900,9 +978,13 @@ final class EditorView: NSView {
             context.setFillColor(hasBreakpoint ? NSColor.white.cgColor : (hasCaret ? Theme.accent : Theme.gutterText).cgColor)
             context.textPosition = CGPoint(x: gutterRight - width, y: top + metrics.ascent)
             CTLineDraw(number, context)
-            if let severity = line.diagnostics.map(\.severity).min() {
+            if let severity = line.diagnostics.filter({ !$0.unnecessary }).map(\.severity).min() {
                 context.setFillColor(Theme.diagnostic(severity).cgColor)
                 context.fill(CGRect(x: gutterRight + 3, y: top + lineHeight / 2 - 2, width: 4, height: 4))
+            }
+            if line.foldable, !wrapSuspended, line.folded || pointerInGutter {
+                drawFoldChevron(in: context, folded: line.folded,
+                                center: CGPoint(x: gutterRight + 16, y: top + lineHeight / 2))
             }
             if let change = gitLineChanges[line.line + 1] {
                 let color: NSColor = switch change {
@@ -915,6 +997,26 @@ final class EditorView: NSView {
                 context.fill(CGRect(x: 1, y: top, width: 3, height: markerHeight))
             }
         }
+    }
+
+    /// A small chevron: points right while folded, down while open.
+    private func drawFoldChevron(in context: CGContext, folded: Bool, center c: CGPoint) {
+        context.saveGState()
+        context.setStrokeColor(Theme.gutterText.cgColor)
+        context.setLineWidth(1.4)
+        context.setLineCap(.round)
+        context.setLineJoin(.round)
+        if folded {
+            context.move(to: CGPoint(x: c.x - 1.5, y: c.y - 3.5))
+            context.addLine(to: CGPoint(x: c.x + 2, y: c.y))
+            context.addLine(to: CGPoint(x: c.x - 1.5, y: c.y + 3.5))
+        } else {
+            context.move(to: CGPoint(x: c.x - 3.5, y: c.y - 1.5))
+            context.addLine(to: CGPoint(x: c.x, y: c.y + 2))
+            context.addLine(to: CGPoint(x: c.x + 3.5, y: c.y - 1.5))
+        }
+        context.strokePath()
+        context.restoreGState()
     }
 
     /// UTF-16 columns of the whitespace that `renderWhitespace` marks in
@@ -993,7 +1095,9 @@ final class EditorView: NSView {
     /// A colored layout is intentionally not cached: style runs, selection
     /// and macOS appearance change independently while plain layouts are
     /// shared for drawing, hit-testing and scrolling.
-    func syntaxLayout(for text: String, styles: [StyleRun]) -> CTLine {
+    static let fadedAlpha: CGFloat = 0.45
+
+    func syntaxLayout(for text: String, styles: [StyleRun], faded: [Range<Int>] = []) -> CTLine {
         // No `kCTForegroundColorFromContextAttributeName` here: it makes
         // CoreText draw every run in the context's fill color, so all syntax
         // colors came out as `textColor`. Unstyled text gets it explicitly.
@@ -1008,6 +1112,31 @@ final class EditorView: NSView {
                                     value: Theme.syntax(style.scope, appearance: effectiveAppearance),
                                     range: NSRange(location: start, length: end - start))
         }
+        for range in faded {
+            let start = min(range.lowerBound, length)
+            let end = min(range.upperBound, length)
+            guard start < end else { continue }
+            let target = NSRange(location: start, length: end - start)
+            // Keep each run's own colour, only lower its opacity.
+            attributed.enumerateAttribute(.foregroundColor, in: target) { value, run, _ in
+                let color = (value as? NSColor) ?? base
+                attributed.addAttribute(.foregroundColor, value: color.withAlphaComponent(Self.fadedAlpha), range: run)
+            }
+        }
         return CTLineCreateWithAttributedString(attributed)
+    }
+}
+
+extension EditorView: NSViewToolTipOwner {
+    nonisolated func view(_ view: NSView, stringForToolTip tag: NSView.ToolTipTag,
+                          point: NSPoint, userData data: UnsafeMutableRawPointer?) -> String {
+        MainActor.assumeIsolated {
+            guard let document, !wrapSuspended else { return "" }
+            switch document.foldState(line: line(atY: point.y).line) {
+            case .plain: return ""
+            case .expanded: return "Click to collapse the range."
+            case .folded: return "Click to expand the range."
+            }
+        }
     }
 }
