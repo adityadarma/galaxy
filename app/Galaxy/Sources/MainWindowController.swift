@@ -4878,7 +4878,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 }
             }
         }
-        restoreTabs(from: session)
+        // Opening the folder already restored its own saved session. Doing
+        // it twice would add the extra groups a second time.
+        if allTabs.isEmpty { restoreTabs(from: session) }
         if restoredWorkspace { setSidebarVisible(session.sidebarVisible) }
         Log.app.info("restored session: workspace \(restoredWorkspace), \(self.allTabs.count) tabs")
         return restoredWorkspace || !allTabs.isEmpty
@@ -5713,9 +5715,12 @@ extension MainWindowController {
         updateEditedState()
     }
 
-    /// Opens a copy of `tab` in a new group beside its own (VS Code "Split Right/Down").
+    /// Moves `tab` into a new group beside its own (VS Code "Split Right/Down").
+    /// A group's only tab stays put and is opened a second time instead:
+    /// moving it would leave nothing to split.
     func splitEditor(_ tab: EditorTab, vertical: Bool) {
-        guard tab.isDocument, let source = group(containing: tab) else { return NSSound.beep() }
+        guard tab.isDocument, let source = group(containing: tab),
+              let index = source.tabs.firstIndex(where: { $0 === tab }) else { return NSSound.beep() }
         if isMarkdownPreviewShown {
             isMarkdownPreviewOn = false
             updateMarkdownPreview()
@@ -5723,19 +5728,24 @@ extension MainWindowController {
         if source !== activeGroup { activateGroup(source) }
         editorView.flushPendingUpdates()
         if groups.count == 1 { groupsSplitView.isVertical = vertical }
-        let copy = EditorTab(doc: tab.doc, title: tab.title, pathComponents: tab.pathComponents,
-                             windowTitle: tab.windowTitle, isPreview: false, status: tab.status)
-        copy.fileKey = tab.fileKey
-        copy.relPath = tab.relPath
-        copy.isEdited = tab.isEdited
-        copy.isDeletedOnDisk = tab.isDeletedOnDisk
-        copy.scrollY = tab === shownTab ? scrollView.contentView.bounds.origin.y : tab.scrollY
+        if tab === shownTab { tab.scrollY = scrollView.contentView.bounds.origin.y }
         let group = makeGroup(at: activeGroupIndex + 1)
-        group.tabs = [copy]
-        group.activeIndex = 0
+        if source.tabs.count > 1 {
+            moveTab(from: source, at: index, to: group, at: nil)
+        } else {
+            let copy = EditorTab(doc: tab.doc, title: tab.title, pathComponents: tab.pathComponents,
+                                 windowTitle: tab.windowTitle, isPreview: false, status: tab.status)
+            copy.fileKey = tab.fileKey
+            copy.relPath = tab.relPath
+            copy.isEdited = tab.isEdited
+            copy.isDeletedOnDisk = tab.isDeletedOnDisk
+            copy.scrollY = tab.scrollY
+            group.tabs = [copy]
+            group.activeIndex = 0
+            activateGroup(group)
+        }
         groupsSplitView.layoutSubtreeIfNeeded()
         groupsSplitView.equalize()
-        activateGroup(group)
     }
 
     /// Puts every group's tabs in the active group, in group order.

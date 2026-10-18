@@ -436,9 +436,9 @@ final class TabTests: XCTestCase {
         c.closeEditorSplit(nil)
 
         try choose(try rightClickMenu(c, tab: 1), "Close to the Right")
-        XCTAssertEqual(titles(c), ["a.txt", "b.txt"])
+        XCTAssertEqual(titles(c), ["a.txt", "c.txt"], "b.txt moved to the split and joined back last")
         try choose(try rightClickMenu(c, tab: 1), "Close Others")
-        XCTAssertEqual(titles(c), ["b.txt"])
+        XCTAssertEqual(titles(c), ["c.txt"])
         try c.openFile(at: file("c.txt"))
         try choose(try rightClickMenu(c, tab: 0), "Close Saved")
         XCTAssertTrue(c.tabBar.items.isEmpty)

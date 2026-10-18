@@ -29,7 +29,7 @@ final class EditorGroupTests: XCTestCase {
     private func file(_ name: String) -> URL { root.appendingPathComponent(name) }
     private func titles(_ group: EditorGroup) -> [String] { group.tabs.map(\.title) }
 
-    func testSplitRightMakesASecondGroupSharingTheDocument() throws {
+    func testSplitRightMovesTheTabIntoASecondGroup() throws {
         let c = makeController()
         defer { c.window?.orderOut(nil) }
         try c.openFile(at: file("a.txt"))
@@ -39,11 +39,20 @@ final class EditorGroupTests: XCTestCase {
         XCTAssertEqual(c.groups.count, 2)
         XCTAssertTrue(c.isEditorSplit)
         XCTAssertEqual(c.activeGroupIndex, 1, "the new group takes focus")
-        XCTAssertEqual(titles(c.groups[0]), ["a.txt", "b.txt"])
+        XCTAssertEqual(titles(c.groups[0]), ["a.txt"], "the tab left its group")
         XCTAssertEqual(titles(c.groups[1]), ["b.txt"])
-        XCTAssertTrue(c.groups[0].tabs[1].doc === c.groups[1].tabs[0].doc, "one buffer for both tabs")
         XCTAssertEqual(c.tabBar.items.map(\.title), ["b.txt"], "the tab bar shows the active group")
-        XCTAssertEqual(c.groups[0].pane?.tabBar.items.map(\.title), ["a.txt", "b.txt"])
+        XCTAssertEqual(c.groups[0].pane?.tabBar.items.map(\.title), ["a.txt"])
+    }
+
+    func testSplitRightOfAGroupsOnlyTabOpensItTwice() throws {
+        let c = makeController()
+        defer { c.window?.orderOut(nil) }
+        try c.openFile(at: file("a.txt"))
+        c.splitEditorRight(nil)
+        XCTAssertEqual(titles(c.groups[0]), ["a.txt"], "moving it would leave nothing to split")
+        XCTAssertEqual(titles(c.groups[1]), ["a.txt"])
+        XCTAssertTrue(c.groups[0].tabs[0].doc === c.groups[1].tabs[0].doc, "one buffer for both tabs")
     }
 
     func testEditsShowInBothTabsAndClosingOneDoesNotAsk() throws {
@@ -88,7 +97,7 @@ final class EditorGroupTests: XCTestCase {
 
         XCTAssertTrue(c.activeGroup === first)
         XCTAssertEqual(c.activeTab?.title, "a.txt")
-        XCTAssertEqual(c.tabBar.items.map(\.title), ["a.txt", "b.txt"])
+        XCTAssertEqual(c.tabBar.items.map(\.title), ["a.txt"])
         XCTAssertEqual(c.groups[1].pane?.tabBar.items.map(\.title), ["b.txt"])
         XCTAssertEqual(c.editorView.document?.lines(first: 0, count: 1), ["a.txt"])
     }
@@ -104,7 +113,7 @@ final class EditorGroupTests: XCTestCase {
         let tab = c.groups[0].tabs[0]      // a
         c.moveTab(from: c.groups[0], at: 0, to: c.groups[1], at: nil)
 
-        XCTAssertEqual(titles(c.groups[0]), ["b.txt", "c.txt"])
+        XCTAssertEqual(titles(c.groups[0]), ["b.txt"])
         XCTAssertEqual(titles(c.groups[1]), ["c.txt", "a.txt"])
         XCTAssertTrue(c.activeTab === tab)
         XCTAssertEqual(c.activeGroupIndex, 1)
@@ -185,7 +194,7 @@ final class EditorGroupTests: XCTestCase {
         c.splitEditorRight(nil)
         try c.openFile(at: file("c.txt"))
         let session = c.currentSession()
-        XCTAssertEqual(session.tabs.map { ($0.path as NSString).lastPathComponent }, ["a.txt", "b.txt"])
+        XCTAssertEqual(session.tabs.map { ($0.path as NSString).lastPathComponent }, ["a.txt"])
         XCTAssertEqual(session.extraGroups?.count, 1)
         XCTAssertEqual(session.extraGroups?[0].tabs.map { ($0.path as NSString).lastPathComponent }, ["b.txt", "c.txt"])
         XCTAssertEqual(session.activeGroup, 1)
@@ -194,10 +203,32 @@ final class EditorGroupTests: XCTestCase {
         defer { other.window?.orderOut(nil) }
         other.restore(session)
         XCTAssertEqual(other.groups.count, 2)
-        XCTAssertEqual(other.groups[0].tabs.map(\.title), ["a.txt", "b.txt"])
+        XCTAssertEqual(other.groups[0].tabs.map(\.title), ["a.txt"])
         XCTAssertEqual(other.groups[1].tabs.map(\.title), ["b.txt", "c.txt"])
         XCTAssertEqual(other.activeGroupIndex, 1)
-        XCTAssertTrue(other.groups[0].tabs[1].doc === other.groups[1].tabs[0].doc)
+    }
+
+    func testRestoringAFolderSessionDoesNotAddTheGroupsTwice() throws {
+        let c = makeController()
+        defer { c.window?.orderOut(nil) }
+        try c.openWorkspace(at: root)
+        let workspaceSession = Session.workspaceURL(for: try XCTUnwrap(c.workspace).root())
+        defer { try? FileManager.default.removeItem(at: workspaceSession) }
+        try c.openFile(at: file("a.txt"))
+        try c.openFile(at: file("b.txt"))
+        c.splitEditorRight(nil)
+        c.saveWorkspaceSessionForQuit()
+        XCTAssertNotNil(Session.load(from: workspaceSession), "the folder's own session was saved")
+        let session = c.currentSession()
+
+        // The folder's own saved session and the window's session both
+        // describe the same groups; only one of them may be applied.
+        let other = makeController()
+        defer { other.window?.orderOut(nil) }
+        XCTAssertTrue(other.restore(session))
+        XCTAssertEqual(other.groups.count, 2)
+        XCTAssertEqual(other.groups[0].tabs.map(\.title), ["a.txt"])
+        XCTAssertEqual(other.groups[1].tabs.map(\.title), ["b.txt"])
     }
 
     func testOldSessionsWithoutGroupsStillDecode() throws {

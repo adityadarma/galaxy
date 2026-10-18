@@ -188,6 +188,29 @@ final class EditorViewTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(large.textOriginX, large.gutterWidth)
     }
 
+    func testDividerShowsOnlyBesideIndentedText() throws {
+        // 0 "x {", 1 "    a", 2 "" (inside the block), 3 "    b", 4 "}", 5 "" (outside), 6 "c"
+        let (view, _, url) = try makeView(text: "x {\n    a\n\n    b\n}\n\nc")
+        defer { try? FileManager.default.removeItem(at: url) }
+        view.forcedCaretVisible = false
+        view.appearance = NSAppearance(named: .aqua)
+        let rep = try bitmap(view)
+        let h = view.metrics.lineHeight
+        let dividerX = view.gutterWidth - 0.5
+        let backgroundX = view.textOriginX + 400
+        func hasDivider(line: Int) throws -> Bool {
+            let y = (CGFloat(line) + 0.5) * h
+            return abs(try luminance(rep, view, x: dividerX, y: y) - luminance(rep, view, x: backgroundX, y: y)) > 0.01
+        }
+        XCTAssertFalse(try hasDivider(line: 0), "text at column 0 touches the divider")
+        XCTAssertTrue(try hasDivider(line: 1), "indented text")
+        XCTAssertTrue(try hasDivider(line: 2), "blank line inside the block keeps it")
+        XCTAssertTrue(try hasDivider(line: 3))
+        XCTAssertFalse(try hasDivider(line: 4))
+        XCTAssertFalse(try hasDivider(line: 5), "blank line outside any block")
+        XCTAssertFalse(try hasDivider(line: 6))
+    }
+
     func testCaretIsDrawnOnlyWhenVisible() throws {
         let (view, _, url) = try makeView(text: "      \nsecond")
         defer { try? FileManager.default.removeItem(at: url) }

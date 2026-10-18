@@ -703,6 +703,37 @@ final class EditorView: NSView {
         context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
 
         let stylesByLine = Dictionary(grouping: snapshot.styles, by: { $0.line })
+        // Blank lines inside an indented block keep the divider and guides.
+        // Their indent is the smaller of the nearest non-blank lines around
+        // them; neighbours outside the viewport are read once per draw.
+        let visibleTexts = Dictionary(snapshot.lines.map { (Int($0.line), $0.text) }, uniquingKeysWith: { first, _ in first })
+        let scanLimit = 100
+        let total = lineCount
+        var padded: (first: Int, lines: [String])?
+        let textOfLine = { (index: Int) -> String? in
+            guard index >= 0, index < total else { return nil }
+            if let text = visibleTexts[index] { return text }
+            if padded == nil {
+                let first = max(0, range.lowerBound - scanLimit)
+                let last = min(total, range.upperBound + scanLimit)
+                padded = (first, document.lines(first: UInt64(first), count: UInt64(last - first)))
+            }
+            guard let padded, index >= padded.first, index - padded.first < padded.lines.count else { return nil }
+            return padded.lines[index - padded.first]
+        }
+        let scopeIndent = { (line: Int) -> Int in
+            func nearestIndent(step: Int) -> Int? {
+                var index = line + step
+                while index >= 0, index < total, abs(index - line) <= scanLimit {
+                    guard let text = textOfLine(index) else { return nil }
+                    if !text.allSatisfy(\.isWhitespace) { return Self.leadingIndentColumns(in: text) }
+                    index += step
+                }
+                return nil
+            }
+            guard let above = nearestIndent(step: -1), let below = nearestIndent(step: 1) else { return 0 }
+            return min(above, below)
+        }
         for line in snapshot.lines {
             let rows = lineRows(line.line)
             let top = rowTop(of: line.line)
@@ -733,17 +764,22 @@ final class EditorView: NSView {
                 context.fill(CGRect(x: 0, y: top, width: bounds.width, height: block))
             }
 
-            // Subtle divider between line numbers and source text. Lines whose
-            // text starts at column 0 touch it, so the divider skips them.
+            // Subtle divider between line numbers and source text. Only lines
+            // with indented text get it: empty and blank lines have nothing
+            // beside it, and text at column 0 would touch it.
+            let isBlank = line.text.allSatisfy(\.isWhitespace)
             let startsAtDivider = line.text.first.map { $0 != " " && $0 != "\t" } ?? false
-            if !startsAtDivider {
+            // A blank line is part of the block around it, so it takes that indent.
+            let indentColumns = isBlank
+                ? max(Self.leadingIndentColumns(in: line.text), scopeIndent(Int(line.line)))
+                : Self.leadingIndentColumns(in: line.text)
+            if isBlank ? indentColumns > 0 : !startsAtDivider {
                 context.setFillColor(NSColor.separatorColor.withAlphaComponent(0.28).cgColor)
                 context.fill(CGRect(x: gutterWidth - 1, y: top, width: 1, height: block))
             }
 
             // Indent guides sit behind text and whitespace markers. Draw one
             // guide for each complete four-space indentation level.
-            let indentColumns = leadingIndentColumns(in: line.text)
             if indentColumns >= 4 {
                 context.setFillColor(NSColor.separatorColor.withAlphaComponent(0.16).cgColor)
                 var column = 4
@@ -898,7 +934,7 @@ final class EditorView: NSView {
         return columns
     }
 
-    private func leadingIndentColumns(in text: String) -> Int {
+    private nonisolated static func leadingIndentColumns(in text: String) -> Int {
         var columns = 0
         for character in text {
             switch character {
