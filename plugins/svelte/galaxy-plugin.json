@@ -1,0 +1,16 @@
+{
+  "id": "svelte-language-server",
+  "name": "Svelte Language Server",
+  "version": "0.18.5",
+  "description": "Svelte components. Installs into the plugin folder with npm and runs with its own TypeScript.",
+  "languages": ["svelte"],
+  "server": {
+    "command": ["${pluginDir}/node_modules/.bin/svelteserver"],
+    "args": ["--stdio"]
+  },
+  "install": {
+    "steps": [
+      ["npm", "install", "--prefix", "${pluginDir}", "--no-audit", "--no-fund", "--loglevel=error", "typescript@5.9.3", "svelte-language-server@0.18.5"]
+    ]
+  }
+}

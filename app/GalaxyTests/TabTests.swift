@@ -370,6 +370,33 @@ final class TabTests: XCTestCase {
         }
     }
 
+    /// Right click in the editor text gets VSCode's editor menu, and a click
+    /// outside the selection moves the caret under the pointer first.
+    func testEditorContextMenuHasVSCodeItems() throws {
+        let c = makeController()
+        defer { c.window?.orderOut(nil) }
+        try c.openFile(at: file("a.txt"))
+        c.window?.contentView?.layoutSubtreeIfNeeded()
+
+        let menu = try XCTUnwrap(c.editorContextMenu())
+        let titles = menu.items.filter { !$0.isSeparatorItem }.map(\.title)
+        XCTAssertEqual(titles, [
+            "Go to Definition", "Go to Type Definition", "Go to Implementations", "Go to References",
+            "Find All References", "Rename Symbol", "Change All Occurrences", "Format Document",
+            "Refactor…", "Source Action…", "Cut", "Copy", "Paste", "Command Palette…",
+        ])
+        XCTAssertEqual(menu.items.filter(\.isSeparatorItem).count, 4)
+
+        let local = NSPoint(x: c.editorView.textOriginX + 2, y: c.editorView.metrics.lineHeight / 2)
+        let point = c.editorView.convert(local, to: nil)
+        let event = try XCTUnwrap(NSEvent.mouseEvent(with: .rightMouseDown, location: point, modifierFlags: [],
+                                                     timestamp: 0, windowNumber: c.window?.windowNumber ?? 0,
+                                                     context: nil, eventNumber: 0, clickCount: 1, pressure: 1))
+        c.editorView.document?.selectAll()
+        XCTAssertNotNil(c.editorView.menu(for: event))
+        XCTAssertEqual(c.editorView.selectedRange().length, 5, "a click inside the selection keeps it")
+    }
+
     func testPinnedTabsMoveFirstAndOnlyCloseThemselves() throws {
         let c = makeController()
         defer { c.window?.orderOut(nil) }

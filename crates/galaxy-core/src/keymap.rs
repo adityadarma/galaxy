@@ -250,6 +250,7 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("cmd+,", "galaxy.openSettings"),
     ("shift+cmd+n", "workbench.action.newWindow"),
     ("cmd+.", "editor.action.quickFix"),
+    ("ctrl+space", "editor.action.triggerSuggest"),
     ("shift+alt+f", "editor.action.formatDocument"),
     ("shift+cmd+x", "workbench.view.extensions"),
     // Second keys, as in VSCode. The first key of a command stays the

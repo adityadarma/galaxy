@@ -52,6 +52,9 @@ const BUILTIN_MANIFESTS: &[&str] = &[
     include_str!("../../../../plugins/phpactor/galaxy-plugin.json"),
     include_str!("../../../../plugins/laravel/galaxy-plugin.json"),
     include_str!("../../../../plugins/vue/galaxy-plugin.json"),
+    include_str!("../../../../plugins/svelte/galaxy-plugin.json"),
+    include_str!("../../../../plugins/sourcekit-lsp/galaxy-plugin.json"),
+    include_str!("../../../../plugins/dart/galaxy-plugin.json"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -638,7 +641,14 @@ mod tests {
             "already installed"
         );
         // Every built-in server needs an install, none falls back to PATH.
-        for plugin in &catalog.plugins {
+        // SourceKit-LSP and the Dart analysis server ship with their SDKs and
+        // have nothing to install.
+        for plugin in catalog.plugins.iter().filter(|plugin| {
+            !matches!(
+                plugin.manifest.id.as_str(),
+                "sourcekit-lsp" | "dart-analysis-server"
+            )
+        }) {
             assert!(plugin.manifest.has_install_work(), "{}", plugin.manifest.id);
             assert!(
                 plugin
@@ -767,6 +777,33 @@ mod tests {
             config.initialization_options["typescript"]["tsdk"],
             "/p/vue/node_modules/typescript/lib"
         );
+        let (ts, _) = catalog.primary("TypeScript", None, &find).unwrap();
+        assert_eq!(ts.manifest.id, "typescript-language-server");
+    }
+
+    #[test]
+    fn svelte_resolves_to_its_own_server_with_a_bundled_typescript() {
+        let bare = Catalog::builtin();
+        let find = fake_find(&[]);
+        assert!(bare.primary("Svelte", None, &find).is_none());
+        assert!(
+            bare.get("svelte-language-server")
+                .unwrap()
+                .installable(&find)
+        );
+        let mut catalog = Catalog::builtin_with_dirs();
+        let plugin = catalog
+            .plugins
+            .iter_mut()
+            .find(|p| p.manifest.id == "svelte-language-server")
+            .unwrap();
+        plugin.dir = Some(PathBuf::from("/p/svelte"));
+        plugin.builtin = false;
+        let find = |program: &str| Some(PathBuf::from(program));
+        let (plugin, config) = catalog.primary("Svelte", None, &find).unwrap();
+        assert_eq!(plugin.manifest.id, "svelte-language-server");
+        assert_eq!(config.program, "/p/svelte/node_modules/.bin/svelteserver");
+        assert_eq!(config.args, ["--stdio"]);
         let (ts, _) = catalog.primary("TypeScript", None, &find).unwrap();
         assert_eq!(ts.manifest.id, "typescript-language-server");
     }

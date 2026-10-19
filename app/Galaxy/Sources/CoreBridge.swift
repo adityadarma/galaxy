@@ -44,6 +44,25 @@ final class CoreBridge {
         (try? core.startLsp(document: document, language: language, root: root)) ?? false
     }
 
+    /// Starts the project's language servers before any file is open, so
+    /// they index in the background.
+    @discardableResult
+    func warmUpLSP(root: String) -> UInt64 {
+        core.warmUpLsp(root: root)
+    }
+
+    /// Applies the installed plugin set to a document's servers: starts
+    /// missing ones (also companions), restarts changed ones, keeps the rest.
+    /// False when no server serves the document afterwards.
+    func refreshLSPPlugins(document: DocumentHandle, language: String, root: String) throws -> Bool {
+        try core.refreshLspPlugins(document: document, language: language, root: root)
+    }
+
+    /// What the user can do when no language server can run for `language`.
+    func lspUnavailableHint(language: String, root: String) -> String? {
+        core.lspUnavailableHint(language: language, root: root)
+    }
+
     func pollLSP() {
         _ = core.pollLsp()
     }

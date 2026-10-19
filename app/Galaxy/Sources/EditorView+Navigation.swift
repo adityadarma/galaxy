@@ -155,6 +155,23 @@ extension EditorView {
         reloadDocument()
     }
 
+    /// Right click in the text. As in VSCode, a click outside the selection
+    /// moves the caret there first so the menu acts on what was clicked.
+    override func menu(for event: NSEvent) -> NSMenu? {
+        guard let document, let onContextMenu else { return super.menu(for: event) }
+        let local = convert(event.locationInWindow, from: nil)
+        guard local.x >= gutterWidth else { return nil }
+        window?.makeFirstResponder(self)
+        let pos = textPosition(at: local)
+        let selection = selectedRange()
+        let offset = Int(document.utf16Offset(pos: pos))
+        if selection.length == 0 || offset < selection.location || offset > selection.location + selection.length {
+            document.setCaret(pos: pos)
+            reloadDocument()
+        }
+        return onContextMenu()
+    }
+
     override func mouseDragged(with event: NSEvent) {
         guard let document else { return }
         autoscroll(with: event)

@@ -199,6 +199,9 @@ final class EditorView: NSView {
     var onTextInput: ((String) -> Void)?
     var onSnippetInvalidated: (() -> Void)?
     var onDefinitionClick: ((TextPos) -> Bool)?
+    /// Builds the right-click menu for the text area. Called after the
+    /// caret has moved under the click.
+    var onContextMenu: (() -> NSMenu?)?
     /// Word under the mouse while Cmd is held: drawn as a link so the user
     /// sees what Cmd+click will open. UTF-16 columns on one line.
     var definitionLink: (line: UInt64, start: UInt64, end: UInt64)? {

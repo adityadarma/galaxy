@@ -927,6 +927,12 @@ const BUILTIN: &[(&str, &str, &str, &[&str])] = &[
         &["quick fix", "refactor", "lightbulb"],
     ),
     (
+        "editor.action.triggerSuggest",
+        "Edit",
+        "Trigger Suggest",
+        &["intellisense", "completion", "autocomplete"],
+    ),
+    (
         "editor.action.formatDocument",
         "Edit",
         "Format Document",

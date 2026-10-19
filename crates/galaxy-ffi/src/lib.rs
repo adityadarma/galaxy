@@ -88,6 +88,31 @@ fn plugins_dir() -> Result<PathBuf, CoreError> {
     plugin_install_mod::default_dir().ok_or_else(|| plugin_error("HOME is not set".into()))
 }
 
+/// Languages a project uses, judged by well-known files in its root.
+fn project_languages(root: &Path) -> Vec<&'static str> {
+    const MARKERS: &[(&str, &[&str])] = &[
+        ("rust", &["Cargo.toml"]),
+        ("php", &["composer.json"]),
+        ("typescript", &["tsconfig.json", "package.json"]),
+        (
+            "python",
+            &["pyproject.toml", "requirements.txt", "setup.py"],
+        ),
+        ("go", &["go.mod"]),
+        ("swift", &["Package.swift"]),
+        ("dart", &["pubspec.yaml"]),
+        (
+            "svelte",
+            &["svelte.config.js", "svelte.config.mjs", "svelte.config.ts"],
+        ),
+    ];
+    MARKERS
+        .iter()
+        .filter(|(_, files)| files.iter().any(|file| root.join(file).is_file()))
+        .map(|(language, _)| *language)
+        .collect()
+}
+
 /// Built-in plugins plus those installed; problems are logged, not fatal.
 fn load_catalog() -> Catalog {
     let Some(dir) = plugin_install_mod::default_dir() else {
@@ -712,6 +737,139 @@ impl Core {
             .unwrap_or_else(|e| e.into_inner())
             .insert(uri, document);
         Ok(true)
+    }
+
+    /// Applies the plugin set that is installed now to one document: starts
+    /// servers that were missing (including companions such as laravel-lsp),
+    /// restarts those whose command changed, and stops those that no longer
+    /// resolve. Servers that are unchanged keep running. Returns whether a
+    /// server serves the document afterwards.
+    pub fn refresh_lsp_plugins(
+        &self,
+        document: Arc<DocumentHandle>,
+        language: String,
+        root: String,
+    ) -> Result<bool, CoreError> {
+        let path = document.path();
+        if path.is_empty() {
+            return Ok(false);
+        }
+        let key = LspKey {
+            language: lsp_server_language(&language),
+            root: PathBuf::from(&root),
+        };
+        let uri = file_uri(Path::new(&path));
+        let registered = self
+            .lsp_documents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&uri);
+        if !registered {
+            return self.start_lsp(document, language, root);
+        }
+        let (settings, errors) = LspSettings::load(
+            LspSettings::global_settings_path().as_deref(),
+            Some(&key.root),
+        );
+        for error in errors {
+            tracing::warn!(%error, "ignoring invalid LSP settings");
+        }
+        let catalog = load_catalog();
+        let fresh = settings.resolve_in(&language, Some(&key.root), &catalog);
+        let mut lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(config) = fresh else {
+            // The plugin was uninstalled or disabled and nothing replaces it.
+            for companion in lsp.companion_keys(&uri) {
+                lsp.stop_server(&companion);
+            }
+            lsp.stop_server(&key);
+            return Ok(false);
+        };
+        lsp.apply_config(&key, &config)?;
+        let companions = companion_servers(&catalog, &language, Some(&key.root), &config);
+        let language_id = lsp_language_id(&language, &path);
+        let doc = document.lock().editor.doc.clone();
+        for (companion_language, companion) in &companions {
+            let companion_key = LspKey {
+                language: companion_language.clone(),
+                root: key.root.clone(),
+            };
+            // Optional extra: a failing companion must not block the primary.
+            if let Err(error) = lsp.apply_config(&companion_key, companion) {
+                tracing::warn!(%error, server = %companion_key.language, "could not start companion server");
+                continue;
+            }
+            if !lsp.companion_keys(&uri).contains(&companion_key)
+                && let Err(error) = lsp.open_companion(
+                    companion_key.clone(),
+                    uri.clone(),
+                    language_id.clone(),
+                    &doc,
+                )
+            {
+                tracing::warn!(%error, server = %companion_key.language, "could not open document in companion server");
+            }
+        }
+        for attached in lsp.companion_keys(&uri) {
+            if !companions
+                .iter()
+                .any(|(companion_language, _)| *companion_language == attached.language)
+            {
+                lsp.stop_server(&attached);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Why no server can run for `language`, when the user can fix it.
+    /// `None` when a server resolves or there is nothing useful to say.
+    pub fn lsp_unavailable_hint(&self, language: String, root: String) -> Option<String> {
+        let hint = match lsp_server_language(&language).as_str() {
+            "swift" => "Swift toolchain not found. Run xcode-select --install",
+            "dart" => {
+                "Dart SDK not found. Install Flutter or Dart, or set DART_SDK or FLUTTER_ROOT"
+            }
+            _ => return None,
+        };
+        let root = PathBuf::from(root);
+        let (settings, _) =
+            LspSettings::load(LspSettings::global_settings_path().as_deref(), Some(&root));
+        let catalog = load_catalog();
+        settings
+            .resolve_in(&language, Some(&root), &catalog)
+            .is_none()
+            .then(|| hint.to_owned())
+    }
+
+    /// Starts the language servers a project needs as soon as its folder is
+    /// opened, so they index while no file is open yet. Languages come from
+    /// marker files in `root`. Missing servers are skipped. Returns how many
+    /// servers were spawned.
+    pub fn warm_up_lsp(&self, root: String) -> u64 {
+        let root = PathBuf::from(root);
+        let (settings, errors) =
+            LspSettings::load(LspSettings::global_settings_path().as_deref(), Some(&root));
+        for error in errors {
+            tracing::warn!(%error, "ignoring invalid LSP settings");
+        }
+        let catalog = load_catalog();
+        let mut lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
+        let mut started = 0;
+        for language in project_languages(&root) {
+            let Some(config) = settings.resolve_in(language, Some(&root), &catalog) else {
+                continue;
+            };
+            let key = LspKey {
+                language: lsp_server_language(language),
+                root: root.clone(),
+            };
+            match lsp.ensure_server(key, &config) {
+                Ok(true) => started += 1,
+                Ok(false) => {}
+                Err(error) => tracing::warn!(%error, language, "could not warm up language server"),
+            }
+        }
+        started
     }
 
     /// Polls all running default servers and applies their latest diagnostics
@@ -4910,6 +5068,15 @@ mod tests {
                 message: "hi".into()
             }
         );
+    }
+
+    #[test]
+    fn project_languages_follow_marker_files() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(project_languages(dir.path()).is_empty());
+        std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+        std::fs::write(dir.path().join("composer.json"), "{}").unwrap();
+        assert_eq!(project_languages(dir.path()), ["rust", "php"]);
     }
 
     #[test]

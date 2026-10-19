@@ -905,6 +905,40 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         return menu
     }
 
+    /// Right click in the editor text, VSCode's editor context menu. Items
+    /// the language server or the buffer cannot serve right now are disabled.
+    func editorContextMenu() -> NSMenu? {
+        guard activeTab?.isDocument == true, editorView.document != nil else { return nil }
+        let readOnly = editorView.isReadOnly
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        func add(_ title: String, _ action: Selector, target: AnyObject? = nil, enabled: Bool = true) {
+            let item = menu.addItem(withTitle: title, action: action, keyEquivalent: "")
+            item.target = target ?? self
+            item.isEnabled = enabled
+        }
+        add("Go to Definition", #selector(goToDefinition(_:)))
+        add("Go to Type Definition", #selector(goToTypeDefinition(_:)))
+        add("Go to Implementations", #selector(goToImplementation(_:)))
+        add("Go to References", #selector(findReferences(_:)))
+        menu.addItem(.separator())
+        add("Find All References", #selector(findReferences(_:)))
+        menu.addItem(.separator())
+        add("Rename Symbol", #selector(renameSymbol(_:)), enabled: !readOnly)
+        add("Change All Occurrences", #selector(EditorView.selectAllOccurrences(_:)), target: editorView)
+        add("Format Document", #selector(formatDocument(_:)), enabled: !readOnly)
+        add("Refactor…", #selector(showCodeActions(_:)), enabled: !readOnly)
+        add("Source Action…", #selector(showCodeActions(_:)), enabled: !readOnly)
+        menu.addItem(.separator())
+        add("Cut", #selector(EditorView.cut(_:)), target: editorView, enabled: !readOnly)
+        add("Copy", #selector(EditorView.copy(_:)), target: editorView)
+        add("Paste", #selector(EditorView.paste(_:)), target: editorView, enabled: !readOnly)
+        menu.addItem(.separator())
+        add("Command Palette…", #selector(showCommandPalette(_:)))
+        keybindings.apply(to: menu)
+        return menu
+    }
+
     /// The tab a tab-menu item was made for, if the sender is one.
     private func menuTab(_ sender: Any?) -> EditorTab? {
         guard let tab = (sender as? NSMenuItem)?.representedObject as? EditorTab else { return nil }
@@ -1170,6 +1204,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         editorView.onDefinitionClick = { [weak self] position in
             self?.requestDefinition(at: position) ?? false
         }
+        editorView.onContextMenu = { [weak self] in self?.editorContextMenu() }
         editorView.onCursorChange = { [weak self] primary, count in
             if let self,
                let document = self.activeTab?.doc,
@@ -1853,7 +1888,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         return HoverPopover.placement(size: size, anchor: anchor, in: visible)
     }
 
-    private func requestCompletionIfNeeded() {
+    /// Ctrl+Space: ask for suggestions now, even with nothing typed and
+    /// after Escape closed the list.
+    @objc func triggerSuggest(_ sender: Any?) {
+        guard activeTab?.isDocument == true, !editorView.isReadOnly else { NSSound.beep(); return }
+        completionDismissed = false
+        requestCompletionIfNeeded(force: true)
+    }
+
+    private func requestCompletionIfNeeded(force: Bool = false) {
         guard let document = activeTab?.doc else { return }
         let position = document.primaryCursor()
         completionPosition = TextPos(line: position.line, colUtf16: position.colUtf16)
@@ -1864,7 +1907,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         completionQuery = prefix
         let beforePrefix = String(line.prefix(max(0, min(column, line.count))))
         let lspTrigger = beforePrefix.hasSuffix(".") || beforePrefix.hasSuffix("::") || beforePrefix.hasSuffix("->")
-        guard !prefix.isEmpty || lspTrigger else {
+        guard force || !prefix.isEmpty || lspTrigger else {
             snippetCompletionItems = []
             completionPopup.isHidden = true
             return
@@ -2893,8 +2936,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         applyDiffPane(for: tab)
         updateMarkdownPreview()
         let root = workspace?.root() ?? (tab.doc.path() as NSString).deletingLastPathComponent
+        statusBar.lspHint = nil
         if tab.isDocument {
-            _ = bridge.startLSP(document: tab.doc, language: tab.doc.syntaxLanguage() ?? StatusBar.language(for: tab.doc.path()), root: root)
+            let language = tab.doc.syntaxLanguage() ?? StatusBar.language(for: tab.doc.path())
+            if !bridge.startLSP(document: tab.doc, language: language, root: root) {
+                statusBar.lspHint = bridge.lspUnavailableHint(language: language, root: root)
+            }
         }
         if let y = tab.scrollY {
             scrollView.contentView.scroll(to: NSPoint(x: 0, y: y))
@@ -3564,12 +3611,31 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
-    /// Refreshes the list and restarts the active document's server so it
-    /// runs the plugin set that is now installed.
+    /// Refreshes the list, then brings every open file's servers in line with
+    /// the plugin set that is now installed.
     private func pluginsChanged() {
         refreshExtensions(network: false)
-        guard activeTab != nil, workspace != nil else { return }
-        restartLanguageServer(nil)
+        refreshLanguageServers()
+    }
+
+    /// Starts servers a new plugin adds (companions too), restarts those whose
+    /// command changed and leaves the rest running. Covers every open file,
+    /// not only the active tab, and the project's own servers.
+    private func refreshLanguageServers() {
+        guard let workspace else { return }
+        let root = workspace.root()
+        var failure: String?
+        for tab in allTabs where tab.isDocument {
+            let language = tab.doc.syntaxLanguage() ?? StatusBar.language(for: tab.doc.path())
+            do {
+                _ = try bridge.refreshLSPPlugins(document: tab.doc, language: language, root: root)
+            } catch {
+                failure = Self.describe(error)
+            }
+        }
+        bridge.warmUpLSP(root: root)
+        statusLabel.stringValue = failure.map { "Language server could not be started: \($0)" }
+            ?? "Language servers updated."
     }
 
     private static func describe(_ error: Error) -> String {
@@ -5037,6 +5103,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         // Ready by the time ⌘P is pressed in all but huge folders.
         rebuildFileFinder()
         startWatching(ws)
+        // Index right away; the status bar shows the server's progress.
+        bridge.warmUpLSP(root: ws.root())
         refreshGitStatus()
         explorer.setWorkspace(ws)
         updateSidebarContent()

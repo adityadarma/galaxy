@@ -304,7 +304,13 @@ fn builtin_plugins_install_locally_only_on_request() {
     assert!(catalog.get("phpactor").unwrap().builtin);
 
     // Every built-in is installed on request; unknown ids are rejected.
-    for id in ["rust-analyzer", "gopls", "pyright", "vue-language-server"] {
+    for id in [
+        "rust-analyzer",
+        "gopls",
+        "pyright",
+        "vue-language-server",
+        "svelte-language-server",
+    ] {
         let pending = install::fetch_builtin(dir, id).unwrap();
         install::discard(dir, &pending.token).unwrap();
     }

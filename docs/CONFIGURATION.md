@@ -124,10 +124,15 @@ Language server dikonfigurasi melalui resolver built-in berdasarkan bahasa:
 | Go | `gopls` (`go install`) |
 | PHP/Blade | `intelephense --stdio` (npm) atau `phpactor language-server` (composer), ditambah `laravel-lsp` di project Laravel |
 | Vue | `vue-language-server --stdio` (npm), lengkap dengan TypeScript sendiri |
+| Svelte | `svelteserver --stdio` (npm), lengkap dengan TypeScript sendiri |
+| Swift | `sourcekit-lsp` dari Xcode, Command Line Tools, atau toolchain swift.org (tanpa install) |
+| Dart/Flutter | `dart language-server` dari Dart SDK atau Flutter SDK (tanpa install) |
 
-Semua server bawaan tidak terpasang secara default dan tidak memakai `PATH`.
-Pasang dari panel Extensions (tombol Install); server masuk ke folder plugin
-Galaxy. Untuk memakai executable sendiri, isi `lsp.servers` di settings.
+Server bawaan berbasis npm, composer, atau unduhan tidak terpasang secara
+default dan tidak memakai `PATH`. Pasang dari panel Extensions (tombol
+Install); server masuk ke folder plugin Galaxy. Server Swift dan Dart sudah
+ikut SDK-nya: Galaxy mencarinya di lokasi SDK yang umum (untuk Dart juga
+`DART_SDK`, `FLUTTER_ROOT`, dan folder `flutter` di home). Untuk memakai executable sendiri, isi `lsp.servers` di settings.
 
 Executable override di `lsp.servers` boleh berupa path absolut atau nama yang
 ada di `PATH`. Galaxy membagi satu server per kombinasi bahasa dan workspace bila lifecycle server

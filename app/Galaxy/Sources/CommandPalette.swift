@@ -108,6 +108,7 @@ final class CommandPaletteView: NSView, NSTextFieldDelegate, NSTableViewDataSour
         "editor.action.goToReferences": #selector(MainWindowController.findReferences(_:)),
         "editor.action.rename": #selector(MainWindowController.renameSymbol(_:)),
         "editor.action.quickFix": #selector(MainWindowController.showCodeActions(_:)),
+        "editor.action.triggerSuggest": #selector(MainWindowController.triggerSuggest(_:)),
         "editor.action.formatDocument": #selector(MainWindowController.formatDocument(_:)),
         "workbench.action.toggleFullScreen": #selector(NSWindow.toggleFullScreen(_:)),
         "workbench.action.zoomIn": #selector(MainWindowController.zoomEditorIn(_:)),

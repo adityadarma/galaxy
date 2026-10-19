@@ -613,6 +613,115 @@ pub fn lsp_server_language(language: &str) -> String {
 }
 
 #[cfg(test)]
+mod sourcekit_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn fake_binary(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn sourcekit_lsp_comes_from_the_developer_dir_or_a_toolchain() {
+        let dir = tempfile::tempdir().unwrap();
+        let clt = dir.path().join("CommandLineTools");
+        let xcode = dir.path().join("Xcode/Developer");
+        let toolchains = dir.path().join("Toolchains");
+        assert_eq!(
+            find_sourcekit_lsp_in(std::slice::from_ref(&clt), &[], &[]),
+            None
+        );
+
+        let swiftorg = toolchains.join("swift-6.1-RELEASE.xctoolchain/usr/bin/sourcekit-lsp");
+        fake_binary(&swiftorg);
+        assert_eq!(
+            find_sourcekit_lsp_in(
+                std::slice::from_ref(&clt),
+                std::slice::from_ref(&toolchains),
+                &[]
+            ),
+            Some(swiftorg)
+        );
+
+        let tools = clt.join("usr/bin/sourcekit-lsp");
+        fake_binary(&tools);
+        assert_eq!(
+            find_sourcekit_lsp_in(
+                std::slice::from_ref(&clt),
+                std::slice::from_ref(&toolchains),
+                &[]
+            ),
+            Some(tools)
+        );
+
+        let full = xcode.join("Toolchains/XcodeDefault.xctoolchain/usr/bin/sourcekit-lsp");
+        fake_binary(&full);
+        assert_eq!(
+            find_sourcekit_lsp_in(&[xcode, clt], &[toolchains], &[]),
+            Some(full)
+        );
+    }
+
+    #[test]
+    fn dart_comes_from_the_sdk_variables_or_a_flutter_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        assert_eq!(find_dart_in(None, None, Some(&home), &[]), None);
+
+        // Flutter in a usual place under HOME, found with no variables set.
+        let flutter = home.join("development/flutter");
+        let bundled = flutter.join("bin/cache/dart-sdk/bin/dart");
+        fake_binary(&bundled);
+        assert_eq!(
+            find_dart_in(None, None, Some(&home), &[]),
+            Some(bundled.clone())
+        );
+
+        // `flutter/bin` on PATH resolves to the SDK's own binary, not the wrapper.
+        let wrapper = flutter.join("bin/dart");
+        fake_binary(&wrapper);
+        assert_eq!(
+            find_dart_in(None, None, None, &[flutter.join("bin")]),
+            Some(bundled.clone())
+        );
+
+        // FLUTTER_ROOT, then DART_SDK, win over everything else.
+        let other = dir.path().join("other-flutter");
+        let other_bundled = other.join("bin/cache/dart-sdk/bin/dart");
+        fake_binary(&other_bundled);
+        assert_eq!(
+            find_dart_in(None, Some(&other), Some(&home), &[]),
+            Some(other_bundled)
+        );
+        let sdk = dir.path().join("dart-sdk");
+        let sdk_dart = sdk.join("bin/dart");
+        fake_binary(&sdk_dart);
+        assert_eq!(
+            find_dart_in(Some(&sdk), Some(&other), Some(&home), &[]),
+            Some(sdk_dart)
+        );
+    }
+
+    #[test]
+    fn sourcekit_lsp_skips_the_usr_bin_shim_on_macos() {
+        let shim = PathBuf::from("/usr/bin");
+        let found = find_sourcekit_lsp_in(&[], &[], std::slice::from_ref(&shim));
+        if cfg!(target_os = "macos") {
+            assert_eq!(found, None);
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin/sourcekit-lsp");
+        fake_binary(&bin);
+        assert_eq!(
+            find_sourcekit_lsp_in(&[], &[], &[shim, dir.path().join("bin")]),
+            Some(bin)
+        );
+    }
+}
+
+#[cfg(test)]
 fn default_server(
     language: &str,
     root: Option<&Path>,
@@ -674,6 +783,9 @@ pub(crate) fn default_server_kind(language: &str) -> Option<&'static str> {
         "go" => Some("go"),
         "php" | "blade" => Some("php"),
         "vue" => Some("vue"),
+        "svelte" => Some("svelte"),
+        "swift" => Some("swift"),
+        "dart" => Some("dart"),
         _ => None,
     }
 }
@@ -681,6 +793,12 @@ pub(crate) fn default_server_kind(language: &str) -> Option<&'static str> {
 /// Finds an executable with no shell expansion. Absolute or relative paths
 /// are accepted only when executable; bare names are searched through PATH.
 pub fn find_in_path(program: &str) -> Option<PathBuf> {
+    if program == "sourcekit-lsp" {
+        return find_sourcekit_lsp();
+    }
+    if program == "dart" {
+        return find_dart();
+    }
     let path = Path::new(program);
     if path.components().count() > 1 {
         return is_executable(path).then(|| path.to_path_buf());
@@ -688,6 +806,125 @@ pub fn find_in_path(program: &str) -> Option<PathBuf> {
     search_directories()
         .into_iter()
         .map(|dir| dir.join(program))
+        .find(|candidate| is_executable(candidate))
+}
+
+/// Finds the real `sourcekit-lsp`. On macOS `/usr/bin/sourcekit-lsp` is only
+/// a shim that exists even without a Swift toolchain and then fails when run,
+/// so it is skipped: the binary must come from the selected developer
+/// directory (Xcode or Command Line Tools), a Swift.org toolchain, or `PATH`.
+pub fn find_sourcekit_lsp() -> Option<PathBuf> {
+    let mut developer_dirs = Vec::new();
+    if let Some(dir) = env::var_os("DEVELOPER_DIR") {
+        developer_dirs.push(PathBuf::from(dir));
+    }
+    // What `xcode-select -p` prints, read without starting a process.
+    if let Ok(dir) = std::fs::read_link("/var/db/xcode_select_link") {
+        developer_dirs.push(dir);
+    }
+    developer_dirs.extend([
+        PathBuf::from("/Applications/Xcode.app/Contents/Developer"),
+        PathBuf::from("/Library/Developer/CommandLineTools"),
+    ]);
+    let mut toolchain_roots = vec![PathBuf::from("/Library/Developer/Toolchains")];
+    if let Some(home) = env::var_os("HOME") {
+        toolchain_roots.push(PathBuf::from(home).join("Library/Developer/Toolchains"));
+    }
+    find_sourcekit_lsp_in(&developer_dirs, &toolchain_roots, &search_directories())
+}
+
+fn find_sourcekit_lsp_in(
+    developer_dirs: &[PathBuf],
+    toolchain_roots: &[PathBuf],
+    path_dirs: &[PathBuf],
+) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    for dir in developer_dirs {
+        // Command Line Tools keep the toolchain directly under `usr`.
+        candidates.push(dir.join("usr/bin/sourcekit-lsp"));
+        candidates.push(dir.join("Toolchains/XcodeDefault.xctoolchain/usr/bin/sourcekit-lsp"));
+    }
+    for root in toolchain_roots {
+        let mut toolchains: Vec<_> = std::fs::read_dir(root)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .collect();
+        // Newest name last: swift-6.1 sorts after swift-5.9.
+        toolchains.sort();
+        candidates.extend(
+            toolchains
+                .into_iter()
+                .rev()
+                .map(|toolchain| toolchain.join("usr/bin/sourcekit-lsp")),
+        );
+    }
+    candidates.extend(
+        path_dirs
+            .iter()
+            .filter(|dir| !(cfg!(target_os = "macos") && dir.as_path() == Path::new("/usr/bin")))
+            .map(|dir| dir.join("sourcekit-lsp")),
+    );
+    candidates
+        .into_iter()
+        .find(|candidate| is_executable(candidate))
+}
+
+/// Finds `dart`, from the Dart SDK or a Flutter SDK (which bundles one).
+/// Terminals have it on `PATH`, but an app started from Finder does not, so
+/// the usual SDK locations are searched too. `DART_SDK` and `FLUTTER_ROOT`
+/// win, as in `flutter` itself.
+pub fn find_dart() -> Option<PathBuf> {
+    let sdk = env::var_os("DART_SDK").map(PathBuf::from);
+    let flutter = env::var_os("FLUTTER_ROOT").map(PathBuf::from);
+    let home = env::var_os("HOME").map(PathBuf::from);
+    find_dart_in(
+        sdk.as_deref(),
+        flutter.as_deref(),
+        home.as_deref(),
+        &search_directories(),
+    )
+}
+
+fn find_dart_in(
+    dart_sdk: Option<&Path>,
+    flutter_root: Option<&Path>,
+    home: Option<&Path>,
+    path_dirs: &[PathBuf],
+) -> Option<PathBuf> {
+    // The Dart inside a Flutter SDK, without the `bin/dart` wrapper script.
+    let in_flutter = |root: &Path| root.join("bin/cache/dart-sdk/bin/dart");
+    let mut candidates = Vec::new();
+    if let Some(sdk) = dart_sdk {
+        candidates.push(sdk.join("bin/dart"));
+    }
+    if let Some(root) = flutter_root {
+        candidates.push(in_flutter(root));
+        candidates.push(root.join("bin/dart"));
+    }
+    for dir in path_dirs {
+        // `.../flutter/bin` on PATH: prefer the SDK's own binary.
+        if let Some(root) = dir.parent().filter(|_| dir.ends_with("bin")) {
+            candidates.push(in_flutter(root));
+        }
+        candidates.push(dir.join("dart"));
+    }
+    if let Some(home) = home {
+        for root in [
+            "flutter",
+            "development/flutter",
+            "Developer/flutter",
+            "fvm/default",
+            ".puro/envs/stable/flutter",
+            "Github/flutter",
+        ] {
+            candidates.push(in_flutter(&home.join(root)));
+        }
+        candidates.push(home.join("dart-sdk/bin/dart"));
+    }
+    candidates
+        .into_iter()
         .find(|candidate| is_executable(candidate))
 }
 
@@ -911,6 +1148,28 @@ impl LspManager {
         };
         self.stop_running_server(key);
         self.ensure_server(key.clone(), &config)
+    }
+
+    /// Makes `key` run `config`: starts the server, or restarts it when it is
+    /// not running or its launch details changed. A server that already runs
+    /// the same command is left alone, so refreshing many documents of one
+    /// project restarts it once. Returns whether a process was spawned.
+    pub fn apply_config(&mut self, key: &LspKey, config: &ServerConfig) -> io::Result<bool> {
+        let running = self.servers.contains_key(key);
+        let unchanged = self.configs.get(key).is_some_and(|current| {
+            current.program == config.program
+                && current.args == config.args
+                && current.initialization_options == config.initialization_options
+        });
+        if running && unchanged {
+            return Ok(false);
+        }
+        self.stopped.remove(key);
+        self.pending_restarts.remove(key);
+        if running {
+            self.stop_running_server(key);
+        }
+        self.ensure_server(key.clone(), config)
     }
 
     fn stop_running_server(&mut self, key: &LspKey) {
@@ -2946,6 +3205,40 @@ mod tests {
     }
 
     #[test]
+    fn apply_config_restarts_only_when_the_launch_details_change() {
+        let config = |script: &str| ServerConfig {
+            program: "/bin/sh".into(),
+            args: vec!["-c".to_owned(), script.to_owned()],
+            log_traffic: false,
+            initialization_options: Value::Null,
+            restart_backoff: [Duration::ZERO; 3],
+        };
+        let key = LspKey {
+            language: "php".into(),
+            root: PathBuf::from("/workspace"),
+        };
+        let mut manager = LspManager::default();
+        assert!(manager.apply_config(&key, &config("sleep 5")).unwrap());
+        let first = manager.server_processes()[0].pid;
+
+        // Same command: the running process stays.
+        assert!(!manager.apply_config(&key, &config("sleep 5")).unwrap());
+        assert_eq!(manager.server_processes()[0].pid, first);
+
+        // New command (a plugin was installed or updated): it is replaced.
+        assert!(manager.apply_config(&key, &config("sleep 6")).unwrap());
+        assert_eq!(manager.len(), 1);
+        assert_ne!(manager.server_processes()[0].pid, first);
+
+        // Stopped, then refreshed with the same command: it starts again.
+        assert!(manager.stop_server(&key));
+        assert_eq!(manager.len(), 0);
+        assert!(manager.apply_config(&key, &config("sleep 6")).unwrap());
+        assert_eq!(manager.len(), 1);
+        manager.shutdown_all();
+    }
+
+    #[test]
     fn tracks_lsp_progress_begin_report_and_end() {
         let mut manager = LspManager::default();
         let begin = serde_json::json!({
@@ -3222,6 +3515,10 @@ mod tests {
         assert_eq!(lsp_server_language("TSX"), "typescript");
         assert_eq!(lsp_server_language("Vue"), "vue");
         assert_eq!(lsp_language_id("Vue", "src/App.vue"), "vue");
+        assert_eq!(lsp_server_language("Svelte"), "svelte");
+        assert_eq!(lsp_server_language("Dart"), "dart");
+        assert_eq!(lsp_language_id("Dart", "lib/main.dart"), "dart");
+        assert_eq!(lsp_language_id("Svelte", "src/App.svelte"), "svelte");
     }
 
     #[test]
