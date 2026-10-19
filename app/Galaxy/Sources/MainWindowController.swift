@@ -18,6 +18,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     let pathBar = PathBar()
     private let breadcrumbBar = BreadcrumbBar()
     private let stickyScopeView = StickyScopeView()
+    /// Right edge of the pinned rows. Pulled in by the minimap's width so the
+    /// map runs the full height of the editor instead of under the rows.
+    private var stickyTrailing: NSLayoutConstraint!
     private var documentSymbols: [OutlineSymbol] = []
     private var lastSemanticRequest = Date.distantPast
     private var lastDiagnosticsRevision: UInt64?
@@ -72,6 +75,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private let outputPanel = OutputPanel()
     private let portsPanel = PortsPanel()
     private let gitGraphPanel = GitGraphPanel()
+    /// Covers the editor while no tab is open.
+    private let emptyEditor = EmptyEditorView()
     private let bottomPanelHeader = BottomPanelHeader()
     private let bottomPanelContent = BottomPanelContentView()
     private var bottomPanelHeight: NSLayoutConstraint!
@@ -659,6 +664,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         minimap.isHidden = !show
         editorView.rightInset = show ? MinimapView.width : 0
         editorView.applyRightInset()
+        stickyTrailing?.constant = show ? -MinimapView.width : 0
         layoutMinimap()
     }
 
@@ -1442,6 +1448,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         groupChrome.addSubview(editorTerminalView)
         gitGraphPanel.translatesAutoresizingMaskIntoConstraints = false
         groupChrome.addSubview(gitGraphPanel)
+        emptyEditor.translatesAutoresizingMaskIntoConstraints = false
+        groupChrome.addSubview(emptyEditor)
         // `TerminalView` is layer-backed. Without a layer here, it was
         // composited above every non-layer sibling and blanked the tab bar
         // and path bar while a terminal tab was active.
@@ -1459,6 +1467,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         detailView.addSubview(blamePopover)
         detailView.addSubview(completionPopup)
         detailView.addSubview(signaturePopup)
+        stickyTrailing = stickyScopeView.trailingAnchor.constraint(equalTo: editorSplitView.trailingAnchor)
+        // `updateMinimap` ran before this constraint existed.
+        stickyTrailing.constant = minimapEnabled && !isDiffPaneShown ? -MinimapView.width : 0
         NSLayoutConstraint.activate([
             groupsSplitView.topAnchor.constraint(equalTo: detailView.topAnchor),
             groupsSplitView.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
@@ -1485,7 +1496,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             editorSplitView.bottomAnchor.constraint(equalTo: groupChrome.bottomAnchor),
             stickyScopeView.topAnchor.constraint(equalTo: editorSplitView.topAnchor),
             stickyScopeView.leadingAnchor.constraint(equalTo: editorSplitView.leadingAnchor),
-            stickyScopeView.trailingAnchor.constraint(equalTo: editorSplitView.trailingAnchor),
+            stickyTrailing,
             // A terminal tab covers the path bar, breadcrumbs and editor.
             editorTerminalView.topAnchor.constraint(equalTo: tabBar.bottomAnchor),
             editorTerminalView.leadingAnchor.constraint(equalTo: groupChrome.leadingAnchor),
@@ -1496,6 +1507,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             gitGraphPanel.leadingAnchor.constraint(equalTo: groupChrome.leadingAnchor),
             gitGraphPanel.trailingAnchor.constraint(equalTo: groupChrome.trailingAnchor),
             gitGraphPanel.bottomAnchor.constraint(equalTo: groupChrome.bottomAnchor),
+            // So does the empty state, under the tab bar.
+            emptyEditor.topAnchor.constraint(equalTo: tabBar.bottomAnchor),
+            emptyEditor.leadingAnchor.constraint(equalTo: groupChrome.leadingAnchor),
+            emptyEditor.trailingAnchor.constraint(equalTo: groupChrome.trailingAnchor),
+            emptyEditor.bottomAnchor.constraint(equalTo: groupChrome.bottomAnchor),
             bottomPanelHeader.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
             bottomPanelHeader.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
             bottomPanelHeaderHeight,
@@ -2896,6 +2912,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
         showEditorTerminal(for: tab)
         showEditorGitGraph(for: tab)
+        showEmptyEditor(false)
         if tab.terminal != nil {
             if isFindVisible { closeFind(nil) }
             window?.makeFirstResponder(editorTerminalView)
@@ -3249,6 +3266,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         return tabs.firstIndex { $0.fileKey == key }
     }
 
+    /// Shows the shortcut hints over the editor, or hides them.
+    private func showEmptyEditor(_ visible: Bool) {
+        if visible { emptyEditor.reload() }
+        emptyEditor.isHidden = !visible
+    }
+
     /// Editor with no document: after the last tab is closed.
     private func showNoDocument() {
         activeIndex = nil
@@ -3256,6 +3279,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         if isFindVisible { closeFind(nil) }
         showEditorTerminal(for: nil)
         showEditorGitGraph(for: nil)
+        showEmptyEditor(true)
         if isDiffPaneShown { leaveDiffPane() }
         editorView.document = nil
         updateMarkdownPreview()
@@ -4893,9 +4917,16 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
     }
 
-    func saveSessionForQuit() {
+    func saveSessionForQuit(otherWindows: [Session] = []) {
         if !didCloseWindow {
-            saveSession()
+            var session = currentSession()
+            session.otherWindows = otherWindows.isEmpty ? nil : otherWindows
+            session.fullScreen = window?.styleMask.contains(.fullScreen) == true
+            do {
+                try session.save(to: sessionURL)
+            } catch {
+                Log.app.error("saving session failed: \(String(describing: error), privacy: .public)")
+            }
             if let window { UserDefaults.standard.set(window.styleMask.contains(.fullScreen), forKey: Self.fullScreenKey) }
         }
     }

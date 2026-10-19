@@ -154,8 +154,6 @@ final class ExtensionsController: NSObject, NSTableViewDataSource, NSTableViewDe
             state += " · disabled"
         } else if !plugin.available {
             state += plugin.installable ? " · not installed" : " · server not found"
-        } else if plugin.builtin {
-            state += " · using PATH"
         }
         if updates[plugin.id] != nil { state += " · update available" }
         let detail = Self.label(state, size: 11, weight: .regular, color: plugin.available || !plugin.enabled ? .secondaryLabelColor : .systemOrange)

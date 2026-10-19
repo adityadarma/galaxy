@@ -109,7 +109,12 @@ final class ExtensionsTests: XCTestCase {
             XCTAssertTrue(plugin.builtin, plugin.id)
             XCTAssertFalse(plugin.available, "\(plugin.id) is on PATH, no install needed")
         }
-        XCTAssertFalse(pluginList().contains { $0.id == "rust-analyzer" && $0.installable }, "PATH-only built-ins have no install")
+        // Every built-in, rust-analyzer and Vue included, is installed on request.
+        for id in ["rust-analyzer", "vue-language-server"] {
+            let info = pluginList().first { $0.id == id }
+            XCTAssertNotNil(info, id)
+            XCTAssertTrue(info?.builtin ?? false, id)
+        }
 
         let controller = MainWindowController(bridge: CoreBridge())
         controller.showWindow(nil)

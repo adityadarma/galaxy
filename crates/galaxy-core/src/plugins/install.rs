@@ -633,6 +633,27 @@ fn run_install(staging: &Path, target: &Path, manifest: &Manifest) -> Result<(),
                         .map_err(|e| e.to_string())?;
                 }
             }
+            Some("gz") => {
+                if let Some(parent) = dest.parent() {
+                    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                let gzip = find_in_path("gzip").ok_or("gzip is not installed")?;
+                let status = Command::new(gzip)
+                    .arg("-dc")
+                    .arg(&file)
+                    .stdin(Stdio::null())
+                    .stdout(fs::File::create(&dest).map_err(|e| e.to_string())?)
+                    .stderr(Stdio::null())
+                    .status()
+                    .map_err(|e| e.to_string())?;
+                if !status.success() {
+                    return Err(format!("could not decompress {}", download.url));
+                }
+                if download.executable {
+                    fs::set_permissions(&dest, fs::Permissions::from_mode(0o755))
+                        .map_err(|e| e.to_string())?;
+                }
+            }
             Some(kind) => {
                 fs::create_dir_all(&dest).map_err(|e| e.to_string())?;
                 let (tool, args): (&str, Vec<OsString>) = if kind == "zip" {

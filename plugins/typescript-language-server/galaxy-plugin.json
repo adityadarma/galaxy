@@ -2,10 +2,10 @@
   "id": "typescript-language-server",
   "name": "TypeScript Language Server",
   "version": "6.0.2",
-  "description": "TypeScript and JavaScript. Installs into the plugin folder with npm, or uses typescript-language-server from PATH.",
+  "description": "TypeScript and JavaScript. Installs into the plugin folder with npm.",
   "languages": ["typescript", "typescriptreact", "javascript", "javascriptreact"],
   "server": {
-    "command": ["${pluginDir}/node_modules/.bin/typescript-language-server", "typescript-language-server"],
+    "command": ["${pluginDir}/node_modules/.bin/typescript-language-server"],
     "args": ["--stdio"]
   },
   "install": {

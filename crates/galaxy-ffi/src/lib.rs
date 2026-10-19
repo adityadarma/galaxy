@@ -3872,7 +3872,11 @@ impl DocumentHandle {
                 let Some(target) = target else { return sel };
                 let column = sel.head - doc.line_to_char(line);
                 let head = (doc.line_to_char(target) + column).min(doc.line_end_char(target));
-                if extend { sel.extend_to(head) } else { Selection::caret(head) }
+                if extend {
+                    sel.extend_to(head)
+                } else {
+                    Selection::caret(head)
+                }
             });
         }
         ed.set_selections(next);
@@ -4713,7 +4717,11 @@ mod tests {
         assert!(doc.toggle_fold(0));
         assert_eq!(doc.fold_state(0), FoldState::Folded);
         assert_eq!(doc.total_rows(), 5);
-        assert_eq!(doc.row_of_line(3), 1, "the closing brace follows the header");
+        assert_eq!(
+            doc.row_of_line(3),
+            1,
+            "the closing brace follows the header"
+        );
         assert_eq!(doc.line_at_row(1).line, 3);
 
         let snap = doc.viewport(0, 7);
@@ -4744,7 +4752,10 @@ mod tests {
     #[test]
     fn folding_moves_a_hidden_caret_to_the_header() {
         let doc = folding_doc();
-        doc.set_caret(TextPos { line: 2, col_utf16: 2 });
+        doc.set_caret(TextPos {
+            line: 2,
+            col_utf16: 2,
+        });
         doc.toggle_fold(0);
         assert_eq!(doc.primary_cursor().line, 0);
     }
@@ -4753,7 +4764,10 @@ mod tests {
     fn arrows_step_over_folded_lines() {
         let doc = folding_doc();
         doc.toggle_fold(0);
-        doc.set_caret(TextPos { line: 0, col_utf16: 0 });
+        doc.set_caret(TextPos {
+            line: 0,
+            col_utf16: 0,
+        });
         doc.move_cursors(CursorMotion::Down, false);
         assert_eq!(doc.primary_cursor().line, 3);
         doc.move_cursors(CursorMotion::Up, false);
@@ -4765,13 +4779,23 @@ mod tests {
         let doc = folding_doc();
         doc.toggle_fold(4);
         assert!(doc.has_folds());
-        doc.set_caret(TextPos { line: 4, col_utf16: 0 });
+        doc.set_caret(TextPos {
+            line: 4,
+            col_utf16: 0,
+        });
         doc.edit(EditCommand::InsertText { text: "// ".into() });
         assert!(doc.has_folds(), "typing on the header keeps its fold");
-        doc.set_caret(TextPos { line: 0, col_utf16: 0 });
+        doc.set_caret(TextPos {
+            line: 0,
+            col_utf16: 0,
+        });
         doc.edit(EditCommand::InsertText { text: "x\n".into() });
         assert!(doc.has_folds());
-        assert_eq!(doc.fold_state(5), FoldState::Folded, "the fold moved down a line");
+        assert_eq!(
+            doc.fold_state(5),
+            FoldState::Folded,
+            "the fold moved down a line"
+        );
     }
 
     #[test]

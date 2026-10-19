@@ -7,6 +7,10 @@ import AppKit
 final class PathBar: NSView {
     static let height: CGFloat = 26
     static let inset: CGFloat = 16
+    /// Folders and chevrons stay readable on the editor surface in both
+    /// appearances; the file name is the brightest.
+    static let folderColor = NSColor.labelColor.withAlphaComponent(0.72)
+    static let separatorColor = NSColor.labelColor.withAlphaComponent(0.55)
 
     let label = NSTextField(labelWithString: "")
     /// Copper dot after the file name while there are unsaved changes.
@@ -41,19 +45,11 @@ final class PathBar: NSView {
         row.translatesAutoresizingMaskIntoConstraints = false
         addSubview(row)
 
-        let separator = NSBox()
-        separator.boxType = .separator
-        separator.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(separator)
-
         NSLayoutConstraint.activate([
             heightAnchor.constraint(equalToConstant: Self.height),
             row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: Self.inset),
             row.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -12),
             row.centerYAnchor.constraint(equalTo: centerYAnchor),
-            separator.bottomAnchor.constraint(equalTo: bottomAnchor),
-            separator.leadingAnchor.constraint(equalTo: leadingAnchor),
-            separator.trailingAnchor.constraint(equalTo: trailingAnchor),
         ])
     }
 
@@ -84,8 +80,8 @@ final class PathBar: NSView {
             let last = i == components.count - 1
             if i > 0 {
                 text.append(NSAttributedString(string: " ", attributes: [.font: font]))
-                text.append(Self.symbol("chevron.right", size: 9, weight: .medium,
-                                        color: .tertiaryLabelColor, font: font))
+                text.append(Self.symbol("chevron.right", size: 10, weight: .semibold,
+                                        color: Self.separatorColor, font: font))
                 text.append(NSAttributedString(string: " ", attributes: [.font: font]))
             }
             if last {
@@ -96,7 +92,7 @@ final class PathBar: NSView {
                 }
             }
             text.append(NSAttributedString(string: part, attributes: [
-                .foregroundColor: last ? NSColor.labelColor : NSColor.secondaryLabelColor,
+                .foregroundColor: last ? NSColor.labelColor : Self.folderColor,
                 .font: font,
             ]))
         }

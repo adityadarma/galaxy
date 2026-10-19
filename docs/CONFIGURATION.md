@@ -116,17 +116,21 @@ memicu dialog Save As otomatis.
 
 Language server dikonfigurasi melalui resolver built-in berdasarkan bahasa:
 
-| Bahasa | Executable default |
+| Bahasa | Plugin bawaan (Extensions, Install) |
 |---|---|
-| Rust | `rust-analyzer` |
-| TypeScript/JavaScript | `typescript-language-server --stdio` |
-| Python | `pyright-langserver --stdio` |
-| Go | `gopls` |
-| PHP/Blade (Laravel, ada `artisan`) | `intelephense --stdio` atau `phpactor language-server`, ditambah `laravel-lsp` |
-| PHP/Blade (non-Laravel) | `intelephense --stdio`, fallback `phpactor language-server` |
+| Rust | `rust-analyzer` (unduh binary rilis resmi) |
+| TypeScript/JavaScript | `typescript-language-server --stdio` (npm) |
+| Python | `pyright-langserver --stdio` (npm) |
+| Go | `gopls` (`go install`) |
+| PHP/Blade | `intelephense --stdio` (npm) atau `phpactor language-server` (composer), ditambah `laravel-lsp` di project Laravel |
+| Vue | `vue-language-server --stdio` (npm), lengkap dengan TypeScript sendiri |
 
-Executable harus tersedia di `PATH` atau lokasi fallback platform. Galaxy
-membagi satu server per kombinasi bahasa dan workspace bila lifecycle server
+Semua server bawaan tidak terpasang secara default dan tidak memakai `PATH`.
+Pasang dari panel Extensions (tombol Install); server masuk ke folder plugin
+Galaxy. Untuk memakai executable sendiri, isi `lsp.servers` di settings.
+
+Executable override di `lsp.servers` boleh berupa path absolut atau nama yang
+ada di `PATH`. Galaxy membagi satu server per kombinasi bahasa dan workspace bila lifecycle server
 mendukungnya. Document `didOpen` dan request fitur baru dikirim setelah server
 menyelesaikan handshake `initialize`/`initialized`.
 

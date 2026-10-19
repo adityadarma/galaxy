@@ -51,6 +51,7 @@ const BUILTIN_MANIFESTS: &[&str] = &[
     include_str!("../../../../plugins/intelephense/galaxy-plugin.json"),
     include_str!("../../../../plugins/phpactor/galaxy-plugin.json"),
     include_str!("../../../../plugins/laravel/galaxy-plugin.json"),
+    include_str!("../../../../plugins/vue/galaxy-plugin.json"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,7 +72,8 @@ pub struct Download {
     /// Relative path inside the plugin folder.
     pub dest: String,
     pub executable: bool,
-    /// `None` saves the file as is; `tar.gz` and `zip` are extracted into `dest`.
+    /// `None` saves the file as is; `gz` decompresses one file to `dest`;
+    /// `tar.gz` and `zip` are extracted into the folder `dest`.
     pub archive: Option<String>,
 }
 
@@ -235,7 +237,7 @@ fn parse_download(entry: &Value) -> Result<Download, String> {
     safe_relative(dest).map_err(|e| format!("download dest: {e}"))?;
     let archive = entry.get("archive").and_then(Value::as_str);
     if let Some(kind) = archive
-        && !matches!(kind, "tar.gz" | "zip")
+        && !matches!(kind, "gz" | "tar.gz" | "zip")
     {
         return Err(format!("unsupported archive {kind:?}"));
     }
@@ -500,6 +502,17 @@ impl Catalog {
         }
     }
 
+    /// Built-ins as if each were installed, so tests can resolve their
+    /// `${pluginDir}` commands.
+    #[cfg(test)]
+    pub(crate) fn builtin_with_dirs() -> Self {
+        let mut catalog = Self::builtin();
+        for plugin in &mut catalog.plugins {
+            plugin.dir = Some(PathBuf::from(format!("/plugins/{}", plugin.manifest.id)));
+        }
+        catalog
+    }
+
     /// Built-ins plus everything installed under `dir`. Installed plugins
     /// replace built-ins with the same id. Problems with single plugins are
     /// returned, never fatal.
@@ -599,10 +612,12 @@ mod tests {
     use super::*;
 
     fn fake_find(available: &'static [&'static str]) -> impl Fn(&str) -> Option<PathBuf> {
+        // Servers are launched from `${pluginDir}/...`, so match on file name.
         move |program| {
+            let name = Path::new(program).file_name()?.to_str()?;
             available
-                .contains(&program)
-                .then(|| PathBuf::from(format!("/fake/bin/{program}")))
+                .contains(&name)
+                .then(|| PathBuf::from(format!("/fake/bin/{name}")))
         }
     }
 
@@ -615,16 +630,26 @@ mod tests {
 
     #[test]
     fn install_is_offered_only_when_the_server_is_missing() {
-        let catalog = Catalog::builtin();
+        let catalog = Catalog::builtin_with_dirs();
         let phpactor = catalog.get("phpactor").unwrap();
         assert!(phpactor.installable(&fake_find(&[])));
         assert!(
             !phpactor.installable(&fake_find(&["phpactor"])),
-            "found on PATH"
+            "already installed"
         );
-        // Nothing to install for a PATH-only server, found or not.
-        let rust = catalog.get("rust-analyzer").unwrap();
-        assert!(!rust.installable(&fake_find(&[])));
+        // Every built-in server needs an install, none falls back to PATH.
+        for plugin in &catalog.plugins {
+            assert!(plugin.manifest.has_install_work(), "{}", plugin.manifest.id);
+            assert!(
+                plugin
+                    .manifest
+                    .command
+                    .iter()
+                    .all(|c| c.contains("${pluginDir}")),
+                "{} may be launched from PATH",
+                plugin.manifest.id
+            );
+        }
         // A local copy is never offered a second install.
         let mut local = phpactor.clone();
         local.builtin = false;
@@ -685,7 +710,7 @@ mod tests {
 
     #[test]
     fn primary_prefers_installed_then_priority() {
-        let mut catalog = Catalog::builtin();
+        let mut catalog = Catalog::builtin_with_dirs();
         let all = fake_find(&["intelephense", "phpactor"]);
         let (plugin, _) = catalog.primary("php", None, &all).unwrap();
         assert_eq!(plugin.manifest.id, "intelephense");
@@ -711,6 +736,39 @@ mod tests {
         let (plugin, config) = catalog.primary("Blade", None, &both).unwrap();
         assert_eq!(plugin.manifest.id, "devsense");
         assert_eq!(config.program, "/fake/bin/devsense");
+    }
+
+    #[test]
+    fn vue_resolves_to_its_own_server_with_a_bundled_typescript() {
+        let bare = Catalog::builtin();
+        // Not installed yet: nothing to launch, but an install is offered.
+        let find = fake_find(&[]);
+        assert!(bare.primary("Vue", None, &find).is_none());
+        let mut catalog = Catalog::builtin_with_dirs();
+        assert!(bare.get("vue-language-server").unwrap().installable(&find));
+        // Typescript's own server never claims .vue files.
+        let plugin = catalog
+            .plugins
+            .iter_mut()
+            .find(|p| p.manifest.id == "vue-language-server")
+            .unwrap();
+        plugin.dir = Some(PathBuf::from("/p/vue"));
+        plugin.builtin = false;
+        let find = |program: &str| Some(PathBuf::from(program));
+        let (plugin, config) = catalog.primary("Vue", None, &find).unwrap();
+        assert_eq!(plugin.manifest.id, "vue-language-server");
+        assert_eq!(
+            config.program,
+            "/p/vue/node_modules/.bin/vue-language-server"
+        );
+        assert_eq!(config.args, ["--stdio"]);
+        assert_eq!(config.initialization_options["vue"]["hybridMode"], false);
+        assert_eq!(
+            config.initialization_options["typescript"]["tsdk"],
+            "/p/vue/node_modules/typescript/lib"
+        );
+        let (ts, _) = catalog.primary("TypeScript", None, &find).unwrap();
+        assert_eq!(ts.manifest.id, "typescript-language-server");
     }
 
     #[test]

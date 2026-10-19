@@ -9,7 +9,7 @@
   "priority": 100,
   "activation": { "rootMarkers": ["artisan"] },
   "server": {
-    "command": ["${pluginDir}/vendor/bin/laravel-lsp", "laravel-lsp"],
+    "command": ["${pluginDir}/vendor/bin/laravel-lsp"],
     "initializationOptions": { "phpCommand": ["${which:php}"] }
   },
   "install": {

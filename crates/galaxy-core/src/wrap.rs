@@ -133,7 +133,10 @@ impl WrapMap {
             while next < hidden.len() && hidden[next].1 < line {
                 next += 1;
             }
-            if hidden.get(next).is_some_and(|&(a, b)| a <= line && line <= b) {
+            if hidden
+                .get(next)
+                .is_some_and(|&(a, b)| a <= line && line <= b)
+            {
                 continue;
             }
             total += match columns {
@@ -150,7 +153,12 @@ impl WrapMap {
         }
     }
 
-    pub fn is_current(&self, doc: &Document, columns: Option<usize>, hidden: &[(usize, usize)]) -> bool {
+    pub fn is_current(
+        &self,
+        doc: &Document,
+        columns: Option<usize>,
+        hidden: &[(usize, usize)],
+    ) -> bool {
         self.columns == columns && self.revision == doc.revision() && self.hidden == hidden
     }
 
@@ -288,10 +296,18 @@ mod tests {
         assert_eq!(map.row_of_line(0), 0);
         assert_eq!(map.rows_of_line(1), 0);
         assert_eq!(map.rows_of_line(2), 0);
-        assert_eq!(map.row_of_line(3), 1, "the line after a fold follows its header");
+        assert_eq!(
+            map.row_of_line(3),
+            1,
+            "the line after a fold follows its header"
+        );
         assert_eq!(map.row_of_line(4), 2);
         assert_eq!(map.line_at_row(0), (0, 0));
-        assert_eq!(map.line_at_row(1), (3, 0), "a row never lands on a hidden line");
+        assert_eq!(
+            map.line_at_row(1),
+            (3, 0),
+            "a row never lands on a hidden line"
+        );
         assert_eq!(map.line_at_row(2), (4, 0));
     }
 

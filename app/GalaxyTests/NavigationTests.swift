@@ -126,6 +126,37 @@ final class NavigationTests: XCTestCase {
         XCTAssertNil(EditorView.identifierRange(in: "a ;; b", at: 3))
     }
 
+    func testQualifiedNameRangeCoversTheWholeNamespacePath() {
+        let text = "use App\\Models\\OutletProduct; new \\Carbon\\Carbon($x);"
+        let ns = text as NSString
+        let full = ns.range(of: "App\\Models\\OutletProduct")
+        // Any segment widens to the whole name.
+        for word in ["App", "Models", "OutletProduct"] {
+            let inner = ns.range(of: word)
+            let range = EditorView.qualifiedNameRange(in: text, around: inner.location..<(inner.location + inner.length))
+            XCTAssertEqual(range, full.location..<(full.location + full.length), word)
+        }
+        // A leading backslash (global namespace) is part of the name.
+        let carbon = ns.range(of: "\\Carbon\\Carbon")
+        let first = ns.range(of: "Carbon")
+        XCTAssertEqual(EditorView.qualifiedNameRange(in: text, around: first.location..<(first.location + first.length)),
+                       carbon.location..<(carbon.location + carbon.length))
+        // A name without a backslash, and a variable, stay as they are.
+        let variable = ns.range(of: "$x")
+        XCTAssertEqual(EditorView.qualifiedNameRange(in: text, around: variable.location..<(variable.location + variable.length)),
+                       variable.location..<(variable.location + variable.length))
+        XCTAssertEqual(EditorView.qualifiedNameRange(in: "new Foo();", around: 4..<7), 4..<7)
+    }
+
+    func testLastSegmentStartIsTheClassName() {
+        let text = "use App\\Models\\OutletProduct;"
+        let ns = text as NSString
+        let full = ns.range(of: "App\\Models\\OutletProduct")
+        let range = full.location..<(full.location + full.length)
+        XCTAssertEqual(EditorView.lastSegmentStart(in: text, range: range), ns.range(of: "OutletProduct").location)
+        XCTAssertEqual(EditorView.lastSegmentStart(in: "Foo", range: 0..<3), 0)
+    }
+
     func testCommandHoverUnderlinesWordAndClearsOnRelease() throws {
         let c = try makeController(text: "use Foo\\BarService;\nsecond")
         let v = c.editorView

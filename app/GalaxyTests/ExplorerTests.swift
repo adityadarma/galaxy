@@ -547,4 +547,22 @@ final class ExplorerTests: XCTestCase {
         row.updateTrackingAreas()
         XCTAssertFalse(row.isHovered, "no window means no pointer over the row")
     }
+
+    // MARK: Indent guides
+
+    func testGuidesAreHiddenUntilThePointerEntersTheExplorer() {
+        let outline = ExplorerOutlineView()
+        XCTAssertFalse(outline.isPointerInside, "guides start hidden")
+        outline.mouseEntered(with: crossing(.mouseEntered))
+        XCTAssertTrue(outline.isPointerInside)
+        outline.mouseExited(with: crossing(.mouseExited))
+        XCTAssertFalse(outline.isPointerInside, "guides hide again when the pointer leaves")
+    }
+
+    func testOutlineWithoutAWindowHasNoPointerInside() {
+        let outline = ExplorerOutlineView()
+        outline.mouseEntered(with: crossing(.mouseEntered))
+        outline.updateTrackingAreas()
+        XCTAssertFalse(outline.isPointerInside, "no window means no pointer over the explorer")
+    }
 }

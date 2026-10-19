@@ -2,11 +2,11 @@
   "id": "phpactor",
   "name": "Phpactor",
   "version": "2026.10.07.0",
-  "description": "PHP language server. Installs into the plugin folder with composer, or uses phpactor from PATH.",
+  "description": "PHP language server. Installs into the plugin folder with composer.",
   "languages": ["php", "blade"],
   "priority": 20,
   "server": {
-    "command": ["${pluginDir}/vendor/bin/phpactor", "phpactor"],
+    "command": ["${pluginDir}/vendor/bin/phpactor"],
     "args": ["language-server"]
   },
   "install": {

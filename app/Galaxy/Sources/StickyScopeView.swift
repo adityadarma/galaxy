@@ -20,6 +20,10 @@ final class StickyScopeView: NSView {
     var onSelect: ((UInt64, Int) -> Void)?
     private(set) var rows: [Row] = []
     private var heightConstraint: NSLayoutConstraint!
+    /// Row under the pointer, drawn with a faint wash like VSCode's hover.
+    private var hoveredRow: Int? {
+        didSet { if hoveredRow != oldValue { needsDisplay = true } }
+    }
 
     override var isFlipped: Bool { true }
     override var mouseDownCanMoveWindow: Bool { false }
@@ -32,7 +36,35 @@ final class StickyScopeView: NSView {
         isHidden = true
         setAccessibilityIdentifier("sticky-scope")
         setAccessibilityRole(.group)
+        // Soft drop shadow under the pinned rows, so code scrolling beneath
+        // reads as passing under them.
+        layer?.masksToBounds = false
+        layer?.shadowColor = NSColor.black.cgColor
+        layer?.shadowOpacity = 0.28
+        layer?.shadowRadius = 4
+        layer?.shadowOffset = CGSize(width: 0, height: -2)
     }
+
+    /// An explicit path spares Core Animation from deriving the shadow shape
+    /// from the layer's pixels on every composited frame while scrolling.
+    override func layout() {
+        super.layout()
+        layer?.shadowPath = CGPath(rect: bounds, transform: nil)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: .zero,
+                                       options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+                                       owner: self))
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        hoveredRow = row(at: convert(event.locationInWindow, from: nil))
+    }
+
+    override func mouseExited(with event: NSEvent) { hoveredRow = nil }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
@@ -42,7 +74,7 @@ final class StickyScopeView: NSView {
 
     func show(_ newRows: [Row]) {
         let visible = isEnabled && !newRows.isEmpty
-        isHidden = !visible
+        if visible == isHidden { fade(in: visible) }
         let shown = visible ? newRows : []
         let height = CGFloat(shown.count) * rowHeight
         // A font change resizes the rows without changing them.
@@ -52,8 +84,25 @@ final class StickyScopeView: NSView {
         }
         guard shown != rows else { return }
         rows = shown
+        hoveredRow = nil
         setAccessibilityLabel("Scope: " + shown.map { $0.text.trimmingCharacters(in: .whitespaces) }.joined(separator: ", "))
         needsDisplay = true
+    }
+
+    /// Fades the bar in on first pin; hides at once otherwise, so no stale
+    /// rows linger over the editor.
+    private func fade(in visible: Bool) {
+        guard visible, window != nil, !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else {
+            alphaValue = 1
+            isHidden = !visible
+            return
+        }
+        alphaValue = 0
+        isHidden = false
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.12
+            animator().alphaValue = 1
+        }
     }
 
     /// The row under `point` (view coordinates), if any.
@@ -85,6 +134,10 @@ final class StickyScopeView: NSView {
 
         for (index, row) in rows.enumerated() {
             let top = CGFloat(index) * metrics.lineHeight
+            if index == hoveredRow {
+                Theme.currentLine.resolved(for: effectiveAppearance).setFill()
+                NSRect(x: 0, y: top, width: bounds.width, height: metrics.lineHeight).fill()
+            }
             let number = editor.layout(for: String(row.line + 1))
             let numberWidth = CGFloat(CTLineGetTypographicBounds(number, nil, nil, nil))
             context.setFillColor(Theme.gutterText.cgColor)
@@ -103,10 +156,8 @@ final class StickyScopeView: NSView {
             context.restoreGState()
         }
 
-        NSColor.separatorColor.setFill()
-        NSRect(x: 0, y: bounds.height - 1, width: bounds.width, height: 1).fill()
         // The gutter divider carries on through the pinned rows.
         NSColor.separatorColor.withAlphaComponent(0.28).setFill()
-        NSRect(x: editor.gutterWidth - 1, y: 0, width: 1, height: max(0, bounds.height - 1)).fill()
+        NSRect(x: editor.gutterWidth - 1, y: 0, width: 1, height: bounds.height).fill()
     }
 }

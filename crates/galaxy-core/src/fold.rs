@@ -99,7 +99,8 @@ fn is_allman_brace(doc: &Document, line: usize) -> bool {
     let Some(base) = indent_of(doc, line) else {
         return false;
     };
-    is_lone_open_brace(doc, line) && prev_nonblank(doc, line).is_some_and(|(_, indent)| indent == base)
+    is_lone_open_brace(doc, line)
+        && prev_nonblank(doc, line).is_some_and(|(_, indent)| indent == base)
 }
 
 /// Lines examined while walking up for enclosing headers.
@@ -123,7 +124,11 @@ fn continues_previous(doc: &Document, line: usize) -> bool {
 fn edge_chars(doc: &Document, line: usize) -> Option<(char, char)> {
     let start = doc.line_to_char(line);
     let end = doc.line_end_char(line);
-    let mut chars = doc.rope().slice(start..end).chars().filter(|c| !c.is_whitespace());
+    let mut chars = doc
+        .rope()
+        .slice(start..end)
+        .chars()
+        .filter(|c| !c.is_whitespace());
     let first = chars.next()?;
     Some((first, chars.last().unwrap_or(first)))
 }
@@ -140,7 +145,8 @@ fn is_header_continuation(doc: &Document, line: usize) -> bool {
     match first {
         '}' => last == '{',
         ')' | ']' => {
-            last == '{' || next_nonblank(doc, line).is_some_and(|(next, _)| is_lone_open_brace(doc, next))
+            last == '{'
+                || next_nonblank(doc, line).is_some_and(|(next, _)| is_lone_open_brace(doc, next))
         }
         _ => false,
     }
@@ -328,7 +334,6 @@ impl FoldSet {
         }
     }
 
-
     /// Folds `line`, or unfolds it when it is already folded. `false` when
     /// the line has nothing to fold.
     pub fn toggle(&mut self, doc: &Document, line: usize) -> bool {
@@ -389,7 +394,8 @@ impl FoldSet {
     /// Unfolds everything that hides `line`. `true` if anything changed.
     pub fn reveal(&mut self, line: usize) -> bool {
         let before = self.folds.len();
-        self.folds.retain(|&(header, end)| !(header < line && line <= end));
+        self.folds
+            .retain(|&(header, end)| !(header < line && line <= end));
         if self.folds.is_empty() {
             self.base = None;
         }
@@ -405,7 +411,8 @@ impl FoldSet {
 mod tests {
     use super::*;
 
-    const SRC: &str = "fn a() {\n    one;\n\n    two;\n}\n\nfn b() {\n    if x {\n        y;\n    }\n}\n";
+    const SRC: &str =
+        "fn a() {\n    one;\n\n    two;\n}\n\nfn b() {\n    if x {\n        y;\n    }\n}\n";
 
     fn doc(text: &str) -> Document {
         Document::from_text(text)
@@ -428,28 +435,53 @@ mod tests {
     fn allman_header_folds_the_brace_and_body() {
         let d = doc("class A\n{\n    x;\n    y;\n}\n");
         assert!(is_foldable(&d, 0));
-        assert!(!is_foldable(&d, 1), "the brace line has no marker of its own");
+        assert!(
+            !is_foldable(&d, 1),
+            "the brace line has no marker of its own"
+        );
         assert_eq!(fold_end(&d, 0), Some(3));
     }
 
     #[test]
     fn enclosing_headers_walk_out_of_nested_blocks() {
-        let d = doc("class A {\n    fn f() {\n        one;\n        two;\n    }\n    fn g() {\n        three;\n    }\n}\nafter;");
+        let d = doc(
+            "class A {\n    fn f() {\n        one;\n        two;\n    }\n    fn g() {\n        three;\n    }\n}\nafter;",
+        );
         assert_eq!(enclosing_headers(&d, 2, 5), [0, 1]);
         assert_eq!(enclosing_headers(&d, 6, 5), [0, 5]);
-        assert_eq!(enclosing_headers(&d, 4, 5), [0], "a closing line sits in the class");
+        assert_eq!(
+            enclosing_headers(&d, 4, 5),
+            [0],
+            "a closing line sits in the class"
+        );
         assert_eq!(enclosing_headers(&d, 5, 5), [0]);
         assert_eq!(enclosing_headers(&d, 0, 5), Vec::<usize>::new());
         assert_eq!(enclosing_headers(&d, 9, 5), Vec::<usize>::new());
-        assert_eq!(enclosing_headers(&d, 2, 1), [0], "the outermost win the limit");
+        assert_eq!(
+            enclosing_headers(&d, 2, 1),
+            [0],
+            "the outermost win the limit"
+        );
     }
 
     #[test]
     fn enclosing_headers_join_wrapped_and_allman_headers() {
         let d = doc("class A\n{\n    fn f(\n            a,\n        ) {\n        body;\n    }\n}");
-        assert_eq!(enclosing_headers(&d, 5, 5), [0, 2], "a closing paren line reports the line that opened it");
-        assert_eq!(enclosing_headers(&d, 3, 5), [0, 2], "inside the parameter list");
-        assert_eq!(enclosing_headers(&d, 2, 5), [0], "the brace line folds into its header");
+        assert_eq!(
+            enclosing_headers(&d, 5, 5),
+            [0, 2],
+            "a closing paren line reports the line that opened it"
+        );
+        assert_eq!(
+            enclosing_headers(&d, 3, 5),
+            [0, 2],
+            "inside the parameter list"
+        );
+        assert_eq!(
+            enclosing_headers(&d, 2, 5),
+            [0],
+            "the brace line folds into its header"
+        );
     }
 
     #[test]
@@ -460,13 +492,31 @@ mod tests {
 
     #[test]
     fn a_header_tail_line_pins_its_own_header() {
-        let d = doc("class A\n{\n    public function f(int $a)\n    {\n        body;\n    }\n    public function g(\n        int $a,\n    ): int {\n        body;\n    }\n}");
-        assert_eq!(enclosing_headers(&d, 1, 5), [0], "the class brace pins the class");
-        assert_eq!(enclosing_headers(&d, 3, 5), [0, 2], "the function brace pins the function");
+        let d = doc(
+            "class A\n{\n    public function f(int $a)\n    {\n        body;\n    }\n    public function g(\n        int $a,\n    ): int {\n        body;\n    }\n}",
+        );
+        assert_eq!(
+            enclosing_headers(&d, 1, 5),
+            [0],
+            "the class brace pins the class"
+        );
+        assert_eq!(
+            enclosing_headers(&d, 3, 5),
+            [0, 2],
+            "the function brace pins the function"
+        );
         assert_eq!(enclosing_headers(&d, 7, 5), [0, 6], "a parameter line");
         assert_eq!(enclosing_headers(&d, 8, 5), [0, 6], "the return type line");
-        assert_eq!(enclosing_headers(&d, 3, 1), [0], "the outermost win the limit");
-        assert_eq!(enclosing_headers(&d, 5, 5), [0], "a closing line is not a header tail");
+        assert_eq!(
+            enclosing_headers(&d, 3, 1),
+            [0],
+            "the outermost win the limit"
+        );
+        assert_eq!(
+            enclosing_headers(&d, 5, 5),
+            [0],
+            "a closing line is not a header tail"
+        );
     }
 
     #[test]

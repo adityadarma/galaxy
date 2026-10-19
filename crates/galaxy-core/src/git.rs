@@ -1540,11 +1540,18 @@ mod tests {
         run(dir.path(), ["switch", "main"]);
         commit_file_as(dir.path(), "Ann", "c.txt", "three");
         // A remote-tracking ref without a remote.
-        run(dir.path(), ["update-ref", "refs/remotes/origin/feature", "feature"]);
+        run(
+            dir.path(),
+            ["update-ref", "refs/remotes/origin/feature", "feature"],
+        );
 
         let all = log_graph_filtered(dir.path(), 50, &LogFilter::default()).unwrap();
         assert_eq!(all.len(), 3);
-        assert!(all.iter().flat_map(|c| &c.refs).any(|r| r.kind == GitRefKind::Remote));
+        assert!(
+            all.iter()
+                .flat_map(|c| &c.refs)
+                .any(|r| r.kind == GitRefKind::Remote)
+        );
 
         let main_only = LogFilter {
             branches: vec!["main".into()],
@@ -1573,7 +1580,12 @@ mod tests {
         };
         let commits = log_graph_filtered(dir.path(), 50, &no_remotes).unwrap();
         assert_eq!(commits.len(), 3);
-        assert!(!commits.iter().flat_map(|c| &c.refs).any(|r| r.kind == GitRefKind::Remote));
+        assert!(
+            !commits
+                .iter()
+                .flat_map(|c| &c.refs)
+                .any(|r| r.kind == GitRefKind::Remote)
+        );
     }
 
     #[test]
@@ -1603,7 +1615,10 @@ mod tests {
         run(dir.path(), ["init", "-b", "main"]);
         commit_file_as(dir.path(), "Ann", "a.txt", "one");
         run(dir.path(), ["branch", "feature/x"]);
-        run(dir.path(), ["update-ref", "refs/remotes/origin/main", "main"]);
+        run(
+            dir.path(),
+            ["update-ref", "refs/remotes/origin/main", "main"],
+        );
         let list = branches(dir.path()).unwrap();
         let find = |name: &str| list.iter().find(|b| b.name == name).unwrap().clone();
         assert!(!find("feature/x").remote);

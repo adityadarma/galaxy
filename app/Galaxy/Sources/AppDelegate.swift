@@ -8,6 +8,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var preferencesController: PreferencesWindowController?
     /// A path handed to us before the window existed (`Galaxy <path>`).
     private var pendingURL: URL?
+    /// Sessions of the extra windows saved at the last quit.
+    private var pendingWindowSessions: [Session] = []
+    /// Windows still to put in full screen, one at a time: each transition
+    /// has to finish before the next starts, or AppKit drops it.
+    private var fullScreenQueue: [NSWindow] = []
 
     func application(_ application: NSApplication, open urls: [URL]) {
         guard let url = urls.first else { return }
@@ -33,8 +38,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // Left in full screen at the last quit: open in full screen again.
         // The project is restored before the window appears, so the
         // transition does not start from an empty window.
+        // Older sessions have no per-window flag; they used one global key.
+        let savedSession = Self.shouldRestoreSession ? Session.load(from: controller.sessionURL) : nil
         let resumeFullScreen = Self.shouldRestoreSession
-            && UserDefaults.standard.bool(forKey: "MainWindowFullScreen")
+            && (savedSession?.fullScreen ?? UserDefaults.standard.bool(forKey: "MainWindowFullScreen"))
         if !resumeFullScreen { showMainWindow(controller) }
         // `Galaxy -OpenPath <file or folder>`; UI tests use this instead of
         // driving the open panel.
@@ -49,10 +56,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             controller.newDocument(nil)
         }
-        if resumeFullScreen {
-            showMainWindow(controller)
-            controller.window?.toggleFullScreen(nil)
-        }
+        if resumeFullScreen { showMainWindow(controller) }
+        // Every window is shown on the regular desktop first. Then the ones
+        // that were full screen enter it in turn, each in its own Space.
+        var fullScreenWindows = resumeFullScreen ? [controller.window].compactMap { $0 } : []
+        fullScreenWindows += restorePendingWindows()
+        fullScreenQueue = fullScreenWindows
+        enterNextFullScreen()
 
         // `scripts/measure-footprint.sh`: open extra files as tabs after the
         // workspace, so the footprint covers a realistic editing session.
@@ -129,7 +139,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func restoreSession(in controller: MainWindowController) -> Bool {
         guard let session = Session.load(from: controller.sessionURL) else { return false }
+        pendingWindowSessions = session.otherWindows ?? []
         return controller.restore(session)
+    }
+
+    /// Reopens the windows that were open besides the first one at quit.
+    /// Returns those that were full screen.
+    private func restorePendingWindows() -> [NSWindow] {
+        let sessions = pendingWindowSessions
+        pendingWindowSessions = []
+        var fullScreen: [NSWindow] = []
+        for session in sessions {
+            let controller = makeWindowController()
+            if !controller.restore(session) { controller.newDocument(nil) }
+            showMainWindow(controller)
+            if session.fullScreen == true, let window = controller.window { fullScreen.append(window) }
+        }
+        return fullScreen
+    }
+
+    /// The window whose full-screen transition is in flight.
+    private var fullScreenPending: NSWindow?
+    private var fullScreenObserver: NSObjectProtocol?
+
+    private func enterNextFullScreen() {
+        guard fullScreenPending == nil, !fullScreenQueue.isEmpty else { return }
+        let window = fullScreenQueue.removeFirst()
+        fullScreenPending = window
+        fullScreenObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didEnterFullScreenNotification, object: window, queue: .main
+        ) { [weak self, weak window] _ in
+            MainActor.assumeIsolated {
+                if let window { self?.finishFullScreen(of: window) }
+            }
+        }
+        // If the transition never reports, do not lose the other windows.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self, weak window] in
+            MainActor.assumeIsolated {
+                if let window { self?.finishFullScreen(of: window) }
+            }
+        }
+        window.toggleFullScreen(nil)
+    }
+
+    private func finishFullScreen(of window: NSWindow) {
+        guard fullScreenPending === window else { return }
+        fullScreenPending = nil
+        if let observer = fullScreenObserver {
+            NotificationCenter.default.removeObserver(observer)
+            fullScreenObserver = nil
+        }
+        enterNextFullScreen()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -139,7 +199,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard windowControllers.allSatisfy({ $0.confirmDiscardChanges() }) else { return .terminateCancel }
-        activeWindowController?.saveSessionForQuit()
+        let active = activeWindowController
+        let others = windowControllers.filter { $0 !== active }.map { controller -> Session in
+            var session = controller.currentSession()
+            session.fullScreen = controller.window?.styleMask.contains(.fullScreen) == true
+            return session
+        }.filter { $0.workspace != nil || !$0.tabs.isEmpty }
+        active?.saveSessionForQuit(otherWindows: others)
         windowControllers.forEach {
             $0.saveWorkspaceSessionForQuit()
             $0.prepareForApplicationQuit()
@@ -156,10 +222,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func newWindow(_ sender: Any?) {
+        let fromFullScreen = isActiveWindowFullScreen
         let controller = makeWindowController()
         controller.showWindow(sender)
         controller.newDocument(nil)
         NSApp.activate(ignoringOtherApps: true)
+        moveToRegularDesktop(controller, fromFullScreen)
+    }
+
+    private var isActiveWindowFullScreen: Bool {
+        activeWindowController?.window?.styleMask.contains(.fullScreen) == true
+    }
+
+    /// A window shown while another one is full screen joins that Space.
+    /// AppKit has no switch to refuse that, so the window enters full screen
+    /// and leaves it again: on exit, macOS puts it on a regular desktop.
+    private func moveToRegularDesktop(_ controller: MainWindowController, _ fromFullScreen: Bool) {
+        guard fromFullScreen, let window = controller.window,
+              !window.styleMask.contains(.fullScreen) else { return }
+        var token: NSObjectProtocol?
+        token = NotificationCenter.default.addObserver(
+            forName: NSWindow.didEnterFullScreenNotification, object: window, queue: .main
+        ) { _ in
+            if let token { NotificationCenter.default.removeObserver(token) }
+            MainActor.assumeIsolated { window.toggleFullScreen(nil) }
+        }
+        window.toggleFullScreen(nil)
     }
 
     private var activeWindowController: MainWindowController? {
@@ -171,11 +259,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let controller = MainWindowController(bridge: bridge)
         controller.openTerminalInNewWindow = { [weak self] terminal, root in
             guard let self else { return }
+            let fromFullScreen = self.isActiveWindowFullScreen
             let window = self.makeWindowController()
             window.showWindow(nil)
             try? window.openWorkspace(at: root)
             window.adoptTerminal(terminal)
             NSApp.activate(ignoringOtherApps: true)
+            self.moveToRegularDesktop(window, fromFullScreen)
         }
         controller.onWindowClosed = { [weak self, weak controller] in
             guard let self, let controller else { return }

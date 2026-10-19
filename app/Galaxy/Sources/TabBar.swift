@@ -166,6 +166,8 @@ final class TabBar: NSView {
     /// Selection or tab count changed: scroll the active tab into view on
     /// the next layout, once the bar has a width.
     private var needsReveal = false
+    /// Line under the tabs. Hidden while no tab is open.
+    private let rule = NSBox()
     /// Width of all the tabs together.
     private(set) var contentWidth: CGFloat = 0
 
@@ -209,7 +211,6 @@ final class TabBar: NSView {
         previewButton.translatesAutoresizingMaskIntoConstraints = false
         addSubview(previewButton)
 
-        let rule = NSBox()
         rule.boxType = .separator
         rule.translatesAutoresizingMaskIntoConstraints = false
         addSubview(rule, positioned: .below, relativeTo: scrollView)
@@ -308,6 +309,7 @@ final class TabBar: NSView {
         if selected != selectedIndex || items.count != self.items.count { needsReveal = true }
         self.items = items
         selectedIndex = selected
+        rule.isHidden = items.isEmpty
         needsLayout = true
         for (i, view) in tabViews.enumerated() {
             view.index = i

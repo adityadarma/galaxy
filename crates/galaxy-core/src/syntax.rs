@@ -57,10 +57,12 @@ pub enum SyntaxLanguage {
     R,
     /// `.blade.php`: HTML grammar plus the [`crate::blade`] overlay.
     Blade,
+    /// `.vue`: HTML grammar plus `<script>`/`<style>` injection.
+    Vue,
 }
 
 impl SyntaxLanguage {
-    pub const ALL: [Self; 28] = [
+    pub const ALL: [Self; 29] = [
         Self::Rust,
         Self::TypeScript,
         Self::Tsx,
@@ -89,6 +91,7 @@ impl SyntaxLanguage {
         Self::Dart,
         Self::R,
         Self::Blade,
+        Self::Vue,
     ];
 
     pub fn name(self) -> &'static str {
@@ -121,6 +124,7 @@ impl SyntaxLanguage {
             Self::Dart => "Dart",
             Self::R => "R",
             Self::Blade => "Blade",
+            Self::Vue => "Vue",
         }
     }
 
@@ -136,7 +140,7 @@ impl SyntaxLanguage {
             }
             Self::Lua | Self::Sql => Some("--"),
             Self::Ini => Some(";"),
-            Self::Json | Self::Html | Self::Css | Self::Markdown | Self::Blade => None,
+            Self::Json | Self::Html | Self::Css | Self::Markdown | Self::Blade | Self::Vue => None,
             Self::Php => Some("//"),
         }
     }
@@ -153,7 +157,7 @@ impl SyntaxLanguage {
             Self::Markdown => tree_sitter_md_025::LANGUAGE.into(),
             Self::Python => tree_sitter_python::LANGUAGE.into(),
             Self::Go => tree_sitter_go::LANGUAGE.into(),
-            Self::Html | Self::Blade => tree_sitter_html::LANGUAGE.into(),
+            Self::Html | Self::Blade | Self::Vue => tree_sitter_html::LANGUAGE.into(),
             Self::Css => tree_sitter_css::LANGUAGE.into(),
             Self::Bash => tree_sitter_bash::LANGUAGE.into(),
             Self::Php => tree_sitter_php::LANGUAGE_PHP.into(),
@@ -187,7 +191,7 @@ impl SyntaxLanguage {
             Self::Markdown => tree_sitter_md_025::HIGHLIGHT_QUERY_BLOCK,
             Self::Python => tree_sitter_python::HIGHLIGHTS_QUERY,
             Self::Go => tree_sitter_go::HIGHLIGHTS_QUERY,
-            Self::Html | Self::Blade => tree_sitter_html::HIGHLIGHTS_QUERY,
+            Self::Html | Self::Blade | Self::Vue => tree_sitter_html::HIGHLIGHTS_QUERY,
             Self::Css => tree_sitter_css::HIGHLIGHTS_QUERY,
             Self::Bash => BASH_HIGHLIGHTS,
             Self::Php => tree_sitter_php::HIGHLIGHTS_QUERY,
@@ -266,6 +270,7 @@ impl SyntaxLanguage {
             "py" | "pyw" => Some(Self::Python),
             "go" => Some(Self::Go),
             "html" | "htm" => Some(Self::Html),
+            "vue" => Some(Self::Vue),
             "css" => Some(Self::Css),
             "sh" | "bash" | "zsh" => Some(Self::Bash),
             "php" => Some(Self::Php),
@@ -314,20 +319,67 @@ pub struct OutlineSymbol {
     pub column_utf16: usize,
 }
 
-/// Whether char offset `pos` lies in plain text between tags (JSX text,
-/// HTML text, or PHP's inline HTML) rather than in code. Such words have no
-/// definition, so Cmd+click must not offer them as links.
+/// Whether char offset `pos` lies in markup rather than code: text between
+/// tags, HTML tag and attribute names, and JSX/TSX intrinsic tags (`<div>`)
+/// and attribute names. Such words have no definition, so Cmd+click must not
+/// offer them as links. Components (`<Button>`, Vue `<my-card>`) stay code,
+/// as do `{{ }}` interpolations in Vue.
 pub fn is_markup_text(doc: &Document, tree: &Tree, language: SyntaxLanguage, pos: usize) -> bool {
-    let kind = match language {
-        SyntaxLanguage::Tsx | SyntaxLanguage::JavaScript => "jsx_text",
-        SyntaxLanguage::Html | SyntaxLanguage::Php | SyntaxLanguage::Blade => "text",
-        _ => return false,
-    };
+    let html = matches!(
+        language,
+        SyntaxLanguage::Html | SyntaxLanguage::Php | SyntaxLanguage::Blade | SyntaxLanguage::Vue
+    );
+    let jsx = matches!(language, SyntaxLanguage::Tsx | SyntaxLanguage::JavaScript);
+    if !html && !jsx {
+        return false;
+    }
     let rope = doc.rope();
     let byte = rope.char_to_byte(pos.min(rope.len_chars()));
-    tree.root_node()
-        .descendant_for_byte_range(byte, byte)
-        .is_some_and(|node| node.kind() == kind)
+    // A one-byte range skips the node that merely ends where this one starts
+    // (the `<` before a tag name).
+    let Some(node) = tree
+        .root_node()
+        .descendant_for_byte_range(byte, (byte + 1).min(rope.len_bytes()))
+    else {
+        return false;
+    };
+    let text = |n: tree_sitter::Node| text_between(rope, n.start_byte(), n.end_byte());
+    let is_component = |name: &str| {
+        name.chars().next().is_some_and(char::is_uppercase)
+            || (language == SyntaxLanguage::Vue && name.contains('-'))
+    };
+    match node.kind() {
+        "jsx_text" => jsx,
+        "text" if html => language != SyntaxLanguage::Vue || !in_interpolation(rope, node, byte),
+        "tag_name" | "erroneous_end_tag_name" if html => {
+            !(language == SyntaxLanguage::Vue && text(node).is_some_and(|n| is_component(&n)))
+        }
+        "attribute_name" if html => true,
+        "identifier" if jsx => {
+            node.parent().is_some_and(|p| {
+                matches!(
+                    p.kind(),
+                    "jsx_opening_element" | "jsx_closing_element" | "jsx_self_closing_element"
+                )
+            }) && text(node).is_some_and(|n| !is_component(&n))
+        }
+        "property_identifier" if jsx => node.parent().is_some_and(|p| p.kind() == "jsx_attribute"),
+        _ => false,
+    }
+}
+
+/// Whether `byte` of the Vue `text` node sits between `{{` and `}}`.
+fn in_interpolation(rope: &Rope, node: tree_sitter::Node, byte: usize) -> bool {
+    let Some(text) = text_between(rope, node.start_byte(), node.end_byte()) else {
+        return false;
+    };
+    let at = byte.saturating_sub(node.start_byte()).min(text.len());
+    let before = text.get(..at).unwrap_or("");
+    let after = text.get(at..).unwrap_or("");
+    match (before.rfind("{{"), before.rfind("}}")) {
+        (Some(open), close) if close.is_none_or(|c| c < open) => after.contains("}}"),
+        _ => false,
+    }
 }
 
 /// Extracts definitions from a completed tree. This never parses or blocks.
@@ -584,6 +636,11 @@ pub fn style_runs_for_viewport(
                 .map(|(s, e, scope)| (s + start_byte, e + start_byte, scope)),
         );
     }
+    if language == SyntaxLanguage::Vue {
+        let overlay = vue_overlay(rope, tree, start_byte, end_byte);
+        spans = crate::blade::subtract(spans, &overlay.claimed);
+        spans.extend(overlay.spans);
+    }
     let mut runs = Vec::new();
     for (start, end, scope) in spans {
         let start_char = rope.byte_to_char(start);
@@ -610,6 +667,263 @@ pub fn style_runs_for_viewport(
     }
     runs.sort_by_key(|run| (run.line, run.start, run.end));
     runs
+}
+
+/// Cached parses of injected code (script/style bodies and template
+/// expressions), keyed by language and text, so scrolling re-parses nothing
+/// and typing re-parses only what changed.
+const INJECTION_CACHE_SLOTS: usize = 64;
+
+thread_local! {
+    static INJECTION_CACHE: std::cell::RefCell<Vec<(SyntaxLanguage, String, Tree)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn cached_parse(language: SyntaxLanguage, text: &str) -> Option<Tree> {
+    INJECTION_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(i) = cache
+            .iter()
+            .position(|(l, t, _)| *l == language && t == text)
+        {
+            let entry = cache.remove(i);
+            let tree = entry.2.clone();
+            cache.push(entry);
+            return Some(tree);
+        }
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).ok()?;
+        let parsed = parser.parse(text, None)?;
+        if cache.len() >= INJECTION_CACHE_SLOTS {
+            cache.remove(0);
+        }
+        cache.push((language, text.to_owned(), parsed.clone()));
+        Some(parsed)
+    })
+}
+
+/// Language of a Vue `<script>` or `<style>` start tag from its `lang`
+/// attribute. Unknown values fall back to nothing (left unstyled).
+fn vue_block_language(element: &str, start_tag: &str) -> Option<SyntaxLanguage> {
+    let lang = ["lang=\"", "lang='"].iter().find_map(|prefix| {
+        let at = start_tag.find(prefix)? + prefix.len();
+        start_tag[at..].split(['"', '\'']).next()
+    });
+    match (element, lang) {
+        ("script_element", Some("ts")) => Some(SyntaxLanguage::TypeScript),
+        ("script_element", Some("tsx")) => Some(SyntaxLanguage::Tsx),
+        ("script_element", Some("js" | "jsx") | None) => Some(SyntaxLanguage::JavaScript),
+        ("style_element", Some("css") | None) => Some(SyntaxLanguage::Css),
+        _ => None,
+    }
+}
+
+/// Text of `start..end`, or `None` when a (possibly stale) tree offset is out
+/// of range or splits a character.
+fn text_between(rope: &Rope, start: usize, end: usize) -> Option<String> {
+    let len = rope.len_bytes();
+    let (start, end) = (start.min(len), end.min(len));
+    if start > end {
+        return None;
+    }
+    let on_boundary = |b: usize| rope.char_to_byte(rope.byte_to_char(b)) == b;
+    (on_boundary(start) && on_boundary(end)).then(|| rope.byte_slice(start..end).to_string())
+}
+
+/// Styles for the embedded languages of a Vue single-file component:
+/// `<script>`/`<style>` bodies, `{{ }}` interpolations and the values of
+/// `v-*`, `:prop` and `@event` attributes. `claimed` lists the attribute
+/// values whose flat HTML string color must be replaced. Only the part of the
+/// document in `start_byte..end_byte` is styled.
+fn vue_overlay(
+    rope: &Rope,
+    tree: &Tree,
+    start_byte: usize,
+    end_byte: usize,
+) -> crate::blade::Overlay {
+    let mut scan = VueScan {
+        rope,
+        window: (start_byte, end_byte),
+        overlay: crate::blade::Overlay::default(),
+    };
+    scan.walk(tree.root_node());
+    let mut overlay = scan.overlay;
+    overlay.spans.retain_mut(|span| {
+        span.0 = span.0.max(start_byte);
+        span.1 = span.1.min(end_byte);
+        span.0 < span.1
+    });
+    overlay
+}
+
+struct VueScan<'a> {
+    rope: &'a Rope,
+    window: (usize, usize),
+    overlay: crate::blade::Overlay,
+}
+
+impl VueScan<'_> {
+    fn walk(&mut self, node: tree_sitter::Node) {
+        if node.end_byte() <= self.window.0 || node.start_byte() >= self.window.1 {
+            return;
+        }
+        match node.kind() {
+            "script_element" | "style_element" => return self.block(node),
+            "attribute" => return self.attribute(node),
+            "text" => return self.interpolations(node),
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            self.walk(child);
+        }
+    }
+
+    fn block(&mut self, element: tree_sitter::Node) {
+        let mut cursor = element.walk();
+        let mut tag = None;
+        let mut raw = None;
+        for child in element.children(&mut cursor) {
+            match child.kind() {
+                "start_tag" => tag = Some(child),
+                "raw_text" => raw = Some(child),
+                _ => {}
+            }
+        }
+        let (Some(tag), Some(raw)) = (tag, raw) else {
+            return;
+        };
+        let Some(tag_text) = text_between(self.rope, tag.start_byte(), tag.end_byte()) else {
+            return;
+        };
+        let Some(language) = vue_block_language(element.kind(), &tag_text) else {
+            return;
+        };
+        let (from, to) = (raw.start_byte(), raw.end_byte());
+        if from >= to || to <= self.window.0 || from >= self.window.1 {
+            return;
+        }
+        let Some(text) = text_between(self.rope, from, to) else {
+            return;
+        };
+        let Some(sub) = cached_parse(language, &text) else {
+            return;
+        };
+        self.captures(language, &text, &sub, from, (from, to));
+    }
+
+    fn attribute(&mut self, attribute: tree_sitter::Node) {
+        let mut cursor = attribute.walk();
+        let mut name = None;
+        let mut value = None;
+        for child in attribute.children(&mut cursor) {
+            match child.kind() {
+                "attribute_name" => name = Some(child),
+                "attribute_value" => value = Some(child),
+                "quoted_attribute_value" => {
+                    let mut inner = child.walk();
+                    value = child
+                        .children(&mut inner)
+                        .find(|n| n.kind() == "attribute_value");
+                }
+                _ => {}
+            }
+        }
+        let (Some(name), Some(value)) = (name, value) else {
+            return;
+        };
+        let Some(name) = text_between(self.rope, name.start_byte(), name.end_byte()) else {
+            return;
+        };
+        if !(name.starts_with("v-") || name.starts_with(':') || name.starts_with('@')) {
+            return;
+        }
+        let (from, to) = (value.start_byte(), value.end_byte());
+        if from >= to {
+            return;
+        }
+        self.overlay.claimed.push((from, to));
+        self.expression(from, to);
+    }
+
+    fn interpolations(&mut self, text_node: tree_sitter::Node) {
+        let base = text_node.start_byte();
+        let Some(text) = text_between(self.rope, base, text_node.end_byte()) else {
+            return;
+        };
+        let mut at = 0;
+        while let Some(open) = text[at..].find("{{").map(|i| i + at) {
+            let Some(close) = text[open + 2..].find("}}").map(|i| i + open + 2) else {
+                break;
+            };
+            let scope = HighlightScope::Punctuation;
+            self.overlay
+                .spans
+                .push((base + open, base + open + 2, scope));
+            self.overlay
+                .spans
+                .push((base + close, base + close + 2, scope));
+            self.expression(base + open + 2, base + close);
+            at = close + 2;
+        }
+    }
+
+    /// Styles `from..to` as one JavaScript expression. It is parsed inside
+    /// parentheses so `{ a: b }` is an object and not a block; when that does
+    /// not parse (`a = 1; b = 2`) it is parsed as plain statements.
+    fn expression(&mut self, from: usize, to: usize) {
+        if to <= self.window.0 || from >= self.window.1 {
+            return;
+        }
+        let Some(expr) = text_between(self.rope, from, to) else {
+            return;
+        };
+        let language = SyntaxLanguage::JavaScript;
+        let wrapped = format!("({expr})");
+        let (text, lead, sub) = match cached_parse(language, &wrapped) {
+            Some(tree) if !tree.root_node().has_error() => (wrapped, 1, tree),
+            _ => match cached_parse(language, &expr) {
+                Some(tree) => (expr, 0, tree),
+                None => return,
+            },
+        };
+        self.captures(language, &text, &sub, from - lead, (from, to));
+    }
+
+    /// Adds the highlight captures of `tree` (parsed from `text`, which sits
+    /// at byte `offset` of the document) that fall inside `keep`.
+    fn captures(
+        &mut self,
+        language: SyntaxLanguage,
+        text: &str,
+        tree: &Tree,
+        offset: usize,
+        keep: (usize, usize),
+    ) {
+        let Some(query) = cached_highlight_query(language) else {
+            return;
+        };
+        let names = query.capture_names();
+        let mut cursor = QueryCursor::new();
+        cursor.set_byte_range(
+            self.window.0.saturating_sub(offset)
+                ..self.window.1.saturating_sub(offset).min(text.len()),
+        );
+        let mut matches = cursor.matches(query, tree.root_node(), text.as_bytes());
+        while let Some(m) = matches.next() {
+            for capture in m.captures {
+                let Some(scope) = HighlightScope::from_capture(names[capture.index as usize])
+                else {
+                    continue;
+                };
+                let from = (capture.node.start_byte() + offset).max(keep.0);
+                let to = (capture.node.end_byte() + offset).min(keep.1);
+                if from < to {
+                    self.overlay.spans.push((from, to, scope));
+                }
+            }
+        }
+    }
 }
 
 /// Feeds Tree-sitter query predicates straight from Rope chunks, so a query
@@ -1014,7 +1328,37 @@ mod tests {
                     "const view"
                 ],
             ),
-            [true, true, false, false, false, false],
+            [true, true, true, false, false, false],
+        );
+    }
+
+    #[test]
+    fn tag_and_attribute_names_are_markup_but_components_and_expressions_are_not() {
+        assert_eq!(
+            markup_flags(
+                SyntaxLanguage::Html,
+                "<section class=\"a\"><p>x</p></section>",
+                &["section", "class", "p>x", "/section"],
+            ),
+            [true, true, true, false],
+        );
+        let jsx = "const v = <div className=\"a\"><Button label=\"b\" /></div>;";
+        assert_eq!(
+            markup_flags(
+                SyntaxLanguage::Tsx,
+                jsx,
+                &["div className", "className", "Button", "label", "v ="],
+            ),
+            [true, true, false, true, false],
+        );
+        let vue = "<template><my-card :id=\"id\">{{ total }} word</my-card><Item /></template>";
+        assert_eq!(
+            markup_flags(
+                SyntaxLanguage::Vue,
+                vue,
+                &["template", "my-card", ":id", "total", "word", "Item"],
+            ),
+            [true, false, true, false, true, false],
         );
     }
 
@@ -1026,7 +1370,7 @@ mod tests {
                 "<p class=\"a\">Hello world</p>",
                 &["Hello", "class"]
             ),
-            [true, false]
+            [true, true]
         );
         assert_eq!(
             markup_flags(
@@ -1189,6 +1533,10 @@ mod tests {
                 SyntaxLanguage::Blade,
                 "<p>{{ $name }}</p>\n@if ($a)\n@endif",
             ),
+            (
+                SyntaxLanguage::Vue,
+                "<template><p>{{ a }}</p></template>\n<script setup lang=\"ts\">\nconst a = 1\n</script>\n",
+            ),
         ];
         assert_eq!(SyntaxLanguage::ALL.len(), samples.len());
         for (language, source) in samples {
@@ -1326,6 +1674,10 @@ mod tests {
         assert_eq!(
             SyntaxLanguage::detect("resources/views/welcome.blade.php", "<?php"),
             Some(SyntaxLanguage::Blade)
+        );
+        assert_eq!(
+            SyntaxLanguage::detect("src/App.vue", ""),
+            Some(SyntaxLanguage::Vue)
         );
         for (path, expected) in [
             ("main.c", SyntaxLanguage::C),
@@ -1504,6 +1856,94 @@ mod tests {
             let text = crate::viewport::display_text(&doc, run.line);
             assert!(run.start < run.end && run.end <= text.encode_utf16().count());
         }
+    }
+
+    #[test]
+    fn vue_script_and_style_blocks_get_injected_styles() {
+        let src = "<template>\n  <p class=\"a\">{{ n }}</p>\n</template>\n<script setup lang=\"ts\">\nconst n: number = 1\n</script>\n<style scoped>\n.a { color: red; }\n</style>\n";
+        let doc = Document::from_text(src);
+        let language = SyntaxLanguage::detect("src/App.vue", "").unwrap();
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(doc.text(), None).unwrap();
+        let runs = style_runs_for_viewport(&doc, &tree, language, 0, 9);
+        let at = |line: usize, text: &str, scope: HighlightScope| {
+            let line_text = crate::viewport::display_text(&doc, line);
+            let start = line_text[..line_text.find(text).unwrap()]
+                .encode_utf16()
+                .count();
+            let end = start + text.encode_utf16().count();
+            runs.iter()
+                .any(|r| r.line == line && r.start == start && r.end == end && r.scope == scope)
+        };
+        assert!(at(1, "p", HighlightScope::Tag));
+        assert!(at(4, "const", HighlightScope::Keyword), "{runs:?}");
+        assert!(at(4, "number", HighlightScope::Type), "{runs:?}");
+        assert!(at(7, "color", HighlightScope::Property), "{runs:?}");
+    }
+
+    #[test]
+    fn vue_template_expressions_are_styled_as_javascript() {
+        let src = "<template>\n  <p :class=\"{ active: on }\" @click=\"count++\">{{ user.name + 1 }}</p>\n</template>\n";
+        let doc = Document::from_text(src);
+        let language = SyntaxLanguage::Vue;
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(doc.text(), None).unwrap();
+        let runs = style_runs_for_viewport(&doc, &tree, language, 0, 4);
+        let find = |text: &str| {
+            let line_text = crate::viewport::display_text(&doc, 1);
+            let start = line_text[..line_text.find(text).unwrap()]
+                .encode_utf16()
+                .count();
+            (start, start + text.encode_utf16().count())
+        };
+        let at = |text: &str, scope: HighlightScope| {
+            let (start, end) = find(text);
+            runs.iter()
+                .any(|r| r.line == 1 && r.start == start && r.end == end && r.scope == scope)
+        };
+        assert!(at("active", HighlightScope::Property), "{runs:?}");
+        assert!(at("on", HighlightScope::Variable), "{runs:?}");
+        assert!(at("count", HighlightScope::Variable), "{runs:?}");
+        assert!(at("user", HighlightScope::Variable), "{runs:?}");
+        assert!(at("name", HighlightScope::Property), "{runs:?}");
+        assert!(at("1", HighlightScope::Number), "{runs:?}");
+        assert!(at("{{", HighlightScope::Punctuation), "{runs:?}");
+        // The flat HTML string color no longer covers a directive value.
+        let (from, to) = find("{ active: on }");
+        assert!(
+            !runs.iter().any(|r| r.line == 1
+                && r.scope == HighlightScope::String
+                && r.start < to
+                && r.end > from),
+            "{runs:?}"
+        );
+        // A plain attribute keeps its string color.
+        let plain = Document::from_text("<p class=\"a\"></p>");
+        let tree = parser.parse(plain.text(), None).unwrap();
+        let runs = style_runs_for_viewport(&plain, &tree, language, 0, 1);
+        assert!(runs.iter().any(|r| r.scope == HighlightScope::String));
+    }
+
+    #[test]
+    fn vue_block_language_follows_lang_attribute() {
+        assert_eq!(
+            vue_block_language("script_element", "<script setup lang=\"ts\">"),
+            Some(SyntaxLanguage::TypeScript)
+        );
+        assert_eq!(
+            vue_block_language("script_element", "<script>"),
+            Some(SyntaxLanguage::JavaScript)
+        );
+        assert_eq!(
+            vue_block_language("style_element", "<style lang='scss'>"),
+            None
+        );
+        assert_eq!(
+            vue_block_language("style_element", "<style scoped>"),
+            Some(SyntaxLanguage::Css)
+        );
     }
 
     #[test]

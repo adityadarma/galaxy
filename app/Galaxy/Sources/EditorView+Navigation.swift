@@ -125,8 +125,8 @@ extension EditorView {
         }
         let flags = event.modifierFlags
         // ⌘+click on a keyword or comment is a plain click, not a lookup.
-        if flags.contains(.command), event.clickCount == 1, navigableRange(at: pos) != nil,
-           onDefinitionClick?(pos) == true { return }
+        if flags.contains(.command), event.clickCount == 1, let range = navigableRange(at: pos),
+           onDefinitionClick?(definitionPosition(at: pos, range: range)) == true { return }
         columnAnchor = nil
         if flags.contains(.option), flags.contains(.shift) {
             // Opt+Shift+drag: column (box) selection.
@@ -218,6 +218,14 @@ extension EditorView {
         }
         definitionLink = navigableRange(at: pos, text: text)
             .map { (line: pos.line, start: UInt64($0.lowerBound), end: UInt64($0.upperBound)) }
+    }
+
+    /// The position to look up for a ⌘+click on the link `range` at `pos`.
+    func definitionPosition(at pos: TextPos, range: Range<Int>) -> TextPos {
+        guard let document, Self.isPHP(document) else { return pos }
+        let text = document.displayLine(line: pos.line)
+        let start = Self.lastSegmentStart(in: text, range: range)
+        return start == range.lowerBound ? pos : TextPos(line: pos.line, colUtf16: UInt64(start))
     }
 
     /// Syntax scopes that never have a definition to jump to. Strings stay
@@ -354,13 +362,59 @@ extension EditorView {
         let units = Array(text.utf16)
         let nameStart = units[range.lowerBound] == UInt16(UInt8(ascii: "$")) ? range.lowerBound + 1 : range.lowerBound
         guard let run = styles.first(where: { Int($0.start) <= nameStart && nameStart < Int($0.end) }) else {
-            return range
+            return qualified(range, in: text, document: document)
         }
         if Self.nonNavigableScopes.contains(run.scope) { return nil }
         if run.scope == "string" {
             return Self.laravelStringRange(in: text, stringStart: Int(run.start), stringEnd: Int(run.end))
         }
-        return range
+        return qualified(range, in: text, document: document)
+    }
+
+    /// In PHP, `App\Models\Product` is one name: the link covers all of it.
+    private func qualified(_ range: Range<Int>, in text: String, document: DocumentHandle) -> Range<Int> {
+        Self.isPHP(document) ? Self.qualifiedNameRange(in: text, around: range) : range
+    }
+
+    /// `range` widened over the `\`-separated segments around it, and a
+    /// leading `\`. Variables (`$x`) and names without a `\` stay as they are.
+    static func qualifiedNameRange(in text: String, around range: Range<Int>) -> Range<Int> {
+        let units = Array(text.utf16)
+        let backslash = UInt16(UInt8(ascii: "\\"))
+        func isWord(_ i: Int) -> Bool {
+            guard i >= 0, i < units.count, let scalar = Unicode.Scalar(units[i]) else { return false }
+            return scalar == "_" || CharacterSet.alphanumerics.contains(scalar)
+        }
+        guard range.lowerBound >= 0, range.upperBound <= units.count, !range.isEmpty,
+              units[range.lowerBound] != UInt16(UInt8(ascii: "$")) else { return range }
+        var start = range.lowerBound, end = range.upperBound
+        while start > 0, units[start - 1] == backslash {
+            start -= 1
+            // A `\` with no name before it is the global-namespace prefix.
+            guard isWord(start - 1) else { break }
+            while isWord(start - 1) { start -= 1 }
+        }
+        while end < units.count, units[end] == backslash, isWord(end + 1) {
+            end += 1
+            while isWord(end) { end += 1 }
+        }
+        return start..<end
+    }
+
+    /// Where a click on the name in `range` is sent to the language server:
+    /// the start of its last segment, since that is the class or function
+    /// the whole name refers to. Clicking `Models` in `App\Models\Product`
+    /// opens `Product`, as in VS Code.
+    static func lastSegmentStart(in text: String, range: Range<Int>) -> Int {
+        let units = Array(text.utf16)
+        let backslash = UInt16(UInt8(ascii: "\\"))
+        guard range.lowerBound >= 0, range.upperBound <= units.count else { return range.lowerBound }
+        var i = range.upperBound - 1
+        while i >= range.lowerBound {
+            if units[i] == backslash { return i + 1 }
+            i -= 1
+        }
+        return range.lowerBound
     }
 
     /// Global helpers whose string argument laravel-lsp can resolve to a file.

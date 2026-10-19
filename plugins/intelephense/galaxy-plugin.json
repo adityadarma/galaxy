@@ -2,11 +2,11 @@
   "id": "intelephense",
   "name": "Intelephense",
   "version": "1.18.5",
-  "description": "PHP language server. Installs into the plugin folder with npm, or uses intelephense from PATH.",
+  "description": "PHP language server. Installs into the plugin folder with npm.",
   "languages": ["php", "blade"],
   "priority": 10,
   "server": {
-    "command": ["${pluginDir}/node_modules/.bin/intelephense", "intelephense"],
+    "command": ["${pluginDir}/node_modules/.bin/intelephense"],
     "args": ["--stdio"]
   },
   "install": {

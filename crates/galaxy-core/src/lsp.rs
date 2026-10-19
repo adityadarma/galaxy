@@ -618,7 +618,7 @@ fn default_server(
     root: Option<&Path>,
     find: &dyn Fn(&str) -> Option<PathBuf>,
 ) -> Option<ServerConfig> {
-    Catalog::builtin()
+    Catalog::builtin_with_dirs()
         .primary(language, root, find)
         .map(|(_, config)| config)
 }
@@ -647,7 +647,7 @@ fn companion_server_with(
     primary: &ServerConfig,
     find: &dyn Fn(&str) -> Option<PathBuf>,
 ) -> Option<ServerConfig> {
-    Catalog::builtin()
+    Catalog::builtin_with_dirs()
         .companions(language, root, &primary.program, find)
         .into_iter()
         .next()
@@ -673,6 +673,7 @@ pub(crate) fn default_server_kind(language: &str) -> Option<&'static str> {
         "python" => Some("python"),
         "go" => Some("go"),
         "php" | "blade" => Some("php"),
+        "vue" => Some("vue"),
         _ => None,
     }
 }
@@ -3002,10 +3003,12 @@ mod tests {
     }
 
     fn fake_find(available: &'static [&'static str]) -> impl Fn(&str) -> Option<PathBuf> {
+        // Servers are launched from `${pluginDir}/...`, so match on file name.
         move |program| {
+            let name = Path::new(program).file_name()?.to_str()?;
             available
-                .contains(&program)
-                .then(|| PathBuf::from(format!("/fake/bin/{program}")))
+                .contains(&name)
+                .then(|| PathBuf::from(format!("/fake/bin/{name}")))
         }
     }
 
@@ -3217,6 +3220,8 @@ mod tests {
         assert_eq!(lsp_server_language("Blade"), "php");
         assert_eq!(lsp_server_language("PHP"), "php");
         assert_eq!(lsp_server_language("TSX"), "typescript");
+        assert_eq!(lsp_server_language("Vue"), "vue");
+        assert_eq!(lsp_language_id("Vue", "src/App.vue"), "vue");
     }
 
     #[test]

@@ -38,6 +38,11 @@ struct Session: Codable, Equatable {
     var activeGroup: Int? = nil
     /// Groups side by side (true) or stacked.
     var groupsVertical: Bool? = nil
+    /// The other open windows at quit. This session is the key window's.
+    /// Optional so sessions saved with one window still decode.
+    var otherWindows: [Session]? = nil
+    /// Whether this window was full screen at quit.
+    var fullScreen: Bool? = nil
 
     /// `~/Library/Application Support/Galaxy/session.json`. Under XCTest
     /// a temp file, so tests never read or overwrite the user's session.

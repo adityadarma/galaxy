@@ -48,7 +48,7 @@ impl Flavor {
     /// `None` for languages without tags (TypeScript has generics, not JSX).
     pub fn for_language(language: SyntaxLanguage) -> Option<Self> {
         match language {
-            SyntaxLanguage::Html => Some(Self {
+            SyntaxLanguage::Html | SyntaxLanguage::Vue => Some(Self {
                 html: true,
                 jsx: false,
                 php: false,

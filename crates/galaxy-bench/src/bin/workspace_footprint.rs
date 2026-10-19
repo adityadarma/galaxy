@@ -12,8 +12,8 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -95,7 +95,8 @@ fn main() {
         peak = peak.max(mb);
         let live = LIVE.load(Ordering::Relaxed) as f64 / 1048576.0;
         // Peak since the previous phase, then reset for the next one.
-        let phase_peak = PEAK.swap(LIVE.load(Ordering::Relaxed), Ordering::Relaxed) as f64 / 1048576.0;
+        let phase_peak =
+            PEAK.swap(LIVE.load(Ordering::Relaxed), Ordering::Relaxed) as f64 / 1048576.0;
         let (malloc_used, malloc_reserved) = malloc_mb();
         println!(
             "phase={phase} rss_mb={mb:.1} rust_heap_mb={live:.1} rust_phase_peak_mb={phase_peak:.1} \
@@ -125,8 +126,16 @@ fn main() {
     let now = Instant::now();
     for tab in &mut tabs {
         for key in 0..KEYSTROKES {
-            let tx = edit::insert_text(&tab.editor.doc, &tab.editor.sel, if key % 40 == 39 { "\n" } else { "x" });
-            tab.editor.apply(tx, EditKind::Insert, now + Duration::from_millis(key as u64 * 30));
+            let tx = edit::insert_text(
+                &tab.editor.doc,
+                &tab.editor.sel,
+                if key % 40 == 39 { "\n" } else { "x" },
+            );
+            tab.editor.apply(
+                tx,
+                EditKind::Insert,
+                now + Duration::from_millis(key as u64 * 30),
+            );
             tab.syntax.submit_document(&tab.editor.doc);
             tab.lsp.note_document(&tab.editor.doc, now);
             // The draw that follows every keystroke in the app.
@@ -160,14 +169,20 @@ fn main() {
     sample("scroll_again");
     println!(
         "undo_bytes={}",
-        tabs.iter().map(|t| t.editor.history.undo_bytes()).sum::<usize>()
+        tabs.iter()
+            .map(|t| t.editor.history.undo_bytes())
+            .sum::<usize>()
     );
 
     drop(index);
     println!("peak_rss_mb={peak:.1}");
 }
 
-fn pick_files(repo: &Path, index: &galaxy_core::workspace::WorkspaceIndex, count: usize) -> Vec<PathBuf> {
+fn pick_files(
+    repo: &Path,
+    index: &galaxy_core::workspace::WorkspaceIndex,
+    count: usize,
+) -> Vec<PathBuf> {
     // Prefer files with a grammar so every tab exercises syntax.
     let mut picked = Vec::new();
     if count == 0 {
@@ -214,7 +229,11 @@ fn wait_for_parse(tab: &mut Tab) {
         while let Some(snapshot) = tab.syntax.poll() {
             tab.snapshot = Some(snapshot);
         }
-        if tab.snapshot.as_ref().is_some_and(|s| s.revision() >= target) {
+        if tab
+            .snapshot
+            .as_ref()
+            .is_some_and(|s| s.revision() >= target)
+        {
             return;
         }
         thread::sleep(Duration::from_millis(2));

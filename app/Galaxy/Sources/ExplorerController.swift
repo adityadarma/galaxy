@@ -487,6 +487,36 @@ final class ExplorerOutlineView: NSOutlineView {
         super.mouseDown(with: event)
     }
 
+    /// The pointer is over the explorer. Indent guides are drawn only then.
+    private(set) var isPointerInside = false {
+        didSet {
+            guard isPointerInside != oldValue else { return }
+            enumerateAvailableRowViews { row, _ in row.needsDisplay = true }
+        }
+    }
+
+    private func syncPointer() {
+        guard let window else { isPointerInside = false; return }
+        let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        isPointerInside = NSMouseInRect(point, visibleRect, isFlipped)
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.filter { $0.owner === self }.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
+                                       owner: self, userInfo: nil))
+        syncPointer()
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        syncPointer()
+    }
+
+    override func mouseEntered(with event: NSEvent) { isPointerInside = true }
+    override func mouseExited(with event: NSEvent) { isPointerInside = false }
+
     override func frameOfOutlineCell(atRow row: Int) -> NSRect { .zero }
 
     override func frameOfCell(atColumn column: Int, row: Int) -> NSRect {
@@ -553,7 +583,7 @@ final class ExplorerCell: NSTableCellView {
         icon.imageScaling = .scaleProportionallyDown
         icon.setAccessibilityElement(false)
         label.font = .systemFont(ofSize: 13)
-        label.lineBreakMode = .byTruncatingMiddle
+        label.lineBreakMode = .byTruncatingTail
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         imageView = icon
         textField = label
@@ -596,7 +626,7 @@ final class ExplorerCell: NSTableCellView {
         label.drawsBackground = editing
         label.backgroundColor = editing ? Theme.editorBackground : nil
         label.isBordered = editing
-        label.lineBreakMode = editing ? .byClipping : .byTruncatingMiddle
+        label.lineBreakMode = editing ? .byClipping : .byTruncatingTail
         label.cell?.isScrollable = editing
     }
 
@@ -674,6 +704,8 @@ final class ExplorerRowView: NSTableRowView {
             NSColor.labelColor.withAlphaComponent(0.05).setFill()
             bounds.fill()
         }
+        // Guides show only while the pointer is over the explorer.
+        guard (superview as? ExplorerOutlineView)?.isPointerInside == true else { return }
         NSColor.labelColor.withAlphaComponent(0.12).setFill()
         for l in 0..<level {
             NSRect(x: ExplorerOutlineView.guideX(level: l), y: 0, width: 1, height: bounds.height).fill()

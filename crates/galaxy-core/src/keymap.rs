@@ -178,8 +178,14 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("cmd+shift+w", "workbench.action.closeWindow"),
     ("alt+cmd+t", "workbench.action.closeOtherEditors"),
     ("alt+cmd+c", "workbench.action.files.copyPathOfActiveFile"),
-    ("shift+alt+cmd+c", "workbench.action.files.copyRelativePathOfActiveFile"),
-    ("alt+cmd+r", "workbench.action.files.revealActiveFileInWindows"),
+    (
+        "shift+alt+cmd+c",
+        "workbench.action.files.copyRelativePathOfActiveFile",
+    ),
+    (
+        "alt+cmd+r",
+        "workbench.action.files.revealActiveFileInWindows",
+    ),
     ("cmd+z", "undo"),
     ("cmd+shift+z", "redo"),
     ("cmd+x", "editor.action.clipboardCutAction"),
@@ -256,7 +262,10 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("cmd+2", "workbench.action.focusSecondEditorGroup"),
     ("cmd+3", "workbench.action.focusThirdEditorGroup"),
     ("ctrl+cmd+right", "workbench.action.moveEditorToNextGroup"),
-    ("ctrl+cmd+left", "workbench.action.moveEditorToPreviousGroup"),
+    (
+        "ctrl+cmd+left",
+        "workbench.action.moveEditorToPreviousGroup",
+    ),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -477,14 +486,23 @@ mod tests {
         let cases = [
             ("workbench.action.showCommands", ["shift+cmd+p", "f1"]),
             ("workbench.action.togglePanel", ["cmd+j", "ctrl+`"]),
-            ("workbench.action.nextEditor", ["shift+cmd+]", "alt+cmd+right"]),
-            ("workbench.action.previousEditor", ["shift+cmd+[", "alt+cmd+left"]),
+            (
+                "workbench.action.nextEditor",
+                ["shift+cmd+]", "alt+cmd+right"],
+            ),
+            (
+                "workbench.action.previousEditor",
+                ["shift+cmd+[", "alt+cmd+left"],
+            ),
         ];
         for (command, keys) in cases {
             assert_eq!(keys_of(&map, command), keys, "{command}");
         }
         assert_eq!(keys_of(&map, "galaxy.openSettings"), ["cmd+,"]);
-        assert_eq!(keys_of(&map, "editor.action.formatDocument"), ["shift+alt+f"]);
+        assert_eq!(
+            keys_of(&map, "editor.action.formatDocument"),
+            ["shift+alt+f"]
+        );
     }
 
     #[test]

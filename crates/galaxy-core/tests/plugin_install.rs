@@ -303,8 +303,11 @@ fn builtin_plugins_install_locally_only_on_request() {
     let (catalog, _) = Catalog::load(dir);
     assert!(catalog.get("phpactor").unwrap().builtin);
 
-    // PATH-only built-ins have nothing to install.
-    assert!(install::fetch_builtin(dir, "rust-analyzer").is_err());
+    // Every built-in is installed on request; unknown ids are rejected.
+    for id in ["rust-analyzer", "gopls", "pyright", "vue-language-server"] {
+        let pending = install::fetch_builtin(dir, id).unwrap();
+        install::discard(dir, &pending.token).unwrap();
+    }
     assert!(install::fetch_builtin(dir, "no-such-plugin").is_err());
 
     // Staging alone changes nothing; discarding removes it.
@@ -357,4 +360,53 @@ fn real_pyright_builtin_installs_and_takes_over() {
     );
     install::uninstall(dir, "pyright").unwrap();
     assert!(Catalog::load(dir).0.get("pyright").unwrap().builtin);
+}
+
+/// A `gz` download is decompressed to a single executable file.
+#[test]
+fn gz_download_installs_an_executable() {
+    let work = tempfile::tempdir().unwrap();
+    let raw = work.path().join("demo-ls");
+    fs::write(&raw, "#!/bin/sh\necho hi\n").unwrap();
+    assert!(
+        Command::new("gzip")
+            .arg("-k")
+            .arg(&raw)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let gz = work.path().join("demo-ls.gz");
+    let sum = Command::new("shasum")
+        .args(["-a", "256"])
+        .arg(&gz)
+        .output()
+        .unwrap();
+    let sha = String::from_utf8(sum.stdout)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    let extra = format!(
+        r#""install":{{"downloads":[{{"platform":"*","url":"file://{}","sha256":"{sha}","dest":"bin/demo-ls","archive":"gz","executable":true}}]}}"#,
+        gz.display()
+    );
+    let text = manifest("1.0.0", "").replace(
+        r#""install":{"steps":[["touch","${pluginDir}/built"]]}"#,
+        &extra,
+    );
+    let remote = repo(&text);
+    let plugins = tempfile::tempdir().unwrap();
+    let dir = plugins.path();
+    let pending = install::fetch(dir, &source(remote.path(), "main"), None).unwrap();
+    install::install(dir, &pending.token).unwrap();
+
+    let binary = dir.join("demo/bin/demo-ls");
+    assert_eq!(fs::read_to_string(&binary).unwrap(), "#!/bin/sh\necho hi\n");
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        fs::metadata(&binary).unwrap().permissions().mode() & 0o111,
+        0o111
+    );
 }
