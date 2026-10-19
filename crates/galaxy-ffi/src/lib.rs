@@ -3,11 +3,11 @@
 //! Design rule: the UI calls in with coarse-grained commands and receives
 //! batched events through `CoreListener`. No per-character FFI chatter.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use galaxy_core::change::{Change, ChangeSet};
 use galaxy_core::clipboard;
@@ -320,6 +320,16 @@ pub fn plugin_registry_entries() -> RegistryListing {
         }
     }
     listing
+}
+
+/// Stops language servers a previous Galaxy left behind after a crash or a
+/// forced quit. Only processes started from the plugin folder whose parent
+/// is gone are touched. Returns how many were told to exit.
+#[uniffi::export]
+pub fn reap_orphaned_lsp_servers() -> u64 {
+    plugins::install::default_dir()
+        .map(|dir| galaxy_core::lsp::reap_orphaned_servers(&dir) as u64)
+        .unwrap_or(0)
 }
 
 /// Returns the core version.
@@ -965,6 +975,57 @@ impl Core {
         let stopped = lsp.stop_server(&key);
         documents.retain(|_, value| value.path() != path);
         stopped
+    }
+
+    /// Frees language servers nobody needs. `open` is every document any
+    /// window still shows: registered documents missing from it are closed,
+    /// then servers left without a document stop, those of `release_root`
+    /// (a folder just left) at once, others after `idle_seconds` unused.
+    /// Returns how many servers stopped.
+    pub fn sweep_lsp(
+        &self,
+        open: Vec<Arc<DocumentHandle>>,
+        release_root: Option<String>,
+        idle_seconds: u64,
+    ) -> u64 {
+        let shown: HashSet<String> = open
+            .iter()
+            .map(|document| document.path())
+            .filter(|path| !path.is_empty())
+            .map(|path| file_uri(Path::new(&path)))
+            .collect();
+        let mut documents = self.lsp_documents.lock().unwrap_or_else(|e| e.into_inner());
+        let mut lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
+        let closed: Vec<String> = documents
+            .keys()
+            .filter(|uri| !shown.contains(*uri))
+            .cloned()
+            .collect();
+        for uri in &closed {
+            let _ = lsp.close_document(uri);
+            documents.remove(uri);
+        }
+        let mut stopped = 0;
+        if let Some(root) = release_root {
+            stopped += lsp.stop_unused_in(Path::new(&root)).len();
+        }
+        stopped += lsp
+            .stop_idle(Instant::now(), Duration::from_secs(idle_seconds))
+            .len();
+        stopped as u64
+    }
+
+    /// Stops every language server, helpers included. Called when the app
+    /// quits so nothing is left running under launchd.
+    pub fn shutdown_lsp(&self) {
+        self.lsp_documents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.lsp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .shutdown_all();
     }
 
     pub fn restart_lsp(
@@ -2338,8 +2399,15 @@ impl Workspace {
         self.inner.name()
     }
 
-    /// Lists one directory (`""` is the root): folders first, then files,
-    /// honoring `.gitignore` and the built-in excludes.
+    /// Sets the `files.exclude` globs the explorer hides, relative to the
+    /// root. A leading double star and slash matches at any depth. Returns
+    /// whether the set changed.
+    pub fn set_explorer_excludes(&self, globs: Vec<String>) -> bool {
+        self.inner.set_explorer_excludes(globs)
+    }
+
+    /// Lists one directory (`""` is the root): folders first, then files.
+    /// Shows ignored files and `.git`; only `set_explorer_excludes` hides.
     pub fn list_dir(&self, rel_path: String) -> Result<Vec<FileEntry>, CoreError> {
         Ok(self
             .inner
@@ -5256,8 +5324,20 @@ mod tests {
             .collect();
         assert_eq!(
             root,
-            vec![("src".into(), true), ("README.md".into(), false)]
+            vec![
+                ("src".into(), true),
+                ("target".into(), true),
+                ("README.md".into(), false)
+            ]
         );
+        assert!(ws.set_explorer_excludes(vec!["target".into()]));
+        let root: Vec<_> = ws
+            .list_dir(String::new())
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(root, vec!["src", "README.md"]);
 
         let src = ws.list_dir("src".into()).unwrap();
         assert_eq!(src[0].rel_path, "src/main.rs");

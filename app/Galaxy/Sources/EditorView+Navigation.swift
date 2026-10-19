@@ -112,9 +112,9 @@ extension EditorView {
             toggleFold(line: UInt64(hit.key))
             return
         }
-        if local.x < gutterWidth, event.clickCount == 1 {
+        if local.x < gutterWidth + gutterShift, event.clickCount == 1 {
             // The chevron column folds; the line numbers set or clear a breakpoint.
-            if local.x >= foldZoneMinX, !wrapSuspended, document.foldState(line: pos.line) != .plain {
+            if local.x - gutterShift >= foldZoneMinX, !wrapSuspended, document.foldState(line: pos.line) != .plain {
                 toggleFold(line: pos.line)
                 return
             }
@@ -160,7 +160,7 @@ extension EditorView {
     override func menu(for event: NSEvent) -> NSMenu? {
         guard let document, let onContextMenu else { return super.menu(for: event) }
         let local = convert(event.locationInWindow, from: nil)
-        guard local.x >= gutterWidth else { return nil }
+        guard local.x >= gutterWidth + gutterShift else { return nil }
         window?.makeFirstResponder(self)
         let pos = textPosition(at: local)
         let selection = selectedRange()
@@ -205,10 +205,11 @@ extension EditorView {
 
     /// Arrow over the line numbers, I-beam (or link hand) over the text.
     override func resetCursorRects() {
-        let gutter = NSRect(x: 0, y: visibleRect.minY, width: gutterWidth, height: visibleRect.height)
+        let edge = gutterWidth + gutterShift
+        let gutter = NSRect(x: gutterShift, y: visibleRect.minY, width: gutterWidth, height: visibleRect.height)
             .intersection(visibleRect)
-        let text = NSRect(x: gutterWidth, y: visibleRect.minY,
-                          width: max(0, visibleRect.maxX - gutterWidth), height: visibleRect.height)
+        let text = NSRect(x: edge, y: visibleRect.minY,
+                          width: max(0, visibleRect.maxX - edge), height: visibleRect.height)
         addCursorRect(gutter, cursor: .arrow)
         addCursorRect(text, cursor: definitionLink == nil ? .iBeam : .pointingHand)
     }
@@ -216,7 +217,7 @@ extension EditorView {
     /// Shows or clears the Cmd-hover link for the word under the mouse.
     func updateDefinitionLink(commandHeld: Bool) {
         guard commandHeld, onDefinitionClick != nil, let point = lastMousePoint,
-              point.x >= textOriginX, let document, lineCount > 0 else {
+              point.x >= gutterWidth + gutterShift, let document, lineCount > 0 else {
             definitionLink = nil
             return
         }

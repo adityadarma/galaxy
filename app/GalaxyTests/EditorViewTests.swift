@@ -39,6 +39,68 @@ final class EditorViewTests: XCTestCase {
         return (try CoreBridge().openDocument(path: url.path), url)
     }
 
+    /// A line wider than the window makes the document wider than the
+    /// viewport, so it can scroll sideways. The line numbers keep their place.
+    func testLongLinesScrollSidewaysAndKeepTheGutterAtTheEdge() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("galaxy-\(UUID().uuidString).txt")
+        let long = String(repeating: "abcdefghij", count: 150)
+        try "short\n\(long)\nend".write(to: url, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let doc = try CoreBridge().openDocument(path: url.path)
+
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 500, height: 300),
+                              styleMask: [.titled], backing: .buffered, defer: false)
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 500, height: 300))
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = true
+        let view = EditorView(frame: NSRect(x: 0, y: 0, width: 500, height: 300))
+        view.autoresizingMask = [.width]
+        scroll.documentView = view
+        window.contentView = scroll
+        view.document = doc
+        window.orderFrontRegardless()
+        defer { window.orderOut(nil) }
+        func settle() { RunLoop.current.run(until: Date().addingTimeInterval(0.3)) }
+
+        let visibleWidth = scroll.contentSize.width
+        // The width follows the first draw by one main-queue hop; wait for it
+        // instead of guessing how long a busy test run needs.
+        let deadline = Date().addingTimeInterval(5)
+        while view.frame.width <= visibleWidth, Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+        }
+        XCTAssertGreaterThan(view.contentTextWidth, visibleWidth, "the long line was measured")
+        XCTAssertGreaterThan(view.frame.width, visibleWidth, "the document is wider than the window")
+        XCTAssertEqual(view.gutterShift, 0)
+
+        // Scrolled to the right: the gutter is drawn at the left edge of the window.
+        scroll.contentView.scroll(to: NSPoint(x: 400, y: 0))
+        scroll.reflectScrolledClipView(scroll.contentView)
+        settle()
+        XCTAssertEqual(view.gutterShift, 400)
+        // A click on the line numbers is still a click on the gutter.
+        XCTAssertLessThan(view.textPosition(at: NSPoint(x: 400 + view.gutterWidth + 1, y: 1)).colUtf16, 100)
+
+        // The caret at the end of the long line brings that end into view.
+        doc.setCaret(pos: TextPos(line: 1, colUtf16: UInt64(long.utf16.count)))
+        view.reloadDocument()
+        scroll.contentView.scroll(to: NSPoint(x: 0, y: 0))
+        scroll.reflectScrolledClipView(scroll.contentView)
+        view.scrollCaretToVisible(primary: doc.primaryCursor(), lineText: long)
+        settle()
+        let caret = view.rect(forLine: 1, column: UInt64(long.utf16.count))
+        XCTAssertGreaterThan(view.gutterShift, 0, "scrolled right to follow the caret")
+        XCTAssertLessThanOrEqual(caret.maxX, scroll.contentView.bounds.maxX + 1)
+        XCTAssertGreaterThanOrEqual(caret.minX, scroll.contentView.bounds.minX + view.gutterWidth)
+
+        // Soft wrap fits the text to the window: nothing to scroll sideways.
+        view.wrapEnabled = true
+        settle()
+        XCTAssertEqual(view.gutterShift, 0)
+        XCTAssertEqual(view.frame.width, visibleWidth, accuracy: 1)
+    }
+
     func testViewHeightCoversWholeDocument() throws {
         let (doc, url) = try makeDocument(lines: 50_000)
         defer { try? FileManager.default.removeItem(at: url) }

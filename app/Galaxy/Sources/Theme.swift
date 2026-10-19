@@ -169,7 +169,7 @@ enum Theme {
     static let gutterText = NSColor.secondaryLabelColor
     static let indentGuide = NSColor.separatorColor.withAlphaComponent(0.55)
     /// Space/tab markers: visible on close look, quieter than comments.
-    static let whitespace = NSColor.secondaryLabelColor.withAlphaComponent(0.38)
+    static let whitespace = NSColor.secondaryLabelColor.withAlphaComponent(0.2)
     static let bracketMatch = NSColor(name: "GalaxyBracketMatch") { appearance in
         accent.resolved(for: appearance).withAlphaComponent(0.28)
     }

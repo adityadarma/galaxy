@@ -1,5 +1,15 @@
 import AppKit
 
+/// Short text for change counts: 0-999 as is, then thousands. An exact
+/// multiple of 1000 reads "1k", anything above it "1k+" (2500 is "2k+").
+enum CountFormat {
+    static func compact(_ count: Int) -> String {
+        guard count >= 1000 else { return "\(max(count, 0))" }
+        let thousands = count / 1000
+        return count % 1000 == 0 ? "\(thousands)k" : "\(thousands)k+"
+    }
+}
+
 /// Narrow icon strip on the far left, as in VSCode and JetBrains' tool
 /// window bar. Clicking the active item hides the sidebar.
 @MainActor
@@ -11,8 +21,8 @@ final class ActivityBar: NSView {
             switch self {
             case .explorer: "folder"
             case .search: "magnifyingglass"
-            case .sourceControl: "arrow.triangle.branch"
-            case .extensions: "puzzlepiece.extension"
+            case .sourceControl: "point.topleft.down.curvedto.point.bottomright.up"
+            case .extensions: "square.grid.2x2"
             }
         }
 
@@ -144,7 +154,7 @@ final class ActivityBarButton: NSButton {
         }
         super.draw(dirtyRect)
         guard badgeValue > 0 else { return }
-        let text = badgeValue > 99 ? "99+" : "\(badgeValue)"
+        let text = CountFormat.compact(badgeValue)
         let font = NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold)
         let attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.white]
         let size = (text as NSString).size(withAttributes: attributes)

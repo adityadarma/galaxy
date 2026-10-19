@@ -113,7 +113,7 @@ final class EditorGroupPane: NSView {
         pathBar.setAccessibilityElement(false)
 
         scrollView.hasVerticalScroller = true
-        scrollView.hasHorizontalScroller = false
+        scrollView.hasHorizontalScroller = true
         scrollView.scrollerStyle = .overlay
         scrollView.autohidesScrollers = true
         scrollView.automaticallyAdjustsContentInsets = false

@@ -96,12 +96,69 @@ final class EditorView: NSView {
         didSet { if rightInset != oldValue { applyRightInset() } }
     }
 
-    /// Sizes the view to the scroll view's width minus `rightInset`. Safe to
-    /// call again: it works from the scroll view, not from the current frame.
-    func applyRightInset() {
-        guard let width = enclosingScrollView?.contentSize.width else { return }
-        // Autoresizing keeps this offset from the scroll view's width.
-        setFrameSize(NSSize(width: max(width - rightInset, 1), height: frame.height))
+    /// Sizes the view to the scroll view's width minus `rightInset`, or wider
+    /// when a long line needs it. Safe to call again: it works from the scroll
+    /// view and the measured text, not from the current frame.
+    func applyRightInset() { updateDocumentWidth() }
+
+    // MARK: Horizontal scrolling
+
+    /// Widest line drawn since the document was set, in points. The core
+    /// never measures a whole document, so the scroll width grows as long
+    /// lines come into view.
+    private(set) var contentTextWidth: CGFloat = 0
+    /// Room kept after the longest line so its end is not at the very edge.
+    private static let trailingRoom: CGFloat = 24
+    private var lastClipWidth: CGFloat = 0
+    private var lastScrollX: CGFloat = 0
+    private var clipObserver: NSObjectProtocol?
+
+    /// How far the text is scrolled to the right. The line numbers stay put
+    /// at the left edge, so they are drawn this far into the document.
+    var gutterShift: CGFloat { max(0, enclosingScrollView?.contentView.bounds.origin.x ?? 0) }
+
+    /// Wide enough for the longest line seen, never narrower than the visible
+    /// area. Soft wrap fits the text to the width, so nothing scrolls then.
+    func updateDocumentWidth() {
+        guard let scroll = enclosingScrollView else { return }
+        var width = max(scroll.contentSize.width - rightInset, 1)
+        if !wrapActive {
+            // The minimap covers the last `rightInset` points of the clip.
+            width = max(width, textOriginX + contentTextWidth + Self.trailingRoom + rightInset)
+        }
+        guard abs(width - frame.width) > 0.5 else { return }
+        setFrameSize(NSSize(width: width, height: frame.height))
+    }
+
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        if let clipObserver { NotificationCenter.default.removeObserver(clipObserver) }
+        clipObserver = nil
+        guard let clip = superview as? NSClipView else { return }
+        clip.postsBoundsChangedNotifications = true
+        lastClipWidth = clip.bounds.width
+        lastScrollX = max(0, clip.bounds.origin.x)
+        clipObserver = NotificationCenter.default.addObserver(
+            forName: NSView.boundsDidChangeNotification, object: clip, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.clipBoundsChanged() }
+        }
+    }
+
+    private func clipBoundsChanged() {
+        guard let clip = superview as? NSClipView else { return }
+        if clip.bounds.width != lastClipWidth {
+            lastClipWidth = clip.bounds.width
+            updateDocumentWidth()
+        }
+        let x = max(0, clip.bounds.origin.x)
+        guard x != lastScrollX else { return }
+        lastScrollX = x
+        // AppKit blits the old pixels on scroll, which would carry the line
+        // numbers along; draw the whole view so they stay at the edge.
+        setNeedsDisplay(visibleRect)
+        updateFoldToolTip()
+        window?.invalidateCursorRects(for: self)
     }
     /// The document, its size or its scroll range changed; overview views
     /// redraw from this.
@@ -215,7 +272,7 @@ final class EditorView: NSView {
             }
             // Cursor rects would reset a bare `set()` on the next move.
             window?.invalidateCursorRects(for: self)
-            let inGutter = (lastMousePoint?.x ?? .infinity) < gutterWidth
+            let inGutter = (lastMousePoint?.x ?? .infinity) < gutterWidth + gutterShift
             (inGutter ? NSCursor.arrow : definitionLink == nil ? NSCursor.iBeam : NSCursor.pointingHand).set()
         }
     }
@@ -244,6 +301,7 @@ final class EditorView: NSView {
             // and give the new one this view's width.
             if appliedWrapColumns != nil { oldValue?.setWrapColumns(columns: nil) }
             appliedWrapColumns = nil
+            contentTextWidth = 0
             applyWrapColumns()
             syntaxAwaiting = document?.syntaxLanguage() != nil
             startSyntaxPollingIfNeeded()
@@ -280,7 +338,7 @@ final class EditorView: NSView {
     override func mouseMoved(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         lastMousePoint = point
-        setPointerInGutter(point.x < gutterWidth)
+        setPointerInGutter(point.x < gutterWidth + gutterShift)
         updateDefinitionLink(commandHeld: event.modifierFlags.contains(.command))
         onHover?(textPosition(at: point), point)
     }
@@ -298,7 +356,7 @@ final class EditorView: NSView {
     private func setPointerInGutter(_ inside: Bool) {
         guard inside != pointerInGutter else { return }
         pointerInGutter = inside
-        setNeedsDisplay(NSRect(x: 0, y: visibleRect.minY, width: gutterWidth, height: visibleRect.height))
+        setNeedsDisplay(NSRect(x: gutterShift, y: visibleRect.minY, width: gutterWidth, height: visibleRect.height))
     }
 
     override func flagsChanged(with event: NSEvent) {
@@ -364,6 +422,7 @@ final class EditorView: NSView {
         font = newFont
         metrics = Metrics(font: newFont)
         layouts.removeAll()
+        contentTextWidth = 0
         reloadDocument()
     }
 
@@ -398,6 +457,7 @@ final class EditorView: NSView {
         let virtual = CGFloat(rowCount) * metrics.lineHeight
         let visible = enclosingScrollView?.contentSize.height ?? 0
         setFrameSize(NSSize(width: frame.width, height: max(virtual, visible)))
+        updateDocumentWidth()
         updateFoldToolTip()
     }
 
@@ -412,7 +472,7 @@ final class EditorView: NSView {
 
     /// Hover text over the chevron column, kept in step with the gutter width.
     private func updateFoldToolTip() {
-        let rect = NSRect(x: foldZoneMinX, y: 0, width: gutterWidth - foldZoneMinX, height: frame.height)
+        let rect = NSRect(x: foldZoneMinX + gutterShift, y: 0, width: gutterWidth - foldZoneMinX, height: frame.height)
         guard rect != foldToolTipRect else { return }
         foldToolTipRect = rect
         // The gutter edge moved too (more digits), and the cursor rects follow it.
@@ -425,6 +485,12 @@ final class EditorView: NSView {
 
     private func wrapSettingsChanged() {
         applyWrapColumns()
+        // Wrapped text fits the width: no sideways scroll, back to column 0.
+        if wrapActive, let clip = superview as? NSClipView, clip.bounds.origin.x != 0 {
+            clip.scroll(to: NSPoint(x: 0, y: clip.bounds.origin.y))
+            enclosingScrollView?.reflectScrolledClipView(clip)
+        }
+        updateDocumentWidth()
         reloadDocument()
     }
 
@@ -751,7 +817,10 @@ final class EditorView: NSView {
         }
 
         let originX = textOriginX
-        let gutterRight = self.gutterRight
+        // Scrolled sideways, the line numbers are drawn this far to the right.
+        let shift = gutterShift
+        let gutterRight = self.gutterRight + shift
+        var drawnWidth: CGFloat = 0
         let lineHeight = metrics.lineHeight
         let drawCarets = showsCaret
         let selectionColor = (isActive || forcedCaretVisible != nil)
@@ -834,15 +903,12 @@ final class EditorView: NSView {
             let indentColumns = isBlank
                 ? max(Self.leadingIndentColumns(in: line.text), scopeIndent(Int(line.line)))
                 : Self.leadingIndentColumns(in: line.text)
-            if isBlank ? indentColumns > 0 : !startsAtDivider {
-                context.setFillColor(NSColor.separatorColor.withAlphaComponent(0.28).cgColor)
-                context.fill(CGRect(x: gutterWidth - 1, y: top, width: 1, height: block))
-            }
+            let drawsDivider = isBlank ? indentColumns > 0 : !startsAtDivider
 
             // Indent guides sit behind text and whitespace markers. Draw one
             // guide for each complete four-space indentation level.
             if indentColumns >= 4 {
-                context.setFillColor(NSColor.separatorColor.withAlphaComponent(0.16).cgColor)
+                context.setFillColor(NSColor.separatorColor.withAlphaComponent(0.08).cgColor)
                 var column = 4
                 // The deepest guide sits immediately beside the text and is
                 // visually noisy; keep only the parent-level guides.
@@ -892,6 +958,7 @@ final class EditorView: NSView {
                 let ctLine = styles.isEmpty && faded.isEmpty
                     ? layout(for: line.text)
                     : syntaxLayout(for: line.text, styles: styles, faded: faded)
+                drawnWidth = max(drawnWidth, CGFloat(CTLineGetTypographicBounds(ctLine, nil, nil, nil)))
                 for row in 0..<rows.count {
                     let rowTopY = top + CGFloat(row) * lineHeight
                     let shift = row == 0 ? 0 : xOffset(in: line.text, column: UInt64(rows.start(of: row)))
@@ -968,6 +1035,20 @@ final class EditorView: NSView {
                 }
             }
 
+            if shift > 0 {
+                // Scrolled sideways: cover the text that ran under the line numbers.
+                let gutterRect = CGRect(x: shift, y: top, width: gutterWidth, height: block)
+                context.setFillColor(Theme.editorBackground.resolved(for: effectiveAppearance).cgColor)
+                context.fill(gutterRect)
+                if hasCaret, line.selections.isEmpty {
+                    context.setFillColor(Theme.currentLine.cgColor)
+                    context.fill(gutterRect)
+                }
+            }
+            if drawsDivider {
+                context.setFillColor(NSColor.separatorColor.withAlphaComponent(0.28).cgColor)
+                context.fill(CGRect(x: shift + gutterWidth - 1, y: top, width: 1, height: block))
+            }
             // Gutter: right-aligned line number, copper on caret lines.
             let number = layout(for: String(line.line + 1))
             let width = CGFloat(CTLineGetTypographicBounds(number, nil, nil, nil))
@@ -997,8 +1078,13 @@ final class EditorView: NSView {
                 }
                 context.setFillColor(color.cgColor)
                 let markerHeight: CGFloat = change == .deleted ? 3 : block
-                context.fill(CGRect(x: 1, y: top, width: 3, height: markerHeight))
+                context.fill(CGRect(x: 1 + shift, y: top, width: 3, height: markerHeight))
             }
+        }
+        if drawnWidth > contentTextWidth {
+            contentTextWidth = drawnWidth
+            // Not while drawing: resizing the view would start another layout.
+            DispatchQueue.main.async { [weak self] in self?.updateDocumentWidth() }
         }
     }
 

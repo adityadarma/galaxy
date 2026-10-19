@@ -184,6 +184,36 @@ impl DiagnosticStore {
         Ok(true)
     }
 
+    /// Drops what `server` reported for files whose URI starts with
+    /// `prefix` (a project folder). Other servers' lists for the same files
+    /// stay.
+    pub fn clear_under(&mut self, server: &str, prefix: &str) {
+        let uris: Vec<String> = self
+            .by_server
+            .iter()
+            .filter(|(uri, servers)| uri.starts_with(prefix) && servers.contains_key(server))
+            .map(|(uri, _)| uri.clone())
+            .collect();
+        for uri in uris {
+            let Some(servers) = self.by_server.get_mut(&uri) else {
+                continue;
+            };
+            servers.remove(server);
+            if servers.is_empty() {
+                self.by_server.remove(&uri);
+                self.by_uri.remove(&uri);
+                continue;
+            }
+            let mut names: Vec<_> = servers.keys().cloned().collect();
+            names.sort();
+            let merged = names
+                .iter()
+                .flat_map(|name| servers[name].iter().cloned())
+                .collect();
+            self.by_uri.insert(uri, merged);
+        }
+    }
+
     pub fn for_uri(&self, uri: &str) -> &[Diagnostic] {
         self.by_uri.get(uri).map(Vec::as_slice).unwrap_or(&[])
     }
@@ -1046,6 +1076,9 @@ pub struct LspManager {
     restart_history: HashMap<LspKey, Vec<Instant>>,
     pending_restarts: HashMap<LspKey, Instant>,
     stopped: HashSet<LspKey>,
+    /// When a server was last started or last had a document opened or
+    /// closed. A server nobody uses is stopped once this is old enough.
+    touched: HashMap<LspKey, Instant>,
     documents: HashMap<String, (LspKey, DocumentSync)>,
     /// Extra servers attached to a document next to its primary one, e.g.
     /// laravel-lsp beside intelephense. They get the full document
@@ -1090,6 +1123,7 @@ impl LspManager {
     /// `true` means a child was spawned; `false` means the shared instance won.
     pub fn ensure_server(&mut self, key: LspKey, config: &ServerConfig) -> io::Result<bool> {
         self.stopped.remove(&key);
+        self.touched.insert(key.clone(), Instant::now());
         if self.servers.contains_key(&key) {
             return Ok(false);
         }
@@ -1130,6 +1164,69 @@ impl LspManager {
         self.requests
             .retain(|(request_key, _), _| request_key != key);
         self.servers.remove(key).is_some()
+    }
+
+    /// Servers that no open document uses, as primary or as companion.
+    fn unused_servers(&self) -> Vec<LspKey> {
+        let used: HashSet<&LspKey> = self
+            .documents
+            .values()
+            .map(|(key, _)| key)
+            .chain(self.companions.values().flatten().map(|(key, _)| key))
+            .collect();
+        self.servers
+            .keys()
+            .filter(|key| !used.contains(key))
+            .cloned()
+            .collect()
+    }
+
+    /// Stops an unused server for good: no restart, and the problems it
+    /// reported go away with it.
+    fn retire_server(&mut self, key: &LspKey) {
+        self.stop_server(key);
+        self.touched.remove(key);
+        self.diagnostics.clear_under(
+            &key.language,
+            &format!("file://{}/", key.root.to_string_lossy()),
+        );
+        if self.servers.is_empty() {
+            // Progress tokens do not say which server owns them.
+            self.progress.clear();
+        }
+    }
+
+    /// Stops the servers of project `root` that no open document uses, e.g.
+    /// when the last window showing that folder moves elsewhere. Servers that
+    /// still serve a document are left running.
+    pub fn stop_unused_in(&mut self, root: &Path) -> Vec<LspKey> {
+        let keys: Vec<_> = self
+            .unused_servers()
+            .into_iter()
+            .filter(|key| key.root == root)
+            .collect();
+        for key in &keys {
+            self.retire_server(key);
+        }
+        keys
+    }
+
+    /// Stops servers that no document has used for `idle`. They start again
+    /// when a file of that project is opened.
+    pub fn stop_idle(&mut self, now: Instant, idle: Duration) -> Vec<LspKey> {
+        let keys: Vec<_> = self
+            .unused_servers()
+            .into_iter()
+            .filter(|key| {
+                self.touched
+                    .get(key)
+                    .is_none_or(|at| now.saturating_duration_since(*at) >= idle)
+            })
+            .collect();
+        for key in &keys {
+            self.retire_server(key);
+        }
+        keys
     }
 
     /// Replaces the launch details used by the next [`Self::restart_server`],
@@ -1413,6 +1510,7 @@ impl LspManager {
         doc: &Document,
     ) -> io::Result<()> {
         let sync = DocumentSync::new(uri.clone(), language_id, doc.rope().clone());
+        self.touched.insert(key.clone(), Instant::now());
         if self
             .servers
             .get(&key)
@@ -1827,6 +1925,7 @@ impl LspManager {
         doc: &Document,
     ) -> io::Result<()> {
         let sync = DocumentSync::new(uri.clone(), language_id, doc.rope().clone());
+        self.touched.insert(key.clone(), Instant::now());
         if self
             .servers
             .get(&key)
@@ -1906,13 +2005,16 @@ impl LspManager {
     }
 
     pub fn close_document(&mut self, uri: &str) -> io::Result<()> {
+        let now = Instant::now();
         for (companion, sync) in self.companions.remove(uri).into_iter().flatten() {
             let _ = self.send(&companion, &sync.did_close());
+            self.touched.insert(companion, now);
         }
         let (key, sync) = self
             .documents
             .remove(uri)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "LSP document is not open"))?;
+        self.touched.insert(key.clone(), now);
         self.send(&key, &sync.did_close())
     }
 
@@ -2740,8 +2842,104 @@ impl LspTransport {
 
 impl Drop for LspTransport {
     fn drop(&mut self) {
+        // Servers spawn helpers of their own (tsserver, rust-analyzer's
+        // proc-macro server). Once the parent dies they are adopted by
+        // launchd and keep running, so collect them first.
+        let helpers = self
+            .child
+            .id()
+            .map(|pid| descendants(&process_table(), pid))
+            .unwrap_or_default();
         let _ = self.runtime.block_on(self.child.kill());
+        terminate(&helpers);
     }
+}
+
+/// One row of `ps`: process id, parent id and the full command line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcessRow {
+    pid: u32,
+    ppid: u32,
+    command: String,
+}
+
+fn parse_process_table(text: &str) -> Vec<ProcessRow> {
+    text.lines()
+        .filter_map(|line| {
+            let (pid, rest) = line.trim_start().split_once(char::is_whitespace)?;
+            let (ppid, command) = rest.trim_start().split_once(char::is_whitespace)?;
+            Some(ProcessRow {
+                pid: pid.parse().ok()?,
+                ppid: ppid.parse().ok()?,
+                command: command.trim().to_owned(),
+            })
+        })
+        .collect()
+}
+
+fn process_table() -> Vec<ProcessRow> {
+    StdCommand::new("/bin/ps")
+        .args(["-axo", "pid=,ppid=,command="])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| parse_process_table(&String::from_utf8_lossy(&output.stdout)))
+        .unwrap_or_default()
+}
+
+/// Every process below `root`, children before grandchildren.
+fn descendants(table: &[ProcessRow], root: u32) -> Vec<u32> {
+    let mut found = Vec::new();
+    let mut frontier = vec![root];
+    while let Some(parent) = frontier.pop() {
+        for row in table.iter().filter(|row| row.ppid == parent) {
+            if row.pid != root && !found.contains(&row.pid) {
+                found.push(row.pid);
+                frontier.push(row.pid);
+            }
+        }
+    }
+    found
+}
+
+fn terminate(pids: &[u32]) {
+    if pids.is_empty() {
+        return;
+    }
+    let _ = StdCommand::new("/bin/kill")
+        .arg("-TERM")
+        .args(pids.iter().map(u32::to_string))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// Processes started from `plugins_dir` whose parent is gone (launchd, pid 1),
+/// plus everything below them. A crash or a quit that skipped the shutdown
+/// leaves these behind; a running Galaxy never owns a process with parent 1.
+fn orphaned_server_pids(table: &[ProcessRow], plugins_dir: &str) -> Vec<u32> {
+    let mut pids = Vec::new();
+    for row in table {
+        if row.ppid == 1 && row.command.contains(plugins_dir) {
+            pids.push(row.pid);
+            pids.extend(descendants(table, row.pid));
+        }
+    }
+    pids.sort_unstable();
+    pids.dedup();
+    pids
+}
+
+/// Stops language servers a previous Galaxy left running. Returns how many
+/// processes were told to exit.
+pub fn reap_orphaned_servers(plugins_dir: &Path) -> usize {
+    let dir = plugins_dir.to_string_lossy();
+    if dir.is_empty() {
+        return 0;
+    }
+    let pids = orphaned_server_pids(&process_table(), &dir);
+    terminate(&pids);
+    pids.len()
 }
 
 pub(crate) fn frame(payload: &[u8]) -> Vec<u8> {
@@ -3202,6 +3400,177 @@ mod tests {
         assert!(manager.restart_server(&key).unwrap());
         assert_eq!(manager.len(), 1);
         manager.shutdown_all();
+    }
+
+    fn sleeper() -> ServerConfig {
+        ServerConfig {
+            program: "/bin/sh".into(),
+            args: vec!["-c".to_owned(), "sleep 5".to_owned()],
+            log_traffic: false,
+            initialization_options: Value::Null,
+            restart_backoff: [Duration::ZERO; 3],
+        }
+    }
+
+    fn php_key(root: &str) -> LspKey {
+        LspKey {
+            language: "php".into(),
+            root: PathBuf::from(root),
+        }
+    }
+
+    #[test]
+    fn stop_unused_in_leaves_servers_that_still_serve_a_document() {
+        let (a, b) = (php_key("/a"), php_key("/b"));
+        let mut manager = LspManager::default();
+        manager.ensure_server(a.clone(), &sleeper()).unwrap();
+        manager.ensure_server(b.clone(), &sleeper()).unwrap();
+        let doc = Document::from_text("<?php\n");
+        manager
+            .open_document(a.clone(), "file:///a/x.php".into(), "php".into(), &doc)
+            .unwrap();
+
+        // /a has an open document, so it stays; /b is unused and stops.
+        assert!(manager.stop_unused_in(Path::new("/a")).is_empty());
+        assert_eq!(manager.stop_unused_in(Path::new("/b")), vec![b]);
+        assert_eq!(manager.len(), 1);
+
+        // Closing the last document makes /a stoppable.
+        manager.close_document("file:///a/x.php").unwrap();
+        assert_eq!(manager.stop_unused_in(Path::new("/a")), vec![a.clone()]);
+        assert_eq!(manager.len(), 0);
+
+        // A stopped server is not restarted behind the user's back.
+        manager.poll();
+        assert_eq!(manager.len(), 0);
+        // But opening a file of the project starts it again.
+        assert!(manager.ensure_server(a, &sleeper()).unwrap());
+        manager.shutdown_all();
+    }
+
+    #[test]
+    fn stop_idle_waits_for_the_timeout_and_spares_servers_with_documents() {
+        let (a, b) = (php_key("/a"), php_key("/b"));
+        let mut manager = LspManager::default();
+        manager.ensure_server(a.clone(), &sleeper()).unwrap();
+        manager.ensure_server(b.clone(), &sleeper()).unwrap();
+        let doc = Document::from_text("<?php\n");
+        manager
+            .open_document(b.clone(), "file:///b/x.php".into(), "php".into(), &doc)
+            .unwrap();
+        let idle = Duration::from_secs(600);
+        let now = Instant::now();
+
+        assert!(
+            manager
+                .stop_idle(now + Duration::from_secs(599), idle)
+                .is_empty()
+        );
+        assert_eq!(
+            manager.stop_idle(now + Duration::from_secs(601), idle),
+            vec![a]
+        );
+        // /b keeps running however long it has been: its document is open.
+        assert!(
+            manager
+                .stop_idle(now + Duration::from_secs(9999), idle)
+                .is_empty()
+        );
+        assert_eq!(manager.len(), 1);
+
+        // Once closed, the idle clock starts from the close.
+        manager.close_document("file:///b/x.php").unwrap();
+        assert!(
+            manager
+                .stop_idle(now + Duration::from_secs(599), idle)
+                .is_empty()
+        );
+        assert_eq!(
+            manager.stop_idle(Instant::now() + Duration::from_secs(601), idle),
+            vec![b]
+        );
+        manager.shutdown_all();
+    }
+
+    #[test]
+    fn stopping_an_unused_server_removes_its_problems_only() {
+        let publish = |uri: &str, message: &str| {
+            serde_json::json!({"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{
+                "uri": uri,
+                "diagnostics":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"message":message}]
+            }})
+        };
+        let mut store = DiagnosticStore::default();
+        store
+            .publish_from("php", &publish("file:///w/a.php", "from php"))
+            .unwrap();
+        store
+            .publish_from("php-laravel", &publish("file:///w/a.php", "from laravel"))
+            .unwrap();
+        store
+            .publish_from("php", &publish("file:///other/b.php", "elsewhere"))
+            .unwrap();
+
+        store.clear_under("php", "file:///w/");
+        let messages = |store: &DiagnosticStore, uri: &str| {
+            store
+                .for_uri(uri)
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(messages(&store, "file:///w/a.php"), ["from laravel"]);
+        assert_eq!(messages(&store, "file:///other/b.php"), ["elsewhere"]);
+
+        store.clear_under("php-laravel", "file:///w/");
+        assert!(store.for_uri("file:///w/a.php").is_empty());
+        assert_eq!(store.problems().len(), 1);
+    }
+
+    #[test]
+    fn orphans_under_the_plugin_folder_are_found_with_their_helpers() {
+        let table = parse_process_table(
+            "  100     1 /Users/me/Library/Application Support/Galaxy/plugins/rust-analyzer/bin/rust-analyzer\n\
+             101   100 /Users/me/.rustup/libexec/rust-analyzer-proc-macro-srv\n\
+             102   101 helper\n\
+             200     1 /usr/bin/other-daemon\n\
+             300   400 /Users/me/Library/Application Support/Galaxy/plugins/intelephense/bin/node\n\
+             400     1 /Applications/Galaxy.app/Contents/MacOS/Galaxy\n",
+        );
+        let dir = "/Users/me/Library/Application Support/Galaxy/plugins";
+        // 300 belongs to a running Galaxy (parent 400), 200 is not ours.
+        assert_eq!(orphaned_server_pids(&table, dir), [100, 101, 102]);
+        assert_eq!(descendants(&table, 400), [300]);
+        assert!(orphaned_server_pids(&table, "/nowhere").is_empty());
+    }
+
+    #[test]
+    fn dropping_a_server_also_ends_the_helpers_it_started() {
+        let key = php_key("/a");
+        let config = ServerConfig {
+            program: "/bin/sh".into(),
+            args: vec!["-c".to_owned(), "sleep 31 & sleep 30".to_owned()],
+            ..sleeper()
+        };
+        let mut manager = LspManager::default();
+        manager.ensure_server(key, &config).unwrap();
+        // Wait for the shell to start its background helper.
+        let helper_running = || {
+            process_table()
+                .iter()
+                .any(|row| row.command.ends_with("sleep 31"))
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !helper_running() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(helper_running(), "helper never started");
+        drop(manager);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while helper_running() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!helper_running(), "helper survived its server");
     }
 
     #[test]

@@ -30,6 +30,34 @@ final class SettingsTests: XCTestCase {
         XCTAssertEqual(settings.effectiveTabSize, 4)
     }
 
+    func testFilesExcludeDefaultsHideVersionControlFoldersAndFilesCanTurnThemOff() throws {
+        let defaults = GalaxySettings.empty.effectiveFilesExclude
+        XCTAssertEqual(Set(defaults), Set(GalaxySettings.defaultFilesExclude))
+        XCTAssertTrue(defaults.contains("**/.git"))
+        XCTAssertTrue(defaults.contains("**/.DS_Store"))
+
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-settings-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let globalURL = dir.appendingPathComponent("global.json")
+        let workspaceURL = dir.appendingPathComponent("workspace.json")
+        try #"{"files":{"exclude":{"**/node_modules":true,"**/.svn":false}}}"#
+            .write(to: globalURL, atomically: true, encoding: .utf8)
+        try #"{"files":{"exclude":{"**/.git":false,"**/dist":true}}}"#
+            .write(to: workspaceURL, atomically: true, encoding: .utf8)
+
+        let global = try GalaxySettings.load(from: globalURL)
+        XCTAssertTrue(global.effectiveFilesExclude.contains("**/node_modules"))
+        XCTAssertFalse(global.effectiveFilesExclude.contains("**/.svn"), "false turns a default off")
+
+        let merged = global.merged(with: try GalaxySettings.load(from: workspaceURL))
+        let globs = merged.effectiveFilesExclude
+        XCTAssertFalse(globs.contains("**/.git"), "the workspace shows .git again")
+        XCTAssertTrue(globs.contains("**/dist"))
+        XCTAssertTrue(globs.contains("**/node_modules"), "global entries still apply")
+        XCTAssertTrue(globs.contains("**/.hg"))
+    }
+
     func testTagEditingSettingsDefaultToOnAndWorkspaceCanTurnThemOff() throws {
         XCTAssertTrue(GalaxySettings.empty.effectiveAutoClosingTags)
         XCTAssertTrue(GalaxySettings.empty.effectiveLinkedEditing)

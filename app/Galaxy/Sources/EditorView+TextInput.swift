@@ -104,15 +104,23 @@ extension EditorView: @preconcurrency NSTextInputClient {
     }
 
     /// The caret comes from the viewport snapshot that scheduled this
-    /// scroll. The editor has no horizontal scroller, so a primary caret
-    /// outside that snapshot can safely use column zero until it is painted
-    /// after the vertical scroll; this avoids a second FFI query.
+    /// scroll, with its line's text. Without it the line is read, but only
+    /// when the text can scroll sideways and the caret is not at column 0.
     func scrollCaretToVisible(primary cursor: CursorInfo, lineText: String? = nil) {
-        let text = lineText ?? ""
+        var text = lineText ?? ""
+        if lineText == nil, cursor.colUtf16 > 0, !wrapActive {
+            text = document?.displayLine(line: cursor.line) ?? ""
+        }
         let p = point(column: Int(cursor.colUtf16), text: text, rows: lineRows(cursor.line),
                       top: rowTop(of: cursor.line), originX: textOriginX)
         let rect = NSRect(x: p.x, y: p.y, width: Self.caretWidth, height: metrics.lineHeight)
-        scrollToVisible(rect.insetBy(dx: -40, dy: 0))
+        // Keep the caret clear of the line numbers on the left (they stay at
+        // the edge) and of the minimap on the right.
+        let margin: CGFloat = 40
+        let left = gutterWidth + margin
+        let right = margin + rightInset
+        scrollToVisible(NSRect(x: rect.minX - left, y: rect.minY,
+                               width: rect.width + left + right, height: rect.height))
     }
 
     // MARK: NSTextInputClient

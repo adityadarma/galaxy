@@ -14,6 +14,15 @@ struct GalaxySettings: Equatable {
     var linkedEditing: Bool? = nil
     /// Author and age of the caret line, after the text (`editor.gitBlame`).
     var gitBlame: Bool? = nil
+    /// `files.exclude` as written in the file: glob to on/off. Entries are
+    /// layered over `defaultFilesExclude`, so `false` turns a default off.
+    var filesExclude: [String: Bool]? = nil
+
+    /// VSCode's defaults, plus the Flutter folders.
+    static let defaultFilesExclude: [String] = [
+        "**/.git", "**/.svn", "**/.hg", "**/.jj", "**/.DS_Store", "**/Thumbs.db",
+        "**/flutter/ephemeral", "**/Flutter/ephemeral", "**/.symlinks", "**/.plugin_symlinks",
+    ]
 
     static let empty = GalaxySettings(insertSpaces: nil, tabSize: nil, autoSave: nil, autoSaveDelay: nil)
 
@@ -26,7 +35,9 @@ struct GalaxySettings: Equatable {
             renderWhitespace: override.renderWhitespace ?? renderWhitespace,
             autoClosingTags: override.autoClosingTags ?? autoClosingTags,
             linkedEditing: override.linkedEditing ?? linkedEditing,
-            gitBlame: override.gitBlame ?? gitBlame
+            gitBlame: override.gitBlame ?? gitBlame,
+            filesExclude: filesExclude.map { $0.merging(override.filesExclude ?? [:]) { _, new in new } }
+                ?? override.filesExclude
         )
     }
 
@@ -34,6 +45,12 @@ struct GalaxySettings: Equatable {
     var effectiveAutoClosingTags: Bool { autoClosingTags ?? true }
     var effectiveLinkedEditing: Bool { linkedEditing ?? true }
     var effectiveGitBlame: Bool { gitBlame ?? true }
+    /// Globs the explorer hides: the defaults, then the file's entries on top.
+    var effectiveFilesExclude: [String] {
+        var all = Dictionary(uniqueKeysWithValues: Self.defaultFilesExclude.map { ($0, true) })
+        all.merge(filesExclude ?? [:]) { _, new in new }
+        return all.filter(\.value).keys.sorted()
+    }
 
     var useTabs: Bool { !(insertSpaces ?? true) }
     var effectiveTabSize: UInt32 { max(tabSize ?? 4, 1) }
@@ -69,12 +86,17 @@ struct GalaxySettings: Equatable {
         case "all", "selection", "trailing": .all
         default: nil
         }
+        // VSCode shape: { "**/.git": true, "**/*.log": false }.
+        let filesExclude = (files["exclude"] as? [String: Any]).map { object in
+            object.compactMapValues { $0 as? Bool }
+        }
         return GalaxySettings(insertSpaces: insertSpaces, tabSize: tabSize,
                               autoSave: autoSave, autoSaveDelay: autoSaveDelay,
                               renderWhitespace: renderWhitespace,
                               autoClosingTags: editor["autoClosingTags"] as? Bool,
                               linkedEditing: editor["linkedEditing"] as? Bool,
-                              gitBlame: editor["gitBlame"] as? Bool)
+                              gitBlame: editor["gitBlame"] as? Bool,
+                              filesExclude: filesExclude)
     }
 
     static func completionItems() -> [CompletionInfo] {
@@ -88,6 +110,7 @@ struct GalaxySettings: Equatable {
             CompletionInfo(label: "gitBlame", detail: "boolean: show who last changed the caret line", insertText: "gitBlame", isSnippet: false),
             CompletionInfo(label: "files.autoSave", detail: "off | afterDelay | onFocusChange", insertText: "files.autoSave", isSnippet: false),
             CompletionInfo(label: "files.autoSaveDelay", detail: "milliseconds", insertText: "files.autoSaveDelay", isSnippet: false),
+            CompletionInfo(label: "files.exclude", detail: "object: globs hidden in the explorer, e.g. {\"**/.git\": true}", insertText: "files.exclude", isSnippet: false),
         ]
     }
 }

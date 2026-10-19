@@ -13,11 +13,16 @@
 //! root's rules reach nested folders. Dotfiles are shown (like VSCode).
 //! The built-in excludes from the PRD (`.git`, `node_modules`, `target`,
 //! `dist`, `build`) are hidden when they are directories.
+//!
+//! Those rules shape the file index, search and watcher. The explorer
+//! (`list_dir`) shows everything except what the `files.exclude` globs hide,
+//! as VSCode does. The globs are set with `set_explorer_excludes`.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use ignore::{DirEntry as WalkEntry, WalkBuilder};
 use regex::RegexBuilder;
@@ -163,6 +168,8 @@ pub struct IndexDelta {
 #[derive(Debug, Clone)]
 pub struct Workspace {
     root: PathBuf,
+    /// `files.exclude` globs, relative to the root. Shared between clones.
+    explorer_excludes: Arc<RwLock<Vec<String>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,11 +234,28 @@ impl Workspace {
                 "not a directory",
             ));
         }
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            explorer_excludes: Arc::default(),
+        })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Replaces the `files.exclude` globs the explorer hides. Returns
+    /// whether the set changed.
+    pub fn set_explorer_excludes(&self, globs: Vec<String>) -> bool {
+        let mut current = self
+            .explorer_excludes
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if *current == globs {
+            return false;
+        }
+        *current = globs;
+        true
     }
 
     pub fn git_status(&self) -> io::Result<Option<crate::git::GitStatus>> {
@@ -365,9 +389,57 @@ impl Workspace {
         Ok((rel, path))
     }
 
-    /// Lists one directory: folders first, then files, each sorted
-    /// case-insensitively. Unreadable entries are skipped.
+    /// Lists one directory for the explorer: folders first, then files, each
+    /// sorted case-insensitively. Shows everything (ignored files, `.git`)
+    /// except entries matching the `files.exclude` globs. Unreadable entries
+    /// are skipped.
     pub fn list_dir(&self, rel: &str) -> io::Result<Vec<DirEntry>> {
+        let dir = self.resolve(rel)?;
+        if !fs::metadata(&dir)?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotADirectory,
+                "not a directory",
+            ));
+        }
+        let excludes = self
+            .explorer_excludes
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+
+        let mut entries: Vec<DirEntry> = fs::read_dir(&dir)?
+            .filter_map(Result::ok)
+            .filter_map(|e| {
+                let path = e.path();
+                let rel_path = self.rel_string(&path)?;
+                if excludes.iter().any(|glob| glob_matches(glob, &rel_path)) {
+                    return None;
+                }
+                Some(DirEntry {
+                    name: e.file_name().to_string_lossy().into_owned(),
+                    rel_path,
+                    // `is_dir` follows symlinks, so linked folders expand.
+                    is_dir: path.is_dir(),
+                })
+            })
+            .collect();
+        sort_entries(&mut entries);
+        Ok(entries)
+    }
+
+    fn rel_string(&self, path: &Path) -> Option<String> {
+        let rel = path.strip_prefix(&self.root).ok()?;
+        Some(
+            rel.components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/"),
+        )
+    }
+
+    /// Like `list_dir`, but with the ignore rules and built-in excludes the
+    /// file index uses. `index_delta` asks it what the index may contain.
+    fn list_visible(&self, rel: &str) -> io::Result<Vec<DirEntry>> {
         let dir = self.resolve(rel)?;
         if !fs::metadata(&dir)?.is_dir() {
             return Err(io::Error::new(
@@ -408,12 +480,7 @@ impl Workspace {
             })
             .collect();
 
-        entries.sort_by(|a, b| {
-            b.is_dir
-                .cmp(&a.is_dir)
-                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-                .then_with(|| a.name.cmp(&b.name))
-        });
+        sort_entries(&mut entries);
         Ok(entries)
     }
 
@@ -524,7 +591,7 @@ impl Workspace {
             let mut parent = String::new();
             for part in rel.split('/') {
                 let names = listings.entry(parent.clone()).or_insert_with(|| {
-                    self.list_dir(&parent)
+                    self.list_visible(&parent)
                         .ok()
                         .map(|list| list.into_iter().map(|e| e.name).collect())
                 });
@@ -640,6 +707,15 @@ impl Workspace {
     }
 }
 
+fn sort_entries(entries: &mut [DirEntry]) {
+    entries.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+}
+
 fn is_default_excluded(entry: &WalkEntry) -> bool {
     let name = entry.file_name().to_string_lossy();
     if name == ".git" {
@@ -694,9 +770,13 @@ mod tests {
         assert_eq!(
             names(&entries),
             vec![
+                ".git",
                 ".github",
                 "alpha",
+                "dist",
+                "node_modules",
                 "src",
+                "target",
                 "Zeta",
                 ".gitignore",
                 "build",
@@ -704,19 +784,33 @@ mod tests {
                 "README.md"
             ]
         );
-        assert!(entries[..4].iter().all(|e| e.is_dir));
-        assert!(entries[4..].iter().all(|e| !e.is_dir));
+        assert!(entries[..8].iter().all(|e| e.is_dir));
+        assert!(entries[8..].iter().all(|e| !e.is_dir));
     }
 
     #[test]
-    fn default_excludes_hide_directories_only() {
+    fn explorer_excludes_hide_matching_entries() {
         let (_dir, ws) = tree();
+        assert!(ws.set_explorer_excludes(vec!["**/.git".into(), "node_modules".into()]));
+        assert!(!ws.set_explorer_excludes(vec!["**/.git".into(), "node_modules".into()]));
         let listed = ws.list_dir("").unwrap();
         let n = names(&listed);
-        for hidden in [".git", "node_modules", "target", "dist"] {
-            assert!(!n.contains(&hidden), "{hidden} should be hidden");
-        }
-        assert!(n.contains(&"build"), "a file named build is a normal file");
+        assert!(!n.contains(&".git") && !n.contains(&"node_modules"));
+        assert!(n.contains(&"target") && n.contains(&"build"));
+        // Nested matches follow `**/`, and the first-level-only glob does not.
+        assert!(names(&ws.list_dir("src").unwrap()).contains(&"deep"));
+        ws.set_explorer_excludes(vec!["**/deep".into()]);
+        assert!(!names(&ws.list_dir("src").unwrap()).contains(&"deep"));
+        ws.set_explorer_excludes(Vec::new());
+        assert!(names(&ws.list_dir("").unwrap()).contains(&".git"));
+    }
+
+    #[test]
+    fn index_still_skips_default_excluded_directories() {
+        let (_dir, ws) = tree();
+        let index = ws.build_file_index();
+        let paths: Vec<String> = (0..index.len()).filter_map(|i| index.path(i)).collect();
+        assert!(!paths.iter().any(|p| p.starts_with("node_modules/")));
     }
 
     #[test]
@@ -735,29 +829,39 @@ mod tests {
     }
 
     #[test]
-    fn gitignore_applies_without_a_git_repo_and_reaches_subdirectories() {
+    fn explorer_shows_ignored_files_but_the_index_skips_them() {
         let (dir, ws) = tree();
         fs::write(dir.path().join(".gitignore"), "*.log\n/alpha/\n*.tmp\n").unwrap();
         fs::write(dir.path().join("debug.log"), "x").unwrap();
+        fs::write(dir.path().join(".env"), "x").unwrap();
         fs::write(dir.path().join("src/scratch.tmp"), "x").unwrap();
 
         let root = ws.list_dir("").unwrap();
         let n = names(&root);
-        assert!(!n.contains(&"debug.log"));
-        assert!(!n.contains(&"alpha"));
-        // The root's rules apply when listing a nested directory.
-        assert!(!names(&ws.list_dir("src").unwrap()).contains(&"scratch.tmp"));
+        assert!(n.contains(&"debug.log") && n.contains(&"alpha") && n.contains(&".env"));
+        assert!(names(&ws.list_dir("src").unwrap()).contains(&"scratch.tmp"));
+
+        let index = ws.build_file_index();
+        let in_index =
+            |path: &str| (0..index.len()).any(|i| index.path(i).as_deref() == Some(path));
+        assert!(!in_index("debug.log"));
+        assert!(!in_index("src/scratch.tmp"));
+        assert!(in_index("src/main.rs"));
     }
 
     #[test]
-    fn nested_gitignore_and_ignore_files_apply() {
+    fn nested_gitignore_and_ignore_files_apply_to_the_index() {
         let (dir, ws) = tree();
         fs::write(dir.path().join("src/.gitignore"), "generated.rs\n").unwrap();
         fs::write(dir.path().join("src/generated.rs"), "x").unwrap();
         fs::write(dir.path().join(".ignore"), "Cargo.toml\n").unwrap();
 
-        assert!(!names(&ws.list_dir("src").unwrap()).contains(&"generated.rs"));
-        assert!(!names(&ws.list_dir("").unwrap()).contains(&"Cargo.toml"));
+        assert!(names(&ws.list_dir("src").unwrap()).contains(&"generated.rs"));
+        let index = ws.build_file_index();
+        let in_index =
+            |path: &str| (0..index.len()).any(|i| index.path(i).as_deref() == Some(path));
+        assert!(!in_index("src/generated.rs"));
+        assert!(!in_index("Cargo.toml"));
     }
 
     #[test]

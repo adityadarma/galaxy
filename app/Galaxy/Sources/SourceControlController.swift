@@ -40,7 +40,7 @@ final class CountPillView: NSView {
     required init?(coder: NSCoder) { fatalError() }
 
     func setCount(_ count: Int) {
-        label.stringValue = "\(count)"
+        label.stringValue = CountFormat.compact(count)
         isHidden = count == 0
     }
 }
@@ -355,6 +355,29 @@ final class CommitSplitButton: NSView {
     var onCommit: (() -> Void)?
     var onDropdown: ((NSButton) -> Void)?
 
+    enum Mode { case commit, publish }
+
+    private var dropdownWidth: NSLayoutConstraint?
+    private var dividerWidth: NSLayoutConstraint?
+
+    /// `.publish` swaps the label for "Publish Branch" and hides the dropdown.
+    var mode: Mode = .commit {
+        didSet {
+            guard mode != oldValue else { return }
+            let publish = mode == .publish
+            commitLabel.stringValue = publish ? "Publish Branch" : "Commit"
+            let symbol = publish ? "icloud.and.arrow.up" : "checkmark"
+            checkIcon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: commitLabel.stringValue)?
+                .withSymbolConfiguration(.init(pointSize: 11, weight: .bold))
+            dropdownButton.isHidden = publish
+            divider.isHidden = publish
+            // Let the main button fill the whole bar when the dropdown is gone.
+            dropdownWidth?.constant = publish ? 0 : 30
+            dividerWidth?.constant = publish ? 0 : 1
+            mainButton.setAccessibilityLabel(commitLabel.stringValue)
+        }
+    }
+
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
@@ -408,6 +431,11 @@ final class CommitSplitButton: NSView {
         addSubview(divider)
         addSubview(dropdownButton)
 
+        let dropdownWidth = dropdownButton.widthAnchor.constraint(equalToConstant: 30)
+        let dividerWidth = divider.widthAnchor.constraint(equalToConstant: 1)
+        self.dropdownWidth = dropdownWidth
+        self.dividerWidth = dividerWidth
+
         NSLayoutConstraint.activate([
             heightAnchor.constraint(equalToConstant: 30),
 
@@ -418,18 +446,18 @@ final class CommitSplitButton: NSView {
 
             contentStack.centerXAnchor.constraint(equalTo: mainButton.centerXAnchor),
             contentStack.centerYAnchor.constraint(equalTo: mainButton.centerYAnchor),
-            checkIcon.widthAnchor.constraint(equalToConstant: 12),
-            checkIcon.heightAnchor.constraint(equalToConstant: 12),
+            checkIcon.widthAnchor.constraint(equalToConstant: 14),
+            checkIcon.heightAnchor.constraint(equalToConstant: 14),
 
             divider.topAnchor.constraint(equalTo: topAnchor),
             divider.bottomAnchor.constraint(equalTo: bottomAnchor),
-            divider.widthAnchor.constraint(equalToConstant: 1),
+            dividerWidth,
             divider.trailingAnchor.constraint(equalTo: dropdownButton.leadingAnchor),
 
             dropdownButton.trailingAnchor.constraint(equalTo: trailingAnchor),
             dropdownButton.topAnchor.constraint(equalTo: topAnchor),
             dropdownButton.bottomAnchor.constraint(equalTo: bottomAnchor),
-            dropdownButton.widthAnchor.constraint(equalToConstant: 30),
+            dropdownWidth,
         ])
         divider.layer?.backgroundColor = NSColor(white: 1.0, alpha: 0.3).cgColor
     }
@@ -488,6 +516,9 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
     private var isChangesCollapsed: Bool = false
     private var currentBranch: String?
     private var generateTask: Task<Void, Never>?
+    /// True when HEAD is on a branch with no upstream and a remote exists.
+    private var isBranchUnpublished = false
+    private var publishCheckTask: Task<Void, Never>?
 
     var workspace: Workspace?
     var onOpen: ((String) -> Void)?
@@ -510,7 +541,8 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         splitCommitButton.translatesAutoresizingMaskIntoConstraints = false
         splitCommitButton.isEnabled = false
         splitCommitButton.onCommit = { [weak self] in
-            self?.commit(nil)
+            guard let self else { return }
+            if self.splitCommitButton.mode == .publish { self.publishBranch() } else { self.commit(nil) }
         }
         splitCommitButton.onDropdown = { [weak self] button in
             self?.showCommitDropdown(from: button)
@@ -580,6 +612,7 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
     func refresh(status: GitStatusInfo?) {
         currentBranch = status?.branch
         updatePlaceholderString()
+        checkPublishState()
 
         let changes = status?.changes ?? []
         stagedChanges = changes.filter { isStagedChange($0) }
@@ -638,7 +671,46 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
 
     private func updateCommitButtonState() {
         let hasChanges = !stagedChanges.isEmpty || !unstagedChanges.isEmpty
-        splitCommitButton.isEnabled = hasChanges
+        let hasMessage = !messageContainer.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        // Like VS Code: an unpublished branch with nothing staged and no
+        // message offers "Publish Branch" in place of "Commit".
+        let publish = isBranchUnpublished && stagedChanges.isEmpty && !hasMessage
+        splitCommitButton.mode = publish ? .publish : .commit
+        splitCommitButton.isEnabled = publish || hasChanges
+    }
+
+    /// Checks off the main thread whether the branch lacks an upstream.
+    private func checkPublishState() {
+        publishCheckTask?.cancel()
+        guard let root = workspace?.root(), let branch = currentBranch, !branch.isEmpty else {
+            isBranchUnpublished = false
+            updateCommitButtonState()
+            return
+        }
+        publishCheckTask = Task { [weak self] in
+            let unpublished = await Task.detached(priority: .utility) {
+                Self.runGit(root: root, args: ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]).status != 0
+                    && !Self.runGit(root: root, args: ["remote"]).output
+                        .trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }.value
+            guard !Task.isCancelled, let self else { return }
+            self.isBranchUnpublished = unpublished
+            self.updateCommitButtonState()
+        }
+    }
+
+    func publishBranch() {
+        guard let root = workspace?.root(), let branch = currentBranch, !branch.isEmpty else { return }
+        splitCommitButton.isEnabled = false
+        Task { [weak self] in
+            await Task.detached(priority: .userInitiated) {
+                let remotes = Self.runGit(root: root, args: ["remote"]).output
+                    .split(whereSeparator: \.isNewline).map(String.init)
+                guard let remote = remotes.contains("origin") ? "origin" : remotes.first else { return }
+                _ = Self.runGit(root: root, args: ["push", "-u", remote, branch])
+            }.value
+            self?.onRefresh?()
+        }
     }
 
 
@@ -939,6 +1011,11 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
     @discardableResult
     private func runGit(args: [String]) -> (status: Int32, output: String) {
         guard let root = workspace?.root() else { return (-1, "") }
+        return Self.runGit(root: root, args: args)
+    }
+
+    @discardableResult
+    private nonisolated static func runGit(root: String, args: [String]) -> (status: Int32, output: String) {
         let process = Process()
         let pipe = Pipe()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/git")

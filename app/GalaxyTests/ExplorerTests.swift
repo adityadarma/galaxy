@@ -7,12 +7,11 @@ final class ExplorerTests: XCTestCase {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("galaxy-ws-\(UUID().uuidString)")
         let fm = FileManager.default
-        for dir in ["src/deep", "node_modules/pkg", "docs"] {
+        for dir in ["src/deep", "docs"] {
             try fm.createDirectory(at: root.appendingPathComponent(dir), withIntermediateDirectories: true)
         }
         try "fn main() {}\n".write(to: root.appendingPathComponent("src/main.rs"), atomically: true, encoding: .utf8)
         try "# hi\n".write(to: root.appendingPathComponent("README.md"), atomically: true, encoding: .utf8)
-        try "x".write(to: root.appendingPathComponent("node_modules/pkg/index.js"), atomically: true, encoding: .utf8)
         return root
     }
 
@@ -25,7 +24,13 @@ final class ExplorerTests: XCTestCase {
     func testOnlyTheRootIsListedUntilAFolderIsExpanded() throws {
         let root = try makeTree()
         defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("node_modules/pkg"), withIntermediateDirectories: true)
         let ws = try CoreBridge().core.openWorkspace(path: root.path)
+
+        XCTAssertEqual(try ws.listDir(relPath: "").map(\.name), ["docs", "node_modules", "src", "README.md"],
+                       "nothing is hidden until files.exclude says so")
+        XCTAssertTrue(ws.setExplorerExcludes(globs: ["node_modules"]))
 
         let explorer = ExplorerController()
         explorer.setWorkspace(ws)

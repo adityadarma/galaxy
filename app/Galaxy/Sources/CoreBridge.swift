@@ -63,6 +63,19 @@ final class CoreBridge {
         core.lspUnavailableHint(language: language, root: root)
     }
 
+    /// Frees language servers nobody needs. `open` is every document any
+    /// window still shows. Servers of `releaseRoot` stop at once if no open
+    /// document uses them; others stop after `idleSeconds` unused.
+    @discardableResult
+    func sweepLSP(open: [DocumentHandle], releaseRoot: String?, idleSeconds: UInt64) -> UInt64 {
+        core.sweepLsp(open: open, releaseRoot: releaseRoot, idleSeconds: idleSeconds)
+    }
+
+    /// Stops every language server and its helpers (app quit).
+    func shutdownLSP() {
+        core.shutdownLsp()
+    }
+
     func pollLSP() {
         _ = core.pollLsp()
     }

@@ -103,7 +103,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private var blameHideItem: DispatchWorkItem?
     /// Quiet time after the last edit before blame is recomputed.
     static let blameRefreshDelay: TimeInterval = 0.5
-    private let completionPopup = CompletionPopup()
+    let completionPopup = CompletionPopup()
     private let signaturePopup = SignaturePopup()
     private let codeActionPopup = CodeActionPopup()
     private var completionQuery = ""
@@ -112,6 +112,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private var snippetSession: SnippetSession?
     private var snippetDocumentKey: String?
     private var completionDismissed = false
+    /// After Ctrl+Space the request is repeated until the server answers with
+    /// something (it may still be starting or indexing), then this is cleared.
+    private var suggestRetryUntil: Date?
+    private var lastSuggestRequest = Date.distantPast
     private var completionPosition = TextPos(line: 0, colUtf16: 0)
     private var hoverPosition: TextPos?
     private var hoverPoint = NSPoint.zero
@@ -153,6 +157,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     let emptyState = NSStackView()
     let explorer = ExplorerController()
     private(set) var workspace: Workspace?
+    /// Called after this window left a folder (another folder opened, or the
+    /// window closed), so the app can stop that folder's language servers.
+    var onWorkspaceLeft: ((String) -> Void)?
+    /// Documents this window shows, for the app's language-server sweep.
+    var openDocuments: [DocumentHandle] {
+        allTabs.filter { $0.isDocument }.map { $0.doc }
+    }
     var onWindowClosed: (() -> Void)?
     /// Go to File index of `workspace`, built in the background.
     private(set) var fileFinder: FileFinder?
@@ -1336,7 +1347,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
 
         scrollView.hasVerticalScroller = true
-        scrollView.hasHorizontalScroller = false
+        // Long lines scroll sideways; the line numbers stay at the left edge.
+        scrollView.hasHorizontalScroller = true
         // Thin scroller over the text instead of a gutter on the right.
         scrollView.scrollerStyle = .overlay
         scrollView.autohidesScrollers = true
@@ -1352,7 +1364,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         scrollView.documentView = editorView
         updateMinimap()
         secondaryScrollView.hasVerticalScroller = true
-        secondaryScrollView.hasHorizontalScroller = false
+        secondaryScrollView.hasHorizontalScroller = true
         secondaryScrollView.scrollerStyle = .overlay
         secondaryScrollView.automaticallyAdjustsContentInsets = false
         secondaryScrollView.contentInsets = scrollView.contentInsets
@@ -1894,10 +1906,25 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         guard activeTab?.isDocument == true, !editorView.isReadOnly else { NSSound.beep(); return }
         completionDismissed = false
         requestCompletionIfNeeded(force: true)
+        lastSuggestRequest = .now
+        suggestRetryUntil = Date().addingTimeInterval(10)
+    }
+
+    /// Asks again while a Ctrl+Space list is still empty, at most every
+    /// 0.6 s for 10 s, and only while the caret stays where it was.
+    private func retrySuggestIfWaiting(_ document: DocumentHandle) {
+        guard let until = suggestRetryUntil else { return }
+        let now = Date()
+        guard now < until else { suggestRetryUntil = nil; return }
+        guard now.timeIntervalSince(lastSuggestRequest) > 0.6 else { return }
+        lastSuggestRequest = now
+        bridge.requestCompletion(document: document, line: completionPosition.line,
+                                 character: completionPosition.colUtf16)
     }
 
     private func requestCompletionIfNeeded(force: Bool = false) {
         guard let document = activeTab?.doc else { return }
+        if !force { suggestRetryUntil = nil }
         let position = document.primaryCursor()
         completionPosition = TextPos(line: position.line, colUtf16: position.colUtf16)
         let line = document.displayLine(line: position.line)
@@ -1931,14 +1958,17 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         guard position.line == completionPosition.line,
               position.colUtf16 == completionPosition.colUtf16 else {
             completionPopup.isHidden = true
+            suggestRetryUntil = nil
             return
         }
         let lspItems = bridge.completions(document: document)
         let items = localCompletionItems ?? (lspItems + snippetCompletionItems)
         guard !items.isEmpty else {
             completionPopup.isHidden = true
+            retrySuggestIfWaiting(document)
             return
         }
+        suggestRetryUntil = nil
         completionPopup.update(items, query: completionQuery)
         if completionPopup.isHidden { return }
         completionPopup.frame = NSRect(x: editorOriginInDetail + editorView.textOriginX + 8, y: editorView.rect(forLine: completionPosition.line, column: completionPosition.colUtf16).maxY + 8, width: 420, height: 192)
@@ -1947,6 +1977,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private func closeCompletion() {
         completionPopup.isHidden = true
         completionDismissed = true
+        suggestRetryUntil = nil
         snippetCompletionItems = []
     }
 
@@ -2456,6 +2487,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             autoClosingTags = settings.effectiveAutoClosingTags
             linkedEditing = settings.effectiveLinkedEditing
         setGitBlame(settings.effectiveGitBlame)
+            if let ws = self.workspace, ws.setExplorerExcludes(globs: settings.effectiveFilesExclude) {
+                explorer.refresh()
+            }
             autoSaveMode = settings.effectiveAutoSave
             autoSaveDelay = settings.effectiveAutoSaveDelay
             if autoSaveMode != .afterDelay { autoSaveWorkItem?.cancel(); autoSaveWorkItem = nil }
@@ -5042,6 +5076,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         workspaceWatch?.stop()
         workspaceWatch = nil
         onWindowClosed?()
+        if let root = workspace?.root() { onWorkspaceLeft?(root) }
     }
 
     /// ⌘O: pick a file or a folder.
@@ -5086,6 +5121,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         // previous workspace into the new tab bar.
         guard confirmDiscardAllGroups() else { return }
         saveWorkspaceSession()
+        let leftRoot = workspace?.root()
         // Shells belong to the old folder; VSCode reloads the window here.
         resetGroups()
         snippetSession = nil
@@ -5093,6 +5129,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         showNoDocument()
         let ws = try bridge.core.openWorkspace(path: url.path)
         workspace = ws
+        if let leftRoot, leftRoot != ws.root() { onWorkspaceLeft?(leftRoot) }
         titleBar.setProjectTitle(ws.name())
         Self.rememberProject(url.path)
         workspaceSettingsModified = nil
@@ -5106,6 +5143,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         // Index right away; the status bar shows the server's progress.
         bridge.warmUpLSP(root: ws.root())
         refreshGitStatus()
+        // Apply files.exclude before the explorer lists the new root.
+        reloadSettings(force: true)
         explorer.setWorkspace(ws)
         updateSidebarContent()
         setSidebarVisible(true)

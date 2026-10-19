@@ -31,6 +31,18 @@ final class SourceControlTests: XCTestCase {
         XCTAssertEqual(sc.numberOfRows(in: dummyTable), 4)
     }
 
+    func testCompactCountFormat() {
+        XCTAssertEqual(CountFormat.compact(0), "0")
+        XCTAssertEqual(CountFormat.compact(3), "3")
+        XCTAssertEqual(CountFormat.compact(999), "999")
+        XCTAssertEqual(CountFormat.compact(1000), "1k")
+        XCTAssertEqual(CountFormat.compact(1001), "1k+")
+        XCTAssertEqual(CountFormat.compact(1999), "1k+")
+        XCTAssertEqual(CountFormat.compact(2000), "2k")
+        XCTAssertEqual(CountFormat.compact(2500), "2k+")
+        XCTAssertEqual(CountFormat.compact(12_000), "12k")
+    }
+
     func testActivityBarToggleSourceControl() {
         let controller = MainWindowController(bridge: CoreBridge())
         controller.showWindow(nil)
