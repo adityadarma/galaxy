@@ -960,6 +960,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         return tab
     }
 
+    /// A double click on a tab keeps it: the title stops being italic and the
+    /// next single click in the explorer no longer replaces it.
+    func keepOpen(_ tab: EditorTab) {
+        guard tab.isPreview else { return }
+        tab.isPreview = false
+        refreshTabBar()
+    }
+
     @objc func togglePinTab(_ sender: Any?) {
         guard let tab = menuTab(sender) ?? activeTab else { return }
         setPinned(!tab.isPinned, tab: tab)
@@ -1386,6 +1394,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         tabBar.setContentCompressionResistancePriority(.required, for: .vertical)
         tabBar.onSelect = { [weak self] i in self?.selectTab(i, fromTabBar: true) }
         tabBar.onClose = { [weak self] i in self?.closeTab(at: i) }
+        tabBar.onKeep = { [weak self] i in
+            guard let self, self.tabs.indices.contains(i) else { return }
+            self.keepOpen(self.tabs[i])
+        }
         tabBar.onUnpin = { [weak self] i in
             guard let self, self.tabs.indices.contains(i) else { return }
             self.setPinned(false, tab: self.tabs[i])
@@ -5740,6 +5752,10 @@ extension MainWindowController {
             guard let self, let group else { return }
             self.activateGroup(group)
             self.closeTab(at: i)
+        }
+        pane.tabBar.onKeep = { [weak self, weak group] i in
+            guard let self, let group, group.tabs.indices.contains(i) else { return }
+            self.keepOpen(group.tabs[i])
         }
         pane.tabBar.onUnpin = { [weak self, weak group] i in
             guard let self, let group, group.tabs.indices.contains(i) else { return }

@@ -37,6 +37,10 @@ pub struct DirEntry {
     pub rel_path: String,
     /// `true` for directories, including symlinks that point to one.
     pub is_dir: bool,
+    /// Matched by a `.gitignore` or `.ignore` rule. The explorer dims these.
+    /// Children of an ignored folder are not flagged here; the caller carries
+    /// the folder's flag down.
+    pub is_ignored: bool,
 }
 
 /// Compact identifier for one path stored in a [`PathArena`].
@@ -170,6 +174,53 @@ pub struct Workspace {
     root: PathBuf,
     /// `files.exclude` globs, relative to the root. Shared between clones.
     explorer_excludes: Arc<RwLock<Vec<String>>>,
+    /// The volume ignores letter case in names (the macOS default), so git
+    /// matches `AGENTS.MD` in a `.gitignore` against `AGENTS.md`. Ignore
+    /// rules are then matched the same way.
+    case_insensitive: bool,
+}
+
+/// Whether the volume holding `root` treats `Name` and `name` as one file.
+/// Asks the file system: the first ancestor whose name has a letter is
+/// looked up with its case swapped, and the same inode means insensitive.
+/// Nothing is written. Without a letter anywhere on the path, or when the
+/// platform has no inodes, this is `false` (git's own default there).
+fn volume_ignores_case(root: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        for path in root.ancestors() {
+            let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            let swapped: String = name
+                .chars()
+                .map(|c| {
+                    if c.is_lowercase() {
+                        c.to_uppercase().next().unwrap_or(c)
+                    } else {
+                        c.to_lowercase().next().unwrap_or(c)
+                    }
+                })
+                .collect();
+            if swapped == name {
+                continue;
+            }
+            let (Ok(real), Ok(other)) = (fs::metadata(path), fs::metadata(path.with_file_name(&swapped)))
+            else {
+                // The swapped name does not exist: this volume is case-sensitive.
+                return false;
+            };
+            return real.dev() == other.dev() && real.ino() == other.ino();
+        }
+        false
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = root;
+        cfg!(windows)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,6 +286,7 @@ impl Workspace {
             ));
         }
         Ok(Self {
+            case_insensitive: volume_ignores_case(&root),
             root,
             explorer_excludes: Arc::default(),
         })
@@ -407,6 +459,8 @@ impl Workspace {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
 
+        let unignored = self.unignored_names(&dir);
+
         let mut entries: Vec<DirEntry> = fs::read_dir(&dir)?
             .filter_map(Result::ok)
             .filter_map(|e| {
@@ -415,8 +469,12 @@ impl Workspace {
                 if excludes.iter().any(|glob| glob_matches(glob, &rel_path)) {
                     return None;
                 }
+                let name = e.file_name().to_string_lossy().into_owned();
                 Some(DirEntry {
-                    name: e.file_name().to_string_lossy().into_owned(),
+                    // When the walk fails nothing is flagged, so a broken
+                    // ignore file never dims the whole folder.
+                    is_ignored: unignored.as_ref().is_some_and(|names| !names.contains(&name)),
+                    name,
                     rel_path,
                     // `is_dir` follows symlinks, so linked folders expand.
                     is_dir: path.is_dir(),
@@ -425,6 +483,33 @@ impl Workspace {
             .collect();
         sort_entries(&mut entries);
         Ok(entries)
+    }
+
+    /// Names in `dir` that no `.gitignore` or `.ignore` rule matches, or
+    /// `None` if the directory could not be walked. Unlike `list_visible`
+    /// this keeps the built-in excludes (`node_modules`, `target`, ...), so
+    /// only real ignore rules count.
+    fn unignored_names(&self, dir: &Path) -> Option<HashSet<String>> {
+        let walker = WalkBuilder::new(dir)
+            .max_depth(Some(1))
+            .hidden(false)
+            .ignore(true)
+            .git_ignore(true)
+            .git_global(false)
+            .git_exclude(false)
+            .require_git(false)
+            .ignore_case_insensitive(self.case_insensitive)
+            .parents(true)
+            .follow_links(false)
+            .build();
+        let mut names = HashSet::new();
+        for entry in walker {
+            let entry = entry.ok()?;
+            if entry.depth() == 1 {
+                names.insert(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+        Some(names)
     }
 
     fn rel_string(&self, path: &Path) -> Option<String> {
@@ -456,6 +541,7 @@ impl Workspace {
             .git_global(false)
             .git_exclude(false)
             .require_git(false)
+            .ignore_case_insensitive(self.case_insensitive)
             .parents(true)
             .follow_links(false)
             .filter_entry(|e| e.depth() == 0 || !is_default_excluded(e))
@@ -476,6 +562,7 @@ impl Workspace {
                         .join("/"),
                     // `is_dir` follows symlinks, so linked folders expand.
                     is_dir: path.is_dir(),
+                    is_ignored: false,
                 })
             })
             .collect();
@@ -519,6 +606,7 @@ impl Workspace {
             .git_global(false)
             .git_exclude(false)
             .require_git(false)
+            .ignore_case_insensitive(self.case_insensitive)
             .follow_links(false)
             .filter_entry(|e| e.depth() == 0 || !is_default_excluded(e))
             .build();
@@ -652,6 +740,7 @@ impl Workspace {
             .git_global(false)
             .git_exclude(false)
             .require_git(false)
+            .ignore_case_insensitive(self.case_insensitive)
             .parents(true)
             .follow_links(false)
             .filter_entry(|e| e.depth() == 0 || !is_default_excluded(e))
@@ -684,6 +773,7 @@ impl Workspace {
             .git_global(false)
             .git_exclude(false)
             .require_git(false)
+            .ignore_case_insensitive(self.case_insensitive)
             .parents(true)
             .follow_links(false)
             .filter_entry(|e| e.depth() == 0 || !is_default_excluded(e))
@@ -847,6 +937,66 @@ mod tests {
         assert!(!in_index("debug.log"));
         assert!(!in_index("src/scratch.tmp"));
         assert!(in_index("src/main.rs"));
+    }
+
+    #[test]
+    fn explorer_flags_gitignored_entries_only() {
+        let (dir, ws) = tree();
+        fs::write(dir.path().join(".gitignore"), "*.log\n/alpha/\n").unwrap();
+        fs::write(dir.path().join("debug.log"), "x").unwrap();
+
+        let root = ws.list_dir("").unwrap();
+        let ignored = |name: &str| root.iter().find(|e| e.name == name).map(|e| e.is_ignored);
+        assert_eq!(ignored("debug.log"), Some(true), "file rule");
+        assert_eq!(ignored("alpha"), Some(true), "folder rule");
+        assert_eq!(ignored("src"), Some(false));
+        assert_eq!(ignored(".gitignore"), Some(false));
+        // Built-in excludes are not ignore rules: only .gitignore dims.
+        assert_eq!(ignored("node_modules"), Some(false));
+        assert_eq!(ignored(".git"), Some(false));
+    }
+
+    #[test]
+    fn case_detection_agrees_with_the_file_system() {
+        let (dir, ws) = tree();
+        fs::write(dir.path().join("probe.txt"), "x").unwrap();
+        let same_file = dir.path().join("PROBE.TXT").exists();
+        assert_eq!(ws.case_insensitive, same_file);
+    }
+
+    #[test]
+    fn ignore_rules_follow_the_volumes_case_rules() {
+        let (dir, mut ws) = tree();
+        fs::write(dir.path().join(".gitignore"), "AGENTS.MD\n").unwrap();
+        fs::write(dir.path().join("AGENTS.md"), "x").unwrap();
+        let flagged = |ws: &Workspace| {
+            ws.list_dir("")
+                .unwrap()
+                .iter()
+                .find(|e| e.name == "AGENTS.md")
+                .map(|e| e.is_ignored)
+        };
+        let in_index = |ws: &Workspace| {
+            let index = ws.build_file_index();
+            (0..index.len()).any(|i| index.path(i).as_deref() == Some("AGENTS.md"))
+        };
+        let found = |ws: &Workspace| {
+            ws.search("x", &SearchOptions::default(), 100)
+                .map(|hits| hits.iter().any(|m| m.rel_path == "AGENTS.md"))
+                .unwrap_or(false)
+        };
+
+        // Case-insensitive volume: git ignores AGENTS.md, so do we, everywhere.
+        ws.case_insensitive = true;
+        assert_eq!(flagged(&ws), Some(true), "dimmed");
+        assert!(!in_index(&ws), "not indexed");
+        assert!(!found(&ws), "not searched");
+
+        // Case-sensitive volume: AGENTS.MD is a different file.
+        ws.case_insensitive = false;
+        assert_eq!(flagged(&ws), Some(false));
+        assert!(in_index(&ws));
+        assert!(found(&ws));
     }
 
     #[test]

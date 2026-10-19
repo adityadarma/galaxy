@@ -764,6 +764,10 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
             cell.onDiscard = { [weak self] in
                 self?.discard(change: change)
             }
+            cell.onOpenFile = { [weak self] in
+                // The file itself, even when a click on the row opens its diff.
+                self?.onOpen?(change.path)
+            }
             return cell
 
         case .empty(let text):
@@ -1344,11 +1348,20 @@ final class SourceControlItemCellView: NSTableCellView {
     let nameLabel = NSTextField(labelWithString: "")
     let dirLabel = NSTextField(labelWithString: "")
     let statusBadge = NSTextField(labelWithString: "")
+    let openFileButton = NSButton()
     let discardButton = NSButton()
     let actionButton = NSButton()
 
     var onAction: (() -> Void)?
     var onDiscard: (() -> Void)?
+    var onOpenFile: (() -> Void)?
+    /// A deleted file has nothing to open.
+    private var canOpenFile = true
+    private var isHovered = false
+    /// The directory fills the row up to the status letter until the
+    /// hover buttons appear, then gives them room.
+    private var dirTrailingIdle: NSLayoutConstraint!
+    private var dirTrailingHovered: NSLayoutConstraint!
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -1374,13 +1387,25 @@ final class SourceControlItemCellView: NSTableCellView {
 
         dirLabel.font = .systemFont(ofSize: 12, weight: .regular)
         dirLabel.textColor = NSColor(white: 0.55, alpha: 1.0)
-        dirLabel.lineBreakMode = .byTruncatingMiddle
+        dirLabel.lineBreakMode = .byTruncatingTail
         dirLabel.translatesAutoresizingMaskIntoConstraints = false
         dirLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         statusBadge.font = .monospacedSystemFont(ofSize: 11, weight: .semibold)
         statusBadge.alignment = .right
         statusBadge.translatesAutoresizingMaskIntoConstraints = false
+
+        openFileButton.isBordered = false
+        openFileButton.target = self
+        openFileButton.action = #selector(openFileClicked(_:))
+        openFileButton.translatesAutoresizingMaskIntoConstraints = false
+        openFileButton.contentTintColor = .secondaryLabelColor
+        openFileButton.image = (NSImage(systemSymbolName: "doc.badge.arrow.up", accessibilityDescription: "Open File")
+            ?? NSImage(systemSymbolName: "doc.text", accessibilityDescription: "Open File"))?
+            .withSymbolConfiguration(.init(pointSize: 10, weight: .semibold))
+        openFileButton.toolTip = "Open File"
+        openFileButton.setAccessibilityLabel("Open File")
+        openFileButton.isHidden = true
 
         discardButton.isBordered = false
         discardButton.target = self
@@ -1403,9 +1428,14 @@ final class SourceControlItemCellView: NSTableCellView {
         addSubview(iconView)
         addSubview(nameLabel)
         addSubview(dirLabel)
+        addSubview(openFileButton)
         addSubview(discardButton)
         addSubview(actionButton)
         addSubview(statusBadge)
+
+        dirTrailingIdle = dirLabel.trailingAnchor.constraint(lessThanOrEqualTo: statusBadge.leadingAnchor, constant: -6)
+        dirTrailingHovered = dirLabel.trailingAnchor.constraint(lessThanOrEqualTo: openFileButton.leadingAnchor, constant: -4)
+        dirTrailingIdle.isActive = true
 
         NSLayoutConstraint.activate([
             // Vertical guide under the section chevron (x = 6 + 14 / 2).
@@ -1425,7 +1455,10 @@ final class SourceControlItemCellView: NSTableCellView {
 
             dirLabel.leadingAnchor.constraint(equalTo: nameLabel.trailingAnchor, constant: 6),
             dirLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
-            dirLabel.trailingAnchor.constraint(lessThanOrEqualTo: discardButton.leadingAnchor, constant: -4),
+            openFileButton.trailingAnchor.constraint(equalTo: discardButton.leadingAnchor, constant: -2),
+            openFileButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            openFileButton.widthAnchor.constraint(equalToConstant: 16),
+            openFileButton.heightAnchor.constraint(equalToConstant: 16),
 
             discardButton.trailingAnchor.constraint(equalTo: actionButton.leadingAnchor, constant: -2),
             discardButton.centerYAnchor.constraint(equalTo: centerYAnchor),
@@ -1464,6 +1497,23 @@ final class SourceControlItemCellView: NSTableCellView {
             accessibilityDescription: tooltip
         )?.withSymbolConfiguration(.init(pointSize: 10, weight: .semibold))
         actionButton.toolTip = tooltip
+
+        canOpenFile = !change.code.contains("D")
+        updateButtonVisibility()
+    }
+
+    private func updateButtonVisibility() {
+        discardButton.isHidden = !isHovered
+        actionButton.isHidden = !isHovered
+        openFileButton.isHidden = !isHovered || !canOpenFile
+        dirTrailingIdle.isActive = !isHovered
+        dirTrailingHovered.isActive = isHovered
+    }
+
+    override func prepareForReuse() {
+        super.prepareForReuse()
+        isHovered = false
+        updateButtonVisibility()
     }
 
     override func updateTrackingAreas() {
@@ -1474,13 +1524,13 @@ final class SourceControlItemCellView: NSTableCellView {
     }
 
     override func mouseEntered(with event: NSEvent) {
-        discardButton.isHidden = false
-        actionButton.isHidden = false
+        isHovered = true
+        updateButtonVisibility()
     }
 
     override func mouseExited(with event: NSEvent) {
-        discardButton.isHidden = true
-        actionButton.isHidden = true
+        isHovered = false
+        updateButtonVisibility()
     }
 
     private func statusBadgeInfo(for change: GitChangeInfo, isStaged: Bool) -> (letter: String, color: NSColor) {
@@ -1518,6 +1568,7 @@ final class SourceControlItemCellView: NSTableCellView {
 
     @objc private func actionClicked(_ sender: Any?) { onAction?() }
     @objc private func discardClicked(_ sender: Any?) { onDiscard?() }
+    @objc private func openFileClicked(_ sender: Any?) { onOpenFile?() }
 }
 
 @MainActor

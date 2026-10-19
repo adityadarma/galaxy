@@ -28,9 +28,13 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
     private let autoSaveDelay = NSStepper(frame: .zero)
     private let autoSaveDelayLabel = NSTextField(labelWithString: "")
     private let settingsStatus = NSTextField(wrappingLabelWithString: "")
+    /// One checkbox per default `files.exclude` glob, in `defaultFilesExclude` order.
+    private let excludeBoxes: [NSButton] = GalaxySettings.defaultFilesExclude.map {
+        NSButton(checkboxWithTitle: $0, target: nil, action: nil)
+    }
     private var editorControls: [NSControl] {
         [tabSizePopup, insertSpacesBox, whitespacePopup, autoClosingTagsBox, linkedEditingBox,
-         autoSavePopup, autoSaveDelay, gitBlameBox]
+         autoSavePopup, autoSaveDelay, gitBlameBox] + excludeBoxes
     }
 
     // View tab: the same switches as the View menu.
@@ -73,6 +77,7 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
         tabs.tabStyle = .toolbar
         tabs.addTabViewItem(tab("General", symbol: "gearshape", pane: buildGeneralPane()))
         tabs.addTabViewItem(tab("Editor", symbol: "text.cursor", pane: buildEditorPane()))
+        tabs.addTabViewItem(tab("Explorer", symbol: "folder", pane: buildExplorerPane()))
         tabs.addTabViewItem(tab("View", symbol: "rectangle.split.3x1", pane: buildViewPane()))
         tabs.addTabViewItem(tab("AI", symbol: "sparkles", pane: buildAIPane()))
         window?.contentViewController = tabs
@@ -128,6 +133,23 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
         return pane(stack)
     }
 
+    private func buildExplorerPane() -> NSView {
+        let stack = NSStackView()
+        stack.addArrangedSubview(section("Hidden in the Explorer (files.exclude)"))
+        for box in excludeBoxes {
+            box.target = self; box.action = #selector(saveFilesExclude(_:))
+            box.setAccessibilityLabel("Hide \(box.title)")
+            stack.addArrangedSubview(box)
+        }
+        let hint = NSTextField(wrappingLabelWithString: "Uncheck a pattern to show it again. Add other patterns under files.exclude in settings.json, for example {\"**/*.log\": true}.")
+        hint.font = .systemFont(ofSize: 11)
+        hint.textColor = .secondaryLabelColor
+        hint.preferredMaxLayoutWidth = 370
+        hint.widthAnchor.constraint(equalToConstant: 370).isActive = true
+        stack.addArrangedSubview(hint)
+        return pane(stack)
+    }
+
     private func buildViewPane() -> NSView {
         let stack = NSStackView()
         stack.addArrangedSubview(section("Editor"))
@@ -179,6 +201,8 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
         autoClosingTagsBox.state = settings.effectiveAutoClosingTags ? .on : .off
         linkedEditingBox.state = settings.effectiveLinkedEditing ? .on : .off
         gitBlameBox.state = settings.effectiveGitBlame ? .on : .off
+        let hidden = Set(settings.effectiveFilesExclude)
+        for box in excludeBoxes { box.state = hidden.contains(box.title) ? .on : .off }
         autoSavePopup.selectItem(at: Self.autoSaveModes.firstIndex { $0.value == settings.effectiveAutoSave } ?? 0)
         autoSaveDelay.doubleValue = settings.effectiveAutoSaveDelay * 1000
         updateAutoSaveDelay()
@@ -216,6 +240,17 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
     @objc private func saveAutoClosingTags(_ sender: Any?) { store(autoClosingTagsBox.state == .on, "autoClosingTags") }
     @objc private func saveLinkedEditing(_ sender: Any?) { store(linkedEditingBox.state == .on, "linkedEditing") }
     @objc private func saveGitBlame(_ sender: Any?) { store(gitBlameBox.state == .on, "gitBlame") }
+
+    @objc private func saveFilesExclude(_ sender: Any?) {
+        guard let box = sender as? NSButton else { return }
+        do {
+            try GalaxySettings.writeFilesExclude(glob: box.title, enabled: box.state == .on, to: settingsURL)
+            onChange()
+        } catch {
+            showSettingsError("Could not save files.exclude: \(error.localizedDescription)")
+            syncControls()
+        }
+    }
 
     @objc private func saveWhitespace(_ sender: Any?) {
         store(Self.whitespaceModes[max(whitespacePopup.indexOfSelectedItem, 0)].value.rawValue, "renderWhitespace")

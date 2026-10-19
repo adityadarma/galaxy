@@ -21,6 +21,37 @@ final class ExplorerTests: XCTestCase {
         }
     }
 
+    func testGitIgnoredEntriesAreDimmedIncludingEverythingInsideAnIgnoredFolder() throws {
+        let root = try makeTree()
+        defer { try? FileManager.default.removeItem(at: root) }
+        try "docs/\n*.log\n".write(to: root.appendingPathComponent(".gitignore"), atomically: true, encoding: .utf8)
+        try "x".write(to: root.appendingPathComponent("debug.log"), atomically: true, encoding: .utf8)
+        try "x".write(to: root.appendingPathComponent("docs/guide.md"), atomically: true, encoding: .utf8)
+        let ws = try CoreBridge().core.openWorkspace(path: root.path)
+
+        let explorer = ExplorerController()
+        explorer.setWorkspace(ws)
+        func node(_ name: String) throws -> ExplorerNode {
+            try XCTUnwrap((0..<explorer.outlineView.numberOfRows).lazy
+                .compactMap { explorer.outlineView.item(atRow: $0) as? ExplorerNode }
+                .first { $0.entry.name == name }, name)
+        }
+        XCTAssertTrue(try node("docs").isIgnored, "folder rule")
+        XCTAssertTrue(try node("debug.log").isIgnored, "file rule")
+        XCTAssertFalse(try node("src").isIgnored)
+        XCTAssertFalse(try node(".gitignore").isIgnored, ".gitignore itself is not ignored")
+
+        explorer.outlineView.expandItem(try node("docs"))
+        XCTAssertTrue(try node("guide.md").isIgnored, "files inside an ignored folder are dimmed too")
+
+        let cell = try XCTUnwrap(explorer.outlineView.view(atColumn: 0, row: explorer.outlineView.row(forItem: try node("docs")),
+                                                           makeIfNecessary: true) as? ExplorerCell)
+        XCTAssertEqual(cell.alphaValue, ExplorerCell.ignoredAlpha, accuracy: 0.001)
+        let normal = try XCTUnwrap(explorer.outlineView.view(atColumn: 0, row: explorer.outlineView.row(forItem: try node("src")),
+                                                             makeIfNecessary: true) as? ExplorerCell)
+        XCTAssertEqual(normal.alphaValue, 1, accuracy: 0.001, "a reused cell is restored")
+    }
+
     func testOnlyTheRootIsListedUntilAFolderIsExpanded() throws {
         let root = try makeTree()
         defer { try? FileManager.default.removeItem(at: root) }
@@ -104,7 +135,9 @@ final class ExplorerTests: XCTestCase {
         defer { controller.window?.orderOut(nil) }
         let window = try XCTUnwrap(controller.window)
         let screen = try XCTUnwrap(window.screen ?? NSScreen.main)
-        let small = NSRect(x: screen.visibleFrame.minX + 40, y: screen.visibleFrame.minY + 40, width: 800, height: 500)
+        // Wider than the window's layout minimum (900), or a layout pass
+        // after the restore grows it and the frame no longer matches.
+        let small = NSRect(x: screen.visibleFrame.minX + 40, y: screen.visibleFrame.minY + 40, width: 1000, height: 500)
         window.setFrame(small, display: true)
 
         controller.titleBar.toggleFill()

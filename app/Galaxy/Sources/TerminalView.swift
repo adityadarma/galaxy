@@ -23,6 +23,9 @@ final class TerminalView: NSView {
         contextMenu?() ?? super.menu(for: event)
     }
 
+    /// Pasteboard for copy and paste; tests swap in a private one.
+    var pasteboard = NSPasteboard.general
+
     private var handle: TerminalHandle?
     private var timer: Timer?
     private(set) var screen: TerminalScreenInfo?
@@ -358,12 +361,12 @@ final class TerminalView: NSView {
         guard let screen else { return }
         var lines = screen.lines.map(\.text)
         while lines.last?.isEmpty == true { lines.removeLast() }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(lines.joined(separator: "\n"), forType: .string)
+        pasteboard.clearContents()
+        pasteboard.setString(lines.joined(separator: "\n"), forType: .string)
     }
 
     @objc func paste(_ sender: Any?) {
-        guard let handle, var text = NSPasteboard.general.string(forType: .string) else { return }
+        guard let handle, var text = pasteboard.string(forType: .string) else { return }
         text = text.replacingOccurrences(of: "\r\n", with: "\r").replacingOccurrences(of: "\n", with: "\r")
         if screen?.bracketedPaste == true { text = "\u{1b}[200~\(text)\u{1b}[201~" }
         try? handle.write(input: text)

@@ -401,4 +401,34 @@ final class TerminalPanelTests: XCTestCase {
         XCTAssertFalse(c.isBottomPanelVisible, "the panel closes with its last terminal")
         XCTAssertFalse(c.validateMenuItem(kill))
     }
+
+    /// ⌘V goes through the window's key monitor and menu, not `keyDown`, so
+    /// the terminal has to answer the paste command itself.
+    func testCommandVPastesIntoTheFocusedTerminal() throws {
+        let (c, root) = try workspaceController()
+        defer { c.window?.orderOut(nil); try? FileManager.default.removeItem(at: root) }
+        c.toggleTerminal(nil)
+        let pane = c.terminalPanelForTesting.activePane
+        pane.pasteboard = NSPasteboard(name: NSPasteboard.Name("galaxy-test-\(UUID().uuidString)"))
+        pane.pasteboard.clearContents()
+        pane.pasteboard.setString("echo galaxy_paste_ok", forType: .string)
+        c.window?.makeFirstResponder(pane)
+        XCTAssertTrue(c.window?.firstResponder === pane)
+
+        // A real ⌘V event, so it takes the same route as a keypress: the
+        // window's key monitor, then the menu.
+        let event = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown, location: .zero, modifierFlags: .command, timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: c.window?.windowNumber ?? 0, context: nil, characters: "v",
+            charactersIgnoringModifiers: "v", isARepeat: false, keyCode: 9))
+        NSApp.sendEvent(event)
+        let deadline = Date().addingTimeInterval(5)
+        var seen = false
+        while Date() < deadline, !seen {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+            seen = pane.screen?.lines.contains { $0.text.contains("galaxy_paste_ok") } == true
+        }
+        XCTAssertTrue(seen, "the pasted text reaches the shell")
+        c.panelTerminals.forEach { $0.handle.kill() }
+    }
 }

@@ -25,6 +25,10 @@ enum GitGraphRows {
         }
         if uncommitted > 0 {
             let lane = commits.first?.lane ?? 0
+            // The core knows nothing of the working-tree entry, so the
+            // newest commit has no line coming in. Without this the line
+            // from the Uncommitted dot stops at the row edge.
+            if !commits.isEmpty, !rows[0].incoming.contains(lane) { rows[0].incoming.append(lane) }
             rows.insert(GitGraphRow(commit: nil, uncommittedCount: uncommitted, lane: lane,
                                     passing: [], incoming: [], outgoing: commits.isEmpty ? [] : [lane],
                                     originTags: originTags),
@@ -898,15 +902,19 @@ final class GitGraphLaneView: NSView {
         func stroke(_ lane: UInt32, _ from: NSPoint, _ to: NSPoint) {
             let path = NSBezierPath()
             path.lineWidth = 1.5
+            path.lineCapStyle = .butt
+            path.lineJoinStyle = .round
             path.move(to: from)
             if from.x == to.x {
                 path.line(to: to)
             } else {
-                // Bend near the far end so a branch leaves its node
-                // straight and joins the lane in the next row.
-                let bendY = from.y == mid ? to.y - 6 : from.y + 6
-                path.line(to: NSPoint(x: from.x, y: bendY))
-                path.line(to: to)
+                // One smooth S-curve over the whole half row. Both control
+                // points sit on the end lanes, so the line leaves its node
+                // and joins the next lane vertically, with no corner.
+                let reach = (to.y - from.y) * 0.5
+                path.curve(to: to,
+                           controlPoint1: NSPoint(x: from.x, y: from.y + reach),
+                           controlPoint2: NSPoint(x: to.x, y: to.y - reach))
             }
             GitGraphPalette.color(lane).setStroke()
             path.stroke()

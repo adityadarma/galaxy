@@ -173,6 +173,27 @@ final class SettingsTests: XCTestCase {
         XCTAssertGreaterThan(changes, 0, "open windows are told")
     }
 
+    func testSettingsWindowListsTheDefaultExcludesAndWritesToggles() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-prefs-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try #"{"files":{"exclude":{"**/*.log":true,"**/.git":true}}}"#.write(to: url, atomically: true, encoding: .utf8)
+        var changes = 0
+        let controller = PreferencesWindowController(settingsURL: url) { changes += 1 }
+        let boxes = try XCTUnwrap(Mirror(reflecting: controller).children.first { $0.label == "excludeBoxes" }?.value as? [NSButton])
+        XCTAssertEqual(boxes.map(\.title), GalaxySettings.defaultFilesExclude, "every default is listed")
+        XCTAssertTrue(boxes.allSatisfy { $0.state == .on }, "defaults are on without being written to the file")
+
+        let git = try XCTUnwrap(boxes.first { $0.title == "**/.git" })
+        git.state = .off
+        _ = git.target?.perform(git.action, with: git)
+        let settings = try GalaxySettings.load(from: url)
+        XCTAssertEqual(settings.filesExclude?["**/.git"], false)
+        XCTAssertEqual(settings.filesExclude?["**/*.log"], true, "the user's own entry survives")
+        XCTAssertFalse(settings.effectiveFilesExclude.contains("**/.git"))
+        XCTAssertTrue(settings.effectiveFilesExclude.contains("**/.DS_Store"))
+        XCTAssertGreaterThan(changes, 0, "open windows are told")
+    }
+
     func testAutoSaveDefaultsStayConservative() {
         XCTAssertEqual(GalaxySettings.empty.effectiveAutoSave, .off)
         XCTAssertEqual(GalaxySettings.empty.effectiveAutoSaveDelay, 1.0, accuracy: 0.001)

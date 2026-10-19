@@ -170,4 +170,18 @@ extension GalaxySettings {
         let data = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys])
         try data.write(to: url, options: .atomic)
     }
+
+    /// Turns one `files.exclude` glob on or off in the file at `url`. The
+    /// other entries stay as written, including ones this app does not read.
+    static func writeFilesExclude(glob: String, enabled: Bool, to url: URL = globalURL) throws {
+        var current: [String: Any] = [:]
+        if let data = try? Data(contentsOf: url), !data.isEmpty {
+            guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            current = (root["files"] as? [String: Any])?["exclude"] as? [String: Any] ?? [:]
+        }
+        current[glob] = enabled
+        try write(current, key: "exclude", section: "files", to: url)
+    }
 }

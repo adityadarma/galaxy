@@ -106,6 +106,20 @@ final class TabTests: XCTestCase {
         XCTAssertEqual(titles(c), ["b.txt", "c.txt", "a.txt"])
     }
 
+    func testDoubleClickingAPreviewTabKeepsItAndDropsTheItalic() throws {
+        let c = makeController()
+        defer { c.window?.orderOut(nil) }
+        let (ws, a) = try entry(c, "a.txt")
+        let (_, b) = try entry(c, "b.txt")
+
+        c.openWorkspaceFile(ws, a, preview: true)
+        XCTAssertEqual(c.tabBar.items.first?.isPreview, true)
+        c.tabBar.onKeep?(0)
+        XCTAssertEqual(c.tabBar.items.first?.isPreview, false, "no longer italic")
+        c.openWorkspaceFile(ws, b, preview: true)
+        XCTAssertEqual(titles(c), ["a.txt", "b.txt"], "the next preview no longer replaces it")
+    }
+
     func testEachTabKeepsItsOwnTextAndDirtyState() throws {
         let c = makeController()
         defer { c.window?.orderOut(nil) }

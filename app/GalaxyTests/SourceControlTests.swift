@@ -31,6 +31,64 @@ final class SourceControlTests: XCTestCase {
         XCTAssertEqual(sc.numberOfRows(in: dummyTable), 4)
     }
 
+    func testChangeRowHasAnOpenFileButtonThatOpensTheFileNotTheDiff() throws {
+        let sc = SourceControlController()
+        var opened: [String] = []
+        var diffs: [String] = []
+        sc.onOpen = { opened.append($0) }
+        sc.onOpenDiff = { diffs.append($0) }
+        sc.refresh(status: GitStatusInfo(
+            branch: "main", changedPaths: ["README.md", "gone.txt"],
+            changes: [GitChangeInfo(path: "README.md", staged: false, code: " M"),
+                      GitChangeInfo(path: "gone.txt", staged: false, code: " D")]))
+
+        let table = NSTableView()
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("scm-changes"))
+        // Row 0 is the Changes header, row 1 README.md, row 2 gone.txt.
+        let modified = try XCTUnwrap(sc.tableView(table, viewFor: column, row: 1) as? SourceControlItemCellView)
+        let deleted = try XCTUnwrap(sc.tableView(table, viewFor: column, row: 2) as? SourceControlItemCellView)
+
+        XCTAssertTrue(modified.openFileButton.isHidden, "buttons show on hover only")
+        modified.mouseEntered(with: NSEvent())
+        XCTAssertFalse(modified.openFileButton.isHidden)
+        XCTAssertEqual(modified.openFileButton.toolTip, "Open File")
+        modified.openFileButton.performClick(nil)
+        XCTAssertEqual(opened, ["README.md"])
+        XCTAssertTrue(diffs.isEmpty, "the button opens the file, not the diff")
+
+        deleted.mouseEntered(with: NSEvent())
+        XCTAssertTrue(deleted.openFileButton.isHidden, "a deleted file has nothing to open")
+        XCTAssertFalse(deleted.discardButton.isHidden)
+        modified.mouseExited(with: NSEvent())
+        XCTAssertTrue(modified.openFileButton.isHidden)
+    }
+
+    func testDirectoryUsesTheFullRowUntilTheHoverButtonsAppear() throws {
+        let sc = SourceControlController()
+        let long = "app/Galaxy/Sources/Deeply/Nested/Folder"
+        sc.refresh(status: GitStatusInfo(
+            branch: "main", changedPaths: ["\(long)/File.swift"],
+            changes: [GitChangeInfo(path: "\(long)/File.swift", staged: false, code: " M")]))
+        let table = NSTableView()
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("scm-changes"))
+        let cell = try XCTUnwrap(sc.tableView(table, viewFor: column, row: 1) as? SourceControlItemCellView)
+        cell.frame = NSRect(x: 0, y: 0, width: 420, height: 24)
+
+        cell.layoutSubtreeIfNeeded()
+        let idle = cell.dirLabel.frame.maxX
+        XCTAssertEqual(cell.dirLabel.lineBreakMode, .byTruncatingTail, "cut at the end, not in the middle")
+        XCTAssertLessThanOrEqual(idle, cell.statusBadge.frame.minX, "never under the status letter")
+        XCTAssertGreaterThan(idle, cell.openFileButton.frame.minX, "reaches into the space the buttons will use")
+
+        cell.mouseEntered(with: NSEvent())
+        cell.layoutSubtreeIfNeeded()
+        XCTAssertLessThanOrEqual(cell.dirLabel.frame.maxX, cell.openFileButton.frame.minX, "makes room for the buttons")
+
+        cell.mouseExited(with: NSEvent())
+        cell.layoutSubtreeIfNeeded()
+        XCTAssertEqual(cell.dirLabel.frame.maxX, idle, accuracy: 0.5)
+    }
+
     func testCompactCountFormat() {
         XCTAssertEqual(CountFormat.compact(0), "0")
         XCTAssertEqual(CountFormat.compact(3), "3")

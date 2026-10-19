@@ -463,4 +463,51 @@ final class GitGraphPanelTests: XCTestCase {
         panel.scrollToHead()
         XCTAssertEqual(messages.count, 1, "found: no message")
     }
+
+    /// Draws `row` and returns the alpha at a point, in view coordinates.
+    private func laneAlpha(_ row: GitGraphRow, at points: [NSPoint]) throws -> [CGFloat] {
+        let view = GitGraphLaneView(frame: NSRect(x: 0, y: 0, width: 60, height: GitGraphPanel.rowHeight))
+        view.row = row
+        let rep = try XCTUnwrap(view.bitmapImageRepForCachingDisplay(in: view.bounds))
+        view.cacheDisplay(in: view.bounds, to: rep)
+        let scale = CGFloat(rep.pixelsWide) / view.bounds.width
+        return points.map { rep.colorAt(x: Int($0.x * scale), y: Int($0.y * scale))?.alphaComponent ?? 0 }
+    }
+
+    func testBranchLinesCurveSmoothlyBetweenLanes() throws {
+        // Lane 0 at x = 15, lane 1 at x = 29; the node sits at mid height (12).
+        let fork = GitGraphRow(commit: nil, lane: 0, passing: [], incoming: [], outgoing: [1])
+        let halfway = NSPoint(x: 22, y: 18)
+        XCTAssertGreaterThan(try laneAlpha(fork, at: [halfway])[0], 0.5,
+                             "the curve crosses the middle of the gap, not a corner at the end")
+        // A corner at the far end would leave the line straight under the node.
+        XCTAssertEqual(try laneAlpha(fork, at: [NSPoint(x: 15, y: 20)])[0], 0, accuracy: 0.05)
+
+        let join = GitGraphRow(commit: nil, lane: 0, passing: [], incoming: [1], outgoing: [])
+        XCTAssertGreaterThan(try laneAlpha(join, at: [NSPoint(x: 22, y: 6)])[0], 0.5)
+    }
+
+    func testLanesReachBothEdgesOfTheRow() throws {
+        let row = GitGraphRow(commit: nil, lane: 0, passing: [2], incoming: [], outgoing: [])
+        let x: CGFloat = 8 + 2 * GitGraphPanel.laneWidth + GitGraphPanel.laneWidth / 2
+        let alpha = try laneAlpha(row, at: [NSPoint(x: x, y: 0.5), NSPoint(x: x, y: GitGraphPanel.rowHeight - 0.5)])
+        XCTAssertGreaterThan(alpha[0], 0.5, "top edge")
+        XCTAssertGreaterThan(alpha[1], 0.5, "bottom edge")
+    }
+
+    func testLineBetweenUncommittedDotAndNewestCommitHasNoGap() throws {
+        let h = GitGraphPanel.rowHeight
+        let rows = GitGraphRows.make(commits: [commit("a"), commit("b")], uncommitted: 2)
+        let x: CGFloat = 8 + GitGraphPanel.laneWidth / 2
+        // Below the hollow dot (radius 4 around mid) to the row's bottom edge,
+        // then from the next row's top edge to just above its dot.
+        let below = stride(from: h / 2 + 5, to: h, by: 1).map { NSPoint(x: x, y: $0) }
+        let above = stride(from: CGFloat(0), to: h / 2 - 5, by: 1).map { NSPoint(x: x, y: $0) }
+        for alpha in try laneAlpha(rows[0], at: below) { XCTAssertGreaterThan(alpha, 0.5) }
+        for alpha in try laneAlpha(rows[1], at: above) { XCTAssertGreaterThan(alpha, 0.5) }
+        // Nothing is drawn above the Uncommitted dot.
+        for alpha in try laneAlpha(rows[0], at: [NSPoint(x: x, y: 1), NSPoint(x: x, y: h / 2 - 6)]) {
+            XCTAssertEqual(alpha, 0, accuracy: 0.05)
+        }
+    }
 }

@@ -143,6 +143,8 @@ final class TabBar: NSView {
 
     var onSelect: ((Int) -> Void)?
     var onClose: ((Int) -> Void)?
+    /// The tab was double-clicked: a preview tab becomes a regular one.
+    var onKeep: ((Int) -> Void)?
     /// The pin on a pinned tab was clicked.
     var onUnpin: ((Int) -> Void)?
     /// `(from, to)`: `to` is the tab's final index.
@@ -339,6 +341,7 @@ final class TabBar: NSView {
     /// Selects on mouse down, then follows the drag until mouse up.
     func track(tab index: Int, from event: NSEvent) {
         onSelect?(index)
+        if event.clickCount == 2 { onKeep?(index) }
         guard let window else { return }
         let start = convert(event.locationInWindow, from: nil)
         var dragging = false

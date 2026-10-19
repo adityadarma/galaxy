@@ -1851,6 +1851,9 @@ pub struct FileEntry {
     /// Path relative to the workspace root, `/` separated.
     pub rel_path: String,
     pub is_dir: bool,
+    /// Matched by a `.gitignore` rule; the explorer dims it.
+    #[uniffi(default = false)]
+    pub is_ignored: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -2417,6 +2420,7 @@ impl Workspace {
                 name: e.name,
                 rel_path: e.rel_path,
                 is_dir: e.is_dir,
+                is_ignored: e.is_ignored,
             })
             .collect())
     }

@@ -7,9 +7,13 @@ import os
 final class ExplorerNode {
     let entry: FileEntry
     var children: [ExplorerNode]?
+    /// Matched by a `.gitignore` rule itself or sits inside a folder that is.
+    /// The core flags only the entry; the folder's flag is carried down here.
+    let isIgnored: Bool
 
-    init(entry: FileEntry) {
+    init(entry: FileEntry, parentIgnored: Bool = false) {
         self.entry = entry
+        self.isIgnored = parentIgnored || entry.isIgnored
     }
 }
 
@@ -364,7 +368,8 @@ final class ExplorerController: NSObject {
         let rel = node?.entry.relPath ?? ""
         let list: [ExplorerNode]
         do {
-            list = try workspace.listDir(relPath: rel).map { ExplorerNode(entry: $0) }
+            let inherited = node?.isIgnored ?? false
+            list = try workspace.listDir(relPath: rel).map { ExplorerNode(entry: $0, parentIgnored: inherited) }
         } catch {
             Log.ui.error("list \(rel, privacy: .public) failed: \(String(describing: error), privacy: .public)")
             list = []
@@ -422,6 +427,7 @@ extension ExplorerController: NSOutlineViewDelegate {
         let cell = outlineView.makeView(withIdentifier: ExplorerCell.reuseID, owner: self) as? ExplorerCell
             ?? ExplorerCell()
         cell.show(node.entry, expanded: outlineView.isItemExpanded(node))
+        cell.isIgnored = node.isIgnored
         cell.isDirty = isDirty(node.entry)
         let status = gitStatus(for: node.entry)
         cell.gitStatus = status
@@ -560,6 +566,12 @@ final class ExplorerCell: NSTableCellView {
             }
         }
     }
+
+    /// Ignored by git: the whole row is dimmed, like VS Code does.
+    var isIgnored = false {
+        didSet { alphaValue = isIgnored ? Self.ignoredAlpha : 1 }
+    }
+    static let ignoredAlpha: CGFloat = 0.5
 
     var isGitChanged = false {
         didSet {
