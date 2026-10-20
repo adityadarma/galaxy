@@ -155,6 +155,11 @@ enum Theme {
         accent.resolved(for: appearance).withAlphaComponent(0.32)
     }
 
+    /// Other occurrences of the identifier under the caret.
+    static let symbolOccurrence = NSColor(name: "GalaxySymbolOccurrence") { appearance in
+        accent.resolved(for: appearance).withAlphaComponent(0.20)
+    }
+
     /// Lines with a caret and no selection: a faint blue wash.
     static let currentLine = NSColor(name: "GalaxyCurrentLine") { appearance in
         let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua

@@ -73,6 +73,20 @@ final class EditorGroupTests: XCTestCase {
         XCTAssertTrue(c.tabs[0].doc.isModified())
     }
 
+    func testClosingATabReturnsToTheOneItWasOpenedFrom() throws {
+        let c = makeController()
+        defer { c.window?.orderOut(nil) }
+        try c.openFile(at: file("a.txt"))
+        try c.openFile(at: file("c.txt"))
+        c.selectTab(0)
+        // A jump from a.txt opens b.txt right after it: [a, b, c].
+        try c.openFile(at: file("b.txt"))
+        XCTAssertEqual(c.tabs.map(\.title), ["a.txt", "b.txt", "c.txt"])
+
+        XCTAssertTrue(c.closeTab(at: 1))
+        XCTAssertEqual(c.activeTab?.title, "a.txt", "not the neighbour on the right")
+    }
+
     func testClosingTheLastTabOfAGroupRemovesTheGroup() throws {
         let c = makeController()
         defer { c.window?.orderOut(nil) }

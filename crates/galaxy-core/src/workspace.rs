@@ -207,8 +207,10 @@ fn volume_ignores_case(root: &Path) -> bool {
             if swapped == name {
                 continue;
             }
-            let (Ok(real), Ok(other)) = (fs::metadata(path), fs::metadata(path.with_file_name(&swapped)))
-            else {
+            let (Ok(real), Ok(other)) = (
+                fs::metadata(path),
+                fs::metadata(path.with_file_name(&swapped)),
+            ) else {
                 // The swapped name does not exist: this volume is case-sensitive.
                 return false;
             };
@@ -473,7 +475,9 @@ impl Workspace {
                 Some(DirEntry {
                     // When the walk fails nothing is flagged, so a broken
                     // ignore file never dims the whole folder.
-                    is_ignored: unignored.as_ref().is_some_and(|names| !names.contains(&name)),
+                    is_ignored: unignored
+                        .as_ref()
+                        .is_some_and(|names| !names.contains(&name)),
                     name,
                     rel_path,
                     // `is_dir` follows symlinks, so linked folders expand.

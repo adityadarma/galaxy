@@ -68,6 +68,13 @@ pub struct CompletionItem {
     pub insert_text: String,
     pub is_snippet: bool,
     pub sort_text: Option<String>,
+    /// Edits elsewhere in the file applied with the item (a `use` import).
+    pub additional_edits: Vec<RenameEdit>,
+    /// UTF-16 column on the cursor's line where the text to replace starts,
+    /// when it is more than the word before the cursor.
+    pub replace_from: Option<u64>,
+    /// LSP `CompletionItemKind` (2 method, 3 function, 7 class, ...).
+    pub kind: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,6 +142,34 @@ pub struct ProgressInfo {
     pub active: bool,
 }
 
+/// The name under which the editor's own analysis is stored.
+const BUILTIN_SERVER: &str = "galaxy";
+
+/// Whether two diagnostics point at the same place: on the same line with
+/// overlapping columns, or both errors on the same line.
+fn overlaps(a: &Diagnostic, b: &Diagnostic) -> bool {
+    if a.range.start_line != b.range.start_line {
+        return false;
+    }
+    if a.severity == DiagnosticSeverity::Error && b.severity == DiagnosticSeverity::Error {
+        return true;
+    }
+    let (a_end, b_end) = (
+        if a.range.end_line == a.range.start_line {
+            a.range.end_character
+        } else {
+            u64::MAX
+        },
+        if b.range.end_line == b.range.start_line {
+            b.range.end_character
+        } else {
+            u64::MAX
+        },
+    );
+    a.range.start_character < b_end.max(b.range.start_character + 1)
+        && b.range.start_character < a_end.max(a.range.start_character + 1)
+}
+
 /// Latest server diagnostics, replaced atomically per URI by
 /// `textDocument/publishDiagnostics` as required by LSP.
 #[derive(Debug, Default)]
@@ -172,16 +207,58 @@ impl DiagnosticStore {
             .iter()
             .map(|value| parse_diagnostic(&uri, value))
             .collect::<Result<Vec<_>, _>>()?;
-        let servers = self.by_server.entry(uri.clone()).or_default();
-        servers.insert(server.to_owned(), diagnostics);
+        self.by_server
+            .entry(uri.clone())
+            .or_default()
+            .insert(server.to_owned(), diagnostics);
+        self.merge(&uri);
+        Ok(true)
+    }
+
+    /// Replaces what the built-in analysis reports for `uri`. `false` when
+    /// nothing changed.
+    pub fn set_builtin(&mut self, uri: &str, diagnostics: Vec<Diagnostic>) -> bool {
+        let servers = self.by_server.entry(uri.to_owned()).or_default();
+        if diagnostics.is_empty() {
+            if servers.remove(BUILTIN_SERVER).is_none() {
+                return false;
+            }
+            if servers.is_empty() {
+                self.by_server.remove(uri);
+            }
+        } else if servers.get(BUILTIN_SERVER) == Some(&diagnostics) {
+            return false;
+        } else {
+            servers.insert(BUILTIN_SERVER.to_owned(), diagnostics);
+        }
+        self.merge(uri);
+        true
+    }
+
+    /// Rebuilds the joined list of `uri`. A built-in problem a language
+    /// server reports as well (same line, overlapping columns) shows once,
+    /// as the server's.
+    fn merge(&mut self, uri: &str) {
+        let Some(servers) = self.by_server.get(uri) else {
+            self.by_uri.remove(uri);
+            return;
+        };
         let mut names: Vec<_> = servers.keys().cloned().collect();
         names.sort();
-        let merged = names
+        let others: Vec<&Diagnostic> = names
             .iter()
-            .flat_map(|name| servers[name].iter().cloned())
+            .filter(|name| name.as_str() != BUILTIN_SERVER)
+            .flat_map(|name| servers[name].iter())
             .collect();
-        self.by_uri.insert(uri, merged);
-        Ok(true)
+        let mut merged: Vec<Diagnostic> = others.iter().map(|d| (*d).clone()).collect();
+        if let Some(own) = servers.get(BUILTIN_SERVER) {
+            merged.extend(
+                own.iter()
+                    .filter(|mine| !others.iter().any(|d| overlaps(mine, d)))
+                    .cloned(),
+            );
+        }
+        self.by_uri.insert(uri.to_owned(), merged);
     }
 
     /// Drops what `server` reported for files whose URI starts with
@@ -201,16 +278,8 @@ impl DiagnosticStore {
             servers.remove(server);
             if servers.is_empty() {
                 self.by_server.remove(&uri);
-                self.by_uri.remove(&uri);
-                continue;
             }
-            let mut names: Vec<_> = servers.keys().cloned().collect();
-            names.sort();
-            let merged = names
-                .iter()
-                .flat_map(|name| servers[name].iter().cloned())
-                .collect();
-            self.by_uri.insert(uri, merged);
+            self.merge(&uri);
         }
     }
 
@@ -1092,6 +1161,16 @@ pub struct LspManager {
     hover_requests: HashMap<(LspKey, u64), String>,
     completion: HashMap<String, Vec<CompletionItem>>,
     completion_requests: HashMap<(LspKey, u64), String>,
+    /// Answers of the built-in engines. They win over server answers for
+    /// the same document and request, which stay as the fallback.
+    builtin_completion: HashMap<String, Vec<CompletionItem>>,
+    builtin_hover: HashMap<String, HoverInfo>,
+    builtin_definitions: HashMap<String, Vec<DefinitionLocation>>,
+    builtin_references: HashMap<String, Vec<DefinitionLocation>>,
+    builtin_rename_edits: HashMap<String, Vec<RenameEdit>>,
+    builtin_signatures: HashMap<String, SignatureInfo>,
+    builtin_code_actions: HashMap<String, Vec<CodeActionInfo>>,
+    builtin_document_symbols: HashMap<String, Vec<DocumentSymbolInfo>>,
     signatures: HashMap<String, SignatureInfo>,
     signature_requests: HashMap<(LspKey, u64), String>,
     definition_locations: HashMap<String, Vec<DefinitionLocation>>,
@@ -1338,6 +1417,11 @@ impl LspManager {
         self.diagnostics.for_uri(uri)
     }
 
+    /// Sets the editor's own problems for `uri` (none clears them).
+    pub fn set_builtin_diagnostics(&mut self, uri: &str, diagnostics: Vec<Diagnostic>) -> bool {
+        self.diagnostics.set_builtin(uri, diagnostics)
+    }
+
     pub fn problems(&self) -> Vec<&Diagnostic> {
         self.diagnostics.problems()
     }
@@ -1367,7 +1451,46 @@ impl LspManager {
     }
 
     pub fn hover(&self, uri: &str) -> Option<&HoverInfo> {
-        self.hover.get(uri)
+        self.builtin_hover.get(uri).or_else(|| self.hover.get(uri))
+    }
+
+    pub fn set_builtin_hover(&mut self, uri: &str, hover: Option<HoverInfo>) {
+        match hover {
+            Some(hover) => self.builtin_hover.insert(uri.to_owned(), hover),
+            None => self.builtin_hover.remove(uri),
+        };
+    }
+
+    pub fn set_builtin_completion(&mut self, uri: &str, items: Vec<CompletionItem>) {
+        self.builtin_completion.insert(uri.to_owned(), items);
+    }
+
+    pub fn set_builtin_definitions(&mut self, uri: &str, locations: Vec<DefinitionLocation>) {
+        self.builtin_definitions.insert(uri.to_owned(), locations);
+    }
+
+    pub fn set_builtin_references(&mut self, uri: &str, locations: Vec<DefinitionLocation>) {
+        self.builtin_references.insert(uri.to_owned(), locations);
+    }
+
+    pub fn set_builtin_rename_edits(&mut self, uri: &str, edits: Vec<RenameEdit>) {
+        self.builtin_rename_edits.insert(uri.to_owned(), edits);
+    }
+
+    pub fn set_builtin_signature(&mut self, uri: &str, signature: Option<SignatureInfo>) {
+        match signature {
+            Some(signature) => self.builtin_signatures.insert(uri.to_owned(), signature),
+            None => self.builtin_signatures.remove(uri),
+        };
+    }
+
+    pub fn set_builtin_code_actions(&mut self, uri: &str, actions: Vec<CodeActionInfo>) {
+        self.builtin_code_actions.insert(uri.to_owned(), actions);
+    }
+
+    pub fn set_builtin_document_symbols(&mut self, uri: &str, symbols: Vec<DocumentSymbolInfo>) {
+        self.builtin_document_symbols
+            .insert(uri.to_owned(), symbols);
     }
 
     pub fn request_completion(
@@ -1388,6 +1511,11 @@ impl LspManager {
     }
 
     pub fn completions(&self, uri: &str) -> &[CompletionItem] {
+        if let Some(items) = self.builtin_completion.get(uri)
+            && !items.is_empty()
+        {
+            return items;
+        }
         self.completion.get(uri).map(Vec::as_slice).unwrap_or(&[])
     }
 
@@ -1409,7 +1537,9 @@ impl LspManager {
     }
 
     pub fn signature_help(&self, uri: &str) -> Option<&SignatureInfo> {
-        self.signatures.get(uri)
+        self.builtin_signatures
+            .get(uri)
+            .or_else(|| self.signatures.get(uri))
     }
 
     pub fn request_definition(
@@ -1525,6 +1655,11 @@ impl LspManager {
     }
 
     pub fn definition_locations(&self, uri: &str) -> &[DefinitionLocation] {
+        if let Some(found) = self.builtin_definitions.get(uri)
+            && !found.is_empty()
+        {
+            return found;
+        }
         self.definition_locations
             .get(uri)
             .map(Vec::as_slice)
@@ -1550,6 +1685,11 @@ impl LspManager {
     }
 
     pub fn references(&self, uri: &str) -> &[DefinitionLocation] {
+        if let Some(found) = self.builtin_references.get(uri)
+            && !found.is_empty()
+        {
+            return found;
+        }
         self.references.get(uri).map(Vec::as_slice).unwrap_or(&[])
     }
 
@@ -1573,6 +1713,11 @@ impl LspManager {
     }
 
     pub fn rename_edits(&self, uri: &str) -> &[RenameEdit] {
+        if let Some(found) = self.builtin_rename_edits.get(uri)
+            && !found.is_empty()
+        {
+            return found;
+        }
         self.rename_edits.get(uri).map(Vec::as_slice).unwrap_or(&[])
     }
 
@@ -1599,6 +1744,11 @@ impl LspManager {
     }
 
     pub fn code_actions(&self, uri: &str) -> &[CodeActionInfo] {
+        if let Some(found) = self.builtin_code_actions.get(uri)
+            && !found.is_empty()
+        {
+            return found;
+        }
         self.code_actions.get(uri).map(Vec::as_slice).unwrap_or(&[])
     }
 
@@ -1654,6 +1804,11 @@ impl LspManager {
     }
 
     pub fn document_symbols(&self, uri: &str) -> &[DocumentSymbolInfo] {
+        if let Some(found) = self.builtin_document_symbols.get(uri)
+            && !found.is_empty()
+        {
+            return found;
+        }
         self.document_symbols
             .get(uri)
             .map(Vec::as_slice)
@@ -2375,6 +2530,9 @@ fn parse_completion(value: &Value) -> Option<Vec<CompletionItem>> {
                         .get("sortText")
                         .and_then(Value::as_str)
                         .map(str::to_owned),
+                    additional_edits: Vec::new(),
+                    replace_from: None,
+                    kind: object.get("kind").and_then(Value::as_u64),
                 })
             })
             .collect(),

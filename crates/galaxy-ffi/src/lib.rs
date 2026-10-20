@@ -21,12 +21,15 @@ use galaxy_core::fold::{self, FoldSet};
 use galaxy_core::history::{EditKind, Editor};
 use galaxy_core::keymap::{self, Keymap};
 use galaxy_core::lsp::{
-    LspKey, LspManager, LspSettings, companion_servers, find_in_path, lsp_language_id,
+    CompletionItem as LspCompletionItem, DefinitionLocation as LspDefinitionLocation,
+    HoverInfo as LspHoverInfo, LspKey, LspManager, LspSettings, Range as LspRange,
+    RenameEdit as LspRenameEdit, companion_servers, find_in_path, lsp_language_id,
     lsp_server_language,
 };
 use galaxy_core::movement::{self, Motion};
 use galaxy_core::multicursor;
 use galaxy_core::navigation::{self, Location, NavHistory};
+use galaxy_core::php::{self, PhpEngine};
 use galaxy_core::plugins::{
     self, Catalog, install as plugin_install_mod, registry as plugin_registry_mod,
 };
@@ -607,6 +610,14 @@ pub struct Core {
     listener: RwLock<Option<Arc<dyn CoreListener>>>,
     lsp: Mutex<LspManager>,
     lsp_documents: Mutex<HashMap<String, Arc<DocumentHandle>>>,
+    /// Built-in PHP engines, one per project root.
+    php: Mutex<HashMap<PathBuf, Arc<Mutex<PhpEngine>>>>,
+    /// Open PHP files, whether or not a language server serves them: the
+    /// built-in analysis covers all of them.
+    php_documents: Mutex<HashMap<String, std::sync::Weak<DocumentHandle>>>,
+    /// Per open PHP file: text revision last analysed, when it was first
+    /// seen and whether the analysis ran.
+    php_checked: Mutex<HashMap<String, (u64, Instant, bool)>>,
 }
 
 impl Default for Core {
@@ -615,6 +626,9 @@ impl Default for Core {
             listener: RwLock::new(None),
             lsp: Mutex::new(LspManager::default()),
             lsp_documents: Mutex::new(HashMap::new()),
+            php: Mutex::new(HashMap::new()),
+            php_documents: Mutex::new(HashMap::new()),
+            php_checked: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -688,6 +702,12 @@ impl Core {
         let path = document.path();
         if path.is_empty() {
             return Ok(false);
+        }
+        if is_php_path(Path::new(&path)) || is_blade_path(Path::new(&path)) {
+            self.php_documents
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(file_uri(Path::new(&path)), Arc::downgrade(&document));
         }
         let key = LspKey {
             language: lsp_server_language(&language),
@@ -888,8 +908,23 @@ impl Core {
         let mut lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
         let _ = lsp.flush_changes(Instant::now());
         let events = lsp.poll();
-        let documents = self.lsp_documents.lock().unwrap_or_else(|e| e.into_inner());
-        for uri in documents.keys() {
+        let mut documents: HashMap<String, Arc<DocumentHandle>> = {
+            let mut open = self.php_documents.lock().unwrap_or_else(|e| e.into_inner());
+            open.retain(|_, weak| weak.strong_count() > 0);
+            open.iter()
+                .filter_map(|(uri, weak)| Some((uri.clone(), weak.upgrade()?)))
+                .collect()
+        };
+        for (uri, document) in self
+            .lsp_documents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            documents.insert(uri.clone(), document.clone());
+        }
+        self.check_php(&mut lsp, &documents);
+        for (uri, document) in &documents {
             let diagnostics = lsp
                 .diagnostics(uri)
                 .iter()
@@ -908,9 +943,7 @@ impl Core {
                     unnecessary: diagnostic.unnecessary,
                 })
                 .collect();
-            if let Some(document) = documents.get(uri) {
-                document.set_diagnostics(diagnostics);
-            }
+            document.set_diagnostics(diagnostics);
         }
         events.len() as u64
     }
@@ -1082,6 +1115,32 @@ impl Core {
             return false;
         }
         let uri = file_uri(Path::new(&path));
+        if let Some(engine) = self.php_engine_any(Path::new(&path)) {
+            let text = document.lock().editor.doc.text();
+            let found = {
+                let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                if engine.is_ready() {
+                    engine.hover(Path::new(&path), &text, line as u32, character as u32)
+                } else {
+                    None
+                }
+            };
+            let hover = found.map(|hover| LspHoverInfo {
+                contents: hover.markdown,
+                range: Some(LspRange {
+                    start_line: u64::from(hover.line),
+                    start_character: u64::from(hover.start_column),
+                    end_line: u64::from(hover.line),
+                    end_character: u64::from(hover.end_column),
+                }),
+            });
+            let answered = hover.is_some();
+            let mut lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
+            lsp.set_builtin_hover(&uri, hover);
+            if answered {
+                return true;
+            }
+        }
         self.lsp
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1121,6 +1180,22 @@ impl Core {
             return false;
         }
         let uri = file_uri(Path::new(&path));
+        if let Some(engine) = self.php_engine_any(Path::new(&path)) {
+            let text = document.lock().editor.doc.text();
+            let found = {
+                let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                if engine.is_ready() {
+                    engine.complete(Path::new(&path), &text, line as u32, character as u32)
+                } else {
+                    Vec::new()
+                }
+            };
+            let items = found.into_iter().map(php_completion_item).collect();
+            self.lsp
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_builtin_completion(&uri, items);
+        }
         self.lsp
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1146,6 +1221,17 @@ impl Core {
                 detail: item.detail.clone(),
                 insert_text: item.insert_text.clone(),
                 is_snippet: item.is_snippet,
+                additional_edits: item
+                    .additional_edits
+                    .iter()
+                    .map(|edit| TextEditInfo {
+                        line: edit.range.start_line,
+                        column: edit.range.start_character,
+                        text: edit.new_text.clone(),
+                    })
+                    .collect(),
+                replace_from: item.replace_from,
+                kind: item.kind,
             })
             .collect()
     }
@@ -1161,6 +1247,29 @@ impl Core {
             return false;
         }
         let uri = file_uri(Path::new(&path));
+        if let Some(engine) = self.php_engine(Path::new(&path)) {
+            let text = document.lock().editor.doc.text();
+            let found = {
+                let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                if engine.is_ready() {
+                    engine.signature(Path::new(&path), &text, line as u32, character as u32)
+                } else {
+                    None
+                }
+            };
+            let signature = found.map(|found| galaxy_core::lsp::SignatureInfo {
+                label: found.label,
+                documentation: found.documentation,
+                parameters: found.parameters,
+                active_parameter: u64::from(found.active),
+            });
+            let answered = signature.is_some();
+            let mut lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
+            lsp.set_builtin_signature(&uri, signature);
+            if answered {
+                return true;
+            }
+        }
         self.lsp
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1251,6 +1360,9 @@ impl Core {
             return false;
         }
         let uri = file_uri(Path::new(&path));
+        if self.php_references(&document, &uri, line, character) {
+            return true;
+        }
         self.lsp
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1291,6 +1403,9 @@ impl Core {
             return false;
         }
         let uri = file_uri(Path::new(&path));
+        if self.php_rename(&document, &uri, line, character, &new_name) {
+            return true;
+        }
         self.lsp
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1333,6 +1448,54 @@ impl Core {
             return false;
         }
         let uri = file_uri(Path::new(&path));
+        if let Some(engine) = self.php_engine_any(Path::new(&path)) {
+            let text = document.lock().editor.doc.text();
+            let found = {
+                let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                if engine.is_ready() {
+                    engine.actions(Path::new(&path), &text, line as u32, character as u32)
+                } else {
+                    Vec::new()
+                }
+            };
+            let actions: Vec<galaxy_core::lsp::CodeActionInfo> = found
+                .into_iter()
+                .map(|action| galaxy_core::lsp::CodeActionInfo {
+                    title: action.title,
+                    kind: Some("quickfix".into()),
+                    edits: action
+                        .edits
+                        .into_iter()
+                        .map(|edit| LspRenameEdit {
+                            uri: uri.clone(),
+                            range: LspRange {
+                                start_line: u64::from(edit.start_line),
+                                start_character: u64::from(edit.start_column),
+                                end_line: u64::from(edit.end_line),
+                                end_character: u64::from(edit.end_column),
+                            },
+                            new_text: edit.text,
+                        })
+                        .chain(action.files.into_iter().map(|change| LspRenameEdit {
+                            uri: file_uri(&change.path),
+                            range: LspRange {
+                                start_line: u64::from(change.line),
+                                start_character: u64::from(change.column),
+                                end_line: u64::from(change.line),
+                                end_character: u64::from(change.column),
+                            },
+                            new_text: change.text,
+                        }))
+                        .collect(),
+                })
+                .collect();
+            let answered = !actions.is_empty();
+            let mut lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
+            lsp.set_builtin_code_actions(&uri, actions);
+            if answered {
+                return true;
+            }
+        }
         let mut lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
         let diagnostics = lsp.diagnostics(&uri).to_vec();
         let range = galaxy_core::lsp::Range {
@@ -1372,6 +1535,22 @@ impl Core {
             return false;
         }
         let uri = file_uri(Path::new(&path));
+        if let Some(engine) = self.php_engine(Path::new(&path)) {
+            let text = document.lock().editor.doc.text();
+            let ready = engine.lock().unwrap_or_else(|e| e.into_inner()).is_ready();
+            if ready {
+                let symbols: Vec<_> = php::outline(Path::new(&path), &text)
+                    .iter()
+                    .map(|symbol| php_outline_symbol(symbol, &uri))
+                    .collect();
+                let answered = !symbols.is_empty();
+                let mut lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
+                lsp.set_builtin_document_symbols(&uri, symbols);
+                if answered {
+                    return true;
+                }
+            }
+        }
         self.lsp
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1717,6 +1896,27 @@ pub struct CompletionInfo {
     pub detail: Option<String>,
     pub insert_text: String,
     pub is_snippet: bool,
+    /// Inserted elsewhere in the file together with the item, e.g. a PHP
+    /// `use` import. Positions refer to the text before the completion.
+    #[uniffi(default = [])]
+    pub additional_edits: Vec<TextEditInfo>,
+    /// Column where the text to replace starts, when more than the word
+    /// before the cursor is replaced (`app.na` in `config('app.na')`).
+    #[uniffi(default = None)]
+    pub replace_from: Option<u64>,
+    /// LSP `CompletionItemKind`: 2 method, 3 function, 5 field, 6 variable,
+    /// 7 class, 8 interface, 10 property, 13 enum, 14 keyword, 15 snippet,
+    /// 21 constant, 22 struct.
+    #[uniffi(default = None)]
+    pub kind: Option<u64>,
+}
+
+/// Text inserted at a line and UTF-16 column.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct TextEditInfo {
+    pub line: u64,
+    pub column: u64,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -1821,6 +2021,376 @@ enum DefinitionKind {
     Implementation,
 }
 
+impl Core {
+    /// The built-in PHP engine for the project holding `path`, started on
+    /// first use. Its index is built on a worker thread and rebuilt when
+    /// it grows old, so no request ever walks the file system.
+    fn php_engine(&self, path: &Path) -> Option<Arc<Mutex<PhpEngine>>> {
+        if !is_php_path(path) {
+            return None;
+        }
+        self.engine_for(path)
+    }
+
+    /// Like `php_engine`, and also for Blade templates. Those only get the
+    /// Laravel features (names, views, components), never PHP parsing.
+    fn php_engine_any(&self, path: &Path) -> Option<Arc<Mutex<PhpEngine>>> {
+        if !is_php_path(path) && !is_blade_path(path) {
+            return None;
+        }
+        self.engine_for(path)
+    }
+
+    fn engine_for(&self, path: &Path) -> Option<Arc<Mutex<PhpEngine>>> {
+        let root = php::project_root(path);
+        let (engine, fresh) = {
+            let mut engines = self.php.lock().unwrap_or_else(|e| e.into_inner());
+            match engines.get(&root) {
+                Some(engine) => (engine.clone(), false),
+                None => {
+                    let engine = Arc::new(Mutex::new(PhpEngine::pending(&root)));
+                    engines.insert(root.clone(), engine.clone());
+                    (engine, true)
+                }
+            }
+        };
+        let stale = engine
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .wants_index(Duration::from_secs(60));
+        if fresh || stale {
+            spawn_php_index(&engine, &root);
+        }
+        Some(engine)
+    }
+
+    /// Runs the built-in PHP analysis on open files whose text has settled,
+    /// so a file is not re-read on every keystroke.
+    fn check_php(&self, lsp: &mut LspManager, documents: &HashMap<String, Arc<DocumentHandle>>) {
+        const SETTLE: Duration = Duration::from_millis(300);
+        let now = Instant::now();
+        let mut checked = self.php_checked.lock().unwrap_or_else(|e| e.into_inner());
+        checked.retain(|uri, _| documents.contains_key(uri));
+        for (uri, document) in documents {
+            let path = document.path();
+            if path.is_empty()
+                || !(is_php_path(Path::new(&path)) || is_blade_path(Path::new(&path)))
+            {
+                continue;
+            }
+            let revision = document.revision();
+            let entry = checked.entry(uri.clone()).or_insert((u64::MAX, now, true));
+            if entry.0 != revision {
+                *entry = (revision, now, false);
+                continue;
+            }
+            if entry.2 || now.duration_since(entry.1) < SETTLE {
+                continue;
+            }
+            let Some(engine) = self.php_engine_any(Path::new(&path)) else {
+                continue;
+            };
+            let text = document.lock().editor.doc.text();
+            let problems = {
+                let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                if !engine.is_ready() {
+                    // Try again on the next poll, once the index is built.
+                    continue;
+                }
+                engine.diagnostics(Path::new(&path), &text)
+            };
+            entry.2 = true;
+            let diagnostics = problems
+                .into_iter()
+                .map(|problem| galaxy_core::lsp::Diagnostic {
+                    uri: uri.clone(),
+                    range: LspRange {
+                        start_line: u64::from(problem.start_line),
+                        start_character: u64::from(problem.start_column),
+                        end_line: u64::from(problem.end_line),
+                        end_character: u64::from(problem.end_column),
+                    },
+                    severity: match problem.severity {
+                        php::Severity::Error => galaxy_core::lsp::DiagnosticSeverity::Error,
+                        php::Severity::Warning => galaxy_core::lsp::DiagnosticSeverity::Warning,
+                        php::Severity::Hint => galaxy_core::lsp::DiagnosticSeverity::Hint,
+                    },
+                    message: problem.message,
+                    source: Some("galaxy".into()),
+                    code: None,
+                    unnecessary: problem.unnecessary,
+                })
+                .collect();
+            lsp.set_builtin_diagnostics(uri, diagnostics);
+        }
+    }
+
+    /// Uses of the PHP symbol at the cursor across the project, read from
+    /// open buffers where a file is open. `None` leaves the request to the
+    /// language servers.
+    fn php_usages(
+        &self,
+        document: &Arc<DocumentHandle>,
+        line: u64,
+        character: u64,
+    ) -> Option<(php::RefQuery, Vec<php::Occurrence>)> {
+        let path = document.path();
+        let engine = self.php_engine(Path::new(&path))?;
+        let text = document.lock().editor.doc.text();
+        let query = {
+            let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+            if !engine.is_ready() {
+                return None;
+            }
+            engine.reference_query(Path::new(&path), &text, line as u32, character as u32)?
+        };
+        // Reading the project's files happens outside the engine's lock.
+        let mut files = query.candidates();
+        {
+            let open = self.lsp_documents.lock().unwrap_or_else(|e| e.into_inner());
+            for (other, body) in &mut files {
+                if let Some(handle) = open.get(&file_uri(other)) {
+                    *body = handle.lock().editor.doc.text();
+                }
+            }
+        }
+        let mut found = Vec::new();
+        {
+            let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+            found.extend(engine.scan_references(&query, Path::new(&path), &text));
+            for (other, body) in &files {
+                if other.as_path() != Path::new(&path) {
+                    found.extend(engine.scan_references(&query, other, body));
+                }
+            }
+        }
+        Some((query, php::finish(found)))
+    }
+
+    fn php_references(
+        &self,
+        document: &Arc<DocumentHandle>,
+        uri: &str,
+        line: u64,
+        character: u64,
+    ) -> bool {
+        let locations: Vec<LspDefinitionLocation> = self
+            .php_usages(document, line, character)
+            .map(|(_, found)| found)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|usage| LspDefinitionLocation {
+                uri: file_uri(&usage.path),
+                range: LspRange {
+                    start_line: u64::from(usage.line),
+                    start_character: u64::from(usage.start_column),
+                    end_line: u64::from(usage.line),
+                    end_character: u64::from(usage.end_column),
+                },
+            })
+            .collect();
+        let found = !locations.is_empty();
+        self.lsp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_builtin_references(uri, locations);
+        found
+    }
+
+    /// Renames the PHP symbol at the cursor. `false` when the name is not
+    /// valid, the symbol lives in `vendor/` or the stubs, or is unknown.
+    fn php_rename(
+        &self,
+        document: &Arc<DocumentHandle>,
+        uri: &str,
+        line: u64,
+        character: u64,
+        new_name: &str,
+    ) -> bool {
+        let bare = new_name.trim().trim_start_matches('$');
+        let mut edits = Vec::new();
+        if php::valid_name(bare)
+            && let Some((query, found)) = self.php_usages(document, line, character)
+            && !query.external
+        {
+            let text = if query.is_variable() {
+                format!("${bare}")
+            } else {
+                bare.to_owned()
+            };
+            edits = found
+                .into_iter()
+                .map(|usage| LspRenameEdit {
+                    uri: file_uri(&usage.path),
+                    range: LspRange {
+                        start_line: u64::from(usage.line),
+                        start_character: u64::from(usage.start_column),
+                        end_line: u64::from(usage.line),
+                        end_character: u64::from(usage.end_column),
+                    },
+                    new_text: if usage.dollar {
+                        text.clone()
+                    } else {
+                        bare.to_owned()
+                    },
+                })
+                .collect();
+        }
+        let found = !edits.is_empty();
+        self.lsp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_builtin_rename_edits(uri, edits);
+        found
+    }
+
+    /// Answers go-to-definition from the PHP engine; `false` leaves the
+    /// request to the language servers.
+    fn php_definition(
+        &self,
+        document: &Arc<DocumentHandle>,
+        uri: &str,
+        line: u64,
+        character: u64,
+    ) -> bool {
+        let path = document.path();
+        let Some(engine) = self.php_engine_any(Path::new(&path)) else {
+            return false;
+        };
+        let text = document.lock().editor.doc.text();
+        let targets = {
+            let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+            if engine.is_ready() {
+                engine.definition(Path::new(&path), &text, line as u32, character as u32)
+            } else {
+                Vec::new()
+            }
+        };
+        let locations: Vec<LspDefinitionLocation> = targets
+            .into_iter()
+            .map(|target| LspDefinitionLocation {
+                uri: file_uri(&target.path),
+                range: LspRange {
+                    start_line: u64::from(target.line),
+                    start_character: u64::from(target.column),
+                    end_line: u64::from(target.line),
+                    end_character: u64::from(target.column),
+                },
+            })
+            .collect();
+        let found = !locations.is_empty();
+        self.lsp
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_builtin_definitions(uri, locations);
+        found
+    }
+}
+
+fn is_php_path(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    name.ends_with(".php") && !name.ends_with(".blade.php")
+}
+
+fn is_blade_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.to_ascii_lowercase().ends_with(".blade.php"))
+}
+
+fn spawn_php_index(engine: &Arc<Mutex<PhpEngine>>, root: &Path) {
+    let engine = Arc::clone(engine);
+    let root = root.to_path_buf();
+    let _ = std::thread::Builder::new()
+        .name("php-index".into())
+        .spawn(move || {
+            let built = php::build(&root);
+            engine
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .install(built);
+        });
+}
+
+/// An outline entry in the shape the language servers use; `kind` is the
+/// LSP `SymbolKind` number.
+fn php_outline_symbol(
+    symbol: &php::OutlineSymbol,
+    uri: &str,
+) -> galaxy_core::lsp::DocumentSymbolInfo {
+    let kind = match symbol.kind {
+        "Class" => 5,
+        "Method" => 6,
+        "Property" => 7,
+        "Constructor" => 9,
+        "Enum" => 10,
+        "Interface" => 11,
+        "Function" => 12,
+        "Constant" => 14,
+        "Enum Member" => 22,
+        // Traits have no kind of their own; servers report them as classes.
+        _ => 5,
+    };
+    let position = LspRange {
+        start_line: u64::from(symbol.line),
+        start_character: u64::from(symbol.column),
+        end_line: u64::from(symbol.line),
+        end_character: u64::from(symbol.column),
+    };
+    galaxy_core::lsp::DocumentSymbolInfo {
+        uri: Some(uri.to_owned()),
+        name: symbol.name.clone(),
+        kind,
+        range: position,
+        children: symbol
+            .children
+            .iter()
+            .map(|child| php_outline_symbol(child, uri))
+            .collect(),
+    }
+}
+
+fn php_completion_item(item: php::Completion) -> LspCompletionItem {
+    LspCompletionItem {
+        label: item.label,
+        detail: item.detail,
+        insert_text: item.insert_text,
+        is_snippet: item.is_snippet,
+        sort_text: Some(item.sort),
+        replace_from: item.replace_from.map(u64::from),
+        kind: Some(match item.kind {
+            php::ItemKind::Method => 2,
+            php::ItemKind::Function => 3,
+            php::ItemKind::Variable => 6,
+            php::ItemKind::Class => 7,
+            php::ItemKind::Interface => 8,
+            php::ItemKind::Property => 10,
+            php::ItemKind::Enum => 13,
+            php::ItemKind::Keyword => 14,
+            php::ItemKind::Constant => 21,
+            php::ItemKind::Trait => 22,
+        }),
+        additional_edits: item
+            .extra
+            .into_iter()
+            .map(|edit| LspRenameEdit {
+                uri: String::new(),
+                range: LspRange {
+                    start_line: u64::from(edit.line),
+                    start_character: u64::from(edit.column),
+                    end_line: u64::from(edit.line),
+                    end_character: u64::from(edit.column),
+                },
+                new_text: edit.text,
+            })
+            .collect(),
+    }
+}
+
 fn request_definition_kind(
     core: &Core,
     document: Arc<DocumentHandle>,
@@ -1833,6 +2403,11 @@ fn request_definition_kind(
         return false;
     }
     let uri = file_uri(Path::new(&path));
+    if matches!(kind, DefinitionKind::Definition)
+        && core.php_definition(&document, &uri, line, character)
+    {
+        return true;
+    }
     let mut lsp = core.lsp.lock().unwrap_or_else(|e| e.into_inner());
     let result = match kind {
         DefinitionKind::Definition => lsp.request_definition(&uri, line, character, Instant::now()),
@@ -3168,6 +3743,9 @@ pub struct ViewportLine {
     pub marked: Option<LineSpan>,
     /// Find matches on this line (UTF-16 columns), empty when not searching.
     pub matches: Vec<LineSpan>,
+    /// Other places the identifier at the caret (or the selected one)
+    /// appears on this line, UTF-16 columns. Empty with several selections.
+    pub occurrences: Vec<LineSpan>,
     /// `text` is only the start of a very long line (see `display_line`).
     pub truncated: bool,
     /// Tab-expanded leading indentation columns for vertical guides.
@@ -3365,6 +3943,7 @@ impl From<viewport::ViewportSnapshot> for ViewportSnapshot {
                         includes_eol: sp.includes_eol,
                     }),
                     matches: Vec::new(),
+                    occurrences: Vec::new(),
                     truncated: l.truncated,
                     indent_guides: l.indent_guides.into_iter().map(|c| c as u64).collect(),
                     brackets: l
@@ -3616,6 +4195,9 @@ impl DocumentHandle {
                 detail: Some(format!("Snippet: {}", snippet.description)),
                 insert_text: snippet.body.to_owned(),
                 is_snippet: true,
+                additional_edits: Vec::new(),
+                replace_from: None,
+                kind: Some(15),
             })
             .collect()
     }
@@ -3786,6 +4368,24 @@ impl DocumentHandle {
             }
         }
         let mut snap = merged.unwrap_or_else(|| st.editor.viewport(first_line, 0).into());
+        // Same identifier elsewhere, marked while the caret rests on one.
+        // Not while searching (find highlights already say "these") or with
+        // several carets, where it would only add noise.
+        if st.finder.is_none() && st.editor.sel.len() == 1 {
+            let key = movement::symbol_at(&st.editor.doc, st.editor.sel.primary());
+            if let Some(key) = key {
+                for line in &mut snap.lines {
+                    line.occurrences = movement::symbol_spans(&line.text, &key)
+                        .into_iter()
+                        .map(|(start, end)| LineSpan {
+                            start: start as u64,
+                            end: end as u64,
+                            includes_eol: false,
+                        })
+                        .collect();
+                }
+            }
+        }
         if let Some(finder) = &st.finder {
             for line in &mut snap.lines {
                 // Only the displayed part, so a minified line stays cheap.
@@ -5552,6 +6152,254 @@ mod tests {
     fn primary(doc: &DocumentHandle) -> (u64, u64) {
         let r = doc.selected_range();
         (r.location, r.length)
+    }
+
+    fn php_project() -> (tempfile::TempDir, String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        std::fs::write(
+            root.join("composer.json"),
+            r#"{"autoload":{"psr-4":{"App\\":"app/"}}}"#,
+        )
+        .unwrap();
+        let order = root.join("app/Order.php");
+        let report = root.join("app/Report.php");
+        std::fs::write(
+            &order,
+            "<?php\nnamespace App;\n\nclass Order\n{\n    public function total(): int\n    {\n        return 1;\n    }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &report,
+            "<?php\nnamespace App;\n\nclass Report\n{\n    public function run(Order $order): int\n    {\n        return $order->total();\n    }\n}\n",
+        )
+        .unwrap();
+        (
+            dir,
+            order.to_string_lossy().into_owned(),
+            report.to_string_lossy().into_owned(),
+        )
+    }
+
+    #[test]
+    fn php_problems_reach_the_document_without_a_language_server() {
+        let (_dir, _order, report_path) = php_project();
+        let core = Core::new();
+        let report = core.open_document(report_path.clone()).unwrap();
+        core.php_documents
+            .lock()
+            .unwrap()
+            .insert(file_uri(Path::new(&report_path)), Arc::downgrade(&report));
+        let wait = |want: usize| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                core.poll_lsp();
+                let found = report.lock().diagnostics.clone();
+                if found.len() == want {
+                    return found;
+                }
+                assert!(Instant::now() < deadline, "got {found:?}, wanted {want}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        // A clean file has none; the first poll only notes the text.
+        wait(0);
+
+        // Typing a class that does not exist is reported once text settles.
+        assert!(report.apply_rename_edits(vec![RenameEdit {
+            uri: String::new(),
+            start_line: 5,
+            start_character: 24,
+            end_line: 5,
+            end_character: 24,
+            new_text: "Ghost $g, ".into(),
+        }]));
+        let found = wait(1);
+        assert_eq!(found[0].severity, 2);
+        assert!(found[0].message.contains("Ghost"), "{found:?}");
+
+        // Fixing it clears the problem.
+        assert!(report.undo());
+        wait(0);
+    }
+
+    #[test]
+    fn blade_templates_get_laravel_names_from_the_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let write = |rel: &str, text: &str| {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        };
+        write("artisan", "<?php");
+        write(
+            "composer.json",
+            r#"{"autoload":{"psr-4":{"App\\":"app/"}}}"#,
+        );
+        write("resources/views/welcome.blade.php", "hi");
+        let page = root.join("resources/views/page.blade.php");
+        write(
+            "resources/views/page.blade.php",
+            "@include('wel')\n@include('gone')\n",
+        );
+        let page_path = page.to_string_lossy().into_owned();
+
+        let core = Core::new();
+        let doc = core.open_document(page_path.clone()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let items = loop {
+            core.request_completion(doc.clone(), 0, 13);
+            let items = core.completions(doc.clone());
+            if !items.is_empty() {
+                break items;
+            }
+            assert!(Instant::now() < deadline, "engine never became ready");
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let item = items
+            .iter()
+            .find(|i| i.label == "welcome")
+            .expect("welcome");
+        assert_eq!(item.replace_from, Some(10));
+
+        // A view that does not exist is reported, with a fix creating it.
+        core.php_documents
+            .lock()
+            .unwrap()
+            .insert(file_uri(&page), Arc::downgrade(&doc));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            core.poll_lsp();
+            let found = doc.lock().diagnostics.clone();
+            if found.len() == 2 {
+                // `wel` is only a prefix of `welcome`, so it is missing too.
+                assert!(found[1].message.contains("gone"), "{found:?}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "got {found:?}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(core.request_code_actions(doc.clone(), 1, 14));
+        let actions = core.code_actions(doc);
+        assert_eq!(actions.len(), 1);
+        assert!(
+            actions[0].edits[0]
+                .uri
+                .ends_with("resources/views/gone.blade.php"),
+            "{actions:?}"
+        );
+    }
+
+    #[test]
+    fn php_references_and_rename_come_from_the_engine() {
+        let (_dir, order_path, report_path) = php_project();
+        let core = Core::new();
+        let report = core.open_document(report_path.clone()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        // The index is built off-thread; ask again until it is ready.
+        while !core.request_references(report.clone(), 7, 24) {
+            assert!(Instant::now() < deadline, "engine never became ready");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let mut found: Vec<(String, u64, u64)> = core
+            .references(report.clone())
+            .into_iter()
+            .map(|r| {
+                (
+                    r.uri.rsplit('/').next().unwrap().to_owned(),
+                    r.line,
+                    r.column,
+                )
+            })
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            vec![("Order.php".into(), 5, 20), ("Report.php".into(), 7, 23)]
+        );
+
+        // Rename edits cover the declaration in the other file too.
+        assert!(core.request_rename(report.clone(), 7, 24, "sum".into()));
+        let mut edits: Vec<(String, u64, u64, String)> = core
+            .rename_edits(report.clone())
+            .into_iter()
+            .map(|e| {
+                (
+                    e.uri.rsplit('/').next().unwrap().to_owned(),
+                    e.start_line,
+                    e.start_character,
+                    e.new_text,
+                )
+            })
+            .collect();
+        edits.sort();
+        assert_eq!(
+            edits,
+            vec![
+                ("Order.php".into(), 5, 20, "sum".into()),
+                ("Report.php".into(), 7, 23, "sum".into()),
+            ]
+        );
+        // A name PHP would reject is not applied.
+        assert!(!core.request_rename(report, 7, 24, "1 bad".into()));
+        let _ = order_path;
+    }
+
+    #[test]
+    fn php_signature_outline_and_actions_come_from_the_engine() {
+        let (dir, _order_path, report_path) = php_project();
+        let extra_path = dir.path().join("app/Extra.php");
+        std::fs::write(
+            &extra_path,
+            "<?php\nnamespace App\\Services;\n\nuse App\\Order;\n\nclass Extra\n{\n}\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let report = core.open_document(report_path).unwrap();
+        let extra = core
+            .open_document(extra_path.to_string_lossy().into_owned())
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+
+        // Inside `total(` of `return $order->total();`.
+        while !core.request_signature_help(report.clone(), 7, 29) {
+            assert!(Instant::now() < deadline, "engine never became ready");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let signature = core.signature_help(report.clone()).expect("signature");
+        assert_eq!(signature.label, "total(): int");
+        assert!(signature.parameters.is_empty());
+
+        assert!(core.request_document_symbols(report.clone()));
+        let names: Vec<(String, String)> = core
+            .document_symbols(report)
+            .into_iter()
+            .map(|s| (s.name, s.kind))
+            .collect();
+        // Kind 5 is a class, 6 a method.
+        assert_eq!(
+            names,
+            vec![("Report".into(), "5".into()), ("run".into(), "6".into())]
+        );
+
+        // The unused `use App\Order;` on line 3 can be removed.
+        assert!(core.request_code_actions(extra.clone(), 3, 5));
+        let actions = core.code_actions(extra);
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert_eq!(actions[0].title, "Remove unused import");
+        let edit = &actions[0].edits[0];
+        assert_eq!(
+            (
+                edit.start_line,
+                edit.start_character,
+                edit.end_line,
+                edit.end_character
+            ),
+            (3, 0, 4, 0)
+        );
+        assert!(edit.new_text.is_empty());
     }
 
     #[test]

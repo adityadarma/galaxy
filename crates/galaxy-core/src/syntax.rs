@@ -194,7 +194,7 @@ impl SyntaxLanguage {
             Self::Html | Self::Blade | Self::Vue => tree_sitter_html::HIGHLIGHTS_QUERY,
             Self::Css => tree_sitter_css::HIGHLIGHTS_QUERY,
             Self::Bash => BASH_HIGHLIGHTS,
-            Self::Php => tree_sitter_php::HIGHLIGHTS_QUERY,
+            Self::Php => php_highlights(),
             Self::C => tree_sitter_c::HIGHLIGHT_QUERY,
             Self::Cpp => tree_sitter_cpp::HIGHLIGHT_QUERY,
             Self::CSharp => tree_sitter_c_sharp::HIGHLIGHTS_QUERY,
@@ -426,6 +426,35 @@ pub fn outline_symbols(
     out.sort_by_key(|symbol| (symbol.line, symbol.column_utf16));
     out.dedup_by_key(|symbol| (symbol.line, symbol.column_utf16));
     out
+}
+
+/// The grammar's PHP query, with `static::`, `self::` and `parent::` styled
+/// as keywords rather than variables, and the class names it leaves out:
+/// declarations, `extends`/`implements`, trait uses, attributes, `X::class`
+/// and `X::$property`.
+fn php_highlights() -> &'static str {
+    static QUERY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    QUERY.get_or_init(|| {
+        let base = tree_sitter_php::HIGHLIGHTS_QUERY.replace(
+            "(relative_scope) @variable.builtin",
+            "(relative_scope) @keyword",
+        );
+        format!(
+            r#"{base}
+(class_declaration name: (name) @type)
+(interface_declaration name: (name) @type)
+(trait_declaration name: (name) @type)
+(enum_declaration name: (name) @type)
+(base_clause [(name) (qualified_name (name))] @type)
+(class_interface_clause [(name) (qualified_name (name))] @type)
+(use_declaration [(name) (qualified_name (name))] @type)
+(attribute [(name) (qualified_name (name))] @type)
+(class_constant_access_expression . [(name) (qualified_name (name))] @type)
+(class_constant_access_expression (name) @keyword (#eq? @keyword "class"))
+(scoped_property_access_expression scope: [(name) (qualified_name (name))] @type)
+"#
+        )
+    })
 }
 
 // These two grammar crates do not export their upstream query. Keep a small,
@@ -1961,5 +1990,37 @@ mod tests {
             assert!(run.line < after.line_count());
             assert!(run.end <= text.encode_utf16().count());
         }
+    }
+
+    #[test]
+    fn php_query_colours_static_scopes_and_class_names() {
+        let language = SyntaxLanguage::Php;
+        let source = "<?php\nclass Pay extends Base implements Contract {\n    protected static function booted(): void {\n        static::creating(fn (Pay $p) => self::make());\n        $m = [Method::class, Status::$all];\n    }\n}\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let query = language.compile_highlights().unwrap();
+        let names = query.capture_names();
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+        let mut found = std::collections::HashSet::new();
+        while let Some(m) = matches.next() {
+            for capture in m.captures {
+                if let Some(scope) = HighlightScope::from_capture(names[capture.index as usize]) {
+                    found.insert((source[capture.node.byte_range()].to_owned(), scope));
+                }
+            }
+        }
+        let has = |text: &str, scope| found.contains(&(text.to_owned(), scope));
+        for word in ["static", "self", "class"] {
+            assert!(
+                has(word, HighlightScope::Keyword),
+                "{word} is not a keyword"
+            );
+        }
+        for name in ["Pay", "Base", "Contract", "Method", "Status"] {
+            assert!(has(name, HighlightScope::Type), "{name} is not a type");
+        }
+        assert!(!has("static", HighlightScope::Variable));
     }
 }

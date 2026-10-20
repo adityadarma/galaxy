@@ -315,7 +315,9 @@ mod tests {
     fn folds_and_wrap_combine() {
         let d = doc("abcdefgh\nhidden\nxy");
         let map = WrapMap::build_with(&d, Some(4), vec![(1, 1)]);
-        assert_eq!(map.total_rows(), 2 + 0 + 1);
+        // Two rows for the wrapped first line, none for the hidden one, one
+        // for the last.
+        assert_eq!(map.total_rows(), 3);
         assert_eq!(map.row_of_line(2), 2);
     }
 

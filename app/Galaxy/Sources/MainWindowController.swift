@@ -1934,6 +1934,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                                  character: completionPosition.colUtf16)
     }
 
+    private func isLaravelFile(_ path: String) -> Bool {
+        let name = (path as NSString).lastPathComponent.lowercased()
+        return name.hasSuffix(".php")
+    }
+
     private func requestCompletionIfNeeded(force: Bool = false) {
         guard let document = activeTab?.doc else { return }
         if !force { suggestRetryUntil = nil }
@@ -1941,11 +1946,16 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         completionPosition = TextPos(line: position.line, colUtf16: position.colUtf16)
         let line = document.displayLine(line: position.line)
         let column = Int(position.colUtf16)
-        let prefix = String(line.prefix(max(0, min(column, line.count))))
-            .split(whereSeparator: { !$0.isLetter && !$0.isNumber && $0 != "_" }).last.map(String.init) ?? ""
-        completionQuery = prefix
         let beforePrefix = String(line.prefix(max(0, min(column, line.count))))
-        let lspTrigger = beforePrefix.hasSuffix(".") || beforePrefix.hasSuffix("::") || beforePrefix.hasSuffix("->")
+        // Only the identifier run directly before the caret: `$o->` has none.
+        let prefix = String(beforePrefix.reversed().prefix { $0.isLetter || $0.isNumber || $0 == "_" }.reversed())
+        completionQuery = prefix
+        var lspTrigger = beforePrefix.hasSuffix(".") || beforePrefix.hasSuffix("::") || beforePrefix.hasSuffix("->")
+        // Laravel names live in strings, Blade directives and component tags.
+        if !lspTrigger, isLaravelFile(document.path()) {
+            lspTrigger = beforePrefix.contains("'") || beforePrefix.contains("\"")
+                || beforePrefix.contains("@") || beforePrefix.contains("<x-") || beforePrefix.contains("<livewire:")
+        }
         guard force || !prefix.isEmpty || lspTrigger else {
             snippetCompletionItems = []
             completionPopup.isHidden = true
@@ -1974,6 +1984,18 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             return
         }
         let lspItems = bridge.completions(document: document)
+        // A name that replaces more than the word before the caret (a dotted
+        // config key, a view name): the query is everything it replaces, and
+        // snippets do not apply.
+        let replaceFrom = lspItems.compactMap { $0.replaceFrom }.first
+        if let replaceFrom, replaceFrom <= completionPosition.colUtf16 {
+            let line = document.displayLine(line: completionPosition.line)
+            let utf16 = Array(line.utf16)
+            let end = min(Int(completionPosition.colUtf16), utf16.count)
+            let start = min(Int(replaceFrom), end)
+            completionQuery = String(utf16CodeUnits: Array(utf16[start..<end]), count: end - start)
+            snippetCompletionItems = []
+        }
         let items = localCompletionItems ?? (lspItems + snippetCompletionItems)
         guard !items.isEmpty else {
             completionPopup.isHidden = true
@@ -1983,7 +2005,21 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         suggestRetryUntil = nil
         completionPopup.update(items, query: completionQuery)
         if completionPopup.isHidden { return }
-        completionPopup.frame = NSRect(x: editorOriginInDetail + editorView.textOriginX + 8, y: editorView.rect(forLine: completionPosition.line, column: completionPosition.colUtf16).maxY + 8, width: 420, height: 192)
+        let prefixColumn = completionPosition.colUtf16 >= UInt64(completionQuery.utf16.count)
+            ? completionPosition.colUtf16 - UInt64(completionQuery.utf16.count) : 0
+        completionPopup.frame = popupFrame(size: completionPopup.preferredSize, line: completionPosition.line, column: prefixColumn)
+    }
+
+    /// Frame in `detailView` for a popup under the caret line (above it when
+    /// there is no room), clamped inside the editor area. The editor is
+    /// flipped and `detailView` is not, so the rect must be converted.
+    private func popupFrame(size: NSSize, line: UInt64, column: UInt64) -> NSRect {
+        let caret = detailView.convert(editorView.rect(forLine: line, column: column), from: editorView)
+        let bounds = detailView.bounds
+        var y = caret.minY - 4 - size.height
+        if y < bounds.minY { y = caret.maxY + 4 }
+        let x = min(max(caret.minX, bounds.minX), max(bounds.minX, bounds.maxX - size.width))
+        return NSRect(x: x, y: y, width: size.width, height: size.height)
     }
 
     private func closeCompletion() {
@@ -2006,7 +2042,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         guard let signature = bridge.signatureHelp(document: document) else { signaturePopup.isHidden = true; return }
         signaturePopup.show(signature)
         signaturePopup.isHidden = false
-        signaturePopup.frame = NSRect(x: editorOriginInDetail + editorView.textOriginX + 8, y: editorView.rect(forLine: completionPosition.line, column: completionPosition.colUtf16).maxY + 8, width: 520, height: signature.documentation == nil ? 48 : 78)
+        signaturePopup.frame = popupFrame(size: NSSize(width: 520, height: signature.documentation == nil ? 48 : 78),
+                                          line: completionPosition.line, column: completionPosition.colUtf16)
     }
 
     private func requestDefinition(at position: TextPos) -> Bool {
@@ -2138,6 +2175,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         for edit in action.edits { grouped[edit.uri, default: []].append(edit) }
         for (uri, edits) in grouped {
             guard let path = URL(string: uri)?.path else { continue }
+            // A fix that creates a view or a page: the file starts out empty.
+            if !FileManager.default.fileExists(atPath: path) {
+                let folder = (path as NSString).deletingLastPathComponent
+                try? FileManager.default.createDirectory(atPath: folder, withIntermediateDirectories: true)
+                guard FileManager.default.createFile(atPath: path, contents: Data()) else { continue }
+            }
             let wasOpen = allTabs.contains { $0.doc.path() == path }
             let target: DocumentHandle
             if let tab = allTabs.first(where: { $0.doc.path() == path }) {
@@ -2235,7 +2278,16 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private func acceptCompletion(_ item: CompletionInfo) {
         guard let document = activeTab?.doc else { return }
         let start = completionPosition.colUtf16 >= UInt64(completionQuery.utf16.count) ? completionPosition.colUtf16 - UInt64(completionQuery.utf16.count) : 0
-        let offset = document.utf16Offset(pos: TextPos(line: completionPosition.line, colUtf16: start))
+        var offset = document.utf16Offset(pos: TextPos(line: completionPosition.line, colUtf16: start))
+        // Edits elsewhere (a PHP `use` import) go in first, bottom to top, so
+        // earlier positions stay valid. Text before the caret shifts it.
+        let extraEdits = item.additionalEdits
+            .map { (offset: document.utf16Offset(pos: TextPos(line: $0.line, colUtf16: $0.column)), text: $0.text) }
+            .sorted { $0.offset > $1.offset }
+        for edit in extraEdits {
+            document.commitText(text: edit.text, replacement: Utf16Range(location: edit.offset, length: 0))
+            if edit.offset <= offset { offset += UInt64(edit.text.utf16.count) }
+        }
         let text: String
         var firstStopIndex: UInt32?
         var firstStops: [SnippetStopInfo] = []
@@ -3253,6 +3305,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         } else if wasActive {
             noteLeaving(tabs[index])
         }
+        let closedID = ObjectIdentifier(tabs[index])
+        tabOrderByUse.removeAll { $0 == closedID }
         tabs.remove(at: index)
         if wasActive { shownTab = nil }
         if let a = activeIndex {
@@ -3262,12 +3316,22 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             // An empty group closes, unless it is the last one.
             if groups.count > 1 { removeGroup(activeGroup) } else { showNoDocument() }
         } else if wasActive {
-            selectTab(min(index, tabs.count - 1), fromTabBar: true)
+            selectTab(tabToShowAfterClosing(at: index), fromTabBar: true)
         } else {
             refreshTabBar()
             updateEditedState()
         }
         return true
+    }
+
+    /// The tab to show once the active tab at `index` is gone: the one used
+    /// last in this group (the place a jump started from), else the
+    /// neighbour that took its slot.
+    private func tabToShowAfterClosing(at index: Int) -> Int {
+        for id in tabOrderByUse {
+            if let i = tabs.firstIndex(where: { ObjectIdentifier($0) == id }) { return i }
+        }
+        return min(index, tabs.count - 1)
     }
 
     /// Pinned tabs are always the first ones.

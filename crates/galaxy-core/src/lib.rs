@@ -28,6 +28,7 @@ pub mod markdown;
 pub mod movement;
 pub mod multicursor;
 pub mod navigation;
+pub mod php;
 pub mod plugins;
 pub mod position;
 pub mod rope_diff;

@@ -925,6 +925,14 @@ final class EditorView: NSView {
                 for rect in span(bracket.start, bracket.end, metrics.spaceWidth, 0) { context.fill(rect) }
             }
 
+            // Other uses of the identifier at the caret, fainter than find matches.
+            if !line.occurrences.isEmpty {
+                context.setFillColor(Theme.symbolOccurrence.cgColor)
+                for occurrence in line.occurrences {
+                    for rect in span(occurrence.start, occurrence.end, 0, 0) { context.fill(rect) }
+                }
+            }
+
             // Find matches, under the selection so the current one stays clear.
             if !line.matches.isEmpty {
                 context.setFillColor(Self.matchColor.cgColor)

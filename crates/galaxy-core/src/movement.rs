@@ -275,6 +275,83 @@ pub(crate) fn is_word_char(c: char) -> bool {
     class(c) == Class::Word
 }
 
+/// The identifier at the caret, or the selected one, for marking its other
+/// occurrences. A `$` right before it is part of the key (`$item` is not
+/// `->item`). `None` for blanks, punctuation, or a selection that is not
+/// a single identifier.
+pub fn symbol_at(doc: &Document, sel: Selection) -> Option<String> {
+    const MAX_CHARS: usize = 128;
+    let rope = doc.rope();
+    let len = rope.len_chars();
+    let (start, end) = if sel.is_empty() {
+        let pos = sel.head.min(len);
+        let mut start = pos;
+        while start > 0 && is_word_char(rope.char(start - 1)) {
+            start -= 1;
+        }
+        let mut end = pos;
+        while end < len && is_word_char(rope.char(end)) {
+            end += 1;
+        }
+        (start, end)
+    } else {
+        let start = sel.start().min(len);
+        // A selected `$item` marks the same thing as a selected `item`.
+        let start = if start < len && rope.char(start) == '$' {
+            start + 1
+        } else {
+            start
+        };
+        (start, sel.end().min(len))
+    };
+    if end <= start || end - start > MAX_CHARS {
+        return None;
+    }
+    if !(start..end).all(|i| is_word_char(rope.char(i))) {
+        return None;
+    }
+    let word = rope.slice(start..end).to_string();
+    let sigil = start > 0 && rope.char(start - 1) == '$';
+    Some(if sigil { format!("${word}") } else { word })
+}
+
+/// Whole-word occurrences of a [`symbol_at`] key in `text`, as UTF-16
+/// column ranges. A key starting with `$` only matches after a `$`, any
+/// other key only matches without one.
+pub fn symbol_spans(text: &str, key: &str) -> Vec<(usize, usize)> {
+    let sigil = key.starts_with('$');
+    let word = key.trim_start_matches('$');
+    let mut out = Vec::new();
+    if word.is_empty() {
+        return out;
+    }
+    let mut column = 0usize;
+    let mut run: Option<(usize, usize, bool)> = None; // byte, column, after `$`
+    let mut previous_dollar = false;
+    let mut finish = |run: &mut Option<(usize, usize, bool)>, byte: usize, column: usize| {
+        if let Some((start_byte, start_column, after_dollar)) = run.take()
+            && &text[start_byte..byte] == word
+            && after_dollar == sigil
+        {
+            // The `$` is one UTF-16 unit and belongs to the variable.
+            out.push((start_column - usize::from(sigil), column));
+        }
+    };
+    for (byte, c) in text.char_indices() {
+        if is_word_char(c) {
+            if run.is_none() {
+                run = Some((byte, column, previous_dollar));
+            }
+        } else {
+            finish(&mut run, byte, column);
+        }
+        previous_dollar = c == '$';
+        column += c.len_utf16();
+    }
+    finish(&mut run, text.len(), column);
+    out
+}
+
 /// End of the next word. Stops at line ends and crosses them one at a time.
 fn word_right(doc: &Document, pos: usize) -> usize {
     let rope = doc.rope();
@@ -628,6 +705,35 @@ mod tests {
     fn word_selection_keeps_combining_marks_together() {
         let d = doc("cafe\u{301} ok");
         assert_eq!(word_at(&d, 1), Selection::new(0, 5));
+    }
+
+    #[test]
+    fn symbol_key_keeps_the_php_sigil() {
+        let d = doc("$item->item");
+        assert_eq!(symbol_at(&d, Selection::caret(2)).as_deref(), Some("$item"));
+        assert_eq!(symbol_at(&d, Selection::caret(8)).as_deref(), Some("item"));
+        // Selecting `$item` or just `item` marks the same thing.
+        assert_eq!(
+            symbol_at(&d, Selection::new(0, 5)).as_deref(),
+            Some("$item")
+        );
+        assert_eq!(
+            symbol_at(&d, Selection::new(1, 5)).as_deref(),
+            Some("$item")
+        );
+        // Not an identifier.
+        assert_eq!(symbol_at(&d, Selection::new(0, 7)), None);
+        assert_eq!(symbol_at(&doc("a  b"), Selection::caret(2)), None);
+    }
+
+    #[test]
+    fn symbol_spans_match_whole_words_with_the_same_sigil() {
+        let line = "foo($item, $items) + item->item + $item";
+        assert_eq!(symbol_spans(line, "$item"), vec![(4, 9), (34, 39)]);
+        assert_eq!(symbol_spans(line, "item"), vec![(21, 25), (27, 31)]);
+        assert!(symbol_spans(line, "ite").is_empty());
+        // UTF-16 columns: an astral char counts for two.
+        assert_eq!(symbol_spans("\u{1F600} x x", "x"), vec![(3, 4), (5, 6)]);
     }
 
     #[test]
