@@ -133,7 +133,11 @@ enum Theme {
     /// editable without coupling the renderer to Rust scopes.
     static func syntax(_ scope: String, appearance: NSAppearance) -> NSColor {
         let theme = definition(for: appearance)
-        return theme.syntaxColors[scope] ?? theme.editorForeground
+        if let color = theme.syntaxColors[scope] { return color }
+        // `function.builtin` falls back to `function` when a theme omits it.
+        if let base = scope.split(separator: ".").first.map(String.init),
+           let color = theme.syntaxColors[base] { return color }
+        return theme.editorForeground
     }
 
     /// Editor surface and plain text, shared by everything that sits flush

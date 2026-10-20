@@ -452,6 +452,8 @@ fn php_highlights() -> &'static str {
 (class_constant_access_expression . [(name) (qualified_name (name))] @type)
 (class_constant_access_expression (name) @keyword (#eq? @keyword "class"))
 (scoped_property_access_expression scope: [(name) (qualified_name (name))] @type)
+((variable_name (name) @_this) @variable.builtin (#eq? @_this "this"))
+(function_call_expression function: (name) @function.builtin (#any-of? @function.builtin "empty" "isset" "unset" "eval" "die" "exit" "compact" "extract"))
 "#
         )
     })
@@ -527,6 +529,9 @@ pub enum HighlightScope {
     Constant,
     Constructor,
     Function,
+    /// Language built-ins (`function.builtin` captures); themes may color
+    /// them apart from user functions and fall back to `function`.
+    FunctionBuiltin,
     Keyword,
     Label,
     Number,
@@ -536,6 +541,9 @@ pub enum HighlightScope {
     String,
     Tag,
     Type,
+    /// `$this`, `self`-like receivers (`variable.builtin` captures); themes
+    /// may color them apart from ordinary variables.
+    VariableBuiltin,
     Variable,
 }
 
@@ -543,6 +551,11 @@ impl HighlightScope {
     /// Maps a capture name, including modifiers like `function.builtin`, to
     /// the stable base scope consumed by themes and viewport style runs.
     pub fn from_capture(capture: &str) -> Option<Self> {
+        match capture {
+            "function.builtin" => return Some(Self::FunctionBuiltin),
+            "variable.builtin" => return Some(Self::VariableBuiltin),
+            _ => {}
+        }
         match capture.split('.').next()? {
             "attribute" => Some(Self::Attribute),
             "comment" => Some(Self::Comment),
@@ -570,6 +583,7 @@ impl HighlightScope {
             Self::Constant => "constant",
             Self::Constructor => "constructor",
             Self::Function => "function",
+            Self::FunctionBuiltin => "function.builtin",
             Self::Keyword => "keyword",
             Self::Label => "label",
             Self::Number => "number",
@@ -579,6 +593,7 @@ impl HighlightScope {
             Self::String => "string",
             Self::Tag => "tag",
             Self::Type => "type",
+            Self::VariableBuiltin => "variable.builtin",
             Self::Variable => "variable",
         }
     }
@@ -1606,6 +1621,10 @@ mod tests {
         );
         assert_eq!(
             HighlightScope::from_capture("function.builtin"),
+            Some(HighlightScope::FunctionBuiltin)
+        );
+        assert_eq!(
+            HighlightScope::from_capture("function.method"),
             Some(HighlightScope::Function)
         );
         assert_eq!(
@@ -1843,6 +1862,42 @@ mod tests {
         let runs = style_runs_for_viewport(&doc, &tree, language, 0, 2);
         assert!(runs.iter().any(|run| run.scope == HighlightScope::Keyword));
         assert!(runs.iter().any(|run| run.scope == HighlightScope::String));
+    }
+
+    #[test]
+    fn php_language_constructs_get_builtin_function_scope() {
+        let doc = Document::from_text("<?php\nif (empty($a)) { foo(); }\n");
+        let language = SyntaxLanguage::Php;
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(doc.text(), None).unwrap();
+        let runs = style_runs_for_viewport(&doc, &tree, language, 0, 2);
+        let on = |from: usize, to: usize| {
+            runs.iter()
+                .filter(|r| r.line == 1 && r.start == from && r.end == to)
+                .map(|r| r.scope)
+                .collect::<Vec<_>>()
+        };
+        assert!(on(4, 9).contains(&HighlightScope::FunctionBuiltin));
+        assert!(on(17, 20).contains(&HighlightScope::Function));
+    }
+
+    #[test]
+    fn php_this_gets_builtin_variable_scope() {
+        let doc = Document::from_text("<?php\n$this->a = $b;\n");
+        let language = SyntaxLanguage::Php;
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(doc.text(), None).unwrap();
+        let runs = style_runs_for_viewport(&doc, &tree, language, 0, 2);
+        let last = |from: usize, to: usize| {
+            runs.iter()
+                .filter(|r| r.line == 1 && r.start == from && r.end == to)
+                .map(|r| r.scope)
+                .next_back()
+        };
+        assert_eq!(last(0, 5), Some(HighlightScope::VariableBuiltin));
+        assert_eq!(last(11, 13), Some(HighlightScope::Variable));
     }
 
     #[test]
