@@ -1,9 +1,6 @@
-//! Laravel lookups that laravel-lsp does not provide.
-//!
-//! laravel-lsp resolves `config()`, routes, views and similar helpers, but
-//! has no provider for log channels, so `Log::channel('queue')` cannot jump
-//! to its definition through the server. These helpers read the project's
-//! config files with Tree-sitter instead of running PHP.
+//! Laravel lookups that read the project's config files with Tree-sitter
+//! instead of running PHP, such as `Log::channel('queue')` jumping to its
+//! definition in `config/logging.php`.
 
 use std::path::{Path, PathBuf};
 

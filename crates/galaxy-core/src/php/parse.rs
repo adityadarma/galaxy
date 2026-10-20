@@ -75,6 +75,9 @@ pub struct Member {
     /// The expression of the first top-level `return` in the body, used to
     /// work out a return type the declaration leaves without arguments.
     pub body_return: Option<String>,
+    /// Declared by an `@method` or `@property` tag, not by code. Its
+    /// position is that of the tag in the docblock.
+    pub in_docblock: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -239,7 +242,11 @@ pub fn resolve_generic(
 ) -> Option<String> {
     let raw = raw.trim().trim_start_matches(':').trim();
     if raw.starts_with('(') {
-        return None;
+        // `($id is array ? Collection<TModel> : TModel|null)`: the else
+        // branch is the common case (one id, one model).
+        let inner = raw.strip_prefix('(')?.strip_suffix(')')?;
+        let otherwise = conditional_else(inner)?;
+        return resolve_generic(otherwise, namespace, uses, self_fqn, templates);
     }
     for part in generics::split_union(raw) {
         let part = part.trim().trim_start_matches('?').trim();
@@ -268,6 +275,25 @@ pub fn resolve_generic(
             })
             .collect();
         return Some(generics::join(&resolved, &args));
+    }
+    None
+}
+
+/// The branch after the top-level ` : ` of a conditional type body
+/// (`$x is T ? A : B` gives `B`).
+fn conditional_else(inner: &str) -> Option<&str> {
+    let mut depth = 0i32;
+    let mut seen_question = false;
+    for (index, c) in inner.char_indices() {
+        match c {
+            '(' | '<' | '[' | '{' => depth += 1,
+            ')' | '>' | ']' | '}' => depth -= 1,
+            '?' if depth == 0 && inner[index..].starts_with("? ") => seen_question = true,
+            ':' if depth == 0 && seen_question && inner[..index].ends_with(' ') => {
+                return Some(inner[index + 1..].trim());
+            }
+            _ => {}
+        }
     }
     None
 }
@@ -606,6 +632,13 @@ impl<'a> Reader<'a> {
         (prev.kind() == "comment" && text.starts_with("/**")).then(|| text.to_owned())
     }
 
+    /// Row and UTF-16 column where the docblock before `node` starts.
+    fn doc_start(&self, node: Node<'_>) -> Option<(u32, u32)> {
+        let prev = node.prev_named_sibling()?;
+        (prev.kind() == "comment" && self.text(prev).starts_with("/**"))
+            .then(|| (prev.start_position().row as u32, self.column(prev)))
+    }
+
     fn modifiers(&self, node: Node<'_>) -> (Visibility, bool) {
         let mut visibility = Visibility::Public;
         let mut is_static = false;
@@ -646,7 +679,8 @@ impl<'a> Reader<'a> {
         }
     }
 
-    /// `@extends`, `@implements` (and `@template-` forms) of a class docblock.
+    /// `@extends`, `@implements` (and `@template-` forms) and `@mixin` of a
+    /// class docblock, with the generic arguments they were written with.
     fn generic_parents(&self, doc: Option<&str>, self_fqn: &str) -> Vec<String> {
         let Some(doc) = doc else { return Vec::new() };
         let mut out = Vec::new();
@@ -657,6 +691,7 @@ impl<'a> Reader<'a> {
                 "extends",
                 "template-implements",
                 "implements",
+                "mixin",
             ] {
                 let Some(after) = rest.strip_prefix('@').and_then(|r| r.strip_prefix(tag)) else {
                     continue;
@@ -729,7 +764,8 @@ impl<'a> Reader<'a> {
             self.read_members(body, &mut info);
         }
         if let Some(doc) = info.doc.clone() {
-            self.read_doc_members(&doc, &mut info);
+            let start = self.doc_start(node).unwrap_or((info.line, info.column));
+            self.read_doc_members(&doc, start, &mut info);
             info.mixins = doc_tag_types(&doc, "mixin")
                 .into_iter()
                 .filter_map(|raw| resolve_type(&raw, &self.namespace, &self.uses, &info.fqn))
@@ -742,7 +778,18 @@ impl<'a> Reader<'a> {
 
     /// `@method` and `@property` tags of a class docblock, which is how
     /// facades and ide-helper models describe their magic members.
-    fn read_doc_members(&self, doc: &str, info: &mut ClassInfo) {
+    fn read_doc_members(&self, doc: &str, start: (u32, u32), info: &mut ClassInfo) {
+        // Row and UTF-16 column of the byte `at` of the docblock.
+        let position = |at: usize| {
+            let before = &doc[..at];
+            let rows = before.matches('\n').count() as u32;
+            let line_start = before.rfind('\n').map_or(0, |i| i + 1);
+            let column = before[line_start..].encode_utf16().count() as u32;
+            (
+                start.0 + rows,
+                if rows == 0 { start.1 + column } else { column },
+            )
+        };
         static METHOD: OnceLock<Regex> = OnceLock::new();
         static PROPERTY: OnceLock<Regex> = OnceLock::new();
         let method = METHOD.get_or_init(|| {
@@ -760,6 +807,7 @@ impl<'a> Reader<'a> {
                 format!("({params}): {raw_type}")
             };
             info.members.push(Member {
+                in_docblock: true,
                 class_arg: None,
                 class_params: Vec::new(),
                 body_return: None,
@@ -769,14 +817,15 @@ impl<'a> Reader<'a> {
                 is_static: caps.get(1).is_some(),
                 detail,
                 ty: resolve_type(raw_type, &self.namespace, &self.uses, &info.fqn),
-                line: info.line,
-                column: info.column,
+                line: position(caps.get(3).map_or(0, |m| m.start())).0,
+                column: position(caps.get(3).map_or(0, |m| m.start())).1,
                 doc: None,
             });
         }
         for caps in property.captures_iter(doc) {
             let raw_type = caps.get(1).map_or("", |m| m.as_str());
             info.members.push(Member {
+                in_docblock: true,
                 class_arg: None,
                 class_params: Vec::new(),
                 body_return: None,
@@ -786,8 +835,8 @@ impl<'a> Reader<'a> {
                 is_static: false,
                 detail: raw_type.to_owned(),
                 ty: resolve_type(raw_type, &self.namespace, &self.uses, &info.fqn),
-                line: info.line,
-                column: info.column,
+                line: position(caps.get(2).map_or(0, |m| m.start())).0,
+                column: position(caps.get(2).map_or(0, |m| m.start())).1,
                 doc: None,
             });
         }
@@ -867,6 +916,7 @@ impl<'a> Reader<'a> {
                     continue;
                 }
                 info.members.push(Member {
+                    in_docblock: false,
                     class_arg: None,
                     class_params: Vec::new(),
                     body_return: None,
@@ -899,6 +949,7 @@ impl<'a> Reader<'a> {
                 "enum_case" => {
                     if let Some(name) = child.child_by_field_name("name") {
                         info.members.push(Member {
+                            in_docblock: false,
                             class_arg: None,
                             class_params: Vec::new(),
                             body_return: None,
@@ -974,6 +1025,7 @@ impl<'a> Reader<'a> {
             self.read_promoted(params, info);
         }
         info.members.push(Member {
+            in_docblock: false,
             class_arg,
             class_params,
             body_return,
@@ -1012,6 +1064,7 @@ impl<'a> Reader<'a> {
                 .map(|t| collapse(self.text(t)))
                 .unwrap_or_default();
             info.members.push(Member {
+                in_docblock: false,
                 class_arg: None,
                 class_params: Vec::new(),
                 body_return: None,
@@ -1060,6 +1113,7 @@ impl<'a> Reader<'a> {
                 self.read_attribute_array(default, source);
             }
             info.members.push(Member {
+                in_docblock: false,
                 class_arg: None,
                 class_params: Vec::new(),
                 body_return: None,
@@ -1094,6 +1148,7 @@ impl<'a> Reader<'a> {
                 detail = detail.chars().take(40).collect::<String>() + "…";
             }
             info.members.push(Member {
+                in_docblock: false,
                 class_arg: None,
                 class_params: Vec::new(),
                 body_return: None,
@@ -1227,6 +1282,11 @@ enum Status: string { case Active = 'a'; }
         assert_eq!(fake.ty.as_deref(), Some("Illuminate\\Events\\Dispatcher"));
         let label = event.members.iter().find(|m| m.name == "label").unwrap();
         assert_eq!(label.kind, MemberKind::Property);
+        // Each one sits on its own tag, not on the class.
+        assert!(listen.in_docblock && fake.in_docblock && label.in_docblock);
+        assert_eq!((listen.line, listen.column), (4, 23));
+        assert_eq!((fake.line, fake.column), (5, 22));
+        assert_eq!((label.line, label.column), (6, 26));
     }
 
     #[test]

@@ -5,10 +5,10 @@
 //!
 //! Defaults to `fixtures/repo_10k` (create it with `gen-fixtures`) and 5
 //! tabs. It mirrors what the app does per tab: open, background parse,
-//! viewport draws with syntax, typing bursts, LSP sync bookkeeping. RSS is
+//! viewport draws with syntax, typing bursts. RSS is
 //! sampled with `ps` after each phase and printed as `phase=<name> rss_mb=`
-//! lines plus a final `peak_rss_mb=`. Language servers are not spawned, so
-//! the numbers cover Galaxy's own process only.
+//! lines plus a final `peak_rss_mb=`. The numbers cover Galaxy's own process
+//! only.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::path::{Path, PathBuf};
@@ -21,7 +21,6 @@ use galaxy_core::document::Document;
 use galaxy_core::edit;
 use galaxy_core::file_finder::FileFinder;
 use galaxy_core::history::{EditKind, Editor};
-use galaxy_core::lsp::DocumentSync;
 use galaxy_core::selection::{Selection, SelectionSet};
 use galaxy_core::syntax::{SyntaxLanguage, SyntaxService, SyntaxSnapshot};
 use galaxy_core::workspace::Workspace;
@@ -74,7 +73,6 @@ struct Tab {
     language: SyntaxLanguage,
     syntax: SyntaxService,
     snapshot: Option<SyntaxSnapshot>,
-    lsp: DocumentSync,
 }
 
 fn main() {
@@ -137,11 +135,9 @@ fn main() {
                 now + Duration::from_millis(key as u64 * 30),
             );
             tab.syntax.submit_document(&tab.editor.doc);
-            tab.lsp.note_document(&tab.editor.doc, now);
             // The draw that follows every keystroke in the app.
             draw(tab, 0);
         }
-        let _ = tab.lsp.flush(now + Duration::from_secs(1));
         wait_for_parse(tab);
     }
     sample("typing");
@@ -205,11 +201,6 @@ fn open_tab(path: &Path) -> Option<Tab> {
     let language = SyntaxLanguage::detect(&path.to_string_lossy(), "")?;
     let syntax = SyntaxService::new(language.grammar());
     syntax.submit_document(&doc);
-    let lsp = DocumentSync::for_document(
-        format!("file://{}", path.display()),
-        language.name().to_lowercase(),
-        &doc,
-    );
     let mut editor = Editor::new(doc);
     let end = editor.doc.len_chars();
     editor.set_selections(SelectionSet::single(Selection::caret(end / 2)));
@@ -218,7 +209,6 @@ fn open_tab(path: &Path) -> Option<Tab> {
         language,
         syntax,
         snapshot: None,
-        lsp,
     })
 }
 

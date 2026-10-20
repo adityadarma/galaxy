@@ -247,7 +247,7 @@ extension EditorView {
     }
 
     /// Syntax scopes that never have a definition to jump to. Strings stay
-    /// navigable: laravel-lsp resolves `config('...')`, `route('...')`, etc.
+    /// navigable: the PHP engine resolves `config('...')`, `route('...')`, etc.
     static let nonNavigableScopes: Set<String> = ["keyword", "comment", "number", "operator", "punctuation"]
 
     /// PHP scalar/pseudo types and literal constants: nothing to open.
@@ -360,12 +360,6 @@ extension EditorView {
         guard let range = Self.identifierRange(in: text, at: Int(pos.colUtf16)) else { return nil }
         // Words between tags (`<p>Recorded admin</p>`) are text, not names.
         if document.isMarkupText(line: pos.line, colUtf16: UInt64(range.lowerBound)) { return nil }
-        // A name that is being declared (a parameter in its signature) would
-        // only jump to itself, so it is not offered as a link.
-        if semanticTokens.contains(where: {
-            $0.isDeclaration && $0.line == pos.line
-                && Int($0.start) < range.upperBound && Int($0.start + $0.length) > range.lowerBound
-        }) { return nil }
         // Built-in types and literals share the `type`/`constant` scopes with
         // classes and user constants, so filter them by name. PHP is
         // case-insensitive here (`NULL`, `String`). Checked before the style
@@ -435,14 +429,14 @@ extension EditorView {
         return range.lowerBound
     }
 
-    /// Global helpers whose string argument laravel-lsp can resolve to a file.
+    /// Global helpers whose string argument the PHP engine can resolve to a file.
     static let laravelStringHelpers: Set<String> = [
         "config", "route", "to_route", "view", "env", "trans", "trans_choice", "__", "asset", "mix", "vite",
         "inertia", "base_path", "resource_path", "config_path", "app_path", "database_path", "lang_path",
         "public_path", "storage_path",
     ]
 
-    /// Facade and method names whose string argument laravel-lsp (or
+    /// Facade and method names whose string argument the PHP engine (or
     /// Galaxy's own resolver, for `Log::channel`) can resolve, e.g.
     /// `Storage::disk('s3')`, `Config::get('app.name')`, `$lang->get('x')`.
     /// Other calls such as `Log::info('message')` stay plain text.

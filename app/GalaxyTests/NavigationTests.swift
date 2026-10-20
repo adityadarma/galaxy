@@ -282,27 +282,6 @@ final class NavigationTests: XCTestCase {
         XCTAssertTrue(link("f("), "the function name stays a link")
     }
 
-    func testCommandHoverSkipsNamesThatAreBeingDeclared() throws {
-        let c = try makeController(text: "function exec(command: string): void {}\nexec(command)")
-        let v = c.editorView
-        v.onDefinitionClick = { _ in true }
-        let text = "function exec(command: string): void {}"
-        let column = (text as NSString).range(of: "command").location
-        v.semanticTokens = [
-            SemanticTokenInfo(line: 0, start: UInt64(column), length: 7, scope: "variable", isDeclaration: true),
-        ]
-        func link(line: Int, column: Int) -> Bool {
-            let source = line == 0 ? text : "exec(command)"
-            v.lastMousePoint = NSPoint(x: v.textOriginX + v.xOffset(in: source, column: UInt64(column)) + 0.5,
-                                       y: CGFloat(line) * v.metrics.lineHeight + v.metrics.lineHeight / 2)
-            v.updateDefinitionLink(commandHeld: true)
-            return v.definitionLink != nil
-        }
-        XCTAssertFalse(link(line: 0, column: column + 2), "a declared parameter would only jump to itself")
-        XCTAssertTrue(link(line: 0, column: 9), "the function name stays a link")
-        XCTAssertTrue(link(line: 1, column: 7), "a use of the parameter stays a link")
-    }
-
     func testCommandHoverSkipsKeywordsButKeepsNames() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-link-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

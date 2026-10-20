@@ -118,7 +118,7 @@ final class HoverPopover: NSView {
             out.append(inlineMarkdown(text, body: body, code: code))
         }
         func flushCode() {
-            // Intelephense prefixes declarations with `<?php`; it adds nothing.
+            // Declarations may be prefixed with `<?php`; it adds nothing.
             let lines = codeLines.filter { $0.trimmingCharacters(in: .whitespaces) != "<?php" }
             codeLines = []
             let text = lines.joined(separator: "\n").trimmingCharacters(in: .newlines)

@@ -3,12 +3,16 @@
 //! Design rule: the UI calls in with coarse-grained commands and receives
 //! batched events through `CoreListener`. No per-character FFI chatter.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use galaxy_core::analysis::{
+    BuiltinStore, CompletionItem as LspCompletionItem, DefinitionLocation as LspDefinitionLocation,
+    HoverInfo as LspHoverInfo, Range as LspRange, RenameEdit as LspRenameEdit,
+};
 use galaxy_core::change::{Change, ChangeSet};
 use galaxy_core::clipboard;
 use galaxy_core::commands::{self, CommandRegistry};
@@ -20,19 +24,10 @@ use galaxy_core::find::{FindError, FindOptions, Finder};
 use galaxy_core::fold::{self, FoldSet};
 use galaxy_core::history::{EditKind, Editor};
 use galaxy_core::keymap::{self, Keymap};
-use galaxy_core::lsp::{
-    CompletionItem as LspCompletionItem, DefinitionLocation as LspDefinitionLocation,
-    HoverInfo as LspHoverInfo, LspKey, LspManager, LspSettings, Range as LspRange,
-    RenameEdit as LspRenameEdit, companion_servers, find_in_path, lsp_language_id,
-    lsp_server_language,
-};
 use galaxy_core::movement::{self, Motion};
 use galaxy_core::multicursor;
 use galaxy_core::navigation::{self, Location, NavHistory};
 use galaxy_core::php::{self, PhpEngine};
-use galaxy_core::plugins::{
-    self, Catalog, install as plugin_install_mod, registry as plugin_registry_mod,
-};
 use galaxy_core::position::Utf16Position;
 use galaxy_core::selection::{Selection, SelectionSet};
 use galaxy_core::snippets;
@@ -83,256 +78,10 @@ pub trait CoreListener: Send + Sync {
     fn on_event(&self, event: CoreEvent);
 }
 
-fn plugin_error(message: String) -> CoreError {
-    CoreError::Io { message }
-}
-
-fn plugins_dir() -> Result<PathBuf, CoreError> {
-    plugin_install_mod::default_dir().ok_or_else(|| plugin_error("HOME is not set".into()))
-}
-
-/// Languages a project uses, judged by well-known files in its root.
-fn project_languages(root: &Path) -> Vec<&'static str> {
-    const MARKERS: &[(&str, &[&str])] = &[
-        ("rust", &["Cargo.toml"]),
-        ("php", &["composer.json"]),
-        ("typescript", &["tsconfig.json", "package.json"]),
-        (
-            "python",
-            &["pyproject.toml", "requirements.txt", "setup.py"],
-        ),
-        ("go", &["go.mod"]),
-        ("swift", &["Package.swift"]),
-        ("dart", &["pubspec.yaml"]),
-        (
-            "svelte",
-            &["svelte.config.js", "svelte.config.mjs", "svelte.config.ts"],
-        ),
-    ];
-    MARKERS
-        .iter()
-        .filter(|(_, files)| files.iter().any(|file| root.join(file).is_file()))
-        .map(|(language, _)| *language)
-        .collect()
-}
-
-/// Built-in plugins plus those installed; problems are logged, not fatal.
-fn load_catalog() -> Catalog {
-    let Some(dir) = plugin_install_mod::default_dir() else {
-        return Catalog::builtin();
-    };
-    let (catalog, errors) = Catalog::load(&dir);
-    for error in errors {
-        tracing::warn!(%error, "ignoring invalid plugin");
-    }
-    catalog
-}
-
-#[derive(Debug, Clone, PartialEq, uniffi::Record)]
-pub struct PluginInfo {
-    pub id: String,
-    pub name: String,
-    pub version: String,
-    pub description: String,
-    pub languages: Vec<String>,
-    pub builtin: bool,
-    pub enabled: bool,
-    /// The server command resolves on this machine.
-    pub available: bool,
-    /// A built-in with install steps whose server is not on this machine.
-    pub installable: bool,
-    pub source: Option<String>,
-    pub commit: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, uniffi::Record)]
-pub struct PluginPreview {
-    pub token: String,
-    pub id: String,
-    pub name: String,
-    pub version: String,
-    pub description: String,
-    pub source: String,
-    pub commit: String,
-    pub previous_commit: Option<String>,
-    /// Everything the install will run or download, in order.
-    pub commands: Vec<String>,
-    /// Server the plugin will launch.
-    pub server: String,
-    /// The files matched a checksum pinned by a registry.
-    pub verified: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, uniffi::Record)]
-pub struct RegistryEntryInfo {
-    pub id: String,
-    pub name: String,
-    pub description: String,
-    pub version: String,
-    pub languages: Vec<String>,
-    pub source: String,
-    pub sha256: Option<String>,
-    pub registry: String,
-}
-
-#[derive(Debug, Clone, PartialEq, uniffi::Record)]
-pub struct RegistryListing {
-    pub entries: Vec<RegistryEntryInfo>,
-    pub errors: Vec<String>,
-}
-
-/// Built-in and installed plugins with their state.
 /// Renders Markdown to an HTML fragment for the preview pane.
 #[uniffi::export]
 pub fn markdown_to_html(source: String) -> String {
     galaxy_core::markdown::to_html(&source)
-}
-
-#[uniffi::export]
-pub fn plugin_list() -> Vec<PluginInfo> {
-    let dir = plugin_install_mod::default_dir();
-    let state = dir
-        .as_deref()
-        .and_then(|dir| plugin_install_mod::State::load(dir).ok())
-        .unwrap_or_default();
-    load_catalog()
-        .plugins
-        .iter()
-        .map(|plugin| {
-            let installed = state.installed.get(&plugin.manifest.id);
-            PluginInfo {
-                id: plugin.manifest.id.clone(),
-                name: plugin.manifest.name.clone(),
-                version: plugin.manifest.version.clone(),
-                description: plugin.manifest.description.clone(),
-                languages: plugin.manifest.languages.clone(),
-                builtin: plugin.builtin,
-                enabled: plugin.enabled,
-                available: plugin.server_config(&find_in_path).is_some(),
-                installable: plugin.installable(&find_in_path),
-                source: installed.map(|item| item.source.to_spec()),
-                commit: installed.map(|item| item.commit.clone()),
-            }
-        })
-        .collect()
-}
-
-/// Clones `spec` (`URL`, `URL#REF` or `URL#REF:SUBDIR`) into staging and
-/// reads its manifest. Runs no plugin code; blocks on the network.
-#[uniffi::export]
-pub fn plugin_fetch(spec: String, sha256: Option<String>) -> Result<PluginPreview, CoreError> {
-    let dir = plugins_dir()?;
-    // `builtin:ID` installs a bundled plugin locally. Nothing is downloaded
-    // or run until the user confirms the install steps.
-    let pending = if let Some(id) = spec.strip_prefix("builtin:") {
-        plugin_install_mod::fetch_builtin(&dir, id)
-    } else {
-        plugin_install_mod::Source::parse(&spec)
-            .and_then(|source| plugin_install_mod::fetch(&dir, &source, sha256.as_deref()))
-    }
-    .map_err(plugin_error)?;
-    let source = pending.source.clone();
-    let manifest = &pending.manifest;
-    Ok(PluginPreview {
-        token: pending.token.clone(),
-        id: manifest.id.clone(),
-        name: manifest.name.clone(),
-        version: manifest.version.clone(),
-        description: manifest.description.clone(),
-        source: source.to_spec(),
-        commit: pending.commit.clone(),
-        previous_commit: pending.previous_commit.clone(),
-        commands: manifest.install_summary(&plugins::platform()),
-        server: manifest.command.first().cloned().unwrap_or_default(),
-        verified: sha256.is_some(),
-    })
-}
-
-/// Runs the install for a fetched plugin. Returns the plugin id.
-#[uniffi::export]
-pub fn plugin_install(token: String) -> Result<String, CoreError> {
-    plugin_install_mod::install(&plugins_dir()?, &token)
-        .map(|manifest| manifest.id)
-        .map_err(plugin_error)
-}
-
-#[uniffi::export]
-pub fn plugin_discard(token: String) -> Result<(), CoreError> {
-    plugin_install_mod::discard(&plugins_dir()?, &token).map_err(plugin_error)
-}
-
-#[uniffi::export]
-pub fn plugin_uninstall(id: String) -> Result<(), CoreError> {
-    plugin_install_mod::uninstall(&plugins_dir()?, &id).map_err(plugin_error)
-}
-
-#[uniffi::export]
-pub fn plugin_set_enabled(id: String, enabled: bool) -> Result<(), CoreError> {
-    plugin_install_mod::set_enabled(&plugins_dir()?, &id, enabled).map_err(plugin_error)
-}
-
-/// Newest upstream commit when the installed plugin is behind. Blocks on the
-/// network.
-#[uniffi::export]
-pub fn plugin_check_update(id: String) -> Result<Option<String>, CoreError> {
-    plugin_install_mod::check_update(&plugins_dir()?, &id).map_err(plugin_error)
-}
-
-#[uniffi::export]
-pub fn plugin_registries() -> Vec<String> {
-    plugin_install_mod::default_dir()
-        .and_then(|dir| plugin_install_mod::State::load(&dir).ok())
-        .map(|state| state.registries)
-        .unwrap_or_default()
-}
-
-#[uniffi::export]
-pub fn plugin_add_registry(url: String) -> Result<(), CoreError> {
-    plugin_install_mod::add_registry(&plugins_dir()?, &url).map_err(plugin_error)
-}
-
-#[uniffi::export]
-pub fn plugin_remove_registry(url: String) -> Result<(), CoreError> {
-    plugin_install_mod::remove_registry(&plugins_dir()?, &url).map_err(plugin_error)
-}
-
-/// Plugins offered by every configured registry. Blocks on the network.
-#[uniffi::export]
-pub fn plugin_registry_entries() -> RegistryListing {
-    let mut listing = RegistryListing {
-        entries: Vec::new(),
-        errors: Vec::new(),
-    };
-    for registry in plugin_registries() {
-        match plugin_registry_mod::fetch_entries(&registry) {
-            Ok(entries) => {
-                listing
-                    .entries
-                    .extend(entries.into_iter().map(|entry| RegistryEntryInfo {
-                        id: entry.id,
-                        name: entry.name,
-                        description: entry.description,
-                        version: entry.version,
-                        languages: entry.languages,
-                        source: entry.source.to_spec(),
-                        sha256: entry.sha256,
-                        registry: entry.registry,
-                    }))
-            }
-            Err(error) => listing.errors.push(format!("{registry}: {error}")),
-        }
-    }
-    listing
-}
-
-/// Stops language servers a previous Galaxy left behind after a crash or a
-/// forced quit. Only processes started from the plugin folder whose parent
-/// is gone are touched. Returns how many were told to exit.
-#[uniffi::export]
-pub fn reap_orphaned_lsp_servers() -> u64 {
-    plugins::install::default_dir()
-        .map(|dir| galaxy_core::lsp::reap_orphaned_servers(&dir) as u64)
-        .unwrap_or(0)
 }
 
 /// Returns the core version.
@@ -342,8 +91,7 @@ pub fn core_version() -> String {
 }
 
 /// Definition of a `Log::channel('name')` channel for the Laravel project
-/// containing `file` (`config/logging.php`). laravel-lsp has no provider
-/// for log channels.
+/// containing `file` (`config/logging.php`).
 #[uniffi::export]
 pub fn laravel_log_channel_location(file: String, channel: String) -> Option<DefinitionLocation> {
     let location = galaxy_core::laravel::log_channel_location(Path::new(&file), &channel)?;
@@ -608,8 +356,8 @@ impl NavigationHistory {
 #[derive(uniffi::Object)]
 pub struct Core {
     listener: RwLock<Option<Arc<dyn CoreListener>>>,
-    lsp: Mutex<LspManager>,
-    lsp_documents: Mutex<HashMap<String, Arc<DocumentHandle>>>,
+    /// What the built-in engines last answered, per document.
+    analysis: Mutex<BuiltinStore>,
     /// Built-in PHP engines, one per project root.
     php: Mutex<HashMap<PathBuf, Arc<Mutex<PhpEngine>>>>,
     /// Open PHP files, whether or not a language server serves them: the
@@ -624,8 +372,7 @@ impl Default for Core {
     fn default() -> Self {
         Self {
             listener: RwLock::new(None),
-            lsp: Mutex::new(LspManager::default()),
-            lsp_documents: Mutex::new(HashMap::new()),
+            analysis: Mutex::new(BuiltinStore::default()),
             php: Mutex::new(HashMap::new()),
             php_documents: Mutex::new(HashMap::new()),
             php_checked: Mutex::new(HashMap::new()),
@@ -690,242 +437,52 @@ impl Core {
         Ok(Arc::new(handle))
     }
 
-    /// Starts the built-in language server for a document when its executable
-    /// is available on PATH. Unsupported languages and missing servers are
-    /// intentionally non-fatal.
-    pub fn start_lsp(
+    /// Tells the core a document is open so the built-in engines analyse
+    /// it. `true` when an engine handles the file.
+    pub fn register_document(
         &self,
         document: Arc<DocumentHandle>,
         language: String,
         root: String,
-    ) -> Result<bool, CoreError> {
+    ) -> bool {
+        let _ = (&language, &root);
         let path = document.path();
         if path.is_empty() {
-            return Ok(false);
+            return false;
         }
-        if is_php_path(Path::new(&path)) || is_blade_path(Path::new(&path)) {
-            self.php_documents
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(file_uri(Path::new(&path)), Arc::downgrade(&document));
+        let path = Path::new(&path);
+        if !(is_php_path(path) || is_blade_path(path)) {
+            return false;
         }
-        let key = LspKey {
-            language: lsp_server_language(&language),
-            root: PathBuf::from(root),
-        };
-        let (settings, errors) = LspSettings::load(
-            LspSettings::global_settings_path().as_deref(),
-            Some(&key.root),
-        );
-        for error in errors {
-            tracing::warn!(%error, "ignoring invalid LSP settings");
-        }
-        let catalog = load_catalog();
-        let Some(config) = settings.resolve_in(&language, Some(&key.root), &catalog) else {
-            return Ok(false);
-        };
-        let language_id = lsp_language_id(&language, &path);
-        let uri = file_uri(Path::new(&path));
-        if self
-            .lsp_documents
+        self.php_documents
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains_key(&uri)
-        {
-            return Ok(true);
-        }
-        let companions = companion_servers(&catalog, &language, Some(&key.root), &config);
-        let mut lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
-        lsp.ensure_server(key.clone(), &config)?;
-        // Document clone is a rope handle; no full-text String round trip.
-        let doc = document.lock().editor.doc.clone();
-        for (companion_language, companion) in companions {
-            let companion_key = LspKey {
-                language: companion_language,
-                root: key.root.clone(),
-            };
-            // Optional extra: a failing companion must not block the primary.
-            match lsp.ensure_server(companion_key.clone(), &companion) {
-                Ok(_) => {
-                    if let Err(error) = lsp.open_companion(
-                        companion_key.clone(),
-                        uri.clone(),
-                        language_id.clone(),
-                        &doc,
-                    ) {
-                        tracing::warn!(%error, server = %companion_key.language, "could not open document in companion server");
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(%error, server = %companion_key.language, "could not start companion server");
-                }
-            }
-        }
-        lsp.open_document(key, uri.clone(), language_id, &doc)?;
-        self.lsp_documents
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(uri, document);
-        Ok(true)
+            .insert(file_uri(path), Arc::downgrade(&document));
+        true
     }
 
-    /// Applies the plugin set that is installed now to one document: starts
-    /// servers that were missing (including companions such as laravel-lsp),
-    /// restarts those whose command changed, and stops those that no longer
-    /// resolve. Servers that are unchanged keep running. Returns whether a
-    /// server serves the document afterwards.
-    pub fn refresh_lsp_plugins(
-        &self,
-        document: Arc<DocumentHandle>,
-        language: String,
-        root: String,
-    ) -> Result<bool, CoreError> {
-        let path = document.path();
-        if path.is_empty() {
-            return Ok(false);
-        }
-        let key = LspKey {
-            language: lsp_server_language(&language),
-            root: PathBuf::from(&root),
-        };
-        let uri = file_uri(Path::new(&path));
-        let registered = self
-            .lsp_documents
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(&uri);
-        if !registered {
-            return self.start_lsp(document, language, root);
-        }
-        let (settings, errors) = LspSettings::load(
-            LspSettings::global_settings_path().as_deref(),
-            Some(&key.root),
-        );
-        for error in errors {
-            tracing::warn!(%error, "ignoring invalid LSP settings");
-        }
-        let catalog = load_catalog();
-        let fresh = settings.resolve_in(&language, Some(&key.root), &catalog);
-        let mut lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(config) = fresh else {
-            // The plugin was uninstalled or disabled and nothing replaces it.
-            for companion in lsp.companion_keys(&uri) {
-                lsp.stop_server(&companion);
-            }
-            lsp.stop_server(&key);
-            return Ok(false);
-        };
-        lsp.apply_config(&key, &config)?;
-        let companions = companion_servers(&catalog, &language, Some(&key.root), &config);
-        let language_id = lsp_language_id(&language, &path);
-        let doc = document.lock().editor.doc.clone();
-        for (companion_language, companion) in &companions {
-            let companion_key = LspKey {
-                language: companion_language.clone(),
-                root: key.root.clone(),
-            };
-            // Optional extra: a failing companion must not block the primary.
-            if let Err(error) = lsp.apply_config(&companion_key, companion) {
-                tracing::warn!(%error, server = %companion_key.language, "could not start companion server");
-                continue;
-            }
-            if !lsp.companion_keys(&uri).contains(&companion_key)
-                && let Err(error) = lsp.open_companion(
-                    companion_key.clone(),
-                    uri.clone(),
-                    language_id.clone(),
-                    &doc,
-                )
-            {
-                tracing::warn!(%error, server = %companion_key.language, "could not open document in companion server");
-            }
-        }
-        for attached in lsp.companion_keys(&uri) {
-            if !companions
-                .iter()
-                .any(|(companion_language, _)| *companion_language == attached.language)
-            {
-                lsp.stop_server(&attached);
-            }
-        }
-        Ok(true)
-    }
-
-    /// Why no server can run for `language`, when the user can fix it.
-    /// `None` when a server resolves or there is nothing useful to say.
-    pub fn lsp_unavailable_hint(&self, language: String, root: String) -> Option<String> {
-        let hint = match lsp_server_language(&language).as_str() {
-            "swift" => "Swift toolchain not found. Run xcode-select --install",
-            "dart" => {
-                "Dart SDK not found. Install Flutter or Dart, or set DART_SDK or FLUTTER_ROOT"
-            }
-            _ => return None,
-        };
-        let root = PathBuf::from(root);
-        let (settings, _) =
-            LspSettings::load(LspSettings::global_settings_path().as_deref(), Some(&root));
-        let catalog = load_catalog();
-        settings
-            .resolve_in(&language, Some(&root), &catalog)
-            .is_none()
-            .then(|| hint.to_owned())
-    }
-
-    /// Starts the language servers a project needs as soon as its folder is
-    /// opened, so they index while no file is open yet. Languages come from
-    /// marker files in `root`. Missing servers are skipped. Returns how many
-    /// servers were spawned.
-    pub fn warm_up_lsp(&self, root: String) -> u64 {
-        let root = PathBuf::from(root);
-        let (settings, errors) =
-            LspSettings::load(LspSettings::global_settings_path().as_deref(), Some(&root));
-        for error in errors {
-            tracing::warn!(%error, "ignoring invalid LSP settings");
-        }
-        let catalog = load_catalog();
-        let mut lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
-        let mut started = 0;
-        for language in project_languages(&root) {
-            let Some(config) = settings.resolve_in(language, Some(&root), &catalog) else {
-                continue;
-            };
-            let key = LspKey {
-                language: lsp_server_language(language),
-                root: root.clone(),
-            };
-            match lsp.ensure_server(key, &config) {
-                Ok(true) => started += 1,
-                Ok(false) => {}
-                Err(error) => tracing::warn!(%error, language, "could not warm up language server"),
-            }
-        }
-        started
-    }
-
-    /// Polls all running default servers and applies their latest diagnostics
-    /// to registered documents. Returns the number of consumed events.
-    pub fn poll_lsp(&self) -> u64 {
-        let mut lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = lsp.flush_changes(Instant::now());
-        let events = lsp.poll();
-        let mut documents: HashMap<String, Arc<DocumentHandle>> = {
+    /// Runs the built-in analysis on open documents and hands the problems
+    /// to each one. Returns how many documents it looked at.
+    pub fn poll_analysis(&self) -> u64 {
+        let mut analysis = self.analysis.lock().unwrap_or_else(|e| e.into_inner());
+        let documents: HashMap<String, Arc<DocumentHandle>> = {
             let mut open = self.php_documents.lock().unwrap_or_else(|e| e.into_inner());
-            open.retain(|_, weak| weak.strong_count() > 0);
+            let gone: Vec<String> = open
+                .iter()
+                .filter(|(_, weak)| weak.strong_count() == 0)
+                .map(|(uri, _)| uri.clone())
+                .collect();
+            for uri in gone {
+                open.remove(&uri);
+                analysis.forget(&uri);
+            }
             open.iter()
                 .filter_map(|(uri, weak)| Some((uri.clone(), weak.upgrade()?)))
                 .collect()
         };
-        for (uri, document) in self
-            .lsp_documents
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-        {
-            documents.insert(uri.clone(), document.clone());
-        }
-        self.check_php(&mut lsp, &documents);
+        self.check_php(&mut analysis, &documents);
         for (uri, document) in &documents {
-            let diagnostics = lsp
+            let diagnostics = analysis
                 .diagnostics(uri)
                 .iter()
                 .map(|diagnostic| DiagnosticInfo {
@@ -934,10 +491,10 @@ impl Core {
                     end_line: diagnostic.range.end_line,
                     end_character: diagnostic.range.end_character,
                     severity: match diagnostic.severity {
-                        galaxy_core::lsp::DiagnosticSeverity::Error => 1,
-                        galaxy_core::lsp::DiagnosticSeverity::Warning => 2,
-                        galaxy_core::lsp::DiagnosticSeverity::Information => 3,
-                        galaxy_core::lsp::DiagnosticSeverity::Hint => 4,
+                        galaxy_core::analysis::DiagnosticSeverity::Error => 1,
+                        galaxy_core::analysis::DiagnosticSeverity::Warning => 2,
+                        galaxy_core::analysis::DiagnosticSeverity::Information => 3,
+                        galaxy_core::analysis::DiagnosticSeverity::Hint => 4,
                     },
                     message: diagnostic.message.clone(),
                     unnecessary: diagnostic.unnecessary,
@@ -945,168 +502,7 @@ impl Core {
                 .collect();
             document.set_diagnostics(diagnostics);
         }
-        events.len() as u64
-    }
-
-    pub fn lsp_status(&self) -> LspStatusInfo {
-        let mut lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
-        LspStatusInfo {
-            servers: lsp.server_count() as u64,
-            progress: lsp
-                .progress()
-                .into_iter()
-                .filter(|item| item.active)
-                .map(|item| LspProgressInfo {
-                    title: item.title,
-                    message: item.message,
-                    percentage: item.percentage,
-                })
-                .collect(),
-            error: lsp.last_server_error(),
-            processes: lsp
-                .server_processes()
-                .into_iter()
-                .map(|process| LspProcessInfo {
-                    language: process.language,
-                    pid: process.pid as u64,
-                    resident_memory_kib: process.resident_memory_kib,
-                })
-                .collect(),
-        }
-    }
-
-    pub fn stop_lsp(&self, document: Arc<DocumentHandle>) -> bool {
-        let path = document.path();
-        if path.is_empty() {
-            return false;
-        }
-        let uri = file_uri(Path::new(&path));
-        let key = self
-            .lsp_documents
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&uri)
-            .map(|_| ());
-        let Some(_) = key else {
-            return false;
-        };
-        let mut documents = self.lsp_documents.lock().unwrap_or_else(|e| e.into_inner());
-        let Some((uri, _)) = documents
-            .iter()
-            .find(|(_, value)| value.path() == path)
-            .map(|(uri, value)| (uri.clone(), value.clone()))
-        else {
-            return false;
-        };
-        let mut lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
-        let Some((key, _)) = lsp.document_key(&uri) else {
-            return false;
-        };
-        for companion in lsp.companion_keys(&uri) {
-            lsp.stop_server(&companion);
-        }
-        let stopped = lsp.stop_server(&key);
-        documents.retain(|_, value| value.path() != path);
-        stopped
-    }
-
-    /// Frees language servers nobody needs. `open` is every document any
-    /// window still shows: registered documents missing from it are closed,
-    /// then servers left without a document stop, those of `release_root`
-    /// (a folder just left) at once, others after `idle_seconds` unused.
-    /// Returns how many servers stopped.
-    pub fn sweep_lsp(
-        &self,
-        open: Vec<Arc<DocumentHandle>>,
-        release_root: Option<String>,
-        idle_seconds: u64,
-    ) -> u64 {
-        let shown: HashSet<String> = open
-            .iter()
-            .map(|document| document.path())
-            .filter(|path| !path.is_empty())
-            .map(|path| file_uri(Path::new(&path)))
-            .collect();
-        let mut documents = self.lsp_documents.lock().unwrap_or_else(|e| e.into_inner());
-        let mut lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
-        let closed: Vec<String> = documents
-            .keys()
-            .filter(|uri| !shown.contains(*uri))
-            .cloned()
-            .collect();
-        for uri in &closed {
-            let _ = lsp.close_document(uri);
-            documents.remove(uri);
-        }
-        let mut stopped = 0;
-        if let Some(root) = release_root {
-            stopped += lsp.stop_unused_in(Path::new(&root)).len();
-        }
-        stopped += lsp
-            .stop_idle(Instant::now(), Duration::from_secs(idle_seconds))
-            .len();
-        stopped as u64
-    }
-
-    /// Stops every language server, helpers included. Called when the app
-    /// quits so nothing is left running under launchd.
-    pub fn shutdown_lsp(&self) {
-        self.lsp_documents
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        self.lsp
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .shutdown_all();
-    }
-
-    pub fn restart_lsp(
-        &self,
-        document: Arc<DocumentHandle>,
-        language: String,
-        root: String,
-    ) -> Result<bool, CoreError> {
-        let path = document.path();
-        if path.is_empty() {
-            return Ok(false);
-        }
-        let key = LspKey {
-            language: lsp_server_language(&language),
-            root: PathBuf::from(root),
-        };
-        let restarted = {
-            let (settings, _) = LspSettings::load(
-                LspSettings::global_settings_path().as_deref(),
-                Some(&key.root),
-            );
-            let catalog = load_catalog();
-            let fresh = settings.resolve_in(&language, Some(&key.root), &catalog);
-            let uri = file_uri(Path::new(&path));
-            let mut lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
-            // Pick up plugin changes: restart with freshly resolved commands.
-            if let Some(config) = &fresh {
-                let companions = companion_servers(&catalog, &language, Some(&key.root), config);
-                for (companion_language, companion) in companions {
-                    let companion_key = LspKey {
-                        language: companion_language,
-                        root: key.root.clone(),
-                    };
-                    lsp.set_config(&companion_key, companion);
-                }
-                lsp.set_config(&key, config.clone());
-            }
-            for companion in lsp.companion_keys(&uri) {
-                if let Err(error) = lsp.restart_server(&companion) {
-                    tracing::warn!(%error, server = %companion.language, "could not restart companion server");
-                }
-            }
-            lsp.restart_server(&key)?
-        };
-        if restarted {
-            return Ok(true);
-        }
-        self.start_lsp(document, language, key.root.to_string_lossy().into_owned())
+        documents.len() as u64
     }
 
     pub fn request_hover(&self, document: Arc<DocumentHandle>, line: u64, character: u64) -> bool {
@@ -1135,19 +531,13 @@ impl Core {
                 }),
             });
             let answered = hover.is_some();
-            let mut lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
-            lsp.set_builtin_hover(&uri, hover);
-            if answered {
-                return true;
-            }
+            self.analysis
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_hover(&uri, hover);
+            return answered;
         }
-        self.lsp
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .request_hover(&uri, line, character, Instant::now())
-            .ok()
-            .flatten()
-            .is_some()
+        false
     }
 
     pub fn hover(&self, document: Arc<DocumentHandle>) -> Option<HoverInfo> {
@@ -1156,7 +546,7 @@ impl Core {
             return None;
         }
         let uri = file_uri(Path::new(&path));
-        self.lsp
+        self.analysis
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .hover(&uri)
@@ -1190,19 +580,16 @@ impl Core {
                     Vec::new()
                 }
             };
-            let items = found.into_iter().map(php_completion_item).collect();
-            self.lsp
+            let items: Vec<LspCompletionItem> =
+                found.into_iter().map(php_completion_item).collect();
+            let answered = !items.is_empty();
+            self.analysis
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .set_builtin_completion(&uri, items);
+                .set_completion(&uri, items);
+            return answered;
         }
-        self.lsp
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .request_completion(&uri, line, character, Instant::now())
-            .ok()
-            .flatten()
-            .is_some()
+        false
     }
 
     pub fn completions(&self, document: Arc<DocumentHandle>) -> Vec<CompletionInfo> {
@@ -1211,7 +598,7 @@ impl Core {
             return Vec::new();
         }
         let uri = file_uri(Path::new(&path));
-        self.lsp
+        self.analysis
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .completions(&uri)
@@ -1257,26 +644,20 @@ impl Core {
                     None
                 }
             };
-            let signature = found.map(|found| galaxy_core::lsp::SignatureInfo {
+            let signature = found.map(|found| galaxy_core::analysis::SignatureInfo {
                 label: found.label,
                 documentation: found.documentation,
                 parameters: found.parameters,
                 active_parameter: u64::from(found.active),
             });
             let answered = signature.is_some();
-            let mut lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
-            lsp.set_builtin_signature(&uri, signature);
-            if answered {
-                return true;
-            }
+            self.analysis
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_signature(&uri, signature);
+            return answered;
         }
-        self.lsp
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .request_signature_help(&uri, line, character, Instant::now())
-            .ok()
-            .flatten()
-            .is_some()
+        false
     }
 
     pub fn signature_help(&self, document: Arc<DocumentHandle>) -> Option<SignatureInfo> {
@@ -1285,7 +666,7 @@ impl Core {
             return None;
         }
         let uri = file_uri(Path::new(&path));
-        self.lsp
+        self.analysis
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .signature_help(&uri)
@@ -1303,31 +684,12 @@ impl Core {
         line: u64,
         character: u64,
     ) -> bool {
-        request_definition_kind(self, document, line, character, DefinitionKind::Definition)
-    }
-
-    pub fn request_type_definition(
-        &self,
-        document: Arc<DocumentHandle>,
-        line: u64,
-        character: u64,
-    ) -> bool {
-        request_definition_kind(self, document, line, character, DefinitionKind::Type)
-    }
-
-    pub fn request_implementation(
-        &self,
-        document: Arc<DocumentHandle>,
-        line: u64,
-        character: u64,
-    ) -> bool {
-        request_definition_kind(
-            self,
-            document,
-            line,
-            character,
-            DefinitionKind::Implementation,
-        )
+        let path = document.path();
+        if path.is_empty() {
+            return false;
+        }
+        let uri = file_uri(Path::new(&path));
+        self.php_definition(&document, &uri, line, character)
     }
 
     pub fn definition_locations(&self, document: Arc<DocumentHandle>) -> Vec<DefinitionLocation> {
@@ -1336,7 +698,7 @@ impl Core {
             return Vec::new();
         }
         let uri = file_uri(Path::new(&path));
-        self.lsp
+        self.analysis
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .definition_locations(&uri)
@@ -1360,16 +722,7 @@ impl Core {
             return false;
         }
         let uri = file_uri(Path::new(&path));
-        if self.php_references(&document, &uri, line, character) {
-            return true;
-        }
-        self.lsp
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .request_references(&uri, line, character, Instant::now())
-            .ok()
-            .flatten()
-            .is_some()
+        self.php_references(&document, &uri, line, character)
     }
 
     pub fn references(&self, document: Arc<DocumentHandle>) -> Vec<DefinitionLocation> {
@@ -1378,7 +731,7 @@ impl Core {
             return Vec::new();
         }
         let uri = file_uri(Path::new(&path));
-        self.lsp
+        self.analysis
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .references(&uri)
@@ -1403,16 +756,7 @@ impl Core {
             return false;
         }
         let uri = file_uri(Path::new(&path));
-        if self.php_rename(&document, &uri, line, character, &new_name) {
-            return true;
-        }
-        self.lsp
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .request_rename(&uri, line, character, &new_name, Instant::now())
-            .ok()
-            .flatten()
-            .is_some()
+        self.php_rename(&document, &uri, line, character, &new_name)
     }
 
     pub fn rename_edits(&self, document: Arc<DocumentHandle>) -> Vec<RenameEdit> {
@@ -1421,7 +765,7 @@ impl Core {
             return Vec::new();
         }
         let uri = file_uri(Path::new(&path));
-        self.lsp
+        self.analysis
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .rename_edits(&uri)
@@ -1458,9 +802,9 @@ impl Core {
                     Vec::new()
                 }
             };
-            let actions: Vec<galaxy_core::lsp::CodeActionInfo> = found
+            let actions: Vec<galaxy_core::analysis::CodeActionInfo> = found
                 .into_iter()
-                .map(|action| galaxy_core::lsp::CodeActionInfo {
+                .map(|action| galaxy_core::analysis::CodeActionInfo {
                     title: action.title,
                     kind: Some("quickfix".into()),
                     edits: action
@@ -1490,24 +834,13 @@ impl Core {
                 })
                 .collect();
             let answered = !actions.is_empty();
-            let mut lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
-            lsp.set_builtin_code_actions(&uri, actions);
-            if answered {
-                return true;
-            }
+            self.analysis
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_code_actions(&uri, actions);
+            return answered;
         }
-        let mut lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
-        let diagnostics = lsp.diagnostics(&uri).to_vec();
-        let range = galaxy_core::lsp::Range {
-            start_line: line,
-            start_character: character,
-            end_line: line,
-            end_character: character,
-        };
-        lsp.request_code_actions(&uri, range, &diagnostics, Instant::now())
-            .ok()
-            .flatten()
-            .is_some()
+        false
     }
 
     pub fn code_actions(&self, document: Arc<DocumentHandle>) -> Vec<CodeActionInfo> {
@@ -1516,7 +849,7 @@ impl Core {
             return Vec::new();
         }
         let uri = file_uri(Path::new(&path));
-        self.lsp
+        self.analysis
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .code_actions(&uri)
@@ -1544,20 +877,14 @@ impl Core {
                     .map(|symbol| php_outline_symbol(symbol, &uri))
                     .collect();
                 let answered = !symbols.is_empty();
-                let mut lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
-                lsp.set_builtin_document_symbols(&uri, symbols);
-                if answered {
-                    return true;
-                }
+                self.analysis
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .set_document_symbols(&uri, symbols);
+                return answered;
             }
         }
-        self.lsp
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .request_document_symbols(&uri, Instant::now())
-            .ok()
-            .flatten()
-            .is_some()
+        false
     }
 
     pub fn document_symbols(&self, document: Arc<DocumentHandle>) -> Vec<LspOutlineSymbol> {
@@ -1567,7 +894,7 @@ impl Core {
         }
         let uri = file_uri(Path::new(&path));
         fn flatten(
-            source: &[galaxy_core::lsp::DocumentSymbolInfo],
+            source: &[galaxy_core::analysis::DocumentSymbolInfo],
             output: &mut Vec<LspOutlineSymbol>,
         ) {
             for symbol in source {
@@ -1582,247 +909,31 @@ impl Core {
             }
         }
         let mut output = Vec::new();
-        let lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
-        flatten(lsp.document_symbols(&uri), &mut output);
+        let analysis = self.analysis.lock().unwrap_or_else(|e| e.into_inner());
+        flatten(analysis.document_symbols(&uri), &mut output);
         output
-    }
-
-    pub fn request_workspace_symbols(&self, root: String, query: String) -> bool {
-        self.lsp
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .request_workspace_symbols(&root, &query, Instant::now())
-            .ok()
-            .flatten()
-            .is_some()
-    }
-
-    pub fn workspace_symbols(&self, root: String) -> Vec<LspOutlineSymbol> {
-        fn flatten(
-            source: &[galaxy_core::lsp::DocumentSymbolInfo],
-            output: &mut Vec<LspOutlineSymbol>,
-        ) {
-            for symbol in source {
-                output.push(LspOutlineSymbol {
-                    uri: symbol.uri.clone(),
-                    name: symbol.name.clone(),
-                    kind: symbol.kind.to_string(),
-                    line: symbol.range.start_line,
-                    column: symbol.range.start_character,
-                });
-                flatten(&symbol.children, output);
-            }
-        }
-        let mut output = Vec::new();
-        let lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
-        flatten(lsp.workspace_symbols(&root), &mut output);
-        output
-    }
-
-    pub fn request_formatting(
-        &self,
-        document: Arc<DocumentHandle>,
-        tab_size: u64,
-        insert_spaces: bool,
-    ) {
-        let path = document.path();
-        if path.is_empty() {
-            return;
-        }
-        let uri = file_uri(Path::new(&path));
-        let _ = self
-            .lsp
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .request_formatting(&uri, tab_size, insert_spaces, Instant::now());
-    }
-
-    pub fn formatting_edits(&self, document: Arc<DocumentHandle>) -> Vec<RenameEdit> {
-        let path = document.path();
-        if path.is_empty() {
-            return Vec::new();
-        }
-        let uri = file_uri(Path::new(&path));
-        self.lsp
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .formatting_edits(&uri)
-            .iter()
-            .map(rename_edit)
-            .collect()
-    }
-
-    pub fn request_range_formatting(
-        &self,
-        document: Arc<DocumentHandle>,
-        range: Utf16Range,
-        tab_size: u64,
-        insert_spaces: bool,
-    ) {
-        let path = document.path();
-        if path.is_empty() {
-            return;
-        }
-        let uri = file_uri(Path::new(&path));
-        let start = document.position_at(range.location);
-        let end = document.position_at(range.location.saturating_add(range.length));
-        let lsp_range = galaxy_core::lsp::Range {
-            start_line: start.line,
-            start_character: start.col_utf16,
-            end_line: end.line,
-            end_character: end.col_utf16,
-        };
-        let _ = self
-            .lsp
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .request_range_formatting(&uri, lsp_range, tab_size, insert_spaces, Instant::now());
-    }
-
-    pub fn request_on_type_formatting(
-        &self,
-        document: Arc<DocumentHandle>,
-        line: u64,
-        character: u64,
-        trigger: String,
-        tab_size: u64,
-        insert_spaces: bool,
-    ) {
-        let path = document.path();
-        if path.is_empty() {
-            return;
-        }
-        let uri = file_uri(Path::new(&path));
-        let _ = self
-            .lsp
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .request_on_type_formatting(
-                &uri,
-                line,
-                character,
-                &trigger,
-                tab_size,
-                insert_spaces,
-                Instant::now(),
-            );
-    }
-
-    pub fn request_semantic_tokens(&self, document: Arc<DocumentHandle>) {
-        let path = document.path();
-        if path.is_empty() {
-            return;
-        }
-        let uri = file_uri(Path::new(&path));
-        let _ = self
-            .lsp
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .request_semantic_tokens(&uri, Instant::now());
-    }
-
-    pub fn request_inlay_hints(
-        &self,
-        document: Arc<DocumentHandle>,
-        start_line: u64,
-        end_line: u64,
-    ) {
-        let path = document.path();
-        if path.is_empty() {
-            return;
-        }
-        let uri = file_uri(Path::new(&path));
-        let range = galaxy_core::lsp::Range {
-            start_line,
-            start_character: 0,
-            end_line,
-            end_character: u64::MAX,
-        };
-        let _ = self
-            .lsp
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .request_inlay_hints(&uri, range, Instant::now());
-    }
-
-    pub fn semantic_tokens(&self, document: Arc<DocumentHandle>) -> Vec<SemanticTokenInfo> {
-        let uri = file_uri(Path::new(&document.path()));
-        self.lsp
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .semantic_tokens(&uri)
-            .iter()
-            .map(|token| SemanticTokenInfo {
-                line: token.line,
-                start: token.start,
-                length: token.length,
-                scope: token.scope.clone(),
-                is_declaration: token.is_declaration,
-            })
-            .collect()
-    }
-
-    pub fn inlay_hints(&self, document: Arc<DocumentHandle>) -> Vec<InlayHintInfo> {
-        let uri = file_uri(Path::new(&document.path()));
-        self.lsp
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .inlay_hints(&uri)
-            .iter()
-            .map(|hint| InlayHintInfo {
-                line: hint.line,
-                character: hint.character,
-                label: hint.label.clone(),
-            })
-            .collect()
     }
 
     pub fn problems(&self) -> Vec<ProblemInfo> {
-        let lsp = self.lsp.lock().unwrap_or_else(|e| e.into_inner());
-        lsp.problems()
+        let analysis = self.analysis.lock().unwrap_or_else(|e| e.into_inner());
+        analysis
+            .problems()
             .into_iter()
             .map(|diagnostic| ProblemInfo {
                 uri: diagnostic.uri.clone(),
                 line: diagnostic.range.start_line,
                 column: diagnostic.range.start_character,
                 severity: match diagnostic.severity {
-                    galaxy_core::lsp::DiagnosticSeverity::Error => 1,
-                    galaxy_core::lsp::DiagnosticSeverity::Warning => 2,
-                    galaxy_core::lsp::DiagnosticSeverity::Information => 3,
-                    galaxy_core::lsp::DiagnosticSeverity::Hint => 4,
+                    galaxy_core::analysis::DiagnosticSeverity::Error => 1,
+                    galaxy_core::analysis::DiagnosticSeverity::Warning => 2,
+                    galaxy_core::analysis::DiagnosticSeverity::Information => 3,
+                    galaxy_core::analysis::DiagnosticSeverity::Hint => 4,
                 },
                 message: diagnostic.message.clone(),
                 source: diagnostic.source.clone(),
                 code: diagnostic.code.clone(),
             })
             .collect()
-    }
-
-    pub fn sync_lsp_document(&self, document: Arc<DocumentHandle>) {
-        let path = document.path();
-        if path.is_empty() {
-            return;
-        }
-        let uri = file_uri(Path::new(&path));
-        // A Document clone shares rope nodes; no full-text String.
-        let doc = document.lock().editor.doc.clone();
-        self.lsp
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .note_document(&uri, &doc, Instant::now());
-    }
-
-    pub fn save_lsp_document(&self, document: Arc<DocumentHandle>) {
-        let path = document.path();
-        if path.is_empty() {
-            return;
-        }
-        let uri = file_uri(Path::new(&path));
-        let _ = self
-            .lsp
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .save_document(&uri);
     }
 }
 
@@ -1839,46 +950,6 @@ pub struct ProblemInfo {
     pub message: String,
     pub source: Option<String>,
     pub code: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, uniffi::Record)]
-pub struct LspProgressInfo {
-    pub title: String,
-    pub message: Option<String>,
-    pub percentage: Option<f64>,
-}
-
-#[derive(Debug, Clone, PartialEq, uniffi::Record)]
-pub struct LspStatusInfo {
-    pub servers: u64,
-    pub progress: Vec<LspProgressInfo>,
-    pub error: Option<String>,
-    pub processes: Vec<LspProcessInfo>,
-}
-
-#[derive(Debug, Clone, PartialEq, uniffi::Record)]
-pub struct LspProcessInfo {
-    pub language: String,
-    pub pid: u64,
-    pub resident_memory_kib: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
-pub struct SemanticTokenInfo {
-    pub line: u64,
-    pub start: u64,
-    pub length: u64,
-    /// Theme scope, as in `StyleRun.scope`.
-    pub scope: String,
-    /// Declares the name (a parameter in its signature) rather than uses it.
-    pub is_declaration: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
-pub struct InlayHintInfo {
-    pub line: u64,
-    pub character: u64,
-    pub label: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -2004,7 +1075,7 @@ pub struct CodeActionInfo {
     pub edits: Vec<RenameEdit>,
 }
 
-fn rename_edit(edit: &galaxy_core::lsp::RenameEdit) -> RenameEdit {
+fn rename_edit(edit: &galaxy_core::analysis::RenameEdit) -> RenameEdit {
     RenameEdit {
         uri: edit.uri.clone(),
         start_line: edit.range.start_line,
@@ -2013,12 +1084,6 @@ fn rename_edit(edit: &galaxy_core::lsp::RenameEdit) -> RenameEdit {
         end_character: edit.range.end_character,
         new_text: edit.new_text.clone(),
     }
-}
-
-enum DefinitionKind {
-    Definition,
-    Type,
-    Implementation,
 }
 
 impl Core {
@@ -2066,7 +1131,11 @@ impl Core {
 
     /// Runs the built-in PHP analysis on open files whose text has settled,
     /// so a file is not re-read on every keystroke.
-    fn check_php(&self, lsp: &mut LspManager, documents: &HashMap<String, Arc<DocumentHandle>>) {
+    fn check_php(
+        &self,
+        analysis: &mut BuiltinStore,
+        documents: &HashMap<String, Arc<DocumentHandle>>,
+    ) {
         const SETTLE: Duration = Duration::from_millis(300);
         let now = Instant::now();
         let mut checked = self.php_checked.lock().unwrap_or_else(|e| e.into_inner());
@@ -2102,7 +1171,7 @@ impl Core {
             entry.2 = true;
             let diagnostics = problems
                 .into_iter()
-                .map(|problem| galaxy_core::lsp::Diagnostic {
+                .map(|problem| galaxy_core::analysis::Diagnostic {
                     uri: uri.clone(),
                     range: LspRange {
                         start_line: u64::from(problem.start_line),
@@ -2111,9 +1180,11 @@ impl Core {
                         end_character: u64::from(problem.end_column),
                     },
                     severity: match problem.severity {
-                        php::Severity::Error => galaxy_core::lsp::DiagnosticSeverity::Error,
-                        php::Severity::Warning => galaxy_core::lsp::DiagnosticSeverity::Warning,
-                        php::Severity::Hint => galaxy_core::lsp::DiagnosticSeverity::Hint,
+                        php::Severity::Error => galaxy_core::analysis::DiagnosticSeverity::Error,
+                        php::Severity::Warning => {
+                            galaxy_core::analysis::DiagnosticSeverity::Warning
+                        }
+                        php::Severity::Hint => galaxy_core::analysis::DiagnosticSeverity::Hint,
                     },
                     message: problem.message,
                     source: Some("galaxy".into()),
@@ -2121,7 +1192,7 @@ impl Core {
                     unnecessary: problem.unnecessary,
                 })
                 .collect();
-            lsp.set_builtin_diagnostics(uri, diagnostics);
+            analysis.set_diagnostics(uri, diagnostics);
         }
     }
 
@@ -2147,9 +1218,12 @@ impl Core {
         // Reading the project's files happens outside the engine's lock.
         let mut files = query.candidates();
         {
-            let open = self.lsp_documents.lock().unwrap_or_else(|e| e.into_inner());
+            let open = self.php_documents.lock().unwrap_or_else(|e| e.into_inner());
             for (other, body) in &mut files {
-                if let Some(handle) = open.get(&file_uri(other)) {
+                if let Some(handle) = open
+                    .get(&file_uri(other))
+                    .and_then(std::sync::Weak::upgrade)
+                {
                     *body = handle.lock().editor.doc.text();
                 }
             }
@@ -2190,10 +1264,10 @@ impl Core {
             })
             .collect();
         let found = !locations.is_empty();
-        self.lsp
+        self.analysis
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .set_builtin_references(uri, locations);
+            .set_references(uri, locations);
         found
     }
 
@@ -2237,10 +1311,10 @@ impl Core {
                 .collect();
         }
         let found = !edits.is_empty();
-        self.lsp
+        self.analysis
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .set_builtin_rename_edits(uri, edits);
+            .set_rename_edits(uri, edits);
         found
     }
 
@@ -2279,10 +1353,10 @@ impl Core {
             })
             .collect();
         let found = !locations.is_empty();
-        self.lsp
+        self.analysis
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .set_builtin_definitions(uri, locations);
+            .set_definitions(uri, locations);
         found
     }
 }
@@ -2321,7 +1395,7 @@ fn spawn_php_index(engine: &Arc<Mutex<PhpEngine>>, root: &Path) {
 fn php_outline_symbol(
     symbol: &php::OutlineSymbol,
     uri: &str,
-) -> galaxy_core::lsp::DocumentSymbolInfo {
+) -> galaxy_core::analysis::DocumentSymbolInfo {
     let kind = match symbol.kind {
         "Class" => 5,
         "Method" => 6,
@@ -2341,7 +1415,7 @@ fn php_outline_symbol(
         end_line: u64::from(symbol.line),
         end_character: u64::from(symbol.column),
     };
-    galaxy_core::lsp::DocumentSymbolInfo {
+    galaxy_core::analysis::DocumentSymbolInfo {
         uri: Some(uri.to_owned()),
         name: symbol.name.clone(),
         kind,
@@ -2389,34 +1463,6 @@ fn php_completion_item(item: php::Completion) -> LspCompletionItem {
             })
             .collect(),
     }
-}
-
-fn request_definition_kind(
-    core: &Core,
-    document: Arc<DocumentHandle>,
-    line: u64,
-    character: u64,
-    kind: DefinitionKind,
-) -> bool {
-    let path = document.path();
-    if path.is_empty() {
-        return false;
-    }
-    let uri = file_uri(Path::new(&path));
-    if matches!(kind, DefinitionKind::Definition)
-        && core.php_definition(&document, &uri, line, character)
-    {
-        return true;
-    }
-    let mut lsp = core.lsp.lock().unwrap_or_else(|e| e.into_inner());
-    let result = match kind {
-        DefinitionKind::Definition => lsp.request_definition(&uri, line, character, Instant::now()),
-        DefinitionKind::Type => lsp.request_type_definition(&uri, line, character, Instant::now()),
-        DefinitionKind::Implementation => {
-            lsp.request_implementation(&uri, line, character, Instant::now())
-        }
-    };
-    result.ok().flatten().is_some()
 }
 
 /// One row of the file explorer.
@@ -5743,15 +4789,6 @@ mod tests {
     }
 
     #[test]
-    fn project_languages_follow_marker_files() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(project_languages(dir.path()).is_empty());
-        std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
-        std::fs::write(dir.path().join("composer.json"), "{}").unwrap();
-        assert_eq!(project_languages(dir.path()), ["rust", "php"]);
-    }
-
-    #[test]
     fn open_document_reads_lines() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.rs");
@@ -6194,7 +5231,7 @@ mod tests {
         let wait = |want: usize| {
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
-                core.poll_lsp();
+                core.poll_analysis();
                 let found = report.lock().diagnostics.clone();
                 if found.len() == want {
                     return found;
@@ -6271,7 +5308,7 @@ mod tests {
             .insert(file_uri(&page), Arc::downgrade(&doc));
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            core.poll_lsp();
+            core.poll_analysis();
             let found = doc.lock().diagnostics.clone();
             if found.len() == 2 {
                 // `wel` is only a prefix of `welcome`, so it is missing too.

@@ -24,10 +24,6 @@ final class StatusBar: NSView {
     let indent = StatusBar.label("status-indent")
     let lineEnding = StatusBar.label("status-eol")
     let encoding = StatusBar.label("status-encoding")
-    let lsp = StatusBar.label("status-lsp")
-    /// Shown instead of an empty LSP label when the active file's language
-    /// has no usable server and the user can fix that.
-    var lspHint: String?
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -76,7 +72,7 @@ final class StatusBar: NSView {
 
         let left = NSStackView(views: [git, gitGraph, message, largeFileBadge])
         left.spacing = 8
-        let right = NSStackView(views: [cursor, language, indent, lineEnding, encoding, lsp])
+        let right = NSStackView(views: [cursor, language, indent, lineEnding, encoding])
         right.spacing = 14
         // The spacer takes the slack, so the facts sit on the right edge.
         let spacer = NSView()
@@ -132,31 +128,6 @@ final class StatusBar: NSView {
         encoding.stringValue = doc.hasBom() ? "\(name) with BOM" : name
         largeFileBadge.isHidden = !doc.isLarge()
         showCursor(of: doc)
-    }
-
-    func showLSP(_ status: LspStatusInfo) {
-        if let error = status.error {
-            let detail = error.components(separatedBy: ": ").last ?? error
-            lsp.stringValue = "LSP: Error (\(detail))"
-            lsp.toolTip = error
-        } else if let progress = status.progress.first {
-            let percent = progress.percentage.map { " \(Int($0))%" } ?? ""
-            lsp.stringValue = "LSP: \(progress.title)\(percent)"
-            lsp.toolTip = progress.message
-        } else if status.servers > 0 {
-            lsp.stringValue = "LSP: \(status.servers) ready"
-            let processes = status.processes.map { process in
-                let memory = process.residentMemoryKib.map { " \($0 / 1024) MB" } ?? ""
-                return "\(process.language) (PID \(process.pid)\(memory))"
-            }
-            lsp.toolTip = processes.isEmpty ? nil : processes.joined(separator: "\n")
-        } else if let hint = lspHint {
-            lsp.stringValue = "LSP: Unavailable"
-            lsp.toolTip = hint
-        } else {
-            lsp.stringValue = ""
-            lsp.toolTip = nil
-        }
     }
 
     func showGit(branch: String?, changedCount: Int) {

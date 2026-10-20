@@ -1,7 +1,7 @@
 # Galaxy User Guide
 
 Galaxy adalah editor macOS native untuk membuka workspace, mengedit file,
-menjalankan tool terminal, dan memakai fitur LSP.
+menjalankan tool terminal, dan memakai analisis kode bawaan.
 
 ## Build Lokal
 
@@ -48,41 +48,37 @@ galaxy /path/to/project
 - `Ctrl+G`: go to line.
 - `Cmd+P`: go to file.
 - `Cmd+Shift+O`: go to symbol.
-- `Cmd+T`: go to workspace symbol.
 - `Cmd+D`: tambah occurrence berikutnya ke multi-cursor.
 - `Cmd+Shift+L`: pilih semua occurrence.
 - `Cmd+Option+Up` / `Cmd+Option+Down`: tambah cursor di atas/bawah.
 - `Cmd+/`: toggle line comment.
 - `Cmd+.`: code actions.
 
-Editor mendukung auto-indent, bracket pairing, bracket matching, UTF-16 LSP
+Editor mendukung auto-indent, bracket pairing, bracket matching, UTF-16
 positions, multi-cursor, IME melalui `NSTextInputClient`, dan undo transaction.
 
 ## Navigasi Kode
 
-Jika language server tersedia dan berhasil menyelesaikan handshake, Galaxy
-menyediakan:
+Engine bawaan Galaxy menyediakan fitur berikut untuk PHP, Blade, dan Laravel.
+Bahasa lain hanya mendapat syntax highlighting sampai engine-nya ada.
 
 - Hover.
 - Completion.
 - Signature help.
-- Go to definition, type definition, dan implementation.
+- Go to definition.
 - Find references.
 - Rename symbol.
 - Code actions.
-- Document/workspace symbols.
+- Document symbols.
 - Diagnostics di editor, gutter, scrollbar, dan Problems panel.
-- Semantic tokens dan inlay hints jika server mendukung capability tersebut.
 
 Klik diagnostic di Problems panel untuk membuka file dan lokasi terkait.
 Breadcrumb di bawah path file menunjukkan symbol aktif. Klik breadcrumb untuk
 menuju deklarasinya.
 
-Go to Definition (`F12`, atau `Cmd`-klik) mengirim request ke language server
-aktif. Untuk TypeScript/JavaScript, buka folder parent yang memuat frontend dan
-backend agar root workspace dapat menemukan `package.json` atau `tsconfig.json`.
-Untuk PHP/Blade, buka root Laravel yang memuat `artisan` dan install
-`laravel/lsp` terlebih dahulu.
+Go to Definition (`F12`, atau `Cmd`-klik) dijawab oleh engine bawaan. Untuk
+PHP/Blade, buka root Laravel atau proyek Composer (folder yang memuat
+`composer.json`) agar engine menemukan `vendor/` dan autoload.
 
 ## Terminal
 

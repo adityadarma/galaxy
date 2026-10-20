@@ -39,61 +39,15 @@ final class CoreBridge {
         try core.openDocument(path: path)
     }
 
+    /// True when a built-in engine handles the file.
     @discardableResult
-    func startLSP(document: DocumentHandle, language: String, root: String) -> Bool {
-        (try? core.startLsp(document: document, language: language, root: root)) ?? false
+    func registerDocument(document: DocumentHandle, language: String, root: String) -> Bool {
+        core.registerDocument(document: document, language: language, root: root)
     }
 
-    /// Starts the project's language servers before any file is open, so
-    /// they index in the background.
-    @discardableResult
-    func warmUpLSP(root: String) -> UInt64 {
-        core.warmUpLsp(root: root)
-    }
-
-    /// Applies the installed plugin set to a document's servers: starts
-    /// missing ones (also companions), restarts changed ones, keeps the rest.
-    /// False when no server serves the document afterwards.
-    func refreshLSPPlugins(document: DocumentHandle, language: String, root: String) throws -> Bool {
-        try core.refreshLspPlugins(document: document, language: language, root: root)
-    }
-
-    /// What the user can do when no language server can run for `language`.
-    func lspUnavailableHint(language: String, root: String) -> String? {
-        core.lspUnavailableHint(language: language, root: root)
-    }
-
-    /// Frees language servers nobody needs. `open` is every document any
-    /// window still shows. Servers of `releaseRoot` stop at once if no open
-    /// document uses them; others stop after `idleSeconds` unused.
-    @discardableResult
-    func sweepLSP(open: [DocumentHandle], releaseRoot: String?, idleSeconds: UInt64) -> UInt64 {
-        core.sweepLsp(open: open, releaseRoot: releaseRoot, idleSeconds: idleSeconds)
-    }
-
-    /// Stops every language server and its helpers (app quit).
-    func shutdownLSP() {
-        core.shutdownLsp()
-    }
-
-    func pollLSP() {
-        _ = core.pollLsp()
-    }
-
-    func lspStatus() -> LspStatusInfo { core.lspStatus() }
-
-    func stopLSP(document: DocumentHandle) -> Bool { core.stopLsp(document: document) }
-
-    func restartLSP(document: DocumentHandle, language: String, root: String) -> Bool {
-        (try? core.restartLsp(document: document, language: language, root: root)) ?? false
-    }
-
-    func syncLSP(document: DocumentHandle) {
-        core.syncLspDocument(document: document)
-    }
-
-    func saveLSP(document: DocumentHandle) {
-        core.saveLspDocument(document: document)
+    /// Drains finished analysis results; drives diagnostics updates.
+    func pollAnalysis() {
+        _ = core.pollAnalysis()
     }
 
     /// False when no request went out (server missing or still initializing).
@@ -135,14 +89,6 @@ final class CoreBridge {
 
     func requestDefinition(document: DocumentHandle, line: UInt64, character: UInt64) {
         _ = core.requestDefinition(document: document, line: line, character: character)
-    }
-
-    func requestTypeDefinition(document: DocumentHandle, line: UInt64, character: UInt64) {
-        _ = core.requestTypeDefinition(document: document, line: line, character: character)
-    }
-
-    func requestImplementation(document: DocumentHandle, line: UInt64, character: UInt64) {
-        _ = core.requestImplementation(document: document, line: line, character: character)
     }
 
     func definitionLocations(document: DocumentHandle) -> [DefinitionLocation] {
@@ -197,21 +143,6 @@ final class CoreBridge {
         core.documentSymbols(document: document)
     }
 
-    func requestWorkspaceSymbols(root: String, query: String) {
-        _ = core.requestWorkspaceSymbols(root: root, query: query)
-    }
-
-    func workspaceSymbols(root: String) -> [LspOutlineSymbol] {
-        core.workspaceSymbols(root: root)
-    }
-
-    func requestSemanticTokens(document: DocumentHandle) { core.requestSemanticTokens(document: document) }
-    func requestInlayHints(document: DocumentHandle, startLine: UInt64, endLine: UInt64) {
-        core.requestInlayHints(document: document, startLine: startLine, endLine: endLine)
-    }
-    func semanticTokens(document: DocumentHandle) -> [SemanticTokenInfo] { core.semanticTokens(document: document) }
-    func inlayHints(document: DocumentHandle) -> [InlayHintInfo] { core.inlayHints(document: document) }
-
     func search(workspace: Workspace, query: String, options: WorkspaceSearchOptions, limit: UInt64) throws -> [WorkspaceSearchMatch] {
         try workspace.search(query: query, options: options, limit: limit)
     }
@@ -262,26 +193,6 @@ final class CoreBridge {
 
     func terminal(workspace: Workspace, cols: UInt16, rows: UInt16) -> TerminalHandle? {
         try? workspace.terminal(cols: cols, rows: rows)
-    }
-
-    func requestFormatting(document: DocumentHandle, tabSize: UInt64, insertSpaces: Bool) {
-        core.requestFormatting(document: document, tabSize: tabSize, insertSpaces: insertSpaces)
-    }
-
-    func formattingEdits(document: DocumentHandle) -> [RenameEdit] {
-        core.formattingEdits(document: document)
-    }
-
-    func applyFormattingEdits(document: DocumentHandle, edits: [RenameEdit]) -> Bool {
-        document.applyFormattingEdits(edits: edits)
-    }
-
-    func requestRangeFormatting(document: DocumentHandle, range: Utf16Range, tabSize: UInt64, insertSpaces: Bool) {
-        core.requestRangeFormatting(document: document, range: range, tabSize: tabSize, insertSpaces: insertSpaces)
-    }
-
-    func requestOnTypeFormatting(document: DocumentHandle, line: UInt64, character: UInt64, trigger: String, tabSize: UInt64, insertSpaces: Bool) {
-        core.requestOnTypeFormatting(document: document, line: line, character: character, trigger: trigger, tabSize: tabSize, insertSpaces: insertSpaces)
     }
 
     fileprivate func deliver(_ event: CoreEvent) {

@@ -79,24 +79,16 @@ enum MainMenu {
         let goItem = NSMenuItem()
         let goMenu = NSMenu(title: "Go")
         goMenu.addItem(withTitle: "Go to Definition", action: #selector(MainWindowController.goToDefinition(_:)), keyEquivalent: "")
-        goMenu.addItem(withTitle: "Go to Type Definition", action: #selector(MainWindowController.goToTypeDefinition(_:)), keyEquivalent: "")
-        goMenu.addItem(withTitle: "Go to Implementation", action: #selector(MainWindowController.goToImplementation(_:)), keyEquivalent: "")
         goMenu.addItem(withTitle: "Find References", action: #selector(MainWindowController.findReferences(_:)), keyEquivalent: "")
         goMenu.addItem(withTitle: "Rename Symbol…", action: #selector(MainWindowController.renameSymbol(_:)), keyEquivalent: "")
         let codeActions = goMenu.addItem(withTitle: "Code Actions…", action: #selector(MainWindowController.showCodeActions(_:)), keyEquivalent: ".")
         codeActions.keyEquivalentModifierMask = [.command]
-        let format = goMenu.addItem(withTitle: "Format Document", action: #selector(MainWindowController.formatDocument(_:)), keyEquivalent: "f")
-        format.keyEquivalentModifierMask = [.command, .option, .shift]
         goMenu.addItem(withTitle: "Go to File…", action: #selector(MainWindowController.showGoToFile(_:)), keyEquivalent: "p")
         let symbol = goMenu.addItem(withTitle: "Go to Symbol…", action: #selector(MainWindowController.showGoToSymbol(_:)), keyEquivalent: "o")
         symbol.keyEquivalentModifierMask = [.command, .shift]
-        let workspaceSymbol = goMenu.addItem(withTitle: "Go to Workspace Symbol…", action: #selector(MainWindowController.showGoToWorkspaceSymbol(_:)), keyEquivalent: "t")
-        workspaceSymbol.keyEquivalentModifierMask = [.command]
         let line = goMenu.addItem(withTitle: "Go to Line…", action: #selector(MainWindowController.showGoToLine(_:)), keyEquivalent: "g")
         line.keyEquivalentModifierMask = [.control]
         goMenu.addItem(.separator())
-        goMenu.addItem(withTitle: "Restart Language Server", action: #selector(MainWindowController.restartLanguageServer(_:)), keyEquivalent: "")
-        goMenu.addItem(withTitle: "Stop Language Server", action: #selector(MainWindowController.stopLanguageServer(_:)), keyEquivalent: "")
         // The window's key monitor handles both keys; these show them.
         let back = goMenu.addItem(withTitle: "Back", action: #selector(MainWindowController.navigateBack(_:)), keyEquivalent: "-")
         back.keyEquivalentModifierMask = [.control]
@@ -125,8 +117,6 @@ enum MainMenu {
         explorer.keyEquivalentModifierMask = [.command, .shift]
         let scm = viewMenu.addItem(withTitle: "Show Source Control", action: #selector(MainWindowController.showSourceControlAction(_:)), keyEquivalent: "g")
         scm.keyEquivalentModifierMask = [.control, .shift]
-        let extensionsItem = viewMenu.addItem(withTitle: "Show Extensions", action: #selector(MainWindowController.showExtensionsAction(_:)), keyEquivalent: "x")
-        extensionsItem.keyEquivalentModifierMask = [.command, .shift]
         viewMenu.addItem(.separator())
         viewMenu.addItem(withTitle: "Show Problems", action: #selector(MainWindowController.showProblemsPanel(_:)), keyEquivalent: "")
         viewMenu.addItem(withTitle: "Show Debug Console", action: #selector(MainWindowController.showDebugConsole(_:)), keyEquivalent: "")

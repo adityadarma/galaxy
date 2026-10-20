@@ -176,23 +176,9 @@ final class EditorView: NSView {
     var gitLineChanges: [UInt64: GitLineChangeKind] = [:] {
         didSet { if gitLineChanges != oldValue { needsDisplay = true } }
     }
-    /// LSP names (types, parameters, functions) colored over Tree-sitter's runs.
-    var semanticTokens: [SemanticTokenInfo] = [] {
-        didSet {
-            guard semanticTokens != oldValue else { return }
-            semanticStylesByLine = Dictionary(grouping: semanticTokens.map {
-                StyleRun(line: $0.line, start: $0.start, end: $0.start + $0.length, scope: $0.scope)
-            }, by: { $0.line })
-            needsDisplay = true
-        }
-    }
-    private(set) var semanticStylesByLine: [UInt64: [StyleRun]] = [:]
     /// `editor.renderWhitespace`; dots everywhere unless settings say otherwise.
     var renderWhitespace: WhitespaceRendering = .all {
         didSet { if renderWhitespace != oldValue { needsDisplay = true } }
-    }
-    var inlayHints: [InlayHintInfo] = [] {
-        didSet { if inlayHints != oldValue { needsDisplay = true } }
     }
 
     /// Git blame shown after the text of one line (`line` is 0-based).
@@ -217,11 +203,9 @@ final class EditorView: NSView {
         return NSRect(x: end.x + Self.blameGap, y: end.y, width: width, height: metrics.lineHeight)
     }
 
-    /// Drops derived Core Text/LSP decorations while retaining the document.
+    /// Drops derived Core Text caches while retaining the document.
     func releaseNonEssentialCaches() {
         layouts.removeAll()
-        semanticTokens = []
-        inlayHints = []
         caretRects.removeAll(keepingCapacity: false)
         needsDisplay = true
     }
@@ -877,11 +861,6 @@ final class EditorView: NSView {
                 context.setFillColor(tint.cgColor)
                 context.fill(CGRect(x: 0, y: top, width: bounds.width, height: block))
             }
-            for hint in inlayHints where hint.line == line.line {
-                let p = point(column: Int(hint.character), text: line.text, rows: rows, top: top, originX: originX)
-                NSColor.secondaryLabelColor.withAlphaComponent(0.7).setFill()
-                NSAttributedString(string: "  \(hint.label)", attributes: [.font: NSFont.monospacedSystemFont(ofSize: font.pointSize - 1, weight: .regular), .foregroundColor: NSColor.secondaryLabelColor]).draw(at: NSPoint(x: p.x, y: p.y + 1))
-            }
 
             // Current line: lines with a caret and no selection on them.
             if hasCaret, line.selections.isEmpty {
@@ -960,7 +939,7 @@ final class EditorView: NSView {
             if !line.text.isEmpty {
                 context.setFillColor(Theme.editorForeground.resolved(for: effectiveAppearance).cgColor)
                 // Semantic runs come last so they win over Tree-sitter's.
-                let styles = (stylesByLine[line.line] ?? []) + (semanticStylesByLine[line.line] ?? [])
+                let styles = (stylesByLine[line.line] ?? [])
                 // Unused code (LSP `Unnecessary`) is faded, not underlined.
                 let faded = line.diagnostics.filter(\.unnecessary).map { Int($0.start)..<Int($0.end) }
                 let ctLine = styles.isEmpty && faded.isEmpty

@@ -508,6 +508,25 @@ impl PhpEngine {
         self.find_member(&builder, name, true)
     }
 
+    /// The `Builder<Model>` type that calls a model or relation does not
+    /// declare are forwarded to, when `chain` is one of those.
+    fn forwarding_builder(
+        &mut self,
+        chain: &[(Arc<ClassInfo>, HashMap<String, String>)],
+    ) -> Option<String> {
+        const MODEL: &str = "Illuminate\\Database\\Eloquent\\Model";
+        const RELATION: &str = "Illuminate\\Database\\Eloquent\\Relations\\Relation";
+        const BUILDER: &str = "Illuminate\\Database\\Eloquent\\Builder";
+        self.class(BUILDER)?;
+        let model = if chain.iter().any(|(c, _)| c.fqn == MODEL) {
+            chain[0].0.fqn.clone()
+        } else {
+            let (_, env) = chain.iter().find(|(c, _)| c.fqn == RELATION)?;
+            env.get("TRelatedModel").filter(|m| !m.is_empty())?.clone()
+        };
+        Some(format!("{BUILDER}<{model}>"))
+    }
+
     // ---- type evaluation ---------------------------------------------
 
     fn class_ref(&mut self, ctx: &Ctx<'_>, name: &str) -> Option<String> {
@@ -642,7 +661,10 @@ impl PhpEngine {
         let call = args.is_some();
         let Some((index, member)) = Self::pick_member(&chain, name, call) else {
             if call {
-                return None;
+                // `$model->where()` and `$relation->create()` reach the
+                // query builder through `__call`.
+                let builder = self.forwarding_builder(&chain)?;
+                return self.member_type(ctx, &builder, name, args);
             }
             // A read of something that is not a property, on a class with
             // `__get`: Eloquent exposes a relation method that way, and
@@ -2679,6 +2701,45 @@ $plain->items;\n";
     }
 
     #[test]
+    fn docblock_methods_open_at_their_tag() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for (path, body) in [
+            (
+                "composer.json",
+                r#"{"autoload":{"psr-4":{"Lib\\":"lib/"}}}"#,
+            ),
+            (
+                "lib/Clock.php",
+                "<?php\nnamespace Lib;\n\n/**\n * @method Clock addMinutes(int $value = 1)\n * @method Clock addDays(int $value = 1)\n */\ninterface Clock\n{\n}\n",
+            ),
+            (
+                "lib/helpers.php",
+                "<?php\nuse Lib\\Clock;\n\nfunction now(): Clock {}\n",
+            ),
+        ] {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        std::fs::create_dir_all(root.join("vendor/composer")).unwrap();
+        std::fs::write(
+            root.join("vendor/composer/autoload_files.php"),
+            "<?php\n$baseDir = dirname(dirname(__DIR__));\nreturn array('a' => $baseDir . '/lib/helpers.php');\n",
+        )
+        .unwrap();
+        let mut engine = PhpEngine::new(root);
+        let file = root.join("main.php");
+        let text = "<?php\n$a = now()->addMinutes(50);\n$b = now()->addDays(1);\n";
+        let found = engine.definition(&file, text, 1, 15);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].path.ends_with("lib/Clock.php"));
+        assert_eq!((found[0].line, found[0].column), (4, 17));
+        let found = engine.definition(&file, text, 2, 15);
+        assert_eq!((found[0].line, found[0].column), (5, 17));
+    }
+
+    #[test]
     fn built_in_functions_and_classes_open_a_real_file() {
         let dir = tempfile::tempdir().unwrap();
         let mut engine = PhpEngine::new(dir.path());
@@ -2741,6 +2802,88 @@ $plain->items;\n";
             hover.markdown
         );
         assert!(engine.definition(&main, text, 4, 8).is_empty());
+    }
+
+    #[test]
+    fn relation_chains_keep_resolving_through_the_query_builder() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for (path, body) in [
+            (
+                "composer.json",
+                r#"{"autoload":{"psr-4":{"Illuminate\\Database\\Eloquent\\":"lib/","App\\":"app/"}}}"#,
+            ),
+            (
+                "lib/Model.php",
+                "<?php\nnamespace Illuminate\\Database\\Eloquent;\n\nabstract class Model\n{\n    public static function __callStatic($method, $parameters) {}\n    public function save(): bool { return true; }\n}\n",
+            ),
+            (
+                "lib/Builder.php",
+                r#"<?php
+namespace Illuminate\Database\Eloquent;
+
+/**
+ * @template TModel of \Illuminate\Database\Eloquent\Model
+ */
+class Builder
+{
+    /** @return $this */
+    public function where($column) { return $this; }
+
+    /** @return TModel|null */
+    public function first() {}
+
+    /** @return TModel */
+    public function create(array $attributes = []) {}
+
+    /**
+     * @return ($id is array ? array : TModel|null)
+     */
+    public function find($id) {}
+}
+"#,
+            ),
+            (
+                "lib/Relations/Relation.php",
+                "<?php\nnamespace Illuminate\\Database\\Eloquent\\Relations;\n\n/**\n * @template TRelatedModel of \\Illuminate\\Database\\Eloquent\\Model\n * @template TDeclaringModel of \\Illuminate\\Database\\Eloquent\\Model\n *\n * @mixin \\Illuminate\\Database\\Eloquent\\Builder<TRelatedModel>\n */\nabstract class Relation\n{\n}\n",
+            ),
+            (
+                "lib/Relations/HasMany.php",
+                "<?php\nnamespace Illuminate\\Database\\Eloquent\\Relations;\n\n/**\n * @template TRelatedModel of \\Illuminate\\Database\\Eloquent\\Model\n * @template TDeclaringModel of \\Illuminate\\Database\\Eloquent\\Model\n *\n * @extends \\Illuminate\\Database\\Eloquent\\Relations\\Relation<TRelatedModel, TDeclaringModel>\n */\nclass HasMany extends Relation\n{\n}\n",
+            ),
+            (
+                "app/Otp.php",
+                "<?php\nnamespace App;\n\nuse Illuminate\\Database\\Eloquent\\Model;\n\nclass Otp extends Model\n{\n}\n",
+            ),
+            (
+                "app/User.php",
+                "<?php\nnamespace App;\n\nuse Illuminate\\Database\\Eloquent\\Model;\nuse Illuminate\\Database\\Eloquent\\Relations\\HasMany;\n\nclass User extends Model\n{\n    /** @return HasMany<Otp, $this> */\n    public function otps(): HasMany {}\n}\n",
+            ),
+        ] {
+            let path = root.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
+        }
+        let mut engine = PhpEngine::new(root);
+        let main = root.join("app/Run.php");
+        let text = "<?php\nnamespace App;\n\nclass Run\n{\n    public function go()\n    {\n        $u = User::find(1);\n        $u->otps()->where('a')->first()->save();\n        $u->otps()->create([])->save();\n    }\n}\n";
+        let at = |engine: &mut PhpEngine, line: u32, needle: &str| {
+            let row = text.lines().nth(line as usize).unwrap();
+            let column = row.find(needle).unwrap() as u32 + 1;
+            engine.definition(&main, text, line, column)
+        };
+        let otps = at(&mut engine, 8, "otps");
+        assert!(otps[0].path.ends_with("app/User.php"), "{otps:?}");
+        let r#where = at(&mut engine, 8, "where");
+        assert!(r#where[0].path.ends_with("lib/Builder.php"), "{where:?}");
+        let first = at(&mut engine, 8, "first");
+        assert!(first[0].path.ends_with("lib/Builder.php"), "{first:?}");
+        let save = at(&mut engine, 8, "save");
+        assert!(save[0].path.ends_with("lib/Model.php"), "{save:?}");
+        let create = at(&mut engine, 9, "create");
+        assert!(create[0].path.ends_with("lib/Builder.php"), "{create:?}");
+        let save = at(&mut engine, 9, "save");
+        assert!(save[0].path.ends_with("lib/Model.php"), "{save:?}");
     }
 
     /// A small copy of how Eloquent declares relations.

@@ -2,7 +2,7 @@ import XCTest
 @testable import Galaxy
 
 /// Opt-in: run with `TEST_RUNNER_GALAXY_LARAVEL_PATH=/path/to/laravel-app`
-/// and intelephense installed. Drives a real mouse hover through the window
+/// (served by the built-in PHP engine). Drives a real mouse hover through the window
 /// controller, LSP poll timer and popover placement.
 @MainActor
 final class HoverEndToEndTests: XCTestCase {
@@ -36,7 +36,7 @@ final class HoverEndToEndTests: XCTestCase {
         let popover = c.hoverPopover
         if let doc = v.document {
             let info = c.bridge.hover(document: doc)
-            print("HOVER info=\(String(describing: info?.contents.prefix(80))) start=\(String(describing: info?.startLine))-\(String(describing: info?.endLine)) status=\(c.bridge.lspStatus())")
+            print("HOVER info=\(String(describing: info?.contents.prefix(80))) start=\(String(describing: info?.startLine))-\(String(describing: info?.endLine))")
         }
         XCTAssertFalse(popover.isHidden, "hover card never became visible")
         XCTAssertFalse(popover.renderedText.isEmpty)

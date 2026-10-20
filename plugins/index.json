@@ -1,6 +1,0 @@
-{
-  "plugins": [
-    { "id": "intelephense", "name": "Intelephense", "version": "1.18.5", "languages": ["php", "blade"], "description": "PHP language server, installed locally with npm.", "path": "plugins/intelephense" },
-    { "id": "laravel", "name": "Laravel", "version": "0.0.32", "languages": ["php", "blade"], "description": "Config, route and view navigation for Laravel projects.", "path": "plugins/laravel" }
-  ]
-}

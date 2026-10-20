@@ -13,10 +13,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Windows still to put in full screen, one at a time: each transition
     /// has to finish before the next starts, or AppKit drops it.
     private var fullScreenQueue: [NSWindow] = []
-    /// A server nobody used for this long is stopped; opening a file of the
-    /// project starts it again.
-    private static let lspIdleSeconds: UInt64 = 600
-    private var lspSweepTimer: Timer?
 
     func application(_ application: NSApplication, open urls: [URL]) {
         guard let url = urls.first else { return }
@@ -32,11 +28,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         StartupProbe.mark("did_finish_launching")
         Log.app.info("launch started")
         bridge.start()
-        // Servers a crashed or force-quit Galaxy left behind keep their memory.
-        Task.detached(priority: .utility) { _ = reapOrphanedLspServers() }
-        lspSweepTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.sweepLanguageServers() }
-        }
         applyAppearancePreference()
         StartupProbe.mark("core_started")
 
@@ -204,17 +195,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         // Session is captured in `applicationShouldTerminate` before AppKit
         // starts closing any windows.
-        lspSweepTimer?.invalidate()
-        lspSweepTimer = nil
-        bridge.shutdownLSP()
-    }
-
-    /// Stops servers no window uses: those of a folder just left at once,
-    /// the rest after `lspIdleSeconds`. Windows share one core, so the open
-    /// documents of all of them count.
-    private func sweepLanguageServers(releasing root: String? = nil) {
-        let open = windowControllers.flatMap { $0.openDocuments }
-        bridge.sweepLSP(open: open, releaseRoot: root, idleSeconds: Self.lspIdleSeconds)
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -290,13 +270,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         controller.onWindowClosed = { [weak self, weak controller] in
             guard let self, let controller else { return }
             self.windowControllers.removeAll { $0 === controller }
-            self.sweepLanguageServers()
             if self.windowControllers.isEmpty && !controller.isClosingForApplicationTermination {
                 Session.remove(at: Session.defaultURL)
             }
-        }
-        controller.onWorkspaceLeft = { [weak self] root in
-            self?.sweepLanguageServers(releasing: root)
         }
         windowControllers.append(controller)
         return controller

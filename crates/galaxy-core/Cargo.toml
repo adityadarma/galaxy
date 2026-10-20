@@ -9,7 +9,6 @@ publish.workspace = true
 
 [dependencies]
 # Plugin checksum verification (artifacts and installed trees).
-sha2.workspace = true
 ropey.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

@@ -237,7 +237,7 @@ impl PhpEngine {
                     .doc
                     .as_deref()
                     .is_some_and(|d| d.starts_with("Attribute listed in"))
-                    || (member.line, member.column) == (owner.line, owner.column);
+                    || member.in_docblock;
                 if member.kind == MemberKind::Property
                     && !member.is_static
                     && listed

@@ -7,7 +7,7 @@
 //!   exposes a synchronous, poll-friendly API for the UI thread.
 //!
 //! Framing is the same `Content-Length` framing LSP uses, so it reuses
-//! `lsp::frame` / `lsp::read_frame`. DAP messages carry no `jsonrpc` field:
+//! `rpc::frame` / `rpc::read_frame`. DAP messages carry no `jsonrpc` field:
 //! `{seq, type: "request"|"response"|"event", ...}`.
 
 use std::collections::HashMap;
@@ -21,7 +21,7 @@ use tokio::io::{AsyncRead, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::runtime::Runtime;
 
-use crate::lsp::{Incoming, frame, read_frame, server_path_env, shared_runtime};
+use crate::rpc::{Incoming, frame, read_frame, server_path_env, shared_runtime};
 
 /// Stack depth fetched after each stop.
 const STACK_LEVELS: u32 = 20;

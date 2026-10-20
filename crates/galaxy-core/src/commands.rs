@@ -331,12 +331,6 @@ const BUILTIN: &[(&str, &str, &str, &[&str])] = &[
         &["cmd+shift+o"],
     ),
     (
-        "workbench.action.gotoWorkspaceSymbol",
-        "Go",
-        "Go to Workspace Symbol…",
-        &["cmd+t"],
-    ),
-    (
         "workbench.action.openUserSettingsJson",
         "Preferences",
         "Open User Settings (JSON)…",
@@ -744,12 +738,6 @@ const BUILTIN: &[(&str, &str, &str, &[&str])] = &[
         &["git", "scm", "changes", "sidebar"],
     ),
     (
-        "workbench.view.extensions",
-        "View",
-        "Show Extensions",
-        &["plugins", "language server", "lsp", "install"],
-    ),
-    (
         "workbench.action.nextEditor",
         "View",
         "Show Next Tab",
@@ -879,34 +867,10 @@ const BUILTIN: &[(&str, &str, &str, &[&str])] = &[
         &["split", "pane"],
     ),
     (
-        "galaxy.restartLanguageServer",
-        "Go",
-        "Restart Language Server",
-        &["lsp", "reload"],
-    ),
-    (
-        "galaxy.stopLanguageServer",
-        "Go",
-        "Stop Language Server",
-        &["lsp", "kill"],
-    ),
-    (
         "editor.action.revealDefinition",
         "Go",
         "Go to Definition",
         &["jump", "declaration"],
-    ),
-    (
-        "editor.action.goToTypeDefinition",
-        "Go",
-        "Go to Type Definition",
-        &["jump"],
-    ),
-    (
-        "editor.action.goToImplementation",
-        "Go",
-        "Go to Implementation",
-        &["jump"],
     ),
     (
         "editor.action.goToReferences",
@@ -931,12 +895,6 @@ const BUILTIN: &[(&str, &str, &str, &[&str])] = &[
         "Edit",
         "Trigger Suggest",
         &["intellisense", "completion", "autocomplete"],
-    ),
-    (
-        "editor.action.formatDocument",
-        "Edit",
-        "Format Document",
-        &["prettier", "indent", "beautify"],
     ),
     ("workbench.action.quit", "Galaxy", "Quit", &["exit"]),
 ];

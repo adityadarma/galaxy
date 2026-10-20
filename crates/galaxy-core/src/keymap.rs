@@ -171,7 +171,6 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("cmd+n", "workbench.action.files.newUntitledFile"),
     ("cmd+o", "workbench.action.files.openFileFolder"),
     ("cmd+shift+o", "workbench.action.gotoSymbol"),
-    ("cmd+t", "workbench.action.gotoWorkspaceSymbol"),
     ("cmd+s", "workbench.action.files.save"),
     ("cmd+shift+s", "workbench.action.files.saveAs"),
     ("cmd+w", "workbench.action.closeActiveEditor"),
@@ -200,7 +199,6 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("cmd+shift+k", "editor.action.deleteLines"),
     ("ctrl+j", "editor.action.joinLines"),
     ("f12", "editor.action.revealDefinition"),
-    ("cmd+f12", "editor.action.goToImplementation"),
     ("shift+f12", "editor.action.goToReferences"),
     ("f2", "editor.action.rename"),
     ("cmd+d", "editor.action.addSelectionToNextFindMatch"),
@@ -251,8 +249,6 @@ pub const DEFAULTS: &[(&str, &str)] = &[
     ("shift+cmd+n", "workbench.action.newWindow"),
     ("cmd+.", "editor.action.quickFix"),
     ("ctrl+space", "editor.action.triggerSuggest"),
-    ("shift+alt+f", "editor.action.formatDocument"),
-    ("shift+cmd+x", "workbench.view.extensions"),
     // Second keys, as in VSCode. The first key of a command stays the
     // one menus show.
     ("f1", "workbench.action.showCommands"),
@@ -500,10 +496,6 @@ mod tests {
             assert_eq!(keys_of(&map, command), keys, "{command}");
         }
         assert_eq!(keys_of(&map, "galaxy.openSettings"), ["cmd+,"]);
-        assert_eq!(
-            keys_of(&map, "editor.action.formatDocument"),
-            ["shift+alt+f"]
-        );
     }
 
     #[test]

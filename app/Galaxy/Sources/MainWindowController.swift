@@ -22,14 +22,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// map runs the full height of the editor instead of under the rows.
     private var stickyTrailing: NSLayoutConstraint!
     private var documentSymbols: [OutlineSymbol] = []
-    private var lastSemanticRequest = Date.distantPast
     private var lastDiagnosticsRevision: UInt64?
     let titleBar = TitleBar()
     let activityBar = ActivityBar()
     private let sourceControl = SourceControlController()
     private let searchSidebar = SearchSidebarController()
-    let extensions = ExtensionsController()
-    private var extensionsGeneration = 0
     private(set) var activeSidebarTab: ActivityBar.Item = .explorer
     let tabBar = TabBar()
     /// Editor groups, left to right (or top to bottom). The tabs below are
@@ -157,13 +154,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     let emptyState = NSStackView()
     let explorer = ExplorerController()
     private(set) var workspace: Workspace?
-    /// Called after this window left a folder (another folder opened, or the
-    /// window closed), so the app can stop that folder's language servers.
-    var onWorkspaceLeft: ((String) -> Void)?
-    /// Documents this window shows, for the app's language-server sweep.
-    var openDocuments: [DocumentHandle] {
-        allTabs.filter { $0.isDocument }.map { $0.doc }
-    }
     var onWindowClosed: (() -> Void)?
     /// Go to File index of `workspace`, built in the background.
     private(set) var fileFinder: FileFinder?
@@ -214,9 +204,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     private var referencesRequest: DocumentHandle?
     private var renameRequest: DocumentHandle?
     private var codeActionRequest: DocumentHandle?
-    private var formattingRequest: DocumentHandle?
     private var outlineRequest: DocumentHandle?
-    private var workspaceSymbolRoot: String?
     private var keyMonitor: Any?
     /// Tabs in the order they were last shown, most recent first (⌃Tab).
     private var tabOrderByUse: [ObjectIdentifier] = []
@@ -929,15 +917,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             item.isEnabled = enabled
         }
         add("Go to Definition", #selector(goToDefinition(_:)))
-        add("Go to Type Definition", #selector(goToTypeDefinition(_:)))
-        add("Go to Implementations", #selector(goToImplementation(_:)))
         add("Go to References", #selector(findReferences(_:)))
         menu.addItem(.separator())
         add("Find All References", #selector(findReferences(_:)))
         menu.addItem(.separator())
         add("Rename Symbol", #selector(renameSymbol(_:)), enabled: !readOnly)
         add("Change All Occurrences", #selector(EditorView.selectAllOccurrences(_:)), target: editorView)
-        add("Format Document", #selector(formatDocument(_:)), enabled: !readOnly)
         add("Refactor…", #selector(showCodeActions(_:)), enabled: !readOnly)
         add("Source Action…", #selector(showCodeActions(_:)), enabled: !readOnly)
         menu.addItem(.separator())
@@ -1198,8 +1183,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             if let document = self?.activeTab?.doc { self?.refreshPanes(showing: document) }
             self?.scheduleAutoSave()
             self?.refreshFindStatus()
-            if let document = self?.activeTab?.doc { self?.bridge.syncLSP(document: document) }
-            self?.bridge.pollLSP()
+            self?.bridge.pollAnalysis()
             self?.requestCompletionIfNeeded()
             self?.refreshGitDiff()
             if self?.isMarkdownPreviewShown == true { self?.updateMarkdownPreview() }
@@ -1319,8 +1303,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 } else {
                     self.showSearchTab()
                 }
-            case .extensions:
-                self.showExtensionsAction(nil)
             }
         }
         titleBar.onToggleSidebar = { [weak self] in self?.toggleSidebarVisibility(nil) }
@@ -1341,13 +1323,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             self.openWorkspaceDiff(workspace, relPath: relPath)
         }
         sourceControl.onRefresh = { [weak self] in self?.refreshGitStatus() }
-        extensions.onInstallSpec = { [weak self] spec, sha in self?.installPlugin(spec: spec, sha256: sha) }
-        extensions.onUpdate = { [weak self] plugin in
-            guard let source = plugin.source else { return }
-            self?.installPlugin(spec: source, sha256: nil)
-        }
-        extensions.onUninstall = { [weak self] id in self?.uninstallPlugin(id: id) }
-        extensions.onSetEnabled = { [weak self] id, enabled in self?.setPluginEnabled(id: id, enabled: enabled) }
         searchSidebar.onSearch = { [weak self] query, options in self?.searchSidebarWorkspace(query, options: options) }
         searchSidebar.onOpen = { [weak self] match in self?.openSearchSidebarMatch(match) }
         searchSidebar.onReplaceAll = { [weak self] query, replacement, options in
@@ -1413,8 +1388,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
         lspTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.bridge.pollLSP()
-                if let self { self.statusBar.showLSP(self.bridge.lspStatus()) }
+                self?.bridge.pollAnalysis()
                 self?.refreshHover()
             self?.refreshCompletion()
                 self?.refreshSignatureHelp()
@@ -1422,17 +1396,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 self?.refreshReferences()
                 self?.refreshRename()
                 self?.refreshCodeActions()
-                self?.refreshFormatting()
                 self?.refreshDocumentSymbols()
-                if let document = self?.activeTab?.doc {
-                    if Date().timeIntervalSince(self?.lastSemanticRequest ?? .distantPast) > 0.5 {
-                        self?.lastSemanticRequest = .now
-                        self?.bridge.requestSemanticTokens(document: document)
-                        self?.bridge.requestInlayHints(document: document, startLine: 0, endLine: document.lineCount())
-                    }
-                    self?.editorView.semanticTokens = self?.bridge.semanticTokens(document: document) ?? []
-                    self?.editorView.inlayHints = self?.bridge.inlayHints(document: document) ?? []
-                }
                 self?.updateStickyScope()
                 self?.reloadSettings()
                 let problems = self?.bridge.core.problems() ?? []
@@ -1662,7 +1626,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         editorView.onCompletionKey = { [weak self] event in self?.handleCompletionKey(event) ?? false }
         editorView.onTextInput = { [weak self] text in
             self?.completionDismissed = false
-            self?.requestOnTypeFormatting(trigger: text)
         }
 
         buildSidebar()
@@ -2048,7 +2011,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     private func requestDefinition(at position: TextPos) -> Bool {
         guard let document = activeTab?.doc else { return false }
-        // laravel-lsp has no log channel provider; the core resolves it.
+        // The core resolves log channels from config/logging.php.
         if let channel = editorView.logChannelName(at: position) {
             if let found = laravelLogChannelLocation(file: document.path(), channel: channel) {
                 jump(to: found)
@@ -2144,7 +2107,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             else { guard let opened = try? bridge.openDocument(path: path) else { continue }; target = opened }
             _ = bridge.applyRenameEdits(document: target, edits: fileEdits)
             if !wasOpen { try? bridge.save(document: target) }
-            bridge.syncLSP(document: target)
         }
         updateEditedState()
     }
@@ -2191,44 +2153,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             }
             _ = bridge.applyRenameEdits(document: target, edits: edits)
             if !wasOpen { try? bridge.save(document: target) }
-            bridge.syncLSP(document: target)
         }
-        updateEditedState()
-        editorView.needsDisplay = true
-    }
-
-    @objc func formatDocument(_ sender: Any?) {
-        guard let document = activeTab?.doc else { NSSound.beep(); return }
-        let selected = document.selectedRange()
-        formattingRequest = document
-        if selected.length > 0 {
-        let indent = document.indentSettings()
-        bridge.requestRangeFormatting(document: document, range: selected, tabSize: UInt64(indent.tabSize), insertSpaces: !indent.useTabs)
-        } else {
-        let indent = document.indentSettings()
-        bridge.requestFormatting(document: document, tabSize: UInt64(indent.tabSize), insertSpaces: !indent.useTabs)
-        }
-    }
-
-    private func requestOnTypeFormatting(trigger: String) {
-        guard trigger == ";" || trigger == "}" || trigger == ")" || trigger == "\n",
-              let document = activeTab?.doc else { return }
-        let position = document.selectedRange().location
-        let cursor = document.positionAt(offset: position)
-        formattingRequest = document
-        let indent = document.indentSettings()
-        bridge.requestOnTypeFormatting(document: document, line: cursor.line, character: cursor.colUtf16, trigger: trigger, tabSize: UInt64(indent.tabSize), insertSpaces: !indent.useTabs)
-    }
-
-    private func refreshFormatting() {
-        guard let document = formattingRequest else { return }
-        let edits = bridge.formattingEdits(document: document)
-        guard !edits.isEmpty else { return }
-        formattingRequest = nil
-        snippetSession = nil
-        snippetDocumentKey = nil
-        _ = bridge.applyFormattingEdits(document: document, edits: edits)
-        bridge.syncLSP(document: document)
         updateEditedState()
         editorView.needsDisplay = true
     }
@@ -2237,20 +2162,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         guard let document = activeTab?.doc else { NSSound.beep(); return }
         let position = document.primaryCursor()
         _ = requestDefinition(at: TextPos(line: position.line, colUtf16: position.colUtf16))
-    }
-
-    @objc func goToTypeDefinition(_ sender: Any?) {
-        guard let document = activeTab?.doc else { NSSound.beep(); return }
-        let position = document.primaryCursor()
-        definitionRequest = (document, TextPos(line: position.line, colUtf16: position.colUtf16))
-        bridge.requestTypeDefinition(document: document, line: position.line, character: position.colUtf16)
-    }
-
-    @objc func goToImplementation(_ sender: Any?) {
-        guard let document = activeTab?.doc else { NSSound.beep(); return }
-        let position = document.primaryCursor()
-        definitionRequest = (document, TextPos(line: position.line, colUtf16: position.colUtf16))
-        bridge.requestImplementation(document: document, line: position.line, character: position.colUtf16)
     }
 
     private func handleCompletionKey(_ event: NSEvent) -> Bool {
@@ -2385,8 +2296,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         sectionHeader.onScmCommit = { [weak self] in self?.sourceControl.commit(nil) }
         sectionHeader.onScmRefresh = { [weak self] in self?.refreshGitStatus() }
         sectionHeader.scmMoreMenu = { [weak self] in self?.sourceControl.moreActionsMenu() ?? NSMenu() }
-        sectionHeader.onExtensionsRefresh = { [weak self] in self?.refreshExtensions(network: true) }
-        sectionHeader.onExtensionsAddRegistry = { [weak self] in self?.addPluginRegistry() }
         sectionHeader.onSearchRefresh = { [weak self] in self?.searchSidebar.refresh() }
         sectionHeader.onSearchClear = { [weak self] in self?.searchSidebar.clearQuery() }
         sectionHeader.onSearchToggleReplace = { [weak self] in self?.searchSidebar.toggleReplace() }
@@ -2423,7 +2332,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         sidebar.addSubview(explorer.scrollView)
         sidebar.addSubview(sourceControl.view)
         sidebar.addSubview(searchSidebar.view)
-        sidebar.addSubview(extensions.view)
         sidebar.addSubview(emptyState)
         NSLayoutConstraint.activate([
             sectionHeader.topAnchor.constraint(equalTo: sidebar.topAnchor),
@@ -2441,10 +2349,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             searchSidebar.view.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor),
             searchSidebar.view.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor),
             searchSidebar.view.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor),
-            extensions.view.topAnchor.constraint(equalTo: sectionHeader.bottomAnchor),
-            extensions.view.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor),
-            extensions.view.trailingAnchor.constraint(equalTo: sidebar.trailingAnchor),
-            extensions.view.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor),
             emptyState.centerXAnchor.constraint(equalTo: sidebar.centerXAnchor).withPriority(.defaultHigh),
             emptyState.centerYAnchor.constraint(equalTo: sidebar.centerYAnchor, constant: -20),
             emptyState.leadingAnchor.constraint(greaterThanOrEqualTo: sidebar.leadingAnchor, constant: 16).withPriority(.defaultLow),
@@ -2452,7 +2356,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         ])
         sourceControl.view.isHidden = true
         searchSidebar.view.isHidden = true
-        extensions.view.isHidden = true
     }
 
     // MARK: Sidebar
@@ -2602,7 +2505,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         case .explorer:
             sourceControl.view.isHidden = true
             searchSidebar.view.isHidden = true
-            extensions.view.isHidden = true
             let hasWorkspace = workspace != nil
             explorer.scrollView.isHidden = !hasWorkspace
             emptyState.isHidden = hasWorkspace
@@ -2614,7 +2516,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             explorer.scrollView.isHidden = true
             emptyState.isHidden = true
             searchSidebar.view.isHidden = true
-            extensions.view.isHidden = true
             sourceControl.view.isHidden = false
             sourceControl.workspace = workspace
             sourceControl.refresh(status: workspace.flatMap { bridge.gitStatus(workspace: $0) })
@@ -2626,19 +2527,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             sourceControl.view.isHidden = true
             emptyState.isHidden = true
             searchSidebar.view.isHidden = false
-            extensions.view.isHidden = true
             sectionHeader.mode = .search
             sectionHeader.title = "SEARCH"
             activityBar.setActive(isSidebarVisible ? .search : nil)
-        case .extensions:
-            explorer.scrollView.isHidden = true
-            sourceControl.view.isHidden = true
-            emptyState.isHidden = true
-            searchSidebar.view.isHidden = true
-            extensions.view.isHidden = false
-            sectionHeader.mode = .extensions
-            sectionHeader.title = "EXTENSIONS"
-            activityBar.setActive(isSidebarVisible ? .extensions : nil)
         }
     }
 
@@ -2654,21 +2545,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         updateSidebarContent()
         setSidebarVisible(true)
         sourceControl.focusMessageInput()
-    }
-
-    @objc func showExtensionsAction(_ sender: Any?) {
-        if isSidebarVisible && activeSidebarTab == .extensions {
-            setSidebarVisible(false)
-        } else {
-            showExtensionsTab()
-        }
-    }
-
-    func showExtensionsTab() {
-        activeSidebarTab = .extensions
-        updateSidebarContent()
-        setSidebarVisible(true)
-        refreshExtensions(network: false)
     }
 
     func showSearchTab() {
@@ -2981,24 +2857,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         add(tab, replacing: nil)
     }
 
-    @objc func restartLanguageServer(_ sender: Any?) {
-        guard let tab = activeTab, let workspace else { NSSound.beep(); return }
-        let language = tab.doc.syntaxLanguage() ?? StatusBar.language(for: tab.doc.path())
-        guard bridge.restartLSP(document: tab.doc, language: language, root: workspace.root()) else {
-            statusLabel.stringValue = "Language server could not be restarted."
-            return
-        }
-        statusLabel.stringValue = "Language server restarting."
-    }
-
-    @objc func stopLanguageServer(_ sender: Any?) {
-        guard let document = activeTab?.doc, bridge.stopLSP(document: document) else {
-            statusLabel.stringValue = "No language server is running."
-            return
-        }
-        statusLabel.stringValue = "Language server stopped."
-    }
-
     // MARK: Tabs (M2-06)
 
     /// Shows tab `index` in the editor. Coming from the tab bar, the
@@ -3034,12 +2892,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         applyDiffPane(for: tab)
         updateMarkdownPreview()
         let root = workspace?.root() ?? (tab.doc.path() as NSString).deletingLastPathComponent
-        statusBar.lspHint = nil
         if tab.isDocument {
             let language = tab.doc.syntaxLanguage() ?? StatusBar.language(for: tab.doc.path())
-            if !bridge.startLSP(document: tab.doc, language: language, root: root) {
-                statusBar.lspHint = bridge.lspUnavailableHint(language: language, root: root)
-            }
+            bridge.registerDocument(document: tab.doc, language: language, root: root)
         }
         if let y = tab.scrollY {
             scrollView.contentView.scroll(to: NSPoint(x: 0, y: y))
@@ -3240,7 +3095,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         guard tab.doc.isModified(), !tab.doc.path().isEmpty else { return }
         do {
             try tab.doc.save()
-            bridge.saveLSP(document: tab.doc)
             tab.isEdited = false
         } catch {
             Log.ui.error("auto-save failed for \(tab.doc.path(), privacy: .public): \(String(describing: error), privacy: .public)")
@@ -3577,177 +3431,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         return alert.runModal() == .alertFirstButtonReturn ? field.stringValue : nil
     }
 
-    // MARK: Extensions (language server plugins)
-
-    /// Shows what an install will run and asks before anything executes.
-    /// Tests replace it.
-    var askConfirmPluginInstall: (_ preview: PluginPreview) -> Bool = { preview in
-        let alert = NSAlert()
-        let verb = preview.previousCommit == nil ? "Install" : "Update"
-        alert.messageText = "\(verb) \"\(preview.name)\" \(preview.version)?"
-        var lines = [
-            "Source: \(preview.source)",
-            "Commit: \(preview.commit.prefix(12))" + (preview.verified ? " (checksum verified)" : ""),
-            "Server: \(preview.server)",
-            "",
-        ]
-        if preview.commands.isEmpty {
-            lines.append("No install commands.")
-        } else {
-            lines.append("These commands run with your permissions:")
-            lines += preview.commands.map { "  \($0)" }
-        }
-        lines += ["", "Only continue if you trust this source."]
-        alert.informativeText = lines.joined(separator: "\n")
-        alert.addButton(withTitle: verb)
-        alert.addButton(withTitle: "Cancel")
-        return alert.runModal() == .alertFirstButtonReturn
-    }
-
-    var askConfirmPluginUninstall: (_ id: String) -> Bool = { id in
-        let alert = NSAlert()
-        alert.messageText = "Uninstall \"\(id)\"?"
-        alert.informativeText = "Its folder is deleted. Built-in plugins are not affected."
-        alert.addButton(withTitle: "Uninstall")
-        alert.addButton(withTitle: "Cancel")
-        return alert.runModal() == .alertFirstButtonReturn
-    }
-
-    var askRegistryURL: () -> String? = {
-        let alert = NSAlert()
-        alert.messageText = "Add Plugin Registry"
-        alert.informativeText = "A git URL (URL#REF to pin a branch or tag) or an absolute folder containing index.json."
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
-        field.placeholderString = "https://host/plugins.git#main"
-        alert.accessoryView = field
-        alert.addButton(withTitle: "Add")
-        alert.addButton(withTitle: "Cancel")
-        alert.window.initialFirstResponder = field
-        return alert.runModal() == .alertFirstButtonReturn ? field.stringValue : nil
-    }
-
-    /// Reloads the list from disk; with `network`, also reads registries and
-    /// checks installed plugins for newer commits.
-    func refreshExtensions(network: Bool) {
-        extensions.show(plugins: pluginList(), hasRegistries: !pluginRegistries().isEmpty)
-        guard network else { return }
-        extensionsGeneration += 1
-        let generation = extensionsGeneration
-        extensions.setStatus("Checking registries and updates…")
-        Task.detached(priority: .utility) { [weak self] in
-            let listing = pluginRegistryEntries()
-            var updates: [String: String] = [:]
-            for plugin in pluginList() where !plugin.builtin {
-                if let latest = try? pluginCheckUpdate(id: plugin.id) { updates[plugin.id] = latest }
-            }
-            await MainActor.run {
-                guard let self, self.extensionsGeneration == generation else { return }
-                self.extensions.show(plugins: pluginList(), available: listing.entries,
-                                     registryErrors: listing.errors, hasRegistries: !pluginRegistries().isEmpty,
-                                     updates: updates)
-                self.extensions.setStatus(updates.isEmpty ? "Up to date." : "\(updates.count) update(s) available.")
-            }
-        }
-    }
-
-    func installPlugin(spec: String, sha256: String?) {
-        extensions.setStatus("Fetching \(spec)…")
-        Task.detached(priority: .userInitiated) { [weak self] in
-            let result = Result { try pluginFetch(spec: spec, sha256: sha256) }
-            await MainActor.run {
-                guard let self else { return }
-                switch result {
-                case .failure(let error):
-                    self.extensions.setStatus("Could not fetch: \(Self.describe(error))")
-                case .success(let preview):
-                    guard self.askConfirmPluginInstall(preview) else {
-                        Task.detached { try? pluginDiscard(token: preview.token) }
-                        self.extensions.setStatus("Cancelled.")
-                        return
-                    }
-                    self.extensions.setStatus("Installing \(preview.name)…")
-                    Task.detached(priority: .userInitiated) { [weak self] in
-                        let installed = Result { try pluginInstall(token: preview.token) }
-                        await MainActor.run {
-                            guard let self else { return }
-                            switch installed {
-                            case .success:
-                                self.extensions.setStatus("Installed \(preview.name) \(preview.version).")
-                                self.pluginsChanged()
-                            case .failure(let error):
-                                self.extensions.setStatus("Install failed: \(Self.describe(error))")
-                                if let window = self.window {
-                                    let alert = NSAlert()
-                                    alert.messageText = "Could not install \(preview.name)"
-                                    alert.informativeText = Self.describe(error)
-                                    alert.beginSheetModal(for: window)
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    func uninstallPlugin(id: String) {
-        guard askConfirmPluginUninstall(id) else { return }
-        do {
-            try pluginUninstall(id: id)
-            extensions.setStatus("Uninstalled \(id).")
-            pluginsChanged()
-        } catch {
-            extensions.setStatus("Uninstall failed: \(Self.describe(error))")
-        }
-    }
-
-    func setPluginEnabled(id: String, enabled: Bool) {
-        do {
-            try pluginSetEnabled(id: id, enabled: enabled)
-            extensions.setStatus("\(enabled ? "Enabled" : "Disabled") \(id).")
-            pluginsChanged()
-        } catch {
-            extensions.setStatus("Could not change \(id): \(Self.describe(error))")
-        }
-    }
-
-    func addPluginRegistry() {
-        guard let url = askRegistryURL()?.trimmingCharacters(in: .whitespacesAndNewlines), !url.isEmpty else { return }
-        do {
-            try pluginAddRegistry(url: url)
-            refreshExtensions(network: true)
-        } catch {
-            extensions.setStatus("Could not add registry: \(Self.describe(error))")
-        }
-    }
-
-    /// Refreshes the list, then brings every open file's servers in line with
-    /// the plugin set that is now installed.
-    private func pluginsChanged() {
-        refreshExtensions(network: false)
-        refreshLanguageServers()
-    }
-
-    /// Starts servers a new plugin adds (companions too), restarts those whose
-    /// command changed and leaves the rest running. Covers every open file,
-    /// not only the active tab, and the project's own servers.
-    private func refreshLanguageServers() {
-        guard let workspace else { return }
-        let root = workspace.root()
-        var failure: String?
-        for tab in allTabs where tab.isDocument {
-            let language = tab.doc.syntaxLanguage() ?? StatusBar.language(for: tab.doc.path())
-            do {
-                _ = try bridge.refreshLSPPlugins(document: tab.doc, language: language, root: root)
-            } catch {
-                failure = Self.describe(error)
-            }
-        }
-        bridge.warmUpLSP(root: root)
-        statusLabel.stringValue = failure.map { "Language server could not be started: \($0)" }
-            ?? "Language servers updated."
-    }
-
     private static func describe(_ error: Error) -> String {
         if case CoreError.Io(let message) = error { return message }
         return String(describing: error)
@@ -4069,7 +3752,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         panel.isHidden = true
         panel.translatesAutoresizingMaskIntoConstraints = false
         panel.onGo = { [weak self] symbol in self?.goTo(symbol) }
-        panel.onQueryChange = { [weak self] query in self?.requestWorkspaceSymbols(query: query) }
         panel.onClose = { [weak self] in self?.closeGoToSymbol() }
         window?.contentView?.addSubview(panel)
         let preferred = panel.widthAnchor.constraint(equalToConstant: OutlinePicker.width)
@@ -4095,30 +3777,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         let panel = outlinePicker
         let fallback = doc.outline()
         panel.reset(symbols: fallback)
-        workspaceSymbolRoot = workspace?.root()
         outlineRequest = doc
-        if let root = workspaceSymbolRoot {
-            bridge.requestWorkspaceSymbols(root: root, query: "")
-        } else {
-            bridge.requestDocumentSymbols(document: doc)
-        }
-        panel.isHidden = false
-        panel.focus()
-    }
-
-    /// Command-T: searches symbols across the active workspace.
-    @objc func showGoToWorkspaceSymbol(_ sender: Any?) {
-        guard let root = workspace?.root() else {
-            statusLabel.stringValue = "Open a workspace to use Go to Workspace Symbol."
-            return NSSound.beep()
-        }
-        if isOutlinePickerVisible { return outlinePicker.move(by: 1) }
-        closeOverlays()
-        let panel = outlinePicker
-        panel.reset(symbols: [])
-        workspaceSymbolRoot = root
-        outlineRequest = nil
-        bridge.requestWorkspaceSymbols(root: root, query: "")
+        bridge.requestDocumentSymbols(document: doc)
         panel.isHidden = false
         panel.focus()
     }
@@ -4132,14 +3792,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         } else {
             documentSymbols = []
             breadcrumbBar.clear()
-        }
-        if let root = workspaceSymbolRoot {
-            let symbols = bridge.workspaceSymbols(root: root)
-            if !symbols.isEmpty {
-                let mapped = symbols.map { OutlineSymbol(uri: $0.uri, name: $0.name, kind: $0.kind, line: $0.line, column: $0.column) }
-                outlinePicker.reset(symbols: mapped)
-            }
-            return
         }
         guard let document = outlineRequest else { return }
         let symbols = bridge.documentSymbols(document: document)
@@ -4201,11 +3853,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         scrollView.reflectScrolledClipView(clip)
         window?.makeFirstResponder(editorView)
         updateStickyScope()
-    }
-
-    private func requestWorkspaceSymbols(query: String) {
-        guard let root = workspaceSymbolRoot else { return }
-        bridge.requestWorkspaceSymbols(root: root, query: query)
     }
 
     func closeGoToSymbol() {
@@ -4873,7 +4520,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             report(error, while: "save \(documentName)")
             return false
         }
-        bridge.saveLSP(document: doc)
         if let tab = activeTab, tab.isDeletedOnDisk {
             tab.isDeletedOnDisk = false
             refreshTabBar()
@@ -4891,7 +4537,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             report(error, while: "save \(url.lastPathComponent)")
             return false
         }
-        bridge.saveLSP(document: doc)
         if let tab = activeTab {
             tab.title = url.lastPathComponent
             tab.windowTitle = url.lastPathComponent
@@ -5152,7 +4797,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         workspaceWatch?.stop()
         workspaceWatch = nil
         onWindowClosed?()
-        if let root = workspace?.root() { onWorkspaceLeft?(root) }
     }
 
     /// ⌘O: pick a file or a folder.
@@ -5197,7 +4841,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         // previous workspace into the new tab bar.
         guard confirmDiscardAllGroups() else { return }
         saveWorkspaceSession()
-        let leftRoot = workspace?.root()
         // Shells belong to the old folder; VSCode reloads the window here.
         resetGroups()
         snippetSession = nil
@@ -5205,7 +4848,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         showNoDocument()
         let ws = try bridge.core.openWorkspace(path: url.path)
         workspace = ws
-        if let leftRoot, leftRoot != ws.root() { onWorkspaceLeft?(leftRoot) }
         titleBar.setProjectTitle(ws.name())
         Self.rememberProject(url.path)
         workspaceSettingsModified = nil
@@ -5216,8 +4858,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         // Ready by the time ⌘P is pressed in all but huge folders.
         rebuildFileFinder()
         startWatching(ws)
-        // Index right away; the status bar shows the server's progress.
-        bridge.warmUpLSP(root: ws.root())
         refreshGitStatus()
         // Apply files.exclude before the explorer lists the new root.
         reloadSettings(force: true)
@@ -5396,7 +5036,6 @@ final class SidebarSectionHeader: NSView {
         case explorer
         case sourceControl
         case search
-        case extensions
     }
 
     static var height: CGFloat { Theme.tabHeight }
@@ -5430,9 +5069,6 @@ final class SidebarSectionHeader: NSView {
     let searchReplaceButton = SidebarSectionHeader.tool("doc.badge.plus", "Toggle Replace")
     let searchFilterButton = SidebarSectionHeader.tool("line.3.horizontal.decrease", "Search Filters")
     let searchMoreButton = SidebarSectionHeader.tool("ellipsis", "More Search Actions…")
-    let extensionsAddRegistryButton = SidebarSectionHeader.tool("plus", "Add Registry…")
-    let extensionsRefreshButton = SidebarSectionHeader.tool("arrow.clockwise", "Refresh and Check for Updates")
-    var extensionsTools: [NSButton] { [extensionsAddRegistryButton, extensionsRefreshButton] }
     var searchTools: [NSButton] { [searchRefreshButton, searchClearButton, searchReplaceButton, searchFilterButton, searchMoreButton] }
 
     var onNewFile: (() -> Void)?
@@ -5447,8 +5083,6 @@ final class SidebarSectionHeader: NSView {
     var onScmRefresh: (() -> Void)?
     var scmMoreMenu: (() -> NSMenu)?
     var onSearchRefresh: (() -> Void)?
-    var onExtensionsRefresh: (() -> Void)?
-    var onExtensionsAddRegistry: (() -> Void)?
     var onSearchClear: (() -> Void)?
     var onSearchToggleReplace: (() -> Void)?
     var onSearchToggleDetails: (() -> Void)?
@@ -5517,16 +5151,7 @@ final class SidebarSectionHeader: NSView {
             button.isHidden = true
         }
 
-        for (button, action) in [
-            (extensionsAddRegistryButton, #selector(extensionsAddRegistryAction(_:))),
-            (extensionsRefreshButton, #selector(extensionsRefreshAction(_:))),
-        ] {
-            button.target = self
-            button.action = action
-            button.isHidden = true
-        }
-
-        let row = NSStackView(views: [label] + tools + scmTools + searchTools + extensionsTools)
+        let row = NSStackView(views: [label] + tools + scmTools + searchTools)
         row.spacing = 3
         row.setCustomSpacing(6, after: label)
         row.translatesAutoresizingMaskIntoConstraints = false
@@ -5548,26 +5173,17 @@ final class SidebarSectionHeader: NSView {
             scmTools.forEach { $0.isHidden = true }
             searchTools.forEach { $0.isHidden = true }
             tools.forEach { $0.isHidden = !showsTools }
-            extensionsTools.forEach { $0.isHidden = true }
             label.stringValue = title.isEmpty ? "EXPLORER" : title.uppercased()
         case .sourceControl:
             tools.forEach { $0.isHidden = true }
             scmTools.forEach { $0.isHidden = false }
             searchTools.forEach { $0.isHidden = true }
-            extensionsTools.forEach { $0.isHidden = true }
             label.stringValue = "SOURCE CONTROL"
         case .search:
             tools.forEach { $0.isHidden = true }
             scmTools.forEach { $0.isHidden = true }
             searchTools.forEach { $0.isHidden = false }
-            extensionsTools.forEach { $0.isHidden = true }
             label.stringValue = "SEARCH"
-        case .extensions:
-            tools.forEach { $0.isHidden = true }
-            scmTools.forEach { $0.isHidden = true }
-            searchTools.forEach { $0.isHidden = true }
-            extensionsTools.forEach { $0.isHidden = false }
-            label.stringValue = "EXTENSIONS"
         }
     }
 
@@ -5610,8 +5226,6 @@ final class SidebarSectionHeader: NSView {
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: scmMoreButton.bounds.maxY + 4), in: scmMoreButton)
     }
     @objc private func searchRefreshAction(_ sender: Any?) { onSearchRefresh?() }
-    @objc private func extensionsRefreshAction(_ sender: Any?) { onExtensionsRefresh?() }
-    @objc private func extensionsAddRegistryAction(_ sender: Any?) { onExtensionsAddRegistry?() }
     @objc private func searchClearAction(_ sender: Any?) { onSearchClear?() }
     @objc private func searchReplaceAction(_ sender: Any?) { onSearchToggleReplace?() }
     @objc private func searchFilterAction(_ sender: Any?) { onSearchToggleDetails?() }

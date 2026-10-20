@@ -376,8 +376,8 @@ pub fn outline(path: &Path, text: &str) -> Vec<OutlineSymbol> {
         let mut children: Vec<OutlineSymbol> = class
             .members
             .iter()
-            // Members read from docblocks sit at the class's own position.
-            .filter(|m| (m.line, m.column) != (class.line, class.column))
+            // Members described by docblock tags are not declarations.
+            .filter(|m| !m.in_docblock)
             .map(|member| OutlineSymbol {
                 name: member.name.clone(),
                 kind: match member.kind {

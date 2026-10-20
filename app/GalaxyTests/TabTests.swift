@@ -395,8 +395,8 @@ final class TabTests: XCTestCase {
         let menu = try XCTUnwrap(c.editorContextMenu())
         let titles = menu.items.filter { !$0.isSeparatorItem }.map(\.title)
         XCTAssertEqual(titles, [
-            "Go to Definition", "Go to Type Definition", "Go to Implementations", "Go to References",
-            "Find All References", "Rename Symbol", "Change All Occurrences", "Format Document",
+            "Go to Definition", "Go to References",
+            "Find All References", "Rename Symbol", "Change All Occurrences",
             "Refactor…", "Source Action…", "Cut", "Copy", "Paste", "Command Palette…",
         ])
         XCTAssertEqual(menu.items.filter(\.isSeparatorItem).count, 4)

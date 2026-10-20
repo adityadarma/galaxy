@@ -66,20 +66,4 @@ final class SyntaxThemeTests: XCTestCase {
         }
         XCTAssertGreaterThan(pink, 10, "keyword run must use its theme color, not the context fill")
     }
-
-    /// LSP names are colored through theme scopes, not drawn as underlines.
-    func testSemanticTokensBecomeStyleRunsByLine() {
-        let view = EditorView(frame: NSRect(x: 0, y: 0, width: 400, height: 100))
-        view.semanticTokens = [
-            SemanticTokenInfo(line: 2, start: 3, length: 4, scope: "type", isDeclaration: false),
-            SemanticTokenInfo(line: 2, start: 9, length: 1, scope: "variable", isDeclaration: false),
-        ]
-        XCTAssertEqual(view.semanticStylesByLine[2], [
-            StyleRun(line: 2, start: 3, end: 7, scope: "type"),
-            StyleRun(line: 2, start: 9, end: 10, scope: "variable"),
-        ])
-        XCTAssertNil(view.semanticStylesByLine[0])
-        view.releaseNonEssentialCaches()
-        XCTAssertTrue(view.semanticStylesByLine.isEmpty)
-    }
 }

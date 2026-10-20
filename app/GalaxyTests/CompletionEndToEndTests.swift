@@ -2,7 +2,7 @@ import XCTest
 @testable import Galaxy
 
 /// Opt-in: run with `TEST_RUNNER_GALAXY_LARAVEL_PATH=/path/to/laravel-app`
-/// and intelephense installed. Types a half-written class constant and
+/// (served by the built-in PHP engine). Types a half-written class constant and
 /// presses Ctrl+Space through the real key path, LSP poll timer and popup.
 @MainActor
 final class CompletionEndToEndTests: XCTestCase {
@@ -46,7 +46,7 @@ final class CompletionEndToEndTests: XCTestCase {
         while c.completionPopup.isHidden, Date() < deadline {
             RunLoop.main.run(until: Date().addingTimeInterval(0.2))
         }
-        print("COMPLETION presses=\(presses) hidden=\(c.completionPopup.isHidden) status=\(c.bridge.lspStatus())")
+        print("COMPLETION presses=\(presses) hidden=\(c.completionPopup.isHidden)")
         print("COMPLETION items=\(c.bridge.completions(document: doc).prefix(5).map(\.label))")
         XCTAssertFalse(c.completionPopup.isHidden, "no suggestion list after ctrl+space")
     }

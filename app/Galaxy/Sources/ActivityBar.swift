@@ -15,14 +15,13 @@ enum CountFormat {
 @MainActor
 final class ActivityBar: NSView {
     enum Item: CaseIterable {
-        case explorer, search, sourceControl, extensions
+        case explorer, search, sourceControl
 
         var symbol: String {
             switch self {
             case .explorer: "folder"
             case .search: "magnifyingglass"
             case .sourceControl: "point.topleft.down.curvedto.point.bottomright.up"
-            case .extensions: "square.grid.2x2"
             }
         }
 
@@ -31,7 +30,6 @@ final class ActivityBar: NSView {
             case .explorer: "Explorer"
             case .search: "Search"
             case .sourceControl: "Source Control"
-            case .extensions: "Extensions"
             }
         }
 
@@ -46,7 +44,6 @@ final class ActivityBar: NSView {
             case .explorer: "Explorer (⇧⌘E)"
             case .search: "Search in Workspace (⇧⌘F)"
             case .sourceControl: "Source Control (⌃⇧G)"
-            case .extensions: "Extensions (⇧⌘X)"
             }
         }
     }

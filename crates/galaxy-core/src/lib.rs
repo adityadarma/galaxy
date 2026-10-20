@@ -4,6 +4,7 @@
 //! `galaxy-ffi`. All heavy work (parsing, indexing, LSP) will live here so the
 //! main thread only renders viewport snapshots.
 
+pub mod analysis;
 pub mod blade;
 pub mod change;
 pub mod clipboard;
@@ -23,15 +24,14 @@ pub mod jsonc;
 pub mod keymap;
 pub mod laravel;
 pub mod logging;
-pub mod lsp;
 pub mod markdown;
 pub mod movement;
 pub mod multicursor;
 pub mod navigation;
 pub mod php;
-pub mod plugins;
 pub mod position;
 pub mod rope_diff;
+pub mod rpc;
 pub mod selection;
 pub mod snippets;
 pub mod syntax;

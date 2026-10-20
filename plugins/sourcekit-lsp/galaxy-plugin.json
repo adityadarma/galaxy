@@ -1,1 +1,0 @@
-{"id":"sourcekit-lsp","name":"SourceKit-LSP","version":"1.0.0","description":"Swift language server. Ships with Xcode, the Command Line Tools and Swift.org toolchains, so nothing is installed.","languages":["swift"],"server":{"command":["sourcekit-lsp"]}}
