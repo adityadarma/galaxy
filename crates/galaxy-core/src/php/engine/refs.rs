@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use tree_sitter::Node;
 
 use super::{Ctx, PhpEngine, Symbol, byte_offset, is_scope, is_stub_path, position_of};
+use crate::php::framework;
 use crate::php::parse::{MemberKind, parse_with_tree};
 
 const MAX_FILES: usize = 20_000;
@@ -109,7 +110,7 @@ impl RefQuery {
                     {
                         stack.push((entry.path(), depth + 1));
                     }
-                } else if name.ends_with(".php") && !name.ends_with(".blade.php") {
+                } else if name.ends_with(".php") && !framework::is_template_name(name) {
                     seen += 1;
                     if seen > MAX_FILES || out.len() >= MAX_CANDIDATES {
                         return out;

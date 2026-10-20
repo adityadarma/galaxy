@@ -57,19 +57,19 @@ pub struct Site {
 
 /// A string literal: `open` is the quote, `start..end` the contents.
 #[derive(Debug, Clone, Copy)]
-struct Str {
-    open: usize,
-    start: usize,
-    end: usize,
-    closed: bool,
+pub(in crate::php) struct Str {
+    pub(in crate::php) open: usize,
+    pub(in crate::php) start: usize,
+    pub(in crate::php) end: usize,
+    pub(in crate::php) closed: bool,
 }
 
 /// A stretch of text that is PHP. `call` is the open parenthesis of the
 /// Blade directive that owns it.
 #[derive(Debug, Clone, Copy)]
-struct Region {
-    start: usize,
-    end: usize,
+pub(in crate::php) struct Region {
+    pub(in crate::php) start: usize,
+    pub(in crate::php) end: usize,
 }
 
 /// Directives that name a view, a translation and so on, with the index of
@@ -193,7 +193,7 @@ const RULE_MARKERS: &[&str] = &[
 ];
 
 /// PHP stretches of a plain `.php` file: from each open tag to its `?>`.
-fn php_regions(text: &str) -> Vec<Region> {
+pub(in crate::php) fn php_regions(text: &str) -> Vec<Region> {
     let mut out = Vec::new();
     let mut at = 0;
     while let Some(open) = text[at..].find("<?") {
@@ -288,12 +288,12 @@ fn blade_regions(text: &str) -> Vec<Region> {
     out
 }
 
-fn is_word(c: u8) -> bool {
+pub(in crate::php) fn is_word(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_'
 }
 
 /// The `)` that closes the `(` at `open`, or the end of the text.
-fn matching_paren(text: &str, open: usize) -> usize {
+pub(in crate::php) fn matching_paren(text: &str, open: usize) -> usize {
     let bytes = text.as_bytes();
     let mut depth = 0i32;
     let mut i = open;
@@ -325,7 +325,7 @@ fn matching_paren(text: &str, open: usize) -> usize {
 /// String literals in the PHP stretches. With `multiline` off, a string
 /// that is not closed on its line ends there, so one unfinished quote does
 /// not swallow the rest of the file while code is being typed.
-fn strings(text: &str, regions: &[Region], multiline: bool) -> Vec<Str> {
+pub(in crate::php) fn strings(text: &str, regions: &[Region], multiline: bool) -> Vec<Str> {
     let bytes = text.as_bytes();
     let mut out = Vec::new();
     for region in regions {
@@ -413,16 +413,21 @@ fn line_offsets(text: &str) -> impl Iterator<Item = (usize, &str)> {
 }
 
 /// How a string sits in the code around it.
-struct Around {
+pub(in crate::php) struct Around {
     /// The `(` of the call whose argument it is.
-    paren: Option<usize>,
+    pub(in crate::php) paren: Option<usize>,
     /// Arguments before it.
-    index: usize,
+    pub(in crate::php) index: usize,
     /// The `[` of the array it is an element of, if any.
-    array: Option<usize>,
+    pub(in crate::php) array: Option<usize>,
 }
 
-fn around(text: &str, string: &Str, floor: usize, closers: &HashMap<usize, usize>) -> Around {
+pub(in crate::php) fn around(
+    text: &str,
+    string: &Str,
+    floor: usize,
+    closers: &HashMap<usize, usize>,
+) -> Around {
     let bytes = text.as_bytes();
     let mut depth = 0i32;
     let mut index = 0usize;
@@ -475,15 +480,15 @@ fn around(text: &str, string: &Str, floor: usize, closers: &HashMap<usize, usize
 }
 
 /// The function, method or directive that is called at `paren`.
-struct Callee {
-    name: String,
+pub(in crate::php) struct Callee {
+    pub(in crate::php) name: String,
     /// `->` or `::`; `None` for plain functions and directives.
-    operator: Option<&'static str>,
+    pub(in crate::php) operator: Option<&'static str>,
     /// Last segment of the class for `::`, the text of the object for `->`.
-    scope: String,
+    pub(in crate::php) scope: String,
 }
 
-fn callee(text: &str, paren: usize) -> Option<Callee> {
+pub(in crate::php) fn callee(text: &str, paren: usize) -> Option<Callee> {
     let before = text[..paren].trim_end();
     let bytes = before.as_bytes();
     let mut start = before.len();
@@ -548,7 +553,7 @@ fn callee(text: &str, paren: usize) -> Option<Callee> {
 
 /// Number of arguments the call at `paren` passes (strings are skipped by
 /// the caller's table of string ends).
-fn argument_count(
+pub(in crate::php) fn argument_count(
     text: &str,
     paren: usize,
     closers: &HashMap<usize, usize>,
@@ -727,7 +732,7 @@ fn value_rule(before: &str, site: &Site) -> Option<Site> {
     before.ends_with("=>").then(|| site.clone())
 }
 
-fn closers_of(strs: &[Str]) -> (HashMap<usize, usize>, HashMap<usize, usize>) {
+pub(in crate::php) fn closers_of(strs: &[Str]) -> (HashMap<usize, usize>, HashMap<usize, usize>) {
     let mut closers = HashMap::new();
     let mut openers = HashMap::new();
     for s in strs.iter().filter(|s| s.closed) {

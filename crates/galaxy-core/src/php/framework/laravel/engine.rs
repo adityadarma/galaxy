@@ -8,13 +8,12 @@ use std::sync::{Arc, OnceLock};
 
 use regex::Regex;
 
-use super::assist::{Action, FileChange};
-use super::diag::{Problem, Severity};
-use super::{
-    Completion, Ctx, HoverResult, ItemKind, PhpEngine, Target, byte_offset, fuzzy, generics,
-    member_operator, position_of, rank, receiver_start,
+use super::{Index, Item, Kind, Loc, Site, site_at, sites};
+use crate::php::engine::{
+    Action, Completion, Ctx, FileChange, HoverResult, ItemKind, PhpEngine, Problem, Severity,
+    Target, byte_offset, fuzzy, member_operator, position_of, rank, receiver_start,
 };
-use crate::php::laravel::{Index, Item, Kind, Loc, Site, site_at, sites};
+use crate::php::generics;
 use crate::php::parse::{ClassInfo, MemberKind, parse_with_tree};
 
 const MAX_ITEMS: usize = 200;
@@ -22,19 +21,17 @@ const MODEL: &str = "Illuminate\\Database\\Eloquent\\Model";
 const RELATIONS: &str = "Illuminate\\Database\\Eloquent\\Relations\\";
 
 pub(super) fn is_blade(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.to_ascii_lowercase().ends_with(".blade.php"))
+    crate::php::framework::is_template(path)
 }
 
 /// What a name resolves to.
-struct Found {
-    detail: String,
-    loc: Option<Loc>,
-    class: Option<String>,
+pub(in crate::php) struct Found {
+    pub(in crate::php) detail: String,
+    pub(in crate::php) loc: Option<Loc>,
+    pub(in crate::php) class: Option<String>,
 }
 
-fn found(item: &Item) -> Found {
+pub(in crate::php) fn found(item: &Item) -> Found {
     Found {
         detail: item.detail.clone(),
         loc: item.loc.clone(),
@@ -76,7 +73,12 @@ fn item_kind(kind: Kind) -> ItemKind {
 }
 
 /// Completions for the items whose name fits `typed`.
-fn named(typed: &str, items: &[Item], kind: ItemKind, from: u32) -> Vec<Completion> {
+pub(in crate::php) fn named(
+    typed: &str,
+    items: &[Item],
+    kind: ItemKind,
+    from: u32,
+) -> Vec<Completion> {
     let mut out: Vec<Completion> = items
         .iter()
         .filter(|item| fuzzy(typed, &item.name))
@@ -172,14 +174,14 @@ fn blade_tag(text: &str, at: usize) -> Option<(Tag, usize, usize)> {
     None
 }
 
-fn pick<'a>(items: &'a [Item], name: &str) -> Option<&'a Item> {
+pub(in crate::php) fn pick<'a>(items: &'a [Item], name: &str) -> Option<&'a Item> {
     items
         .iter()
         .filter(|item| item.name == name)
         .max_by_key(|item| item.class.is_some())
 }
 
-fn target_of(loc: &Loc) -> Target {
+pub(in crate::php) fn target_of(loc: &Loc) -> Target {
     Target {
         path: loc.path.clone(),
         line: loc.line,
@@ -187,7 +189,7 @@ fn target_of(loc: &Loc) -> Target {
     }
 }
 
-fn relative(root: &Path, path: &Path) -> String {
+pub(in crate::php) fn relative(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
         .display()
@@ -195,11 +197,6 @@ fn relative(root: &Path, path: &Path) -> String {
 }
 
 impl PhpEngine {
-    /// `true` for the root of a Laravel application.
-    pub fn is_laravel(&self) -> bool {
-        self.laravel.is_some()
-    }
-
     // ---- model helpers -------------------------------------------------
 
     fn is_model(&mut self, class: &Arc<ClassInfo>) -> bool {
@@ -295,7 +292,7 @@ impl PhpEngine {
     }
 
     /// Public methods of a controller written in the project itself.
-    fn fully_known(&mut self, class: &Arc<ClassInfo>) -> bool {
+    pub(in crate::php) fn fully_known(&mut self, class: &Arc<ClassInfo>) -> bool {
         for owner in self.lineage(class) {
             let parents: Vec<String> = owner
                 .extends
@@ -311,7 +308,11 @@ impl PhpEngine {
         true
     }
 
-    fn action_methods(&mut self, class: &Arc<ClassInfo>, vendor: bool) -> Vec<Item> {
+    pub(in crate::php) fn action_methods(
+        &mut self,
+        class: &Arc<ClassInfo>,
+        vendor: bool,
+    ) -> Vec<Item> {
         let mut out: Vec<Item> = Vec::new();
         for owner in self.lineage(class).into_iter().take(8) {
             if !vendor && owner.path.to_string_lossy().contains("/vendor/") {
@@ -341,7 +342,7 @@ impl PhpEngine {
     }
 
     /// Runs `run` with a context at `byte` of the PHP in `text`.
-    fn with_context<T>(
+    pub(in crate::php) fn with_context<T>(
         &mut self,
         path: &Path,
         text: &str,
@@ -591,12 +592,12 @@ impl PhpEngine {
     /// is not in one, so the caller goes on with plain PHP.
     pub(super) fn laravel_complete(
         &mut self,
+        idx: Arc<Index>,
         path: &Path,
         text: &str,
         line: u32,
         column: u32,
     ) -> Option<Vec<Completion>> {
-        let idx = self.laravel.clone()?;
         let blade = is_blade(path);
         let byte = byte_offset(text, line, column)?;
         if blade && let Some((tag, start, end)) = blade_tag(text, byte) {
@@ -686,12 +687,12 @@ impl PhpEngine {
     /// Where the Laravel string under the cursor is defined.
     pub(super) fn laravel_definition(
         &mut self,
+        idx: Arc<Index>,
         path: &Path,
         text: &str,
         line: u32,
         column: u32,
     ) -> Option<Vec<Target>> {
-        let idx = self.laravel.clone()?;
         let blade = is_blade(path);
         let byte = byte_offset(text, line, column)?;
         if blade && let Some((tag, start, end)) = blade_tag(text, byte) {
@@ -719,7 +720,11 @@ impl PhpEngine {
         Some(self.targets(hit.loc.as_ref(), hit.class.as_deref()))
     }
 
-    fn targets(&mut self, loc: Option<&Loc>, class: Option<&str>) -> Vec<Target> {
+    pub(in crate::php) fn targets(
+        &mut self,
+        loc: Option<&Loc>,
+        class: Option<&str>,
+    ) -> Vec<Target> {
         if let Some(fqn) = class
             && let Some(class) = self.class(fqn)
             && !class.path.as_os_str().is_empty()
@@ -736,12 +741,12 @@ impl PhpEngine {
     /// Documentation for the Laravel string under the cursor.
     pub(super) fn laravel_hover(
         &mut self,
+        idx: Arc<Index>,
         path: &Path,
         text: &str,
         line: u32,
         column: u32,
     ) -> Option<HoverResult> {
-        let idx = self.laravel.clone()?;
         let blade = is_blade(path);
         let byte = byte_offset(text, line, column)?;
         let result = |start: usize, end: usize, markdown: String| HoverResult {
@@ -782,11 +787,13 @@ impl PhpEngine {
     }
 
     /// Strings that name something the project does not have.
-    pub(super) fn laravel_problems(&mut self, path: &Path, text: &str) -> Vec<Problem> {
+    pub(super) fn laravel_problems(
+        &mut self,
+        idx: Arc<Index>,
+        path: &Path,
+        text: &str,
+    ) -> Vec<Problem> {
         const MAX: usize = 200;
-        let Some(idx) = self.laravel.clone() else {
-            return Vec::new();
-        };
         let blade = is_blade(path);
         let mut out = Vec::new();
         for site in sites(text, blade) {
@@ -831,14 +838,12 @@ impl PhpEngine {
     /// Fixes for a missing view, environment variable or Inertia page.
     pub(super) fn laravel_actions(
         &mut self,
+        idx: Arc<Index>,
         path: &Path,
         text: &str,
         byte: usize,
         out: &mut Vec<Action>,
     ) {
-        let Some(idx) = self.laravel.clone() else {
-            return;
-        };
         let Some(site) = site_at(text, byte, is_blade(path)) else {
             return;
         };
@@ -911,7 +916,13 @@ impl PhpEngine {
 }
 
 /// Markdown for a hover: what it is, its value and where it is defined.
-fn describe(what: &str, name: &str, hit: &Found, plain: bool, root: &Path) -> String {
+pub(in crate::php) fn describe(
+    what: &str,
+    name: &str,
+    hit: &Found,
+    plain: bool,
+    root: &Path,
+) -> String {
     let mut out = format!("**{what}** `{name}`");
     if !hit.detail.is_empty() {
         if plain {
@@ -935,7 +946,7 @@ fn describe(what: &str, name: &str, hit: &Found, plain: bool, root: &Path) -> St
 }
 
 /// A change that adds `line` at the end of the file `path`.
-fn append_line(path: PathBuf, line: &str) -> FileChange {
+pub(in crate::php) fn append_line(path: PathBuf, line: &str) -> FileChange {
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let rows = existing.lines().count() as u32;
     if !existing.is_empty() && !existing.ends_with('\n') {

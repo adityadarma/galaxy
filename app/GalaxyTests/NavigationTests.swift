@@ -394,10 +394,10 @@ final class NavigationTests: XCTestCase {
         XCTAssertEqual(caret?.colUtf16, 8)
     }
 
-    func testOnlyLaravelHelperStringsAreLinks() {
+    func testOnlyFrameworkHelperStringsAreLinks() {
         func range(_ text: String, _ literal: String) -> Range<Int>? {
             let r = (text as NSString).range(of: literal)
-            return EditorView.laravelStringRange(in: text, stringStart: r.location, stringEnd: r.location + r.length)
+            return EditorView.frameworkStringRange(in: text, stringStart: r.location, stringEnd: r.location + r.length)
         }
         let config = "$url = config('services.sipay.url');"
         let start = (config as NSString).range(of: "services").location
@@ -412,13 +412,27 @@ final class NavigationTests: XCTestCase {
     func testFacadeAndMethodStringsAreLinks() {
         func range(_ text: String, _ literal: String) -> Range<Int>? {
             let r = (text as NSString).range(of: literal)
-            return EditorView.laravelStringRange(in: text, stringStart: r.location, stringEnd: r.location + r.length)
+            return EditorView.frameworkStringRange(in: text, stringStart: r.location, stringEnd: r.location + r.length)
         }
         XCTAssertNotNil(range("Storage::disk('s3')->put($p, $c);", "'s3'"))
         XCTAssertNotNil(range("Config::get('app.name')", "'app.name'"))
         XCTAssertNotNil(range("\\Illuminate\\Support\\Facades\\Log::channel('queue')", "'queue'"))
         XCTAssertNotNil(range("$path = storage_path('logs/x.log');", "'logs/x.log'"))
         XCTAssertNotNil(range("$this->lang->get('auth.failed')", "'auth.failed'"))
+    }
+
+    func testCodeIgniterAndSymfonyStringsAreLinks() {
+        func range(_ text: String, _ literal: String) -> Range<Int>? {
+            let r = (text as NSString).range(of: literal)
+            return EditorView.frameworkStringRange(in: text, stringStart: r.location, stringEnd: r.location + r.length)
+        }
+        XCTAssertNotNil(range("return route_to('user_profile', 1);", "'user_profile'"))
+        XCTAssertNotNil(range("$text = lang('App.welcome');", "'App.welcome'"))
+        XCTAssertNotNil(range("$m = model('UserModel');", "'UserModel'"))
+        XCTAssertNotNil(range("return $this->render('product/index.html.twig');", "'product/index.html.twig'"))
+        XCTAssertNotNil(range("return $this->redirectToRoute('app_home');", "'app_home'"))
+        XCTAssertNotNil(range("$p = $this->getParameter('kernel.project_dir');", "'kernel.project_dir'"))
+        XCTAssertNil(range("$this->logger->info('app_home');", "'app_home'"))
     }
 
     func testLogChannelNameIsExtracted() {

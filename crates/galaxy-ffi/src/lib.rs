@@ -94,7 +94,10 @@ pub fn core_version() -> String {
 /// containing `file` (`config/logging.php`).
 #[uniffi::export]
 pub fn laravel_log_channel_location(file: String, channel: String) -> Option<DefinitionLocation> {
-    let location = galaxy_core::laravel::log_channel_location(Path::new(&file), &channel)?;
+    let location = galaxy_core::php::framework::laravel::config::log_channel_location(
+        Path::new(&file),
+        &channel,
+    )?;
     Some(DefinitionLocation {
         uri: file_uri(&location.path),
         line: location.line as u64,

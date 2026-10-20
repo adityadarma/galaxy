@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 
-use crate::laravel::flatten_config;
+use super::config::flatten_config;
 
 const MAX_FILES: usize = 4000;
 const MAX_BYTES: u64 = 2 * 1024 * 1024;
@@ -67,7 +67,7 @@ pub struct Index {
     pub has_middleware_source: bool,
 }
 
-fn read(path: &Path) -> Option<String> {
+pub(in crate::php) fn read(path: &Path) -> Option<String> {
     let meta = fs::metadata(path).ok()?;
     if !meta.is_file() || meta.len() > MAX_BYTES {
         return None;
@@ -76,7 +76,7 @@ fn read(path: &Path) -> Option<String> {
 }
 
 /// Files below `dir`, sorted, skipping hidden entries.
-fn walk(dir: &Path) -> Vec<PathBuf> {
+pub(in crate::php) fn walk(dir: &Path) -> Vec<PathBuf> {
     fn go(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
         if depth == 0 || out.len() >= MAX_FILES {
             return;
@@ -103,7 +103,7 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-fn stem(path: &Path) -> String {
+pub(in crate::php) fn stem(path: &Path) -> String {
     path.file_name()
         .and_then(|n| n.to_str())
         .and_then(|n| n.split('.').next())
@@ -136,7 +136,7 @@ fn kebab(name: &str) -> String {
 }
 
 /// Line and UTF-16 column of byte `at`.
-fn position(text: &str, at: usize) -> (u32, u32) {
+pub(in crate::php) fn position(text: &str, at: usize) -> (u32, u32) {
     let before = &text[..at.min(text.len())];
     let line = before.matches('\n').count() as u32;
     let start = before.rfind('\n').map_or(0, |i| i + 1);
@@ -146,7 +146,7 @@ fn position(text: &str, at: usize) -> (u32, u32) {
     )
 }
 
-fn at(path: &Path, text: &str, byte: usize) -> Option<Loc> {
+pub(in crate::php) fn at(path: &Path, text: &str, byte: usize) -> Option<Loc> {
     let (line, column) = position(text, byte);
     Some(Loc {
         path: path.to_path_buf(),
@@ -155,7 +155,7 @@ fn at(path: &Path, text: &str, byte: usize) -> Option<Loc> {
     })
 }
 
-fn file_loc(path: &Path) -> Option<Loc> {
+pub(in crate::php) fn file_loc(path: &Path) -> Option<Loc> {
     Some(Loc {
         path: path.to_path_buf(),
         line: 0,
@@ -164,7 +164,7 @@ fn file_loc(path: &Path) -> Option<Loc> {
 }
 
 /// `use` statements of a file: lowercase alias to class.
-fn uses(text: &str) -> Vec<(String, String)> {
+pub(in crate::php) fn uses(text: &str) -> Vec<(String, String)> {
     static USE: OnceLock<Regex> = OnceLock::new();
     let re =
         USE.get_or_init(|| Regex::new(r"(?m)^use\s+([\w\\]+?)(?:\s+as\s+(\w+))?;").expect("valid"));
@@ -180,7 +180,7 @@ fn uses(text: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-fn resolve(class: &str, uses: &[(String, String)]) -> String {
+pub(in crate::php) fn resolve(class: &str, uses: &[(String, String)]) -> String {
     if let Some(rest) = class.strip_prefix('\\') {
         return rest.to_owned();
     }
@@ -200,7 +200,7 @@ fn resolve(class: &str, uses: &[(String, String)]) -> String {
 }
 
 /// Byte offset of the bracket that closes the one at `open`.
-fn close_of(text: &str, open: usize) -> usize {
+pub(in crate::php) fn close_of(text: &str, open: usize) -> usize {
     let bytes = text.as_bytes();
     let mut depth = 0i32;
     let mut i = open;

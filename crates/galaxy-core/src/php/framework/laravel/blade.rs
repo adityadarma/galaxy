@@ -15,6 +15,11 @@
 
 use crate::syntax::HighlightScope;
 
+/// `true` for the file name of a Blade template.
+pub fn is_blade_name(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(".blade.php")
+}
+
 /// A colored byte range of the scanned text.
 pub type Span = (usize, usize, HighlightScope);
 

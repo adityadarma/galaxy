@@ -5,7 +5,6 @@
 //! main thread only renders viewport snapshots.
 
 pub mod analysis;
-pub mod blade;
 pub mod change;
 pub mod clipboard;
 pub mod commands;
@@ -22,7 +21,6 @@ pub mod grapheme;
 pub mod history;
 pub mod jsonc;
 pub mod keymap;
-pub mod laravel;
 pub mod logging;
 pub mod markdown;
 pub mod movement;

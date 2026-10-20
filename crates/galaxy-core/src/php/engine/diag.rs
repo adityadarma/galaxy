@@ -11,6 +11,7 @@ use regex::Regex;
 use tree_sitter::Node;
 
 use super::{PhpEngine, position_of};
+use crate::php::framework;
 use crate::php::parse::{parse_with_tree, resolve_name};
 
 const MAX_PROBLEMS: usize = 200;
@@ -45,13 +46,16 @@ impl PhpEngine {
     /// Problems in `text`, the content of `path`.
     pub fn diagnostics(&mut self, path: &Path, text: &str) -> Vec<Problem> {
         let previous = self.register_current(path, text);
-        let mut out = if super::laravel::is_blade(path) {
+        let mut out = if framework::is_template(path) {
             Vec::new()
         } else {
             self.diagnostics_inner(path, text)
         };
         if !out.iter().any(|p| p.severity == Severity::Error) {
-            out.extend(self.laravel_problems(path, text));
+            let frameworks = self.frameworks.clone();
+            for fw in &frameworks {
+                out.extend(fw.problems(self, path, text));
+            }
         }
         self.restore_current(path, previous);
         out

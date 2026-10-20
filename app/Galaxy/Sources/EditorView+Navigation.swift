@@ -378,7 +378,7 @@ extension EditorView {
         }
         if Self.nonNavigableScopes.contains(run.scope) { return nil }
         if run.scope == "string" {
-            return Self.laravelStringRange(in: text, stringStart: Int(run.start), stringEnd: Int(run.end))
+            return Self.frameworkStringRange(in: text, stringStart: Int(run.start), stringEnd: Int(run.end))
         }
         return qualified(range, in: text, document: document)
     }
@@ -429,21 +429,27 @@ extension EditorView {
         return range.lowerBound
     }
 
-    /// Global helpers whose string argument the PHP engine can resolve to a file.
-    static let laravelStringHelpers: Set<String> = [
+    /// Global helpers whose string argument the PHP engine can resolve to a
+    /// file: Laravel (`config`, `route`, `view`, ...) and CodeIgniter 4
+    /// (`route_to`, `url_to`, `lang`, `helper`, `model`, `service`) names.
+    static let frameworkStringHelpers: Set<String> = [
         "config", "route", "to_route", "view", "env", "trans", "trans_choice", "__", "asset", "mix", "vite",
         "inertia", "base_path", "resource_path", "config_path", "app_path", "database_path", "lang_path",
         "public_path", "storage_path",
+        "route_to", "url_to", "lang", "helper", "model", "service", "t",
     ]
 
     /// Facade and method names whose string argument the PHP engine (or
     /// Galaxy's own resolver, for `Log::channel`) can resolve, e.g.
-    /// `Storage::disk('s3')`, `Config::get('app.name')`, `$lang->get('x')`.
+    /// `Storage::disk('s3')`, `Config::get('app.name')`, `$lang->get('x')`,
+    /// and Symfony's `generateUrl('route')`, `render('a.html.twig')`.
     /// Other calls such as `Log::info('message')` stay plain text.
-    static let laravelStringMethods: Set<String> = [
+    static let frameworkStringMethods: Set<String> = [
         "get", "getMany", "string", "integer", "boolean", "float", "array", "prepend", "push", "has",
         "hasForLocale", "choice", "disk", "fake", "persistentFake", "forgetDisk", "make", "view", "render",
         "modal", "inertia", "asset", "route", "channel",
+        "generateUrl", "redirectToRoute", "generate", "renderView", "renderForm", "renderBlock",
+        "getParameter", "trans", "htmlTemplate", "textTemplate",
     ]
 
     /// The call a string literal is the first argument of: the function or
@@ -510,7 +516,7 @@ extension EditorView {
 
     static func logChannelName(in text: String, stringStart: Int, stringEnd: Int) -> String? {
         guard isLogChannel(stringCall(in: text, stringStart: stringStart)),
-              let inner = laravelStringRange(in: text, stringStart: stringStart, stringEnd: stringEnd) else { return nil }
+              let inner = frameworkStringRange(in: text, stringStart: stringStart, stringEnd: stringEnd) else { return nil }
         let units = Array(text.utf16)
         return String(utf16CodeUnits: Array(units[inner]), count: inner.count)
     }
@@ -519,16 +525,16 @@ extension EditorView {
     /// argument of a Laravel helper such as `config('app.name')` or of a
     /// resolvable method such as `Storage::disk('s3')`. Any other string,
     /// e.g. a log message, is not a link.
-    static func laravelStringRange(in text: String, stringStart: Int, stringEnd: Int) -> Range<Int>? {
+    static func frameworkStringRange(in text: String, stringStart: Int, stringEnd: Int) -> Range<Int>? {
         let units = Array(text.utf16)
         guard stringStart >= 0, stringEnd <= units.count, stringEnd - stringStart >= 2,
               let call = stringCall(in: text, stringStart: stringStart) else { return nil }
         if call.isMethod {
-            guard laravelStringMethods.contains(call.name) else { return nil }
+            guard frameworkStringMethods.contains(call.name) else { return nil }
             // `channel` is only resolvable on the Log facade.
             if call.name == "channel", !isLogChannel(call) { return nil }
         } else {
-            guard laravelStringHelpers.contains(call.name) else { return nil }
+            guard frameworkStringHelpers.contains(call.name) else { return nil }
         }
         let first = units[stringStart], last = units[stringEnd - 1]
         let quotes: Set<UInt16> = [UInt16(UInt8(ascii: "'")), UInt16(UInt8(ascii: "\""))]

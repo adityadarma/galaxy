@@ -1,12 +1,12 @@
 //! Completion, definition and hover for PHP, answered from sources.
 //!
-//! Nothing here knows a framework. Classes come from Composer's autoload
-//! data (or a workspace scan), and types from declarations and docblocks,
-//! so facades (`@method`), ide-helper models (`@property`), container
-//! helpers (`@template` + `class-string<T>`) and plain PHP all work the
-//! same way.
+//! Nothing here knows a framework by name. Classes come from Composer's
+//! autoload data (or a workspace scan), and types from declarations and
+//! docblocks, so facades (`@method`), ide-helper models (`@property`),
+//! container helpers (`@template` + `class-string<T>`) and plain PHP all
+//! work the same way. Whatever a framework adds is asked through the
+//! [`Framework`] trait; see [`crate::php::framework`].
 
-use crate::php::laravel::Index;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -16,6 +16,7 @@ use regex::Regex;
 use tree_sitter::{Node, Tree};
 
 use super::composer::{Autoload, ClassName};
+use super::framework::{self, Framework};
 use super::generics;
 use super::parse::{
     ClassInfo, ClassKind, FileSymbols, FunctionInfo, Member, MemberKind, Visibility, parse_file,
@@ -25,7 +26,6 @@ use super::stubs::{Stubs, is_stub_path, materialize};
 
 mod assist;
 mod diag;
-mod laravel;
 mod refs;
 
 pub use assist::{Action, Edit, FileChange, OutlineSymbol, Signature, outline};
@@ -95,12 +95,12 @@ struct Parsed {
 }
 
 #[derive(Debug, Clone)]
-struct Ctx<'a> {
-    src: &'a str,
-    tree: &'a Tree,
-    file: &'a FileSymbols,
-    byte: usize,
-    class: Option<Arc<ClassInfo>>,
+pub(in crate::php) struct Ctx<'a> {
+    pub(in crate::php) src: &'a str,
+    pub(in crate::php) tree: &'a Tree,
+    pub(in crate::php) file: &'a FileSymbols,
+    pub(in crate::php) byte: usize,
+    pub(in crate::php) class: Option<Arc<ClassInfo>>,
 }
 
 enum Symbol {
@@ -125,7 +125,7 @@ pub struct Built {
     autoload: Autoload,
     names: Vec<ClassName>,
     scanned: HashMap<String, PathBuf>,
-    laravel: Option<Index>,
+    frameworks: Vec<Arc<dyn Framework>>,
 }
 
 /// Reads Composer's data and walks the autoload directories (and, without
@@ -151,7 +151,7 @@ pub fn build(root: &Path) -> Built {
         autoload,
         names,
         scanned,
-        laravel: Index::detect(root),
+        frameworks: framework::detect_all(root),
     }
 }
 
@@ -182,14 +182,19 @@ pub struct PhpEngine {
     building: bool,
     built_at: Option<Instant>,
     functions: Option<HashMap<String, Arc<FunctionInfo>>>,
-    /// What the project defines, when it is a Laravel application.
-    laravel: Option<Arc<Index>>,
+    /// The frameworks the project uses, asked in order.
+    frameworks: Vec<Arc<dyn Framework>>,
     /// Nesting of return types worked out from method bodies.
     infer_depth: u8,
 }
 
 impl PhpEngine {
     pub fn new(root: &Path) -> Self {
+        Self::with_frameworks(root, framework::detect_all(root))
+    }
+
+    /// Like [`Self::new`], with `frameworks` instead of the detected ones.
+    pub fn with_frameworks(root: &Path, frameworks: Vec<Arc<dyn Framework>>) -> Self {
         Self {
             root: root.to_path_buf(),
             autoload: Autoload::load(root),
@@ -201,13 +206,18 @@ impl PhpEngine {
             building: false,
             built_at: None,
             functions: None,
-            laravel: Index::detect(root).map(Arc::new),
+            frameworks,
             infer_depth: 0,
         }
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// `true` when the project uses the framework called `name`.
+    pub fn is_framework(&self, name: &str) -> bool {
+        self.frameworks.iter().any(|fw| fw.name() == name)
     }
 
     /// An engine that reads nothing yet: Composer data and class names
@@ -225,7 +235,7 @@ impl PhpEngine {
             building: true,
             built_at: None,
             functions: None,
-            laravel: None,
+            frameworks: Vec::new(),
             infer_depth: 0,
         }
     }
@@ -257,7 +267,7 @@ impl PhpEngine {
         self.scanned = Some(built.scanned);
         self.names = Some(Arc::new(built.names));
         self.functions = None;
-        self.laravel = built.laravel.map(Arc::new);
+        self.frameworks = built.frameworks;
         self.building = false;
         self.built_at = Some(Instant::now());
     }
@@ -404,7 +414,7 @@ impl PhpEngine {
     }
 
     /// The class and what it inherits from or mixes in, nearest first.
-    fn lineage(&mut self, class: &Arc<ClassInfo>) -> Vec<Arc<ClassInfo>> {
+    pub(in crate::php) fn lineage(&mut self, class: &Arc<ClassInfo>) -> Vec<Arc<ClassInfo>> {
         let mut out = vec![class.clone()];
         let mut seen = HashSet::from([class.fqn.to_lowercase()]);
         let mut index = 0;
@@ -430,7 +440,7 @@ impl PhpEngine {
         out
     }
 
-    fn find_member(
+    pub(in crate::php) fn find_member(
         &mut self,
         class: &Arc<ClassInfo>,
         name: &str,
@@ -485,51 +495,19 @@ impl PhpEngine {
     ) -> Option<(Arc<ClassInfo>, Member)> {
         self.find_member(class, name, call).or_else(|| {
             if call {
-                self.forwarded_method(class, name)
+                let frameworks = self.frameworks.clone();
+                frameworks
+                    .iter()
+                    .find_map(|fw| fw.forwarded_method(self, class, name))
             } else {
                 self.magic_property_method(class, name)
             }
         })
     }
 
-    /// `Model::create()` and friends: Eloquent models forward calls they do
-    /// not declare to a query builder through `__call` and `__callStatic`.
-    fn forwarded_method(
-        &mut self,
-        class: &Arc<ClassInfo>,
-        name: &str,
-    ) -> Option<(Arc<ClassInfo>, Member)> {
-        const MODEL: &str = "Illuminate\\Database\\Eloquent\\Model";
-        const BUILDER: &str = "Illuminate\\Database\\Eloquent\\Builder";
-        if !self.lineage(class).iter().any(|c| c.fqn == MODEL) {
-            return None;
-        }
-        let builder = self.class(BUILDER)?;
-        self.find_member(&builder, name, true)
-    }
-
-    /// The `Builder<Model>` type that calls a model or relation does not
-    /// declare are forwarded to, when `chain` is one of those.
-    fn forwarding_builder(
-        &mut self,
-        chain: &[(Arc<ClassInfo>, HashMap<String, String>)],
-    ) -> Option<String> {
-        const MODEL: &str = "Illuminate\\Database\\Eloquent\\Model";
-        const RELATION: &str = "Illuminate\\Database\\Eloquent\\Relations\\Relation";
-        const BUILDER: &str = "Illuminate\\Database\\Eloquent\\Builder";
-        self.class(BUILDER)?;
-        let model = if chain.iter().any(|(c, _)| c.fqn == MODEL) {
-            chain[0].0.fqn.clone()
-        } else {
-            let (_, env) = chain.iter().find(|(c, _)| c.fqn == RELATION)?;
-            env.get("TRelatedModel").filter(|m| !m.is_empty())?.clone()
-        };
-        Some(format!("{BUILDER}<{model}>"))
-    }
-
     // ---- type evaluation ---------------------------------------------
 
-    fn class_ref(&mut self, ctx: &Ctx<'_>, name: &str) -> Option<String> {
+    pub(in crate::php) fn class_ref(&mut self, ctx: &Ctx<'_>, name: &str) -> Option<String> {
         match name.to_ascii_lowercase().as_str() {
             "self" | "static" | "$this" => ctx.class.as_ref().map(|c| c.fqn.clone()),
             "parent" => ctx.class.as_ref()?.extends.first().cloned(),
@@ -663,7 +641,10 @@ impl PhpEngine {
             if call {
                 // `$model->where()` and `$relation->create()` reach the
                 // query builder through `__call`.
-                let builder = self.forwarding_builder(&chain)?;
+                let frameworks = self.frameworks.clone();
+                let builder = frameworks
+                    .iter()
+                    .find_map(|fw| fw.forwarding_builder(self, &chain))?;
                 return self.member_type(ctx, &builder, name, args);
             }
             // A read of something that is not a property, on a class with
@@ -756,7 +737,7 @@ impl PhpEngine {
     }
 
     /// The class an expression evaluates to, when it can be told.
-    fn eval(&mut self, ctx: &Ctx<'_>, expr: &str, depth: u8) -> Option<String> {
+    pub(in crate::php) fn eval(&mut self, ctx: &Ctx<'_>, expr: &str, depth: u8) -> Option<String> {
         if depth > MAX_DEPTH {
             return None;
         }
@@ -1077,13 +1058,17 @@ impl PhpEngine {
     /// Suggestions at `(line, column)` of `text`, a UTF-16 column.
     pub fn complete(&mut self, path: &Path, text: &str, line: u32, column: u32) -> Vec<Completion> {
         let previous = self.register_current(path, text);
-        let out = match self.laravel_complete(path, text, line, column) {
+        let frameworks = self.frameworks.clone();
+        let answer = frameworks
+            .iter()
+            .find_map(|fw| fw.complete(self, path, text, line, column));
+        let out = match answer {
             Some(items) => items,
-            None if laravel::is_blade(path) => Vec::new(),
-            // A string that is not one of Laravel's has nothing to suggest.
-            None if self.laravel.is_some()
-                && byte_offset(text, line, column)
-                    .is_some_and(|byte| crate::php::laravel::in_string(text, byte, false)) =>
+            // Templates are not PHP: only a framework has anything to say.
+            None if framework::is_template(path) => Vec::new(),
+            // A string a framework handles but has no suggestion for.
+            None if byte_offset(text, line, column)
+                .is_some_and(|byte| frameworks.iter().any(|fw| fw.owns_string(text, byte))) =>
             {
                 Vec::new()
             }
@@ -1456,14 +1441,16 @@ impl PhpEngine {
     /// Where the symbol under the cursor is declared.
     pub fn definition(&mut self, path: &Path, text: &str, line: u32, column: u32) -> Vec<Target> {
         let previous = self.register_current(path, text);
-        let named = self.laravel_definition(path, text, line, column);
+        let frameworks = self.frameworks.clone();
+        let named = frameworks.iter().find_map(|fw| {
+            fw.definition(self, path, text, line, column)
+                .filter(|targets| !targets.is_empty())
+        });
         self.restore_current(path, previous);
-        if let Some(targets) = named
-            && !targets.is_empty()
-        {
+        if let Some(targets) = named {
             return targets;
         }
-        if laravel::is_blade(path) {
+        if framework::is_template(path) {
             return Vec::new();
         }
         self.with_symbol(path, text, line, column, |engine, _ctx, symbol, _range| {
@@ -1495,12 +1482,15 @@ impl PhpEngine {
         column: u32,
     ) -> Option<HoverResult> {
         let previous = self.register_current(path, text);
-        let named = self.laravel_hover(path, text, line, column);
+        let frameworks = self.frameworks.clone();
+        let named = frameworks
+            .iter()
+            .find_map(|fw| fw.hover(self, path, text, line, column));
         self.restore_current(path, previous);
         if named.is_some() {
             return named;
         }
-        if laravel::is_blade(path) {
+        if framework::is_template(path) {
             return None;
         }
         self.with_symbol(path, text, line, column, |engine, ctx, symbol, range| {
@@ -1908,7 +1898,7 @@ fn keyword_items(prefix: &str) -> Vec<Completion> {
 }
 
 /// `0` exact prefix, `1` other match, behind the caller's group digit.
-fn rank(prefix: &str, name: &str, group: char) -> String {
+pub(in crate::php) fn rank(prefix: &str, name: &str, group: char) -> String {
     let lower = name.to_lowercase();
     let near = if lower.starts_with(&prefix.to_lowercase()) {
         '0'
@@ -1919,7 +1909,7 @@ fn rank(prefix: &str, name: &str, group: char) -> String {
 }
 
 /// Letters of `needle` appear in `haystack` in order, ignoring case.
-fn fuzzy(needle: &str, haystack: &str) -> bool {
+pub(in crate::php) fn fuzzy(needle: &str, haystack: &str) -> bool {
     let mut hay = haystack.chars().flat_map(char::to_lowercase);
     needle
         .chars()
@@ -2106,7 +2096,7 @@ fn split_args(args: &str) -> Vec<&str> {
 }
 
 /// Byte offset of a line and UTF-16 column.
-fn byte_offset(text: &str, line: u32, column: u32) -> Option<usize> {
+pub(in crate::php) fn byte_offset(text: &str, line: u32, column: u32) -> Option<usize> {
     let mut start = 0usize;
     for _ in 0..line {
         start += text[start..].find('\n')? + 1;
@@ -2122,7 +2112,7 @@ fn byte_offset(text: &str, line: u32, column: u32) -> Option<usize> {
 }
 
 /// Line and UTF-16 column of a byte offset.
-fn position_of(text: &str, byte: usize) -> (u32, u32, u32) {
+pub(in crate::php) fn position_of(text: &str, byte: usize) -> (u32, u32, u32) {
     let before = &text[..byte.min(text.len())];
     let line = before.matches('\n').count() as u32;
     let line_start = before.rfind('\n').map_or(0, |i| i + 1);
@@ -2141,7 +2131,7 @@ fn word_start(text: &str, byte: usize) -> usize {
 
 /// If `before` ends with `->`, `?->` or `::`, the byte where the receiver
 /// ends and whether the operator is `::`.
-fn member_operator(before: &str) -> Option<(usize, bool)> {
+pub(in crate::php) fn member_operator(before: &str) -> Option<(usize, bool)> {
     let text = before.trim_end();
     if let Some(rest) = text.strip_suffix("?->") {
         return Some((rest.len(), false));
@@ -2157,7 +2147,7 @@ fn member_operator(before: &str) -> Option<(usize, bool)> {
 
 /// Start of the chain expression that ends at `end`, scanning backwards
 /// over calls, indexes and `->`/`::` links (also across lines).
-fn receiver_start(text: &str, end: usize) -> usize {
+pub(in crate::php) fn receiver_start(text: &str, end: usize) -> usize {
     let bytes = text.as_bytes();
     let skip_ws = |mut i: usize| {
         while i > 0 && bytes[i - 1].is_ascii_whitespace() {
@@ -2259,7 +2249,7 @@ fn scan_sources(root: &Path) -> Vec<(String, PathBuf)> {
                 {
                     stack.push((entry.path(), depth + 1));
                 }
-            } else if name.ends_with(".php") && !name.ends_with(".blade.php") {
+            } else if name.ends_with(".php") && !framework::is_template_name(name) {
                 budget = budget.saturating_sub(1);
                 if budget == 0 {
                     return out;
@@ -2788,7 +2778,7 @@ $plain->items;\n";
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, body).unwrap();
         }
-        let mut engine = PhpEngine::new(root);
+        let mut engine = PhpEngine::with_frameworks(root, eloquent());
         let main = root.join("app/Service.php");
         let text = "<?php\nnamespace App;\n\nLog::create([]);\nLog::missing();\n";
         let found = engine.definition(&main, text, 3, 8);
@@ -2864,7 +2854,7 @@ class Builder
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, body).unwrap();
         }
-        let mut engine = PhpEngine::new(root);
+        let mut engine = PhpEngine::with_frameworks(root, eloquent());
         let main = root.join("app/Run.php");
         let text = "<?php\nnamespace App;\n\nclass Run\n{\n    public function go()\n    {\n        $u = User::find(1);\n        $u->otps()->where('a')->first()->save();\n        $u->otps()->create([])->save();\n    }\n}\n";
         let at = |engine: &mut PhpEngine, line: u32, needle: &str| {
@@ -2884,6 +2874,217 @@ class Builder
         assert!(create[0].path.ends_with("lib/Builder.php"), "{create:?}");
         let save = at(&mut engine, 9, "save");
         assert!(save[0].path.ends_with("lib/Model.php"), "{save:?}");
+    }
+
+    /// Eloquent as Laravel declares it: `first()` lives in the
+    /// `BuildsQueries` trait, whose `TValue` the builder binds with a
+    /// `@use` docblock on its `use` statement.
+    fn query_builder_project() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for (path, body) in [
+            (
+                "composer.json",
+                r#"{"autoload":{"psr-4":{"Illuminate\\Database\\":"lib/","App\\":"app/"}}}"#,
+            ),
+            (
+                "lib/Eloquent/Model.php",
+                "<?php\nnamespace Illuminate\\Database\\Eloquent;\n\nabstract class Model\n{\n    public function __call($method, $parameters) {}\n    public static function __callStatic($method, $parameters) {}\n    public function save(): bool { return true; }\n    /** @return \\Illuminate\\Database\\Eloquent\\Builder<static> */\n    public static function query() {}\n}\n",
+            ),
+            (
+                "lib/Concerns/BuildsQueries.php",
+                r#"<?php
+namespace Illuminate\Database\Concerns;
+
+/**
+ * @template TValue
+ *
+ * @mixin \Illuminate\Database\Query\Builder
+ */
+trait BuildsQueries
+{
+    /**
+     * @param  array|string  $columns
+     * @return TValue|null
+     */
+    public function first($columns = ['*']) {}
+}
+"#,
+            ),
+            (
+                "lib/Query/Builder.php",
+                "<?php\nnamespace Illuminate\\Database\\Query;\n\nclass Builder\n{\n    public function toSql() {}\n}\n",
+            ),
+            (
+                "lib/Eloquent/Collection.php",
+                r#"<?php
+namespace Illuminate\Database\Eloquent;
+
+/**
+ * @template TKey of array-key
+ * @template TModel of \Illuminate\Database\Eloquent\Model
+ *
+ * @implements \IteratorAggregate<TKey, TModel>
+ */
+class Collection implements \IteratorAggregate
+{
+    /** @return TModel|null */
+    public function first() {}
+
+    public function getIterator(): \Traversable {}
+}
+"#,
+            ),
+            (
+                "lib/Eloquent/Builder.php",
+                r#"<?php
+namespace Illuminate\Database\Eloquent;
+
+use Illuminate\Database\Concerns\BuildsQueries;
+
+/**
+ * @template TModel of \Illuminate\Database\Eloquent\Model
+ *
+ * @mixin \Illuminate\Database\Query\Builder
+ */
+class Builder
+{
+    /** @use \Illuminate\Database\Concerns\BuildsQueries<TModel> */
+    use BuildsQueries;
+
+    /** @return $this */
+    public function where($column, $operator = null) { return $this; }
+
+    /** @return $this */
+    public function latest($column = null) { return $this; }
+
+    /** @return TModel */
+    public function firstOrFail($columns = ['*']) {}
+
+    /**
+     * @return ($id is array ? \Illuminate\Database\Eloquent\Collection<int, TModel> : TModel|null)
+     */
+    public function find($id, $columns = ['*']) {}
+
+    /** @return \Illuminate\Database\Eloquent\Collection<int, TModel> */
+    public function get($columns = ['*']) {}
+}
+"#,
+            ),
+            (
+                "lib/Eloquent/Relations/Relation.php",
+                "<?php\nnamespace Illuminate\\Database\\Eloquent\\Relations;\n\n/**\n * @template TRelatedModel of \\Illuminate\\Database\\Eloquent\\Model\n * @template TDeclaringModel of \\Illuminate\\Database\\Eloquent\\Model\n *\n * @mixin \\Illuminate\\Database\\Eloquent\\Builder<TRelatedModel>\n */\nabstract class Relation\n{\n}\n",
+            ),
+            (
+                "lib/Eloquent/Relations/HasMany.php",
+                "<?php\nnamespace Illuminate\\Database\\Eloquent\\Relations;\n\n/**\n * @template TRelatedModel of \\Illuminate\\Database\\Eloquent\\Model\n * @template TDeclaringModel of \\Illuminate\\Database\\Eloquent\\Model\n *\n * @extends \\Illuminate\\Database\\Eloquent\\Relations\\Relation<TRelatedModel, TDeclaringModel>\n */\nclass HasMany extends Relation\n{\n}\n",
+            ),
+            (
+                "app/Post.php",
+                "<?php\nnamespace App;\n\nuse Illuminate\\Database\\Eloquent\\Model;\n\nclass Post extends Model\n{\n    public function publish(): bool { return true; }\n}\n",
+            ),
+            (
+                "app/User.php",
+                "<?php\nnamespace App;\n\nuse Illuminate\\Database\\Eloquent\\Model;\nuse Illuminate\\Database\\Eloquent\\Relations\\HasMany;\n\nclass User extends Model\n{\n    /** @return HasMany<Post, $this> */\n    public function posts(): HasMany {}\n\n    public function isActive(): bool { return true; }\n}\n",
+            ),
+        ] {
+            let full = root.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, body).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn query_builder_chains_resolve_to_the_model() {
+        let dir = query_builder_project();
+        let mut engine = PhpEngine::with_frameworks(dir.path(), eloquent());
+        let main = dir.path().join("app/Run.php");
+        let text = "<?php
+namespace App;
+
+class Run
+{
+    public function go($request, User $owner)
+    {
+        $a = User::where('email', $request->email)->first();
+        $a->isActive();
+        $b = User::where('email', 'x')->firstOrFail();
+        $b->isActive();
+        $c = User::latest()->first();
+        $c->isActive();
+        $d = User::query()->where('a', 1)->first();
+        $d->isActive();
+        $e = User::query()->where('a', 1)->get()->first();
+        $e->isActive();
+        $f = User::where('a', 1)->find(3);
+        $f->isActive();
+        $g = $owner->posts()->where('a', 1)->first();
+        $g->publish();
+        $h = $owner->posts()->latest()->first();
+        $h->publish();
+        foreach (User::query()->where('a', 1)->get() as $item) {
+            $item->isActive();
+        }
+        $i = User::find(1);
+        $i->isActive();
+        $j = User::where('a', 1)->first()->isActive();
+    }
+}
+";
+        let lines: Vec<&str> = text.lines().collect();
+        let cases = [
+            ("$a->isActive", "first()"),
+            ("$b->isActive", "firstOrFail()"),
+            ("$c->isActive", "latest()->first()"),
+            ("$d->isActive", "query()->where()->first()"),
+            ("$e->isActive", "get()->first()"),
+            ("$f->isActive", "where()->find()"),
+            ("$i->isActive", "find()"),
+            ("$item->isActive", "foreach over get()"),
+            (
+                "$j = User::where('a', 1)->first()->isActive",
+                "first()->isActive()",
+            ),
+        ];
+        let mut failures = Vec::new();
+        for (needle, label) in cases {
+            let row = lines.iter().position(|l| l.contains(needle)).unwrap();
+            let column = if needle.starts_with("$j") {
+                lines[row].rfind("isActive").unwrap()
+            } else {
+                lines[row].find("isActive").unwrap()
+            } as u32
+                + 1;
+            let found = engine.definition(&main, text, row as u32, column);
+            if !found
+                .first()
+                .is_some_and(|f| f.path.ends_with("app/User.php"))
+            {
+                failures.push(format!("{label}: {found:?}"));
+            }
+        }
+        for (needle, label) in [
+            ("$g->publish", "relation where()->first()"),
+            ("$h->publish", "relation latest()->first()"),
+        ] {
+            let row = lines.iter().position(|l| l.contains(needle)).unwrap();
+            let column = lines[row].find("publish").unwrap() as u32 + 1;
+            let found = engine.definition(&main, text, row as u32, column);
+            if !found
+                .first()
+                .is_some_and(|f| f.path.ends_with("app/Post.php"))
+            {
+                failures.push(format!("{label}: {found:?}"));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+    }
+
+    /// The mock projects below have no `artisan` script or Laravel
+    /// requirement, so Eloquent forwarding is registered by hand.
+    fn eloquent() -> Vec<Arc<dyn Framework>> {
+        vec![Arc::new(framework::laravel::LaravelFramework::new(None))]
     }
 
     /// A small copy of how Eloquent declares relations.

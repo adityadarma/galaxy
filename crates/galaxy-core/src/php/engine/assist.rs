@@ -6,6 +6,7 @@ use super::{
     Ctx, PhpEngine, byte_offset, clean_doc, import_edit, is_ident, member_operator, position_of,
     receiver_start, word_start,
 };
+use crate::php::framework;
 use crate::php::parse::{ClassKind, MemberKind, parse_file, parse_with_tree};
 
 /// The call the cursor is inside.
@@ -265,14 +266,17 @@ impl PhpEngine {
     pub fn actions(&mut self, path: &Path, text: &str, line: u32, column: u32) -> Vec<Action> {
         let previous = self.register_current(path, text);
         let mut out = Vec::new();
-        let blade = super::laravel::is_blade(path);
+        let template = framework::is_template(path);
         if let Some(byte) = byte_offset(text, line, column) {
-            if !blade {
+            if !template {
                 self.import_actions(path, text, byte, &mut out);
             }
-            self.laravel_actions(path, text, byte, &mut out);
+            let frameworks = self.frameworks.clone();
+            for fw in &frameworks {
+                fw.actions(self, path, text, byte, &mut out);
+            }
         }
-        if !blade {
+        if !template {
             self.unused_import_actions(path, text, line, &mut out);
         }
         self.restore_current(path, previous);

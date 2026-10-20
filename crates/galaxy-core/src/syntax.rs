@@ -55,7 +55,7 @@ pub enum SyntaxLanguage {
     PowerShell,
     Dart,
     R,
-    /// `.blade.php`: HTML grammar plus the [`crate::blade`] overlay.
+    /// `.blade.php`: HTML grammar plus the [`crate::php::framework::laravel::blade`] overlay.
     Blade,
     /// `.vue`: HTML grammar plus `<script>`/`<style>` injection.
     Vue,
@@ -664,8 +664,8 @@ pub fn style_runs_for_viewport(
         // Blade syntax is scanned from the first requested line, so a
         // directive or comment opened further up the file is not seen.
         let text = rope.byte_slice(start_byte..end_byte).to_string();
-        let overlay = crate::blade::scan(&text);
-        spans = crate::blade::subtract(
+        let overlay = crate::php::framework::laravel::blade::scan(&text);
+        spans = crate::php::framework::laravel::blade::subtract(
             spans,
             &overlay
                 .claimed
@@ -682,7 +682,7 @@ pub fn style_runs_for_viewport(
     }
     if language == SyntaxLanguage::Vue {
         let overlay = vue_overlay(rope, tree, start_byte, end_byte);
-        spans = crate::blade::subtract(spans, &overlay.claimed);
+        spans = crate::php::framework::laravel::blade::subtract(spans, &overlay.claimed);
         spans.extend(overlay.spans);
     }
     let mut runs = Vec::new();
@@ -784,11 +784,11 @@ fn vue_overlay(
     tree: &Tree,
     start_byte: usize,
     end_byte: usize,
-) -> crate::blade::Overlay {
+) -> crate::php::framework::laravel::blade::Overlay {
     let mut scan = VueScan {
         rope,
         window: (start_byte, end_byte),
-        overlay: crate::blade::Overlay::default(),
+        overlay: crate::php::framework::laravel::blade::Overlay::default(),
     };
     scan.walk(tree.root_node());
     let mut overlay = scan.overlay;
@@ -803,7 +803,7 @@ fn vue_overlay(
 struct VueScan<'a> {
     rope: &'a Rope,
     window: (usize, usize),
-    overlay: crate::blade::Overlay,
+    overlay: crate::php::framework::laravel::blade::Overlay,
 }
 
 impl VueScan<'_> {

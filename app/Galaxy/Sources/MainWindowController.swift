@@ -1897,7 +1897,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                                  character: completionPosition.colUtf16)
     }
 
-    private func isLaravelFile(_ path: String) -> Bool {
+    private func isPHPFile(_ path: String) -> Bool {
         let name = (path as NSString).lastPathComponent.lowercased()
         return name.hasSuffix(".php")
     }
@@ -1914,8 +1914,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         let prefix = String(beforePrefix.reversed().prefix { $0.isLetter || $0.isNumber || $0 == "_" }.reversed())
         completionQuery = prefix
         var lspTrigger = beforePrefix.hasSuffix(".") || beforePrefix.hasSuffix("::") || beforePrefix.hasSuffix("->")
-        // Laravel names live in strings, Blade directives and component tags.
-        if !lspTrigger, isLaravelFile(document.path()) {
+        // Framework names (Laravel, CodeIgniter, Symfony) live in strings; Blade also has directives and component tags.
+        if !lspTrigger, isPHPFile(document.path()) {
             lspTrigger = beforePrefix.contains("'") || beforePrefix.contains("\"")
                 || beforePrefix.contains("@") || beforePrefix.contains("<x-") || beforePrefix.contains("<livewire:")
         }

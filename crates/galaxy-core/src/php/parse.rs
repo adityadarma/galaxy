@@ -679,8 +679,8 @@ impl<'a> Reader<'a> {
         }
     }
 
-    /// `@extends`, `@implements` (and `@template-` forms) and `@mixin` of a
-    /// class docblock, with the generic arguments they were written with.
+    /// `@extends`, `@implements`, `@use` (and `@template-` forms) and `@mixin`
+    /// of a class docblock or of a trait `use` statement, with the generic arguments they were written with.
     fn generic_parents(&self, doc: Option<&str>, self_fqn: &str) -> Vec<String> {
         let Some(doc) = doc else { return Vec::new() };
         let mut out = Vec::new();
@@ -691,6 +691,8 @@ impl<'a> Reader<'a> {
                 "extends",
                 "template-implements",
                 "implements",
+                "template-use",
+                "use",
                 "mixin",
             ] {
                 let Some(after) = rest.strip_prefix('@').and_then(|r| r.strip_prefix(tag)) else {
@@ -968,7 +970,13 @@ impl<'a> Reader<'a> {
                         });
                     }
                 }
-                "use_declaration" => info.traits.extend(self.names_in(child)),
+                "use_declaration" => {
+                    info.traits.extend(self.names_in(child));
+                    // `/** @use BuildsQueries<TModel> */` binds the trait's templates.
+                    let doc = self.doc_before(child);
+                    let bound = self.generic_parents(doc.as_deref(), &info.fqn);
+                    info.generic_parents.extend(bound);
+                }
                 _ => {}
             }
         }
