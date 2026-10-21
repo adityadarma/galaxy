@@ -22,8 +22,12 @@ use galaxy_core::edit::{self, IndentConfig};
 use galaxy_core::file_finder::FileFinder as CoreFileFinder;
 use galaxy_core::find::{FindError, FindOptions, Finder};
 use galaxy_core::fold::{self, FoldSet};
+use galaxy_core::go::{self, GoEngine};
 use galaxy_core::history::{EditKind, Editor};
 use galaxy_core::keymap::{self, Keymap};
+use galaxy_core::lang::{
+    Action, Completion, HoverResult, OutlineSymbol as LangOutlineSymbol, Problem, Signature, Target,
+};
 use galaxy_core::movement::{self, Motion};
 use galaxy_core::multicursor;
 use galaxy_core::navigation::{self, Location, NavHistory};
@@ -363,6 +367,8 @@ pub struct Core {
     analysis: Mutex<BuiltinStore>,
     /// Built-in PHP engines, one per project root.
     php: Mutex<HashMap<PathBuf, Arc<Mutex<PhpEngine>>>>,
+    /// Built-in Go engines, one per project root.
+    go: Mutex<HashMap<PathBuf, Arc<Mutex<GoEngine>>>>,
     /// Open PHP files, whether or not a language server serves them: the
     /// built-in analysis covers all of them.
     php_documents: Mutex<HashMap<String, std::sync::Weak<DocumentHandle>>>,
@@ -377,6 +383,7 @@ impl Default for Core {
             listener: RwLock::new(None),
             analysis: Mutex::new(BuiltinStore::default()),
             php: Mutex::new(HashMap::new()),
+            go: Mutex::new(HashMap::new()),
             php_documents: Mutex::new(HashMap::new()),
             php_checked: Mutex::new(HashMap::new()),
         }
@@ -454,7 +461,7 @@ impl Core {
             return false;
         }
         let path = Path::new(&path);
-        if !(is_php_path(path) || is_blade_path(path)) {
+        if !(is_php_path(path) || is_blade_path(path) || is_go_path(path)) {
             return false;
         }
         self.php_documents
@@ -478,6 +485,7 @@ impl Core {
             for uri in gone {
                 open.remove(&uri);
                 analysis.forget(&uri);
+                self.release_go_buffer(&uri);
             }
             open.iter()
                 .filter_map(|(uri, weak)| Some((uri.clone(), weak.upgrade()?)))
@@ -514,16 +522,14 @@ impl Core {
             return false;
         }
         let uri = file_uri(Path::new(&path));
-        if let Some(engine) = self.php_engine_any(Path::new(&path)) {
+        let engine = if is_go_path(Path::new(&path)) {
+            self.go_engine(Path::new(&path)).map(Engine::Go)
+        } else {
+            self.php_engine_any(Path::new(&path)).map(Engine::Php)
+        };
+        if let Some(engine) = engine {
             let text = document.lock().editor.doc.text();
-            let found = {
-                let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
-                if engine.is_ready() {
-                    engine.hover(Path::new(&path), &text, line as u32, character as u32)
-                } else {
-                    None
-                }
-            };
+            let found = engine.hover(Path::new(&path), &text, line as u32, character as u32);
             let hover = found.map(|hover| LspHoverInfo {
                 contents: hover.markdown,
                 range: Some(LspRange {
@@ -573,16 +579,14 @@ impl Core {
             return false;
         }
         let uri = file_uri(Path::new(&path));
-        if let Some(engine) = self.php_engine_any(Path::new(&path)) {
+        let engine = if is_go_path(Path::new(&path)) {
+            self.go_engine(Path::new(&path)).map(Engine::Go)
+        } else {
+            self.php_engine_any(Path::new(&path)).map(Engine::Php)
+        };
+        if let Some(engine) = engine {
             let text = document.lock().editor.doc.text();
-            let found = {
-                let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
-                if engine.is_ready() {
-                    engine.complete(Path::new(&path), &text, line as u32, character as u32)
-                } else {
-                    Vec::new()
-                }
-            };
+            let found = engine.complete(Path::new(&path), &text, line as u32, character as u32);
             let items: Vec<LspCompletionItem> =
                 found.into_iter().map(php_completion_item).collect();
             let answered = !items.is_empty();
@@ -637,16 +641,14 @@ impl Core {
             return false;
         }
         let uri = file_uri(Path::new(&path));
-        if let Some(engine) = self.php_engine(Path::new(&path)) {
+        let engine = if is_go_path(Path::new(&path)) {
+            self.go_engine(Path::new(&path)).map(Engine::Go)
+        } else {
+            self.php_engine(Path::new(&path)).map(Engine::Php)
+        };
+        if let Some(engine) = engine {
             let text = document.lock().editor.doc.text();
-            let found = {
-                let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
-                if engine.is_ready() {
-                    engine.signature(Path::new(&path), &text, line as u32, character as u32)
-                } else {
-                    None
-                }
-            };
+            let found = engine.signature(Path::new(&path), &text, line as u32, character as u32);
             let signature = found.map(|found| galaxy_core::analysis::SignatureInfo {
                 label: found.label,
                 documentation: found.documentation,
@@ -795,16 +797,14 @@ impl Core {
             return false;
         }
         let uri = file_uri(Path::new(&path));
-        if let Some(engine) = self.php_engine_any(Path::new(&path)) {
+        let engine = if is_go_path(Path::new(&path)) {
+            self.go_engine(Path::new(&path)).map(Engine::Go)
+        } else {
+            self.php_engine_any(Path::new(&path)).map(Engine::Php)
+        };
+        if let Some(engine) = engine {
             let text = document.lock().editor.doc.text();
-            let found = {
-                let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
-                if engine.is_ready() {
-                    engine.actions(Path::new(&path), &text, line as u32, character as u32)
-                } else {
-                    Vec::new()
-                }
-            };
+            let found = engine.actions(Path::new(&path), &text, line as u32, character as u32);
             let actions: Vec<galaxy_core::analysis::CodeActionInfo> = found
                 .into_iter()
                 .map(|action| galaxy_core::analysis::CodeActionInfo {
@@ -871,11 +871,16 @@ impl Core {
             return false;
         }
         let uri = file_uri(Path::new(&path));
-        if let Some(engine) = self.php_engine(Path::new(&path)) {
+        let engine = if is_go_path(Path::new(&path)) {
+            self.go_engine(Path::new(&path)).map(Engine::Go)
+        } else {
+            self.php_engine(Path::new(&path)).map(Engine::Php)
+        };
+        if let Some(engine) = engine {
             let text = document.lock().editor.doc.text();
-            let ready = engine.lock().unwrap_or_else(|e| e.into_inner()).is_ready();
-            if ready {
-                let symbols: Vec<_> = php::outline(Path::new(&path), &text)
+            if engine.is_ready() {
+                let symbols: Vec<_> = engine
+                    .outline(Path::new(&path), &text)
                     .iter()
                     .map(|symbol| php_outline_symbol(symbol, &uri))
                     .collect();
@@ -1089,7 +1094,258 @@ fn rename_edit(edit: &galaxy_core::analysis::RenameEdit) -> RenameEdit {
     }
 }
 
+/// A built-in engine serving one open file, whatever the language.
+enum Engine {
+    Php(Arc<Mutex<PhpEngine>>),
+    Go(Arc<Mutex<GoEngine>>),
+}
+
+impl Engine {
+    fn is_ready(&self) -> bool {
+        match self {
+            Engine::Php(engine) => engine.lock().unwrap_or_else(|e| e.into_inner()).is_ready(),
+            Engine::Go(engine) => engine.lock().unwrap_or_else(|e| e.into_inner()).is_ready(),
+        }
+    }
+
+    fn hover(&self, path: &Path, text: &str, line: u32, column: u32) -> Option<HoverResult> {
+        match self {
+            Engine::Php(engine) => {
+                let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                engine
+                    .is_ready()
+                    .then(|| engine.hover(path, text, line, column))
+                    .flatten()
+            }
+            Engine::Go(engine) => {
+                let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                engine
+                    .is_ready()
+                    .then(|| engine.hover(path, text, line, column))
+                    .flatten()
+            }
+        }
+    }
+
+    fn complete(&self, path: &Path, text: &str, line: u32, column: u32) -> Vec<Completion> {
+        match self {
+            Engine::Php(engine) => {
+                let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                if engine.is_ready() {
+                    engine.complete(path, text, line, column)
+                } else {
+                    Vec::new()
+                }
+            }
+            Engine::Go(engine) => {
+                let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                if engine.is_ready() {
+                    engine.complete(path, text, line, column)
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+    }
+
+    fn signature(&self, path: &Path, text: &str, line: u32, column: u32) -> Option<Signature> {
+        match self {
+            Engine::Php(engine) => {
+                let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                engine
+                    .is_ready()
+                    .then(|| engine.signature(path, text, line, column))
+                    .flatten()
+            }
+            Engine::Go(engine) => {
+                let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                engine
+                    .is_ready()
+                    .then(|| engine.signature(path, text, line, column))
+                    .flatten()
+            }
+        }
+    }
+
+    fn definition(&self, path: &Path, text: &str, line: u32, column: u32) -> Vec<Target> {
+        match self {
+            Engine::Php(engine) => {
+                let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                if engine.is_ready() {
+                    engine.definition(path, text, line, column)
+                } else {
+                    Vec::new()
+                }
+            }
+            Engine::Go(engine) => {
+                let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                if engine.is_ready() {
+                    engine.definition(path, text, line, column)
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+    }
+
+    fn actions(&self, path: &Path, text: &str, line: u32, column: u32) -> Vec<Action> {
+        match self {
+            Engine::Php(engine) => {
+                let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                if engine.is_ready() {
+                    engine.actions(path, text, line, column)
+                } else {
+                    Vec::new()
+                }
+            }
+            Engine::Go(engine) => {
+                let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                if engine.is_ready() {
+                    engine.actions(path, text, line, column)
+                } else {
+                    Vec::new()
+                }
+            }
+        }
+    }
+
+    fn diagnostics(&self, path: &Path, text: &str) -> Vec<Problem> {
+        match self {
+            Engine::Php(engine) => engine
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .diagnostics(path, text),
+            Engine::Go(engine) => engine
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .diagnostics(path, text),
+        }
+    }
+
+    fn outline(&self, path: &Path, text: &str) -> Vec<LangOutlineSymbol> {
+        match self {
+            Engine::Php(_) => php::outline(path, text),
+            Engine::Go(_) => go::outline(path, text),
+        }
+    }
+}
+
 impl Core {
+    /// The built-in Go engine for the project holding `path`, started on
+    /// first use; its index is built on a worker thread.
+    fn go_engine(&self, path: &Path) -> Option<Arc<Mutex<GoEngine>>> {
+        if !is_go_path(path) {
+            return None;
+        }
+        let root = go::project_root(path);
+        let (engine, fresh) = {
+            let mut engines = self.go.lock().unwrap_or_else(|e| e.into_inner());
+            match engines.get(&root) {
+                Some(engine) => (engine.clone(), false),
+                None => {
+                    let engine = Arc::new(Mutex::new(GoEngine::pending(&root)));
+                    engines.insert(root.clone(), engine.clone());
+                    (engine, true)
+                }
+            }
+        };
+        let stale = engine
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .wants_index(Duration::from_secs(120));
+        if fresh || stale {
+            spawn_go_index(&engine, &root);
+        }
+        Some(engine)
+    }
+
+    /// A closed Go document no longer overrides the file on disk.
+    fn release_go_buffer(&self, uri: &str) {
+        let Some(path) = uri.strip_prefix("file://") else {
+            return;
+        };
+        let path = Path::new(path);
+        if !is_go_path(path) {
+            return;
+        }
+        let engines: Vec<_> = self
+            .go
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        for engine in engines {
+            engine
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .close_document(path);
+        }
+    }
+
+    /// Uses of the Go symbol at the cursor across the project.
+    fn go_usages(
+        &self,
+        document: &Arc<DocumentHandle>,
+        line: u64,
+        character: u64,
+    ) -> Option<Vec<galaxy_core::lang::Occurrence>> {
+        let path = document.path();
+        let engine = self.go_engine(Path::new(&path))?;
+        let text = document.lock().editor.doc.text();
+        let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+        engine
+            .is_ready()
+            .then(|| engine.references(Path::new(&path), &text, line as u32, character as u32))
+    }
+
+    /// Renames the Go symbol at the cursor; `false` when the name is not
+    /// valid, the symbol is external or unknown.
+    fn go_rename(
+        &self,
+        document: &Arc<DocumentHandle>,
+        uri: &str,
+        line: u64,
+        character: u64,
+        new_name: &str,
+    ) -> bool {
+        let path = document.path();
+        let mut edits = Vec::new();
+        if let Some(engine) = self.go_engine(Path::new(&path)) {
+            let text = document.lock().editor.doc.text();
+            let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+            if engine.is_ready()
+                && let Ok(found) = engine.rename(
+                    Path::new(&path),
+                    &text,
+                    line as u32,
+                    character as u32,
+                    new_name.trim(),
+                )
+            {
+                edits = go::rename_edits(&found, new_name.trim())
+                    .into_iter()
+                    .map(|(path, line, start, end, new_text)| LspRenameEdit {
+                        uri: file_uri(&path),
+                        range: LspRange {
+                            start_line: u64::from(line),
+                            start_character: u64::from(start),
+                            end_line: u64::from(line),
+                            end_character: u64::from(end),
+                        },
+                        new_text,
+                    })
+                    .collect();
+            }
+        }
+        let found = !edits.is_empty();
+        self.analysis
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_rename_edits(uri, edits);
+        found
+    }
+
     /// The built-in PHP engine for the project holding `path`, started on
     /// first use. Its index is built on a worker thread and rebuilt when
     /// it grows old, so no request ever walks the file system.
@@ -1146,7 +1402,9 @@ impl Core {
         for (uri, document) in documents {
             let path = document.path();
             if path.is_empty()
-                || !(is_php_path(Path::new(&path)) || is_blade_path(Path::new(&path)))
+                || !(is_php_path(Path::new(&path))
+                    || is_blade_path(Path::new(&path))
+                    || is_go_path(Path::new(&path)))
             {
                 continue;
             }
@@ -1159,18 +1417,20 @@ impl Core {
             if entry.2 || now.duration_since(entry.1) < SETTLE {
                 continue;
             }
-            let Some(engine) = self.php_engine_any(Path::new(&path)) else {
+            let engine = if is_go_path(Path::new(&path)) {
+                self.go_engine(Path::new(&path)).map(Engine::Go)
+            } else {
+                self.php_engine_any(Path::new(&path)).map(Engine::Php)
+            };
+            let Some(engine) = engine else {
                 continue;
             };
+            if !engine.is_ready() {
+                // Try again on the next poll, once the index is built.
+                continue;
+            }
             let text = document.lock().editor.doc.text();
-            let problems = {
-                let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
-                if !engine.is_ready() {
-                    // Try again on the next poll, once the index is built.
-                    continue;
-                }
-                engine.diagnostics(Path::new(&path), &text)
-            };
+            let problems = engine.diagnostics(Path::new(&path), &text);
             entry.2 = true;
             let diagnostics = problems
                 .into_iter()
@@ -1251,9 +1511,13 @@ impl Core {
         line: u64,
         character: u64,
     ) -> bool {
-        let locations: Vec<LspDefinitionLocation> = self
-            .php_usages(document, line, character)
-            .map(|(_, found)| found)
+        let usages = if is_go_path(Path::new(&document.path())) {
+            self.go_usages(document, line, character)
+        } else {
+            self.php_usages(document, line, character)
+                .map(|(_, found)| found)
+        };
+        let locations: Vec<LspDefinitionLocation> = usages
             .unwrap_or_default()
             .into_iter()
             .map(|usage| LspDefinitionLocation {
@@ -1284,6 +1548,9 @@ impl Core {
         character: u64,
         new_name: &str,
     ) -> bool {
+        if is_go_path(Path::new(&document.path())) {
+            return self.go_rename(document, uri, line, character, new_name);
+        }
         let bare = new_name.trim().trim_start_matches('$');
         let mut edits = Vec::new();
         if php::valid_name(bare)
@@ -1331,18 +1598,16 @@ impl Core {
         character: u64,
     ) -> bool {
         let path = document.path();
-        let Some(engine) = self.php_engine_any(Path::new(&path)) else {
+        let engine = if is_go_path(Path::new(&path)) {
+            self.go_engine(Path::new(&path)).map(Engine::Go)
+        } else {
+            self.php_engine_any(Path::new(&path)).map(Engine::Php)
+        };
+        let Some(engine) = engine else {
             return false;
         };
         let text = document.lock().editor.doc.text();
-        let targets = {
-            let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
-            if engine.is_ready() {
-                engine.definition(Path::new(&path), &text, line as u32, character as u32)
-            } else {
-                Vec::new()
-            }
-        };
+        let targets = engine.definition(Path::new(&path), &text, line as u32, character as u32);
         let locations: Vec<LspDefinitionLocation> = targets
             .into_iter()
             .map(|target| LspDefinitionLocation {
@@ -1371,6 +1636,25 @@ fn is_php_path(path: &Path) -> bool {
         .unwrap_or("")
         .to_ascii_lowercase();
     name.ends_with(".php") && !name.ends_with(".blade.php")
+}
+
+fn is_go_path(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("go"))
+}
+
+fn spawn_go_index(engine: &Arc<Mutex<GoEngine>>, root: &Path) {
+    let engine = Arc::clone(engine);
+    let root = root.to_path_buf();
+    let _ = std::thread::Builder::new()
+        .name("go-index".into())
+        .spawn(move || {
+            let built = GoEngine::build(&root);
+            engine
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .install(built);
+        });
 }
 
 fn is_blade_path(path: &Path) -> bool {
@@ -1408,6 +1692,7 @@ fn php_outline_symbol(
         "Interface" => 11,
         "Function" => 12,
         "Constant" => 14,
+        "Variable" => 13,
         "Enum Member" => 22,
         // Traits have no kind of their own; servers report them as classes.
         _ => 5,
@@ -5261,6 +5546,148 @@ mod tests {
 
         // Fixing it clears the problem.
         assert!(report.undo());
+        wait(0);
+    }
+
+    const GO_MAIN: &str = "package main\n\ntype User struct {\n\tName string\n}\n\nfunc (u *User) Greet(greeting string) string {\n\treturn greeting + u.Name\n}\n\nfunc main() {\n\tu := &User{Name: \"a\"}\n\tu.Greet(\"hi\")\n}\n";
+
+    fn go_project() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("go.mod"),
+            "module example.com/app\n\ngo 1.22\n",
+        )
+        .unwrap();
+        let main = dir.path().join("main.go");
+        std::fs::write(&main, GO_MAIN).unwrap();
+        (dir, main.to_string_lossy().into_owned())
+    }
+
+    /// Asks again until the index, built off-thread, is ready.
+    fn until(what: &str, mut ask: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !ask() {
+            assert!(Instant::now() < deadline, "{what}: engine never answered");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn go_files_are_registered_and_other_files_are_not() {
+        let (dir, main_path) = go_project();
+        let core = Core::new();
+        let main = core.open_document(main_path).unwrap();
+        assert!(core.register_document(main, "go".into(), String::new()));
+        let notes = dir.path().join("notes.txt");
+        std::fs::write(&notes, "x").unwrap();
+        let notes = core
+            .open_document(notes.to_string_lossy().into_owned())
+            .unwrap();
+        assert!(!core.register_document(notes, "text".into(), String::new()));
+    }
+
+    #[test]
+    fn go_navigation_comes_from_the_engine() {
+        let (_dir, main_path) = go_project();
+        let core = Core::new();
+        let main = core.open_document(main_path).unwrap();
+
+        until("definition", || {
+            core.request_definition(main.clone(), 12, 4)
+        });
+        let found = core.definition_locations(main.clone());
+        assert_eq!(found.len(), 1);
+        assert!(found[0].uri.ends_with("main.go"));
+        assert_eq!((found[0].line, found[0].column), (6, 15));
+
+        until("hover", || core.request_hover(main.clone(), 12, 4));
+        let hover = core.hover(main.clone()).unwrap();
+        assert!(hover.contents.contains("Greet"), "{}", hover.contents);
+
+        until("references", || {
+            core.request_references(main.clone(), 12, 4)
+        });
+        let mut lines: Vec<u64> = core
+            .references(main.clone())
+            .into_iter()
+            .map(|r| r.line)
+            .collect();
+        lines.sort();
+        assert_eq!(lines, [6, 12]);
+
+        assert!(core.request_rename(main.clone(), 12, 4, "Hello".into()));
+        let edits = core.rename_edits(main.clone());
+        assert_eq!(edits.len(), 2);
+        assert!(edits.iter().all(|e| e.new_text == "Hello"));
+        assert!(!core.request_rename(main.clone(), 12, 4, "1bad".into()));
+
+        until("symbols", || core.request_document_symbols(main.clone()));
+        let names: Vec<String> = core
+            .document_symbols(main.clone())
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(names.contains(&"User".to_owned()), "{names:?}");
+        assert!(names.contains(&"Greet".to_owned()), "{names:?}");
+    }
+
+    #[test]
+    fn go_completion_lists_members_after_a_dot() {
+        let (_dir, main_path) = go_project();
+        let core = Core::new();
+        let main = core.open_document(main_path).unwrap();
+        assert!(main.apply_rename_edits(vec![RenameEdit {
+            uri: String::new(),
+            start_line: 12,
+            start_character: 3,
+            end_line: 12,
+            end_character: 14,
+            new_text: String::new(),
+        }]));
+        until("completion", || {
+            core.request_completion(main.clone(), 12, 3)
+        });
+        let labels: Vec<String> = core
+            .completions(main.clone())
+            .into_iter()
+            .map(|c| c.label)
+            .collect();
+        assert!(labels.contains(&"Name".to_owned()), "{labels:?}");
+        assert!(labels.contains(&"Greet".to_owned()), "{labels:?}");
+    }
+
+    #[test]
+    fn go_problems_reach_the_document_without_a_language_server() {
+        let (_dir, main_path) = go_project();
+        let core = Core::new();
+        let main = core.open_document(main_path).unwrap();
+        assert!(core.register_document(main.clone(), "go".into(), String::new()));
+        let wait = |want: usize| {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                core.poll_analysis();
+                let found = main.lock().diagnostics.clone();
+                if found.len() == want {
+                    return found;
+                }
+                assert!(Instant::now() < deadline, "got {found:?}, wanted {want}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        wait(0);
+
+        assert!(main.apply_rename_edits(vec![RenameEdit {
+            uri: String::new(),
+            start_line: 12,
+            start_character: 1,
+            end_line: 12,
+            end_character: 1,
+            new_text: "unused := 1\n\t".into(),
+        }]));
+        let found = wait(1);
+        assert!(found[0].message.contains("unused"), "{found:?}");
+
+        assert!(main.undo());
         wait(0);
     }
 

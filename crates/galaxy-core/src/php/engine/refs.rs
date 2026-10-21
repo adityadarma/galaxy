@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use tree_sitter::Node;
 
 use super::{Ctx, PhpEngine, Symbol, byte_offset, is_scope, is_stub_path, position_of};
+use crate::lang::Occurrence;
 use crate::php::framework;
 use crate::php::parse::{MemberKind, parse_with_tree};
 
@@ -43,17 +44,6 @@ pub struct RefQuery {
     pub external: bool,
     /// A variable lives in one scope: file and byte span.
     scope: Option<(PathBuf, usize, usize)>,
-}
-
-/// One use of a symbol. Columns are UTF-16 on a single line.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Occurrence {
-    pub path: PathBuf,
-    pub line: u32,
-    pub start_column: u32,
-    pub end_column: u32,
-    /// The range includes the `$` of a variable.
-    pub dollar: bool,
 }
 
 /// Whether `name` can replace a symbol's name (a `$` is allowed in front).

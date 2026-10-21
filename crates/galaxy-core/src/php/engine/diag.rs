@@ -11,30 +11,11 @@ use regex::Regex;
 use tree_sitter::Node;
 
 use super::{PhpEngine, position_of};
+use crate::lang::{Problem, Severity};
 use crate::php::framework;
 use crate::php::parse::{parse_with_tree, resolve_name};
 
 const MAX_PROBLEMS: usize = 200;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Severity {
-    Error,
-    Warning,
-    Hint,
-}
-
-/// A problem in the text. Columns are UTF-16.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Problem {
-    pub start_line: u32,
-    pub start_column: u32,
-    pub end_line: u32,
-    pub end_column: u32,
-    pub severity: Severity,
-    pub message: String,
-    /// Unused code, drawn faded rather than underlined.
-    pub unnecessary: bool,
-}
 
 /// Names that look like classes to the grammar but are not.
 const NOT_CLASSES: &[&str] = &[

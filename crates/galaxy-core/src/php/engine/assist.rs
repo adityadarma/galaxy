@@ -6,56 +6,9 @@ use super::{
     Ctx, PhpEngine, byte_offset, clean_doc, import_edit, is_ident, member_operator, position_of,
     receiver_start, word_start,
 };
+use crate::lang::{Action, Edit, OutlineSymbol, Signature};
 use crate::php::framework;
 use crate::php::parse::{ClassKind, MemberKind, parse_file, parse_with_tree};
-
-/// The call the cursor is inside.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Signature {
-    pub label: String,
-    pub documentation: Option<String>,
-    pub parameters: Vec<String>,
-    /// Index of the argument being typed.
-    pub active: u32,
-}
-
-/// A name of a file's outline, with the members of a class below it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OutlineSymbol {
-    pub name: String,
-    pub kind: &'static str,
-    pub line: u32,
-    pub column: u32,
-    pub children: Vec<OutlineSymbol>,
-}
-
-/// A change to the text; columns are UTF-16.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Edit {
-    pub start_line: u32,
-    pub start_column: u32,
-    pub end_line: u32,
-    pub end_column: u32,
-    pub text: String,
-}
-
-/// Text inserted into another file, which is created when it is missing.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileChange {
-    pub path: std::path::PathBuf,
-    pub line: u32,
-    pub column: u32,
-    pub text: String,
-}
-
-/// A quick fix and the edits that make it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Action {
-    pub title: String,
-    pub edits: Vec<Edit>,
-    /// Changes to other files.
-    pub files: Vec<FileChange>,
-}
 
 const MAX_IMPORT_CHOICES: usize = 8;
 

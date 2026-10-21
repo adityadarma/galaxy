@@ -40,65 +40,15 @@ pub(in crate::php) use helpers::{
     byte_offset, fuzzy, member_operator, position_of, rank, receiver_start,
 };
 
-pub use assist::{Action, Edit, FileChange, OutlineSymbol, Signature, outline};
-pub use diag::{Problem, Severity};
-pub use refs::{Occurrence, RefQuery, finish, valid_name};
+pub use crate::lang::{
+    Action, Completion, Edit, FileChange, HoverResult, Insertion, ItemKind, Occurrence,
+    OutlineSymbol, Problem, Severity, Signature, Target,
+};
+pub use assist::outline;
+pub use refs::{RefQuery, finish, valid_name};
 
 const MAX_ITEMS: usize = 200;
 const MAX_DEPTH: u8 = 8;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ItemKind {
-    Class,
-    Interface,
-    Trait,
-    Enum,
-    Method,
-    Property,
-    Constant,
-    Variable,
-    Function,
-    Keyword,
-}
-
-/// Text to insert at a position of the original document.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Insertion {
-    pub line: u32,
-    pub column: u32,
-    pub text: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Completion {
-    pub label: String,
-    pub detail: Option<String>,
-    pub insert_text: String,
-    pub is_snippet: bool,
-    pub kind: ItemKind,
-    pub sort: String,
-    /// Extra edits elsewhere in the file, such as a `use` import.
-    pub extra: Vec<Insertion>,
-    /// UTF-16 column where the text to replace starts, when it is not just
-    /// the word before the cursor (`app.na` in `config('app.na')`).
-    pub replace_from: Option<u32>,
-}
-
-/// Where a symbol is declared.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Target {
-    pub path: PathBuf,
-    pub line: u32,
-    pub column: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HoverResult {
-    pub markdown: String,
-    pub line: u32,
-    pub start_column: u32,
-    pub end_column: u32,
-}
 
 #[derive(Debug)]
 struct Parsed {

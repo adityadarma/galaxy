@@ -59,8 +59,8 @@ positions, multi-cursor, IME melalui `NSTextInputClient`, dan undo transaction.
 
 ## Navigasi Kode
 
-Engine bawaan Galaxy menyediakan fitur berikut untuk PHP, Blade, dan Laravel.
-Bahasa lain hanya mendapat syntax highlighting sampai engine-nya ada.
+Engine bawaan Galaxy menyediakan fitur berikut untuk PHP, Blade, Laravel, dan
+Go. Bahasa lain hanya mendapat syntax highlighting sampai engine-nya ada.
 
 - Hover.
 - Completion.
@@ -78,7 +78,10 @@ menuju deklarasinya.
 
 Go to Definition (`F12`, atau `Cmd`-klik) dijawab oleh engine bawaan. Untuk
 PHP/Blade, buka root Laravel atau proyek Composer (folder yang memuat
-`composer.json`) agar engine menemukan `vendor/` dan autoload.
+`composer.json`) agar engine menemukan `vendor/` dan autoload. Untuk Go, buka
+folder yang memuat `go.mod` (atau `go.work`); engine membaca GOROOT dan module
+cache untuk paket standar dan dependensi. Modul yang belum diunduh
+(`go mod download`) tidak punya completion atau definition.
 
 ## Terminal
 

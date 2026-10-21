@@ -29,6 +29,10 @@ extension MainWindowController {
         return name.hasSuffix(".php")
     }
 
+    private func isGoFile(_ path: String) -> Bool {
+        (path as NSString).lastPathComponent.lowercased().hasSuffix(".go")
+    }
+
     func requestCompletionIfNeeded(force: Bool = false) {
         guard let document = activeTab?.doc else { return }
         if !force { suggestRetryUntil = nil }
@@ -45,6 +49,10 @@ extension MainWindowController {
         if !lspTrigger, isPHPFile(document.path()) {
             lspTrigger = beforePrefix.contains("'") || beforePrefix.contains("\"")
                 || beforePrefix.contains("@") || beforePrefix.contains("<x-") || beforePrefix.contains("<livewire:")
+        }
+        // Go import paths live in strings: `import "net/ht`.
+        if !lspTrigger, isGoFile(document.path()) {
+            lspTrigger = beforePrefix.contains("\"")
         }
         guard force || !prefix.isEmpty || lspTrigger else {
             snippetCompletionItems = []

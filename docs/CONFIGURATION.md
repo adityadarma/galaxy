@@ -30,9 +30,11 @@ menggunakan Fira Code, install font tersebut di Font Book, buka `Settings`,
 lalu pilih `Fira Code` pada `Editor font`. Ukuran font diatur terpisah dan
 berlaku untuk editor serta terminal.
 
-PHP, Blade, dan Laravel ditangani engine bawaan Galaxy, tanpa language server
-eksternal. Engine membaca source, `composer.json`, dan `vendor/` secara statis
-(PHP tidak dijalankan). Tidak ada yang perlu di-install.
+PHP, Blade, Laravel, dan Go ditangani engine bawaan Galaxy, tanpa language
+server eksternal. Engine PHP membaca source, `composer.json`, dan `vendor/`
+secara statis (PHP tidak dijalankan). Engine Go membaca `go.mod`, `go.work`,
+`vendor/`, GOROOT, dan module cache secara statis (perintah `go` tidak
+dijalankan). Tidak ada yang perlu di-install.
 
 Syntax highlighting saat ini juga mencakup PHP (`.php`) dan file Blade
 (`.blade.php`, memakai grammar PHP untuk bagian PHP). Snippet mendukung
@@ -73,7 +75,19 @@ diagnostics datang dari engine bawaan di dalam proses Galaxy.
 | Bahasa | Status |
 |---|---|
 | PHP/Blade/Laravel | engine bawaan |
-| Rust, TypeScript/JavaScript, Python, Go, Swift, Dart, Vue, Svelte | syntax highlighting saja; engine bawaan belum ada |
+| Go | engine bawaan |
+| Rust, TypeScript/JavaScript, Python, Swift, Dart, Vue, Svelte | syntax highlighting saja; engine bawaan belum ada |
+
+Batas engine Go: tidak ada type checker penuh, jadi diagnostics hanya mencakup
+syntax error, import yang tidak dipakai, import std yang tidak ada, variabel
+yang dideklarasikan tetapi tidak dipakai, dan deklarasi ganda. References dan
+rename menghubungkan method interface dengan implementasi struct workspace
+hanya bila seluruh method set cocok secara struktural; dependensi eksternal
+
+Goravel terdeteksi sebagai framework dan Fiber v2/v3 sebagai library dari
+`require` di `go.mod`. Keduanya dipisahkan dari resolver generik agar dukungan
+site-aware atau API khusus berikutnya tidak mencampur aturan framework dengan
+bahasa Go biasa.
 
 Pengaturan `lsp.servers` dan `servers` tidak dibaca lagi. Format Document,
 Go to Type Definition, Go to Implementation, Go to Workspace Symbol, semantic
