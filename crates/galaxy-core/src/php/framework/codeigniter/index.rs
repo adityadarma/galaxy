@@ -11,10 +11,10 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 
-use crate::php::framework::laravel::config::flatten_config;
-use crate::php::framework::laravel::index::{at, file_loc, position, read};
-use crate::php::framework::laravel::site::matching_paren;
-use crate::php::framework::laravel::{Item, Loc};
+use crate::php::framework::common::files::{
+    Item, Loc, at, file_loc, flatten_config, position, read,
+};
+use crate::php::framework::common::scan::matching_paren;
 
 /// Most files one directory walk collects.
 pub const MAX_FILES: usize = 20_000;

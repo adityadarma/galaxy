@@ -11,32 +11,19 @@ use regex::Regex;
 use super::{Index, Item, Kind, Loc, Site, site_at, sites};
 use crate::php::engine::{
     Action, Completion, Ctx, FileChange, HoverResult, ItemKind, PhpEngine, Problem, Severity,
-    Target, byte_offset, fuzzy, member_operator, position_of, rank, receiver_start,
+    Target, byte_offset, member_operator, position_of, receiver_start,
+};
+use crate::php::framework::common::complete::{
+    Found, describe, found, named, pick, relative, target_of,
 };
 use crate::php::generics;
 use crate::php::parse::{ClassInfo, MemberKind, parse_with_tree};
 
-const MAX_ITEMS: usize = 200;
 const MODEL: &str = "Illuminate\\Database\\Eloquent\\Model";
 const RELATIONS: &str = "Illuminate\\Database\\Eloquent\\Relations\\";
 
 pub(super) fn is_blade(path: &Path) -> bool {
     crate::php::framework::is_template(path)
-}
-
-/// What a name resolves to.
-pub(in crate::php) struct Found {
-    pub(in crate::php) detail: String,
-    pub(in crate::php) loc: Option<Loc>,
-    pub(in crate::php) class: Option<String>,
-}
-
-pub(in crate::php) fn found(item: &Item) -> Found {
-    Found {
-        detail: item.detail.clone(),
-        loc: item.loc.clone(),
-        class: item.class.clone(),
-    }
 }
 
 fn label(kind: Kind) -> &'static str {
@@ -70,33 +57,6 @@ fn item_kind(kind: Kind) -> ItemKind {
         Kind::Binding | Kind::Livewire | Kind::Middleware => ItemKind::Class,
         _ => ItemKind::Function,
     }
-}
-
-/// Completions for the items whose name fits `typed`.
-pub(in crate::php) fn named(
-    typed: &str,
-    items: &[Item],
-    kind: ItemKind,
-    from: u32,
-) -> Vec<Completion> {
-    let mut out: Vec<Completion> = items
-        .iter()
-        .filter(|item| fuzzy(typed, &item.name))
-        .map(|item| Completion {
-            label: item.name.clone(),
-            detail: (!item.detail.is_empty()).then(|| item.detail.clone()),
-            insert_text: item.name.clone(),
-            is_snippet: false,
-            kind,
-            sort: rank(typed, &item.name, '0'),
-            extra: Vec::new(),
-            replace_from: Some(from),
-        })
-        .collect();
-    out.sort_by(|a, b| a.sort.cmp(&b.sort));
-    out.dedup_by(|a, b| a.label == b.label);
-    out.truncate(MAX_ITEMS);
-    out
 }
 
 fn snake(name: &str) -> String {
@@ -172,28 +132,6 @@ fn blade_tag(text: &str, at: usize) -> Option<(Tag, usize, usize)> {
         }
     }
     None
-}
-
-pub(in crate::php) fn pick<'a>(items: &'a [Item], name: &str) -> Option<&'a Item> {
-    items
-        .iter()
-        .filter(|item| item.name == name)
-        .max_by_key(|item| item.class.is_some())
-}
-
-pub(in crate::php) fn target_of(loc: &Loc) -> Target {
-    Target {
-        path: loc.path.clone(),
-        line: loc.line,
-        column: loc.column,
-    }
-}
-
-pub(in crate::php) fn relative(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .display()
-        .to_string()
 }
 
 impl PhpEngine {
@@ -291,58 +229,8 @@ impl PhpEngine {
         out
     }
 
-    /// Public methods of a controller written in the project itself.
-    pub(in crate::php) fn fully_known(&mut self, class: &Arc<ClassInfo>) -> bool {
-        for owner in self.lineage(class) {
-            let parents: Vec<String> = owner
-                .extends
-                .iter()
-                .chain(&owner.traits)
-                .chain(&owner.implements)
-                .cloned()
-                .collect();
-            if parents.iter().any(|p| self.class(p).is_none()) {
-                return false;
-            }
-        }
-        true
-    }
-
-    pub(in crate::php) fn action_methods(
-        &mut self,
-        class: &Arc<ClassInfo>,
-        vendor: bool,
-    ) -> Vec<Item> {
-        let mut out: Vec<Item> = Vec::new();
-        for owner in self.lineage(class).into_iter().take(8) {
-            if !vendor && owner.path.to_string_lossy().contains("/vendor/") {
-                continue;
-            }
-            for member in &owner.members {
-                if member.kind == MemberKind::Method
-                    && member.visibility == crate::php::parse::Visibility::Public
-                    && !member.is_static
-                    && !member.name.starts_with("__")
-                    && !out.iter().any(|i| i.name == member.name)
-                {
-                    out.push(Item {
-                        name: member.name.clone(),
-                        detail: member.detail.clone(),
-                        loc: Some(Loc {
-                            path: owner.path.clone(),
-                            line: member.line,
-                            column: member.column,
-                        }),
-                        class: None,
-                    });
-                }
-            }
-        }
-        out
-    }
-
     /// Runs `run` with a context at `byte` of the PHP in `text`.
-    pub(in crate::php) fn with_context<T>(
+    fn with_context<T>(
         &mut self,
         path: &Path,
         text: &str,
@@ -720,11 +608,7 @@ impl PhpEngine {
         Some(self.targets(hit.loc.as_ref(), hit.class.as_deref()))
     }
 
-    pub(in crate::php) fn targets(
-        &mut self,
-        loc: Option<&Loc>,
-        class: Option<&str>,
-    ) -> Vec<Target> {
+    fn targets(&mut self, loc: Option<&Loc>, class: Option<&str>) -> Vec<Target> {
         if let Some(fqn) = class
             && let Some(class) = self.class(fqn)
             && !class.path.as_os_str().is_empty()
@@ -915,38 +799,8 @@ impl PhpEngine {
     }
 }
 
-/// Markdown for a hover: what it is, its value and where it is defined.
-pub(in crate::php) fn describe(
-    what: &str,
-    name: &str,
-    hit: &Found,
-    plain: bool,
-    root: &Path,
-) -> String {
-    let mut out = format!("**{what}** `{name}`");
-    if !hit.detail.is_empty() {
-        if plain {
-            out.push_str(&format!("\n\n{}", hit.detail));
-        } else {
-            out.push_str(&format!("\n\n`{}`", hit.detail.replace('`', "'")));
-        }
-    }
-    if let Some(class) = &hit.class {
-        out.push_str(&format!("\n\n`{class}`"));
-    }
-    if let Some(loc) = &hit.loc {
-        let file = relative(root, &loc.path);
-        if loc.line == 0 && loc.column == 0 {
-            out.push_str(&format!("\n\nDefined in `{file}`"));
-        } else {
-            out.push_str(&format!("\n\nDefined in `{file}:{}`", loc.line + 1));
-        }
-    }
-    out
-}
-
 /// A change that adds `line` at the end of the file `path`.
-pub(in crate::php) fn append_line(path: PathBuf, line: &str) -> FileChange {
+fn append_line(path: PathBuf, line: &str) -> FileChange {
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let rows = existing.lines().count() as u32;
     if !existing.is_empty() && !existing.ends_with('\n') {

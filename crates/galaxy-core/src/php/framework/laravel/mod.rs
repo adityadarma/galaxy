@@ -11,7 +11,7 @@
 pub mod blade;
 pub mod config;
 mod eloquent;
-pub(in crate::php::framework) mod engine;
+mod engine;
 pub mod index;
 pub mod site;
 

@@ -28,6 +28,7 @@ use crate::php::engine::{Action, Completion, HoverResult, PhpEngine, Problem, Ta
 use crate::php::parse::{ClassInfo, Member};
 
 pub mod codeigniter;
+pub(in crate::php) mod common;
 pub mod laravel;
 pub mod symfony;
 

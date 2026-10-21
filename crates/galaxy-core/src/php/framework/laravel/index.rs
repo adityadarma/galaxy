@@ -11,28 +11,10 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 
-use super::config::flatten_config;
-
-const MAX_FILES: usize = 4000;
-const MAX_BYTES: u64 = 2 * 1024 * 1024;
-
-/// Where a name is defined. Line and UTF-16 column are 0-based.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Loc {
-    pub path: PathBuf,
-    pub line: u32,
-    pub column: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct Item {
-    pub name: String,
-    /// A value, a signature or a short description.
-    pub detail: String,
-    pub loc: Option<Loc>,
-    /// Fully qualified class behind the name, when there is one.
-    pub class: Option<String>,
-}
+pub use crate::php::framework::common::files::{Item, Loc};
+use crate::php::framework::common::files::{
+    at, close_of, file_loc, flatten_config, read, resolve, stem, uses, walk,
+};
 
 /// A database table and the columns migrations give it.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -67,50 +49,6 @@ pub struct Index {
     pub has_middleware_source: bool,
 }
 
-pub(in crate::php) fn read(path: &Path) -> Option<String> {
-    let meta = fs::metadata(path).ok()?;
-    if !meta.is_file() || meta.len() > MAX_BYTES {
-        return None;
-    }
-    fs::read_to_string(path).ok()
-}
-
-/// Files below `dir`, sorted, skipping hidden entries.
-pub(in crate::php) fn walk(dir: &Path) -> Vec<PathBuf> {
-    fn go(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
-        if depth == 0 || out.len() >= MAX_FILES {
-            return;
-        }
-        let Ok(entries) = fs::read_dir(dir) else {
-            return;
-        };
-        let mut entries: Vec<_> = entries.flatten().collect();
-        entries.sort_by_key(|e| e.file_name());
-        for entry in entries {
-            if entry.file_name().to_string_lossy().starts_with('.') {
-                continue;
-            }
-            let path = entry.path();
-            if path.is_dir() {
-                go(&path, depth - 1, out);
-            } else {
-                out.push(path);
-            }
-        }
-    }
-    let mut out = Vec::new();
-    go(dir, 8, &mut out);
-    out
-}
-
-pub(in crate::php) fn stem(path: &Path) -> String {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .and_then(|n| n.split('.').next())
-        .unwrap_or("")
-        .to_owned()
-}
-
 /// `a/b/c.blade.php` below `base` as `a.b.c`.
 fn dotted(base: &Path, path: &Path) -> Option<String> {
     let rel = path.strip_prefix(base).ok()?.to_str()?;
@@ -133,100 +71,6 @@ fn kebab(name: &str) -> String {
         }
     }
     out
-}
-
-/// Line and UTF-16 column of byte `at`.
-pub(in crate::php) fn position(text: &str, at: usize) -> (u32, u32) {
-    let before = &text[..at.min(text.len())];
-    let line = before.matches('\n').count() as u32;
-    let start = before.rfind('\n').map_or(0, |i| i + 1);
-    (
-        line,
-        text[start..before.len()].encode_utf16().count() as u32,
-    )
-}
-
-pub(in crate::php) fn at(path: &Path, text: &str, byte: usize) -> Option<Loc> {
-    let (line, column) = position(text, byte);
-    Some(Loc {
-        path: path.to_path_buf(),
-        line,
-        column,
-    })
-}
-
-pub(in crate::php) fn file_loc(path: &Path) -> Option<Loc> {
-    Some(Loc {
-        path: path.to_path_buf(),
-        line: 0,
-        column: 0,
-    })
-}
-
-/// `use` statements of a file: lowercase alias to class.
-pub(in crate::php) fn uses(text: &str) -> Vec<(String, String)> {
-    static USE: OnceLock<Regex> = OnceLock::new();
-    let re =
-        USE.get_or_init(|| Regex::new(r"(?m)^use\s+([\w\\]+?)(?:\s+as\s+(\w+))?;").expect("valid"));
-    re.captures_iter(text)
-        .map(|c| {
-            let class = c[1].to_owned();
-            let alias = c.get(2).map_or_else(
-                || class.rsplit('\\').next().unwrap_or("").to_owned(),
-                |m| m.as_str().to_owned(),
-            );
-            (alias.to_ascii_lowercase(), class)
-        })
-        .collect()
-}
-
-pub(in crate::php) fn resolve(class: &str, uses: &[(String, String)]) -> String {
-    if let Some(rest) = class.strip_prefix('\\') {
-        return rest.to_owned();
-    }
-    let (first, rest) = class
-        .split_once('\\')
-        .map_or((class, None), |(a, b)| (a, Some(b)));
-    match uses
-        .iter()
-        .find(|(alias, _)| *alias == first.to_ascii_lowercase())
-    {
-        Some((_, full)) => match rest {
-            Some(rest) => format!("{full}\\{rest}"),
-            None => full.clone(),
-        },
-        None => class.to_owned(),
-    }
-}
-
-/// Byte offset of the bracket that closes the one at `open`.
-pub(in crate::php) fn close_of(text: &str, open: usize) -> usize {
-    let bytes = text.as_bytes();
-    let mut depth = 0i32;
-    let mut i = open;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'(' | b'[' | b'{' => depth += 1,
-            b')' | b']' | b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return i;
-                }
-            }
-            q @ (b'\'' | b'"') => {
-                i += 1;
-                while i < bytes.len() && bytes[i] != q {
-                    if bytes[i] == b'\\' {
-                        i += 1;
-                    }
-                    i += 1;
-                }
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    bytes.len()
 }
 
 impl Index {

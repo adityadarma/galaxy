@@ -4,11 +4,11 @@
 //! so on.
 //!
 //! This is a text scan, not a parse, so it also works on half-typed code.
-//! It shares the string scanner with the Laravel module.
+//! It shares the string scanner from `framework::common`.
 
 use std::collections::HashMap;
 
-use crate::php::framework::laravel::site::{
+use crate::php::framework::common::scan::{
     Str, around, callee, closers_of, is_word, php_regions, strings,
 };
 

@@ -1,0 +1,1076 @@
+use super::*;
+
+struct Project {
+    dir: tempfile::TempDir,
+}
+
+impl Project {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for (path, body) in [
+            (
+                "composer.json",
+                r#"{"autoload":{"psr-4":{"App\\":"app/"}}}"#,
+            ),
+            (
+                "app/Models/Base.php",
+                "<?php\nnamespace App\\Models;\n\nclass Base\n{\n    public int $id = 0;\n    protected string $secret = '';\n\n    public function save(): static { return $this; }\n}\n",
+            ),
+            (
+                "app/Models/User.php",
+                "<?php\nnamespace App\\Models;\n\n/**\n * @property-read string $label\n * @method static User find(int $id)\n */\nclass User extends Base\n{\n    public const ROLE = 'admin';\n    public static int $count = 0;\n    public ?Profile $profile = null;\n\n    /** Display name of the user. */\n    public function name(): string { return ''; }\n    public function profile(): Profile { return $this->profile; }\n    private function hidden(): void {}\n}\n",
+            ),
+            (
+                "app/Models/Profile.php",
+                "<?php\nnamespace App\\Models;\n\nclass Profile\n{\n    public function avatar(): string { return ''; }\n}\n",
+            ),
+            (
+                "app/Support/Container.php",
+                "<?php\nnamespace App\\Support;\n\n/**\n * @template T\n * @param class-string<T> $class\n * @return T\n */\nfunction make(string $class) { return new $class; }\n",
+            ),
+            (
+                "app/Support/Greeter.php",
+                "<?php\nnamespace App\\Support;\n\ninterface Greeter {}\n",
+            ),
+        ] {
+            let full = root.join(path);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(full, body).unwrap();
+        }
+        std::fs::create_dir_all(root.join("vendor/composer")).unwrap();
+        std::fs::write(
+            root.join("vendor/composer/autoload_files.php"),
+            "<?php\nreturn array(\n    'abc' => $baseDir . '/app/Support/Container.php',\n);\n",
+        )
+        .unwrap();
+        Self { dir }
+    }
+
+    fn file(&self) -> PathBuf {
+        self.dir.path().join("app/Http/Page.php")
+    }
+
+    /// Completions at the `|` marker of `source`.
+    fn complete(&self, source: &str) -> Vec<Completion> {
+        let (text, line, column) = marker(source);
+        let mut engine = PhpEngine::new(self.dir.path());
+        engine.complete(&self.file(), &text, line, column)
+    }
+}
+
+fn marker(source: &str) -> (String, u32, u32) {
+    let at = source.find('|').expect("marker");
+    let text = source.replacen('|', "", 1);
+    let (line, column, _) = position_of(&text, at);
+    (text, line, column)
+}
+
+fn labels(items: &[Completion]) -> Vec<&str> {
+    items.iter().map(|c| c.label.as_str()).collect()
+}
+
+const HEAD: &str = "<?php\nnamespace App\\Http;\n\nuse App\\Models\\User;\n\nclass Page extends \\App\\Models\\Base\n{\n    private User $owner;\n    public function show(User $user)\n    {\n";
+
+#[test]
+fn completes_members_of_a_typed_parameter() {
+    let project = Project::new();
+    let items = project.complete(&format!("{HEAD}        $user->|\n    }}\n}}\n"));
+    let names = labels(&items);
+    assert!(names.contains(&"name"), "{names:?}");
+    assert!(names.contains(&"profile"));
+    assert!(names.contains(&"save"), "inherited method");
+    assert!(names.contains(&"id"), "inherited property");
+    assert!(names.contains(&"label"), "@property");
+    assert!(!names.contains(&"hidden"), "private");
+    assert!(
+        names.contains(&"secret"),
+        "protected, declared in a shared ancestor"
+    );
+    assert!(
+        !names.contains(&"ROLE"),
+        "constants are not instance members"
+    );
+    assert!(
+        items
+            .iter()
+            .any(|c| c.label == "name" && c.insert_text == "name()")
+    );
+}
+
+#[test]
+fn filters_by_typed_prefix() {
+    let project = Project::new();
+    let items = project.complete(&format!("{HEAD}        $user->na|\n    }}\n}}\n"));
+    assert_eq!(labels(&items), ["name"]);
+}
+
+#[test]
+fn completes_static_members_and_magic_methods() {
+    let project = Project::new();
+    let items = project.complete(&format!("{HEAD}        User::|\n    }}\n}}\n"));
+    let names = labels(&items);
+    assert!(names.contains(&"ROLE"));
+    assert!(names.contains(&"$count"));
+    assert!(names.contains(&"find"), "@method static");
+    assert!(names.contains(&"class"));
+    assert!(!names.contains(&"name"), "instance method");
+}
+
+#[test]
+fn follows_chains_assignments_and_this() {
+    let project = Project::new();
+    let items = project.complete(&format!(
+        "{HEAD}        $p = $user->profile();\n        $p->|\n    }}\n}}\n"
+    ));
+    assert_eq!(labels(&items), ["avatar"]);
+
+    let items = project.complete(&format!("{HEAD}        $user->profile()->|\n    }}\n}}\n"));
+    assert_eq!(labels(&items), ["avatar"]);
+
+    let items = project.complete(&format!("{HEAD}        $this->owner->|\n    }}\n}}\n"));
+    assert!(labels(&items).contains(&"name"));
+
+    let items = project.complete(&format!("{HEAD}        $this->|\n    }}\n}}\n"));
+    let names = labels(&items);
+    assert!(names.contains(&"owner"), "private of own class");
+    assert!(names.contains(&"secret"), "protected of parent");
+    assert!(names.contains(&"show"));
+
+    let items = project.complete(&format!(
+        "{HEAD}        $user\n            ->save()\n            ->|\n    }}\n}}\n"
+    ));
+    assert!(
+        labels(&items).contains(&"name"),
+        "static return and multi-line chain"
+    );
+}
+
+#[test]
+fn resolves_class_string_templates_and_new() {
+    let project = Project::new();
+    let items = project.complete(&format!(
+        "{HEAD}        \\App\\Support\\make(User::class)->|\n    }}\n}}\n"
+    ));
+    assert!(labels(&items).contains(&"name"));
+
+    let items = project.complete(&format!("{HEAD}        (new User)->|\n    }}\n}}\n"));
+    assert!(labels(&items).contains(&"name"));
+
+    let items = project.complete(&format!(
+        "{HEAD}        /** @var User $x */\n        $x = foo();\n        $x->|\n    }}\n}}\n"
+    ));
+    assert!(
+        labels(&items).contains(&"name"),
+        "docblock beats unknown call"
+    );
+
+    let items = project.complete(&format!(
+            "{HEAD}        if ($thing instanceof User) {{\n            $thing->|\n        }}\n    }}\n}}\n"
+        ));
+    assert!(labels(&items).contains(&"name"), "instanceof narrowing");
+}
+
+#[test]
+fn suggests_classes_with_import() {
+    let project = Project::new();
+    let items = project.complete(&format!("{HEAD}        $x = new Prof|\n    }}\n}}\n"));
+    let profile = items
+        .iter()
+        .find(|c| c.label == "Profile")
+        .expect("Profile");
+    assert_eq!(profile.detail.as_deref(), Some("App\\Models"));
+    assert_eq!(
+        profile.extra,
+        [Insertion {
+            line: 4,
+            column: 0,
+            text: "use App\\Models\\Profile;\n".into()
+        }]
+    );
+    assert!(
+        !items.iter().any(|c| c.label == "Greeter"),
+        "interfaces cannot be instantiated"
+    );
+
+    let items = project.complete(&format!("{HEAD}        $x = new Us|\n    }}\n}}\n"));
+    let user = items.iter().find(|c| c.label == "User").expect("User");
+    assert!(user.extra.is_empty(), "already imported");
+}
+
+#[test]
+fn completes_use_statements() {
+    let project = Project::new();
+    let items = project.complete("<?php\nuse App\\Mo|\n");
+    assert_eq!(labels(&items), ["Models"]);
+    assert_eq!(items[0].insert_text, "Models\\");
+
+    let items = project.complete("<?php\nuse App\\Models\\Us|\n");
+    assert_eq!(labels(&items), ["User"]);
+}
+
+#[test]
+fn suggests_variables_and_functions() {
+    let project = Project::new();
+    let items = project.complete(&format!("{HEAD}        $us|\n    }}\n}}\n"));
+    assert!(labels(&items).contains(&"$user"));
+    let items = project.complete(&format!("{HEAD}        ma|\n    }}\n}}\n"));
+    assert!(
+        items
+            .iter()
+            .any(|c| c.label == "make" && c.kind == ItemKind::Function)
+    );
+}
+
+#[test]
+fn finds_definitions_and_hover() {
+    let project = Project::new();
+    let source = format!("{HEAD}        $user->name();\n        User::find(1);\n    }}\n}}\n");
+    let mut engine = PhpEngine::new(project.dir.path());
+    let line = source
+        .lines()
+        .position(|l| l.contains("$user->name"))
+        .unwrap() as u32;
+    let column = source
+        .lines()
+        .nth(line as usize)
+        .unwrap()
+        .find("name")
+        .unwrap() as u32
+        + 1;
+
+    let target = engine.definition(&project.file(), &source, line, column);
+    assert_eq!(target.len(), 1);
+    assert!(target[0].path.ends_with("app/Models/User.php"));
+    assert_eq!(target[0].line, 14);
+
+    let hover = engine
+        .hover(&project.file(), &source, line, column)
+        .unwrap();
+    assert!(
+        hover.markdown.contains("function User::name(): string"),
+        "{}",
+        hover.markdown
+    );
+    assert!(hover.markdown.contains("Display name of the user."));
+
+    let column = source
+        .lines()
+        .nth(line as usize + 1)
+        .unwrap()
+        .find("User")
+        .unwrap() as u32
+        + 1;
+    let target = engine.definition(&project.file(), &source, line + 1, column);
+    assert!(target[0].path.ends_with("app/Models/User.php"));
+    assert_eq!(target[0].line, 7);
+}
+
+#[test]
+fn works_without_composer() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Thing.php"),
+        "<?php\nclass Thing { public function run(): int { return 1; } }\n",
+    )
+    .unwrap();
+    let mut engine = PhpEngine::new(dir.path());
+    let text = "<?php\n$t = new Thing();\n$t->";
+    let items = engine.complete(&dir.path().join("main.php"), text, 2, 4);
+    assert_eq!(labels(&items), ["run"]);
+}
+
+#[test]
+fn knows_phps_own_classes_and_functions() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = PhpEngine::new(dir.path());
+    let file = dir.path().join("main.php");
+
+    // Inherited from the built-in Exception.
+    let text = "<?php\nclass Boom extends Exception {}\n$b = new Boom();\n$b->";
+    let items = engine.complete(&file, text, 3, 4);
+    let names = labels(&items);
+    assert!(names.contains(&"getMessage"), "{names:?}");
+    assert!(names.contains(&"getTraceAsString"), "{names:?}");
+
+    // Built-in function and its return type.
+    let text = "<?php\n$d = new DateTime();\n$d->";
+    let items = engine.complete(&file, text, 2, 4);
+    assert!(labels(&items).contains(&"format"));
+
+    let text = "<?php\nstrle";
+    let items = engine.complete(&file, text, 1, 5);
+    assert!(labels(&items).contains(&"strlen"));
+
+    // Class names come with the index.
+    let text = "<?php\nnew ArrayIt";
+    let items = engine.complete(&file, text, 1, 10);
+    assert!(labels(&items).contains(&"ArrayIterator"));
+
+    // Hover shows the stub; definition opens a copy of it on disk.
+    let text = "<?php\nstrlen('a');";
+    let hover = engine.hover(&file, text, 1, 2).expect("hover on strlen");
+    assert!(hover.markdown.contains("strlen"), "{}", hover.markdown);
+    let found = engine.definition(&file, text, 1, 2);
+    assert_eq!(found.len(), 1);
+    assert!(found[0].path.is_file());
+}
+
+#[test]
+fn property_reads_resolve_to_a_method_when_the_class_has_get() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = PhpEngine::new(dir.path());
+    let file = dir.path().join("main.php");
+    let text = "<?php\n\
+class Base { public function __get($key) { return null; } }\n\
+class Order extends Base {\n\
+    public function items(): array { return []; }\n\
+}\n\
+class Plain {\n\
+    public function items(): array { return []; }\n\
+}\n\
+$order = new Order();\n\
+$order->items;\n\
+$plain = new Plain();\n\
+$plain->items;\n";
+
+    // `__get` is inherited: the read points at `items()`.
+    let found = engine.definition(&file, text, 9, 10);
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].line, 3);
+    let hover = engine.hover(&file, text, 9, 10).expect("hover");
+    assert!(hover.markdown.contains("items"), "{}", hover.markdown);
+
+    // Without `__get` a read is not a call: nothing to jump to.
+    assert!(engine.definition(&file, text, 11, 10).is_empty());
+}
+
+#[test]
+fn helpers_declared_behind_function_exists_are_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir_all(root.join("vendor/composer")).unwrap();
+    std::fs::create_dir_all(root.join("lib")).unwrap();
+    std::fs::write(root.join("composer.json"), "{}").unwrap();
+    std::fs::write(
+            root.join("vendor/composer/autoload_files.php"),
+            "<?php\n$vendorDir = dirname(__DIR__);\n$baseDir = dirname($vendorDir);\n\nreturn array(\n    'abc' => $baseDir . '/lib/helpers.php',\n);\n",
+        )
+        .unwrap();
+    std::fs::write(
+            root.join("lib/helpers.php"),
+            "<?php\n\nif (! function_exists('now')) {\n    /** The current time. */\n    function now($tz = null)\n    {\n    }\n}\n",
+        )
+        .unwrap();
+    let mut engine = PhpEngine::new(root);
+    let file = root.join("main.php");
+    let text = "<?php\n$at = now();\n";
+    let found = engine.definition(&file, text, 1, 7);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].path.ends_with("lib/helpers.php"));
+    assert_eq!(found[0].line, 4);
+    let hover = engine.hover(&file, text, 1, 7).expect("hover");
+    assert!(
+        hover.markdown.contains("The current time"),
+        "{}",
+        hover.markdown
+    );
+}
+
+#[test]
+fn language_constructs_that_look_like_calls_have_a_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = PhpEngine::new(dir.path());
+    let file = dir.path().join("main.php");
+    let text = "<?php\nif (empty($a) && isset($b)) {}\n";
+    for column in [5, 20] {
+        let found = engine.definition(&file, text, 1, column);
+        assert_eq!(found.len(), 1, "column {column}: {found:?}");
+        assert!(found[0].path.is_file());
+    }
+    let hover = engine.hover(&file, text, 1, 5).expect("hover");
+    assert!(hover.markdown.contains("empty"), "{}", hover.markdown);
+}
+
+#[test]
+fn unset_exit_and_die_have_a_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = PhpEngine::new(dir.path());
+    let file = dir.path().join("main.php");
+    let text = "<?php\nunset($a);\nexit(1);\ndie('x');\nEXIT;\n";
+    // The cursor inside the word and right after it both count.
+    for (line, column) in [(1, 2), (1, 5), (2, 2), (2, 4), (3, 1), (4, 2)] {
+        let found = engine.definition(&file, text, line, column);
+        assert_eq!(found.len(), 1, "{line}:{column} {found:?}");
+        assert!(found[0].path.is_file());
+    }
+    let hover = engine.hover(&file, text, 1, 2).expect("hover on unset");
+    assert!(hover.markdown.contains("unset"), "{}", hover.markdown);
+    assert_eq!((hover.start_column, hover.end_column), (0, 5));
+    // A variable inside the call is still a variable.
+    assert!(engine.definition(&file, text, 1, 8).is_empty());
+}
+
+#[test]
+fn docblock_methods_open_at_their_tag() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for (path, body) in [
+        (
+            "composer.json",
+            r#"{"autoload":{"psr-4":{"Lib\\":"lib/"}}}"#,
+        ),
+        (
+            "lib/Clock.php",
+            "<?php\nnamespace Lib;\n\n/**\n * @method Clock addMinutes(int $value = 1)\n * @method Clock addDays(int $value = 1)\n */\ninterface Clock\n{\n}\n",
+        ),
+        (
+            "lib/helpers.php",
+            "<?php\nuse Lib\\Clock;\n\nfunction now(): Clock {}\n",
+        ),
+    ] {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+    std::fs::create_dir_all(root.join("vendor/composer")).unwrap();
+    std::fs::write(
+            root.join("vendor/composer/autoload_files.php"),
+            "<?php\n$baseDir = dirname(dirname(__DIR__));\nreturn array('a' => $baseDir . '/lib/helpers.php');\n",
+        )
+        .unwrap();
+    let mut engine = PhpEngine::new(root);
+    let file = root.join("main.php");
+    let text = "<?php\n$a = now()->addMinutes(50);\n$b = now()->addDays(1);\n";
+    let found = engine.definition(&file, text, 1, 15);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].path.ends_with("lib/Clock.php"));
+    assert_eq!((found[0].line, found[0].column), (4, 17));
+    let found = engine.definition(&file, text, 2, 15);
+    assert_eq!((found[0].line, found[0].column), (5, 17));
+}
+
+#[test]
+fn built_in_functions_and_classes_open_a_real_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engine = PhpEngine::new(dir.path());
+    let file = dir.path().join("main.php");
+    let text = "<?php\n$x = json_encode([]);\n$e = new \\Exception('x');\n";
+    let found = engine.definition(&file, text, 1, 8);
+    assert_eq!(found.len(), 1, "{found:?}");
+    let body = std::fs::read_to_string(&found[0].path).unwrap();
+    assert!(
+        body.contains("function json_encode"),
+        "{}",
+        found[0].path.display()
+    );
+    let line = body.lines().nth(found[0].line as usize).unwrap();
+    assert!(line.contains("json_encode"), "{line}");
+
+    let found = engine.definition(&file, text, 2, 17);
+    assert_eq!(found.len(), 1, "{found:?}");
+    let body = std::fs::read_to_string(&found[0].path).unwrap();
+    assert!(body.contains("class Exception"));
+}
+
+#[test]
+fn model_static_calls_resolve_to_the_query_builder() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for (path, body) in [
+        (
+            "composer.json",
+            r#"{"autoload":{"psr-4":{"Illuminate\\Database\\Eloquent\\":"lib/","App\\":"app/"}}}"#,
+        ),
+        (
+            "lib/Model.php",
+            "<?php\nnamespace Illuminate\\Database\\Eloquent;\n\nabstract class Model\n{\n    public static function __callStatic($method, $parameters) {}\n}\n",
+        ),
+        (
+            "lib/Builder.php",
+            "<?php\nnamespace Illuminate\\Database\\Eloquent;\n\nclass Builder\n{\n    public function create(array $attributes = []) {}\n}\n",
+        ),
+        (
+            "app/Log.php",
+            "<?php\nnamespace App;\n\nuse Illuminate\\Database\\Eloquent\\Model;\n\nclass Log extends Model\n{\n}\n",
+        ),
+    ] {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+    let mut engine = PhpEngine::with_frameworks(root, eloquent());
+    let main = root.join("app/Service.php");
+    let text = "<?php\nnamespace App;\n\nLog::create([]);\nLog::missing();\n";
+    let found = engine.definition(&main, text, 3, 8);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].path.ends_with("lib/Builder.php"));
+    assert_eq!(found[0].line, 5);
+    let hover = engine.hover(&main, text, 3, 8).expect("hover");
+    assert!(
+        hover.markdown.contains("Builder::create"),
+        "{}",
+        hover.markdown
+    );
+    assert!(engine.definition(&main, text, 4, 8).is_empty());
+}
+
+#[test]
+fn relation_chains_keep_resolving_through_the_query_builder() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for (path, body) in [
+        (
+            "composer.json",
+            r#"{"autoload":{"psr-4":{"Illuminate\\Database\\Eloquent\\":"lib/","App\\":"app/"}}}"#,
+        ),
+        (
+            "lib/Model.php",
+            "<?php\nnamespace Illuminate\\Database\\Eloquent;\n\nabstract class Model\n{\n    public static function __callStatic($method, $parameters) {}\n    public function save(): bool { return true; }\n}\n",
+        ),
+        (
+            "lib/Builder.php",
+            r#"<?php
+namespace Illuminate\Database\Eloquent;
+
+/**
+ * @template TModel of \Illuminate\Database\Eloquent\Model
+ */
+class Builder
+{
+    /** @return $this */
+    public function where($column) { return $this; }
+
+    /** @return TModel|null */
+    public function first() {}
+
+    /** @return TModel */
+    public function create(array $attributes = []) {}
+
+    /**
+     * @return ($id is array ? array : TModel|null)
+     */
+    public function find($id) {}
+}
+"#,
+        ),
+        (
+            "lib/Relations/Relation.php",
+            "<?php\nnamespace Illuminate\\Database\\Eloquent\\Relations;\n\n/**\n * @template TRelatedModel of \\Illuminate\\Database\\Eloquent\\Model\n * @template TDeclaringModel of \\Illuminate\\Database\\Eloquent\\Model\n *\n * @mixin \\Illuminate\\Database\\Eloquent\\Builder<TRelatedModel>\n */\nabstract class Relation\n{\n}\n",
+        ),
+        (
+            "lib/Relations/HasMany.php",
+            "<?php\nnamespace Illuminate\\Database\\Eloquent\\Relations;\n\n/**\n * @template TRelatedModel of \\Illuminate\\Database\\Eloquent\\Model\n * @template TDeclaringModel of \\Illuminate\\Database\\Eloquent\\Model\n *\n * @extends \\Illuminate\\Database\\Eloquent\\Relations\\Relation<TRelatedModel, TDeclaringModel>\n */\nclass HasMany extends Relation\n{\n}\n",
+        ),
+        (
+            "app/Otp.php",
+            "<?php\nnamespace App;\n\nuse Illuminate\\Database\\Eloquent\\Model;\n\nclass Otp extends Model\n{\n}\n",
+        ),
+        (
+            "app/User.php",
+            "<?php\nnamespace App;\n\nuse Illuminate\\Database\\Eloquent\\Model;\nuse Illuminate\\Database\\Eloquent\\Relations\\HasMany;\n\nclass User extends Model\n{\n    /** @return HasMany<Otp, $this> */\n    public function otps(): HasMany {}\n}\n",
+        ),
+    ] {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+    let mut engine = PhpEngine::with_frameworks(root, eloquent());
+    let main = root.join("app/Run.php");
+    let text = "<?php\nnamespace App;\n\nclass Run\n{\n    public function go()\n    {\n        $u = User::find(1);\n        $u->otps()->where('a')->first()->save();\n        $u->otps()->create([])->save();\n    }\n}\n";
+    let at = |engine: &mut PhpEngine, line: u32, needle: &str| {
+        let row = text.lines().nth(line as usize).unwrap();
+        let column = row.find(needle).unwrap() as u32 + 1;
+        engine.definition(&main, text, line, column)
+    };
+    let otps = at(&mut engine, 8, "otps");
+    assert!(otps[0].path.ends_with("app/User.php"), "{otps:?}");
+    let r#where = at(&mut engine, 8, "where");
+    assert!(r#where[0].path.ends_with("lib/Builder.php"), "{where:?}");
+    let first = at(&mut engine, 8, "first");
+    assert!(first[0].path.ends_with("lib/Builder.php"), "{first:?}");
+    let save = at(&mut engine, 8, "save");
+    assert!(save[0].path.ends_with("lib/Model.php"), "{save:?}");
+    let create = at(&mut engine, 9, "create");
+    assert!(create[0].path.ends_with("lib/Builder.php"), "{create:?}");
+    let save = at(&mut engine, 9, "save");
+    assert!(save[0].path.ends_with("lib/Model.php"), "{save:?}");
+}
+
+/// Eloquent as Laravel declares it: `first()` lives in the
+/// `BuildsQueries` trait, whose `TValue` the builder binds with a
+/// `@use` docblock on its `use` statement.
+fn query_builder_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for (path, body) in [
+        (
+            "composer.json",
+            r#"{"autoload":{"psr-4":{"Illuminate\\Database\\":"lib/","App\\":"app/"}}}"#,
+        ),
+        (
+            "lib/Eloquent/Model.php",
+            "<?php\nnamespace Illuminate\\Database\\Eloquent;\n\nabstract class Model\n{\n    public function __call($method, $parameters) {}\n    public static function __callStatic($method, $parameters) {}\n    public function save(): bool { return true; }\n    /** @return \\Illuminate\\Database\\Eloquent\\Builder<static> */\n    public static function query() {}\n}\n",
+        ),
+        (
+            "lib/Concerns/BuildsQueries.php",
+            r#"<?php
+namespace Illuminate\Database\Concerns;
+
+/**
+ * @template TValue
+ *
+ * @mixin \Illuminate\Database\Query\Builder
+ */
+trait BuildsQueries
+{
+    /**
+     * @param  array|string  $columns
+     * @return TValue|null
+     */
+    public function first($columns = ['*']) {}
+}
+"#,
+        ),
+        (
+            "lib/Query/Builder.php",
+            "<?php\nnamespace Illuminate\\Database\\Query;\n\nclass Builder\n{\n    public function toSql() {}\n}\n",
+        ),
+        (
+            "lib/Eloquent/Collection.php",
+            r#"<?php
+namespace Illuminate\Database\Eloquent;
+
+/**
+ * @template TKey of array-key
+ * @template TModel of \Illuminate\Database\Eloquent\Model
+ *
+ * @implements \IteratorAggregate<TKey, TModel>
+ */
+class Collection implements \IteratorAggregate
+{
+    /** @return TModel|null */
+    public function first() {}
+
+    public function getIterator(): \Traversable {}
+}
+"#,
+        ),
+        (
+            "lib/Eloquent/Builder.php",
+            r#"<?php
+namespace Illuminate\Database\Eloquent;
+
+use Illuminate\Database\Concerns\BuildsQueries;
+
+/**
+ * @template TModel of \Illuminate\Database\Eloquent\Model
+ *
+ * @mixin \Illuminate\Database\Query\Builder
+ */
+class Builder
+{
+    /** @use \Illuminate\Database\Concerns\BuildsQueries<TModel> */
+    use BuildsQueries;
+
+    /** @return $this */
+    public function where($column, $operator = null) { return $this; }
+
+    /** @return $this */
+    public function latest($column = null) { return $this; }
+
+    /** @return TModel */
+    public function firstOrFail($columns = ['*']) {}
+
+    /**
+     * @return ($id is array ? \Illuminate\Database\Eloquent\Collection<int, TModel> : TModel|null)
+     */
+    public function find($id, $columns = ['*']) {}
+
+    /** @return \Illuminate\Database\Eloquent\Collection<int, TModel> */
+    public function get($columns = ['*']) {}
+}
+"#,
+        ),
+        (
+            "lib/Eloquent/Relations/Relation.php",
+            "<?php\nnamespace Illuminate\\Database\\Eloquent\\Relations;\n\n/**\n * @template TRelatedModel of \\Illuminate\\Database\\Eloquent\\Model\n * @template TDeclaringModel of \\Illuminate\\Database\\Eloquent\\Model\n *\n * @mixin \\Illuminate\\Database\\Eloquent\\Builder<TRelatedModel>\n */\nabstract class Relation\n{\n}\n",
+        ),
+        (
+            "lib/Eloquent/Relations/HasMany.php",
+            "<?php\nnamespace Illuminate\\Database\\Eloquent\\Relations;\n\n/**\n * @template TRelatedModel of \\Illuminate\\Database\\Eloquent\\Model\n * @template TDeclaringModel of \\Illuminate\\Database\\Eloquent\\Model\n *\n * @extends \\Illuminate\\Database\\Eloquent\\Relations\\Relation<TRelatedModel, TDeclaringModel>\n */\nclass HasMany extends Relation\n{\n}\n",
+        ),
+        (
+            "app/Post.php",
+            "<?php\nnamespace App;\n\nuse Illuminate\\Database\\Eloquent\\Model;\n\nclass Post extends Model\n{\n    public function publish(): bool { return true; }\n}\n",
+        ),
+        (
+            "app/User.php",
+            "<?php\nnamespace App;\n\nuse Illuminate\\Database\\Eloquent\\Model;\nuse Illuminate\\Database\\Eloquent\\Relations\\HasMany;\n\nclass User extends Model\n{\n    /** @return HasMany<Post, $this> */\n    public function posts(): HasMany {}\n\n    public function isActive(): bool { return true; }\n}\n",
+        ),
+    ] {
+        let full = root.join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, body).unwrap();
+    }
+    dir
+}
+
+#[test]
+fn query_builder_chains_resolve_to_the_model() {
+    let dir = query_builder_project();
+    let mut engine = PhpEngine::with_frameworks(dir.path(), eloquent());
+    let main = dir.path().join("app/Run.php");
+    let text = "<?php
+namespace App;
+
+class Run
+{
+    public function go($request, User $owner)
+    {
+        $a = User::where('email', $request->email)->first();
+        $a->isActive();
+        $b = User::where('email', 'x')->firstOrFail();
+        $b->isActive();
+        $c = User::latest()->first();
+        $c->isActive();
+        $d = User::query()->where('a', 1)->first();
+        $d->isActive();
+        $e = User::query()->where('a', 1)->get()->first();
+        $e->isActive();
+        $f = User::where('a', 1)->find(3);
+        $f->isActive();
+        $g = $owner->posts()->where('a', 1)->first();
+        $g->publish();
+        $h = $owner->posts()->latest()->first();
+        $h->publish();
+        foreach (User::query()->where('a', 1)->get() as $item) {
+            $item->isActive();
+        }
+        $i = User::find(1);
+        $i->isActive();
+        $j = User::where('a', 1)->first()->isActive();
+    }
+}
+";
+    let lines: Vec<&str> = text.lines().collect();
+    let cases = [
+        ("$a->isActive", "first()"),
+        ("$b->isActive", "firstOrFail()"),
+        ("$c->isActive", "latest()->first()"),
+        ("$d->isActive", "query()->where()->first()"),
+        ("$e->isActive", "get()->first()"),
+        ("$f->isActive", "where()->find()"),
+        ("$i->isActive", "find()"),
+        ("$item->isActive", "foreach over get()"),
+        (
+            "$j = User::where('a', 1)->first()->isActive",
+            "first()->isActive()",
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (needle, label) in cases {
+        let row = lines.iter().position(|l| l.contains(needle)).unwrap();
+        let column = if needle.starts_with("$j") {
+            lines[row].rfind("isActive").unwrap()
+        } else {
+            lines[row].find("isActive").unwrap()
+        } as u32
+            + 1;
+        let found = engine.definition(&main, text, row as u32, column);
+        if !found
+            .first()
+            .is_some_and(|f| f.path.ends_with("app/User.php"))
+        {
+            failures.push(format!("{label}: {found:?}"));
+        }
+    }
+    for (needle, label) in [
+        ("$g->publish", "relation where()->first()"),
+        ("$h->publish", "relation latest()->first()"),
+    ] {
+        let row = lines.iter().position(|l| l.contains(needle)).unwrap();
+        let column = lines[row].find("publish").unwrap() as u32 + 1;
+        let found = engine.definition(&main, text, row as u32, column);
+        if !found
+            .first()
+            .is_some_and(|f| f.path.ends_with("app/Post.php"))
+        {
+            failures.push(format!("{label}: {found:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// The mock projects below have no `artisan` script or Laravel
+/// requirement, so Eloquent forwarding is registered by hand.
+fn eloquent() -> Vec<Arc<dyn Framework>> {
+    vec![Arc::new(framework::laravel::LaravelFramework::new(None))]
+}
+
+/// A small copy of how Eloquent declares relations.
+fn eloquent_project() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for (path, body) in [
+        (
+            "composer.json",
+            r#"{"autoload":{"psr-4":{"Lib\\":"lib/","App\\":"app/"}}}"#,
+        ),
+        (
+            "lib/Model.php",
+            r#"<?php
+namespace Lib;
+
+class Model
+{
+    use HasRelationships;
+    public function __get($key) { return null; }
+    public function save(): bool { return true; }
+}
+"#,
+        ),
+        (
+            "lib/HasRelationships.php",
+            r#"<?php
+namespace Lib;
+
+trait HasRelationships
+{
+    /**
+     * @template TRelatedModel of \Lib\Model
+     * @param  class-string<TRelatedModel>  $related
+     * @return \Lib\HasOne<TRelatedModel, $this>
+     */
+    public function hasOne($related) {}
+
+    /**
+     * @template TRelatedModel of \Lib\Model
+     * @param  class-string<TRelatedModel>  $related
+     * @return \Lib\HasMany<TRelatedModel, $this>
+     */
+    public function hasMany($related) {}
+}
+"#,
+        ),
+        (
+            "lib/Relation.php",
+            r#"<?php
+namespace Lib;
+
+/**
+ * @template TRelatedModel of \Lib\Model
+ * @template TDeclaringModel of \Lib\Model
+ * @template TResult
+ */
+abstract class Relation
+{
+    /** @return TResult */
+    abstract public function getResults();
+}
+"#,
+        ),
+        (
+            "lib/HasOneOrMany.php",
+            r#"<?php
+namespace Lib;
+
+/**
+ * @template TRelatedModel of \Lib\Model
+ * @template TDeclaringModel of \Lib\Model
+ * @template TResult
+ *
+ * @extends \Lib\Relation<TRelatedModel, TDeclaringModel, TResult>
+ */
+abstract class HasOneOrMany extends Relation
+{
+    /** @return TRelatedModel */
+    public function create(array $attributes = []) {}
+
+    /** @return $this */
+    public function latestOfMany() { return $this; }
+}
+"#,
+        ),
+        (
+            "lib/HasOne.php",
+            r#"<?php
+namespace Lib;
+
+/**
+ * @template TRelatedModel of \Lib\Model
+ * @template TDeclaringModel of \Lib\Model
+ *
+ * @extends \Lib\HasOneOrMany<TRelatedModel, TDeclaringModel, ?TRelatedModel>
+ */
+class HasOne extends HasOneOrMany
+{
+    /** @inheritDoc */
+    public function getResults() {}
+}
+"#,
+        ),
+        (
+            "lib/HasMany.php",
+            r#"<?php
+namespace Lib;
+
+/**
+ * @template TRelatedModel of \Lib\Model
+ * @template TDeclaringModel of \Lib\Model
+ *
+ * @extends \Lib\HasOneOrMany<TRelatedModel, TDeclaringModel, \Lib\Collection<int, TRelatedModel>>
+ */
+class HasMany extends HasOneOrMany
+{
+    /** @inheritDoc */
+    public function getResults() {}
+}
+"#,
+        ),
+        (
+            "lib/Collection.php",
+            r#"<?php
+namespace Lib;
+
+/**
+ * @template TKey of array-key
+ * @template TValue
+ *
+ * @implements \IteratorAggregate<TKey, TValue>
+ */
+class Collection implements \IteratorAggregate
+{
+    public function getIterator(): \Traversable {}
+}
+"#,
+        ),
+        (
+            "app/Order.php",
+            r#"<?php
+namespace App;
+
+use Lib\HasMany;
+use Lib\HasOne;
+use Lib\Model;
+
+class Order extends Model
+{
+    public function payment(): HasOne
+    {
+        return $this->hasOne(Payment::class)->latestOfMany();
+    }
+
+    public function lines(): HasMany
+    {
+        return $this->hasMany(Line::class);
+    }
+}
+"#,
+        ),
+        (
+            "app/Payment.php",
+            "<?php\nnamespace App;\n\nuse Lib\\Model;\n\nclass Payment extends Model\n{\n    public function details(): \\Lib\\HasMany\n    {\n        return $this->hasMany(Line::class);\n    }\n}\n",
+        ),
+        (
+            "app/Line.php",
+            "<?php\nnamespace App;\n\nuse Lib\\Model;\n\nclass Line extends Model\n{\n    public function product(): string { return ''; }\n}\n",
+        ),
+    ] {
+        let full = root.join(path);
+        std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+        std::fs::write(full, body).unwrap();
+    }
+    dir
+}
+
+#[test]
+fn follows_relations_through_generics() {
+    let dir = eloquent_project();
+    let mut engine = PhpEngine::new(dir.path());
+    let file = dir.path().join("app/Service.php");
+
+    // `create()` on a relation gives the related model.
+    let text = "<?php\nnamespace App;\nclass Service {\n    public function run(Order $order) {\n        $payment = $order->payment()->create([]);\n        $payment->\n    }\n}\n";
+    let items = engine.complete(&file, text, 5, 18);
+    let names = labels(&items);
+    assert!(names.contains(&"details"), "{names:?}");
+    assert!(names.contains(&"save"), "{names:?}");
+    assert!(!names.contains(&"product"), "{names:?}");
+
+    // Next call through the new model's own relation.
+    let text = "<?php\nnamespace App;\nclass Service {\n    public function run(Order $order) {\n        $payment = $order->payment()->create([]);\n        $payment->details()->create([])->\n    }\n}\n";
+    let items = engine.complete(&file, text, 5, 50);
+    assert!(labels(&items).contains(&"product"), "{:?}", labels(&items));
+
+    // `foreach` over a has-many read gives the related model.
+    let text = "<?php\nnamespace App;\nclass Service {\n    public function run(Order $order) {\n        foreach ($order->lines as $line) {\n            $line->\n    }\n}\n";
+    let items = engine.complete(&file, text, 5, 19);
+    assert!(labels(&items).contains(&"product"), "{:?}", labels(&items));
+
+    // Clicking `create` on the chain reaches the declaration.
+    let text = "<?php\nnamespace App;\nclass Service {\n    public function run(Order $order) {\n        $order->payment()->create([]);\n    }\n}\n";
+    let found = engine.definition(&file, text, 4, 28);
+    assert_eq!(found.len(), 1);
+    assert!(
+        found[0].path.ends_with("lib/HasOneOrMany.php"),
+        "{:?}",
+        found[0].path
+    );
+}
+
+#[test]
+fn variables_are_not_mistaken_for_classes_of_the_same_name() {
+    let dir = eloquent_project();
+    let mut engine = PhpEngine::new(dir.path());
+    let file = dir.path().join("app/Service.php");
+    // `$line` has the short name of the class `App\Line`.
+    let text = "<?php\nnamespace App;\nclass Service {\n    public function run(Order $order) {\n        foreach ($order->lines as $line) {\n            $line->product();\n        }\n    }\n}\n";
+    let hover = engine.hover(&file, text, 5, 14).expect("hover on $line");
+    assert!(
+        hover.markdown.contains("$line: App\\Line"),
+        "{}",
+        hover.markdown
+    );
+    assert_eq!((hover.start_column, hover.end_column), (12, 17));
+    assert!(engine.definition(&file, text, 5, 14).is_empty());
+    // The method called on the iterated model resolves.
+    let found = engine.definition(&file, text, 5, 22);
+    assert_eq!(found.len(), 1);
+    assert!(
+        found[0].path.ends_with("app/Line.php"),
+        "{:?}",
+        found[0].path
+    );
+}
+
+#[test]
+fn attribute_reads_point_at_the_fillable_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(
+        root.join("composer.json"),
+        r#"{"autoload":{"psr-4":{"App\\":"app/"}}}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join("app")).unwrap();
+    std::fs::write(
+            root.join("app/Item.php"),
+            "<?php\nnamespace App;\n\nclass Item\n{\n    protected $fillable = [\n        'name',\n        'price',\n    ];\n\n    public function __get($key) { return null; }\n}\n",
+        )
+        .unwrap();
+    let mut engine = PhpEngine::new(root);
+    let file = root.join("main.php");
+    let text = "<?php\nuse App\\Item;\nfunction show(Item $item) {\n    return $item->price;\n}\n";
+    let found = engine.definition(&file, text, 3, 20);
+    assert_eq!(found.len(), 1);
+    assert!(found[0].path.ends_with("app/Item.php"));
+    assert_eq!((found[0].line, found[0].column), (7, 9));
+    let items = engine.complete(
+        &file,
+        "<?php\nuse App\\Item;\nfunction show(Item $item) {\n    return $item->\n}\n",
+        3,
+        18,
+    );
+    assert!(labels(&items).contains(&"name"), "{:?}", labels(&items));
+}

@@ -11,8 +11,8 @@ use crate::php::engine::{
     Action, Completion, FileChange, HoverResult, ItemKind, PhpEngine, Problem, Severity, Target,
     byte_offset, position_of,
 };
-use crate::php::framework::laravel::engine::{Found, describe, named, pick, target_of};
-use crate::php::framework::laravel::{Item, Loc};
+use crate::php::framework::common::complete::{Found, describe, named, pick, target_of};
+use crate::php::framework::common::files::{Item, Loc};
 use crate::php::parse::{ClassInfo, Member, MemberKind};
 
 /// Namespace route handlers are relative to unless the routes change it.

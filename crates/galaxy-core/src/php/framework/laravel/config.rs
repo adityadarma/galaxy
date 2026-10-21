@@ -6,6 +6,8 @@ use std::path::{Path, PathBuf};
 
 use tree_sitter::{Node, Parser};
 
+use crate::php::framework::common::files::{returned_array, string_value};
+
 /// A key in a config file: 0-based line and UTF-16 column of its string.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigKeyLocation {
@@ -62,121 +64,6 @@ pub fn config_key_position(source: &str, keys: &[&str]) -> Option<(usize, usize)
     Some((point.row, column_utf16))
 }
 
-/// One value of a file that returns an array (`config/*.php`, `lang/*/*.php`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConfigEntry {
-    /// Dotted path of the key, e.g. `connections.mysql.host`.
-    pub key: String,
-    pub line: usize,
-    pub column_utf16: usize,
-    /// The string itself, or the source text of other values, shortened.
-    pub value: String,
-    pub is_array: bool,
-}
-
-const MAX_CONFIG_ENTRIES: usize = 5000;
-const MAX_CONFIG_DEPTH: usize = 8;
-
-/// Every keyed value of the array a file returns, nested arrays included.
-/// Elements without a string key are skipped.
-pub fn flatten_config(source: &str) -> Vec<ConfigEntry> {
-    let mut parser = Parser::new();
-    if parser
-        .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
-        .is_err()
-    {
-        return Vec::new();
-    }
-    let Some(tree) = parser.parse(source, None) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    if let Some(array) = returned_array(tree.root_node()) {
-        collect_entries(array, "", source, 0, &mut out);
-    }
-    out
-}
-
-fn collect_entries(
-    array: Node<'_>,
-    prefix: &str,
-    source: &str,
-    depth: usize,
-    out: &mut Vec<ConfigEntry>,
-) {
-    let bytes = source.as_bytes();
-    let mut cursor = array.walk();
-    let elements: Vec<Node<'_>> = array
-        .named_children(&mut cursor)
-        .filter(|node| node.kind() == "array_element_initializer")
-        .collect();
-    for element in elements {
-        if out.len() >= MAX_CONFIG_ENTRIES {
-            return;
-        }
-        let mut children = element.walk();
-        if !element.children(&mut children).any(|n| n.kind() == "=>") {
-            continue;
-        }
-        let mut named = element.walk();
-        let mut parts = element.named_children(&mut named);
-        let (Some(key_node), Some(value)) = (parts.next(), parts.next()) else {
-            continue;
-        };
-        let Some(name) = string_value(key_node, bytes) else {
-            continue;
-        };
-        let key = if prefix.is_empty() {
-            name.to_owned()
-        } else {
-            format!("{prefix}.{name}")
-        };
-        let point = key_node.start_position();
-        let line_start = key_node.start_byte() - point.column;
-        let column_utf16 = source[line_start..key_node.start_byte()]
-            .encode_utf16()
-            .count();
-        let is_array = value.kind() == "array_creation_expression";
-        let preview = match string_value(value, bytes) {
-            Some(text) => text.to_owned(),
-            None if is_array => String::new(),
-            None => {
-                let text = value.utf8_text(bytes).unwrap_or("");
-                let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-                if text.chars().count() > 60 {
-                    text.chars().take(60).collect::<String>() + "…"
-                } else {
-                    text
-                }
-            }
-        };
-        out.push(ConfigEntry {
-            key: key.clone(),
-            line: point.row,
-            column_utf16,
-            value: preview,
-            is_array,
-        });
-        if is_array && depth < MAX_CONFIG_DEPTH {
-            collect_entries(value, &key, source, depth + 1, out);
-        }
-    }
-}
-
-/// The array literal in the file's top-level `return [...]`.
-fn returned_array(program: Node<'_>) -> Option<Node<'_>> {
-    let mut cursor = program.walk();
-    let returns: Vec<Node<'_>> = program
-        .named_children(&mut cursor)
-        .filter(|node| node.kind() == "return_statement")
-        .collect();
-    returns.into_iter().find_map(|ret| {
-        let mut inner = ret.walk();
-        let mut children = ret.named_children(&mut inner);
-        children.find(|node| node.kind() == "array_creation_expression")
-    })
-}
-
 /// Key and value nodes of the `'key' => value` element of `array`.
 fn entry<'t>(array: Node<'t>, key: &str, source: &[u8]) -> Option<(Node<'t>, Option<Node<'t>>)> {
     let mut cursor = array.walk();
@@ -198,16 +85,6 @@ fn entry<'t>(array: Node<'t>, key: &str, source: &[u8]) -> Option<(Node<'t>, Opt
         let value = parts.next();
         (string_value(key_node, source)? == key).then_some((key_node, value))
     })
-}
-
-/// Contents of a plain string literal (no interpolation handling needed for
-/// config keys).
-fn string_value<'s>(node: Node<'_>, source: &'s [u8]) -> Option<&'s str> {
-    if !matches!(node.kind(), "string" | "encapsed_string") {
-        return None;
-    }
-    let text = node.utf8_text(source).ok()?;
-    text.strip_prefix(['\'', '"'])?.strip_suffix(['\'', '"'])
 }
 
 #[cfg(test)]

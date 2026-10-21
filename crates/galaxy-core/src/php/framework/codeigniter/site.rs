@@ -4,12 +4,12 @@
 //! handler of `$routes->get('path', 'Home::index')`.
 //!
 //! This is a text scan, not a parse, so it also works on half-typed code.
-//! It shares the string and call scanning of the Laravel module.
+//! It shares the string and call scanning of `framework::common`.
 
 use std::path::Path;
 
 use super::index::ROUTE_VERBS;
-use crate::php::framework::laravel::site::{
+use crate::php::framework::common::scan::{
     Region, Str, argument_count, around, callee, closers_of, php_regions, strings,
 };
 
