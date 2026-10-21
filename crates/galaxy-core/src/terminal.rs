@@ -492,11 +492,16 @@ mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
+    /// Upper bound for the shell to start and answer. A login shell with a
+    /// heavy prompt theme takes seconds under parallel load; passing tests
+    /// return as soon as the output appears.
+    const SHELL_DEADLINE: Duration = Duration::from_secs(20);
+
     fn wait_for(
         session: &TerminalSession,
         what: impl Fn(&TerminalScreen) -> bool,
     ) -> TerminalScreen {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + SHELL_DEADLINE;
         loop {
             let _ = session.take_output();
             let screen = session.screen();
@@ -512,7 +517,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let session = TerminalSession::spawn(dir.path(), 80, 24).unwrap();
         session.write(b"printf 'galaxy-pty\\n'\n").unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + SHELL_DEADLINE;
         let mut output = String::new();
         while Instant::now() < deadline {
             output.push_str(&session.take_output());
@@ -614,7 +619,7 @@ mod tests {
         assert!(session.is_running());
         assert!(!session.shell_name().is_empty());
         session.write(b"exit\n").unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + SHELL_DEADLINE;
         while session.is_running() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }

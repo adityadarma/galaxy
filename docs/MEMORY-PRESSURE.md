@@ -11,6 +11,5 @@ Galaxy installs a macOS `DispatchSourceMemoryPressure` source per window.
 - The next draw or tab activation recreates derived caches and resumes syntax
   parsing as needed.
 
-The handler is intentionally process-local and does not attempt to terminate
-language servers or close user data. Status bar messages report cleanup without
+The handler is intentionally process-local and does not close user data. Status bar messages report cleanup without
 blocking the main thread on allocation-heavy work.

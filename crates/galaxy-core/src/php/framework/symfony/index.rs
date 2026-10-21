@@ -8,6 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::yaml::{self, Entry};
+use crate::php::framework::common::scan::is_word;
 
 const MAX_FILES: usize = 20_000;
 const MAX_BYTES: u64 = 2 * 1024 * 1024;
@@ -407,10 +408,6 @@ enum Decl {
     Class,
     Function,
     Other,
-}
-
-fn is_word(c: u8) -> bool {
-    c.is_ascii_alphanumeric() || c == b'_'
 }
 
 /// Index after the string literal that starts at `at`.

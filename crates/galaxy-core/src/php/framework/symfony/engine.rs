@@ -18,6 +18,7 @@ use crate::php::engine::{
     Action, Completion, FileChange, HoverResult, ItemKind, PhpEngine, Problem, Severity, Target,
     byte_offset, fuzzy, position_of, rank,
 };
+use crate::php::framework::common::complete::relative;
 
 const MAX_ITEMS: usize = 200;
 const MAX_PROBLEMS: usize = 200;
@@ -142,13 +143,6 @@ fn target_of(loc: &Loc) -> Target {
         line: loc.line,
         column: loc.column_utf16,
     }
-}
-
-fn relative(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .display()
-        .to_string()
 }
 
 fn first_segment(name: &str) -> &str {
