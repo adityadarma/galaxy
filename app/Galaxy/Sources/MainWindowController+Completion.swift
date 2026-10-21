@@ -35,6 +35,9 @@ extension MainWindowController {
 
     func requestCompletionIfNeeded(force: Bool = false) {
         guard let document = activeTab?.doc else { return }
+        // Completion owns the space below the caret. Cancel the old hover so
+        // its asynchronous refresh cannot cover the suggestion list.
+        dismissHover()
         if !force { suggestRetryUntil = nil }
         let position = document.primaryCursor()
         completionPosition = TextPos(line: position.line, colUtf16: position.colUtf16)
@@ -125,6 +128,7 @@ extension MainWindowController {
         completionDismissed = true
         suggestRetryUntil = nil
         snippetCompletionItems = []
+        dismissHover()
     }
 
     func isSettingsDocument(_ document: DocumentHandle) -> Bool {

@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -73,6 +74,9 @@ impl From<std::io::Error> for CoreError {
 #[derive(Debug, Clone, PartialEq, uniffi::Enum)]
 pub enum CoreEvent {
     Pong { message: String },
+    GoModulesStarted { root: String },
+    GoModulesFinished { root: String },
+    GoModulesFailed { root: String, message: String },
 }
 
 /// Implemented in Swift. Called from core threads, so the Swift side must
@@ -415,6 +419,85 @@ impl Core {
                 .spawn(move || listener.on_event(CoreEvent::Pong { message }))
                 .ok();
         }
+    }
+
+    /// Runs `go mod download` for a detected Go project. The command is
+    /// user-invoked, has fixed arguments and never goes through a shell. A
+    /// successful download clears only the Go caches, then rebuilds the
+    /// project index without discarding open buffers.
+    pub fn download_go_modules(&self, root: String) -> bool {
+        let root = PathBuf::from(root);
+        let Some(project) = go::GoProject::detect(&root) else {
+            return false;
+        };
+        let root = project.root().to_path_buf();
+        let listener = self
+            .listener
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let engines = self.go.lock().unwrap_or_else(|e| e.into_inner());
+        let engine = engines
+            .get(&root)
+            .cloned()
+            .unwrap_or_else(|| Arc::new(Mutex::new(GoEngine::pending(&root))));
+        drop(engines);
+        let map = &self.go;
+        map.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(root.clone())
+            .or_insert_with(|| engine.clone());
+        std::thread::Builder::new()
+            .name("go-mod-download".into())
+            .spawn(move || {
+                if let Some(listener) = &listener {
+                    listener.on_event(CoreEvent::GoModulesStarted {
+                        root: root.to_string_lossy().into_owned(),
+                    });
+                }
+                let result = Command::new("go")
+                    .args(["mod", "download"])
+                    .current_dir(&root)
+                    .output();
+                match result {
+                    Ok(output) if output.status.success() => {
+                        engine
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .reset_index();
+                        spawn_go_index(&engine, &root);
+                        if let Some(listener) = &listener {
+                            listener.on_event(CoreEvent::GoModulesFinished {
+                                root: root.to_string_lossy().into_owned(),
+                            });
+                        }
+                    }
+                    Ok(output) => {
+                        let mut message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+                        if message.is_empty() {
+                            message = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+                        }
+                        if message.is_empty() {
+                            message = format!("go mod download exited with {}", output.status);
+                        }
+                        if let Some(listener) = &listener {
+                            listener.on_event(CoreEvent::GoModulesFailed {
+                                root: root.to_string_lossy().into_owned(),
+                                message: message.chars().take(4000).collect(),
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(listener) = &listener {
+                            listener.on_event(CoreEvent::GoModulesFailed {
+                                root: root.to_string_lossy().into_owned(),
+                                message: error.to_string(),
+                            });
+                        }
+                    }
+                }
+            })
+            .is_ok()
     }
 
     /// An empty, unsaved document ("Untitled"). It has no path until the

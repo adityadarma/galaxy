@@ -853,7 +853,7 @@ fn build_installs_framework_and_library_markers() {
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(
         root.join("go.mod"),
-        "module example.com/app\n\nrequire (\n\tgithub.com/goravel/framework v1.16.3\n\tgithub.com/gofiber/fiber/v2 v2.52.10\n)\n",
+        "module example.com/app\n\nrequire (\n\tgithub.com/goravel/framework v1.16.3\n\tgithub.com/gin-gonic/gin v1.10.0\n\tgithub.com/gofiber/fiber/v2 v2.52.10\n)\n",
     )
     .unwrap();
     let mut engine = GoEngine::with_project(None);
@@ -866,9 +866,85 @@ fn build_installs_framework_and_library_markers() {
             .collect::<Vec<_>>(),
         vec![
             ("Goravel", crate::go::GoIntegrationKind::Framework),
+            ("Gin", crate::go::GoIntegrationKind::Framework),
             ("Fiber", crate::go::GoIntegrationKind::Library),
         ]
     );
+}
+
+#[test]
+fn routes_use_open_buffers_for_detected_integrations() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("app");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("go.mod"),
+        "module example.com/app\n\nrequire github.com/gofiber/fiber/v2 v2.52.10\n",
+    )
+    .unwrap();
+    let route_file = root.join("routes.go");
+    std::fs::write(&route_file, "package app\n").unwrap();
+    let mut engine = GoEngine::with_project(None);
+    engine.install(GoEngine::build(&root));
+    engine.open_document(
+        &route_file,
+        "package app\nimport \"github.com/gofiber/fiber/v2\"\nfunc routes() { app := fiber.New(); app.Get(\"/live\", live) }\n",
+    );
+    assert!(engine.routes().iter().any(|route| matches!(
+        route,
+        crate::go::GoRoute::Fiber { file, route }
+            if file == &route_file && route.handler == "live"
+    )));
+}
+
+#[test]
+fn routes_use_open_buffers_for_gin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("app");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("go.mod"),
+        "module example.com/app\n\nrequire github.com/gin-gonic/gin v1.10.0\n",
+    )
+    .unwrap();
+    let route_file = root.join("routes.go");
+    std::fs::write(&route_file, "package app\n").unwrap();
+    let mut engine = GoEngine::with_project(None);
+    engine.install(GoEngine::build(&root));
+    engine.open_document(
+        &route_file,
+        "package app\nimport \"github.com/gin-gonic/gin\"\nfunc routes() { app := gin.New(); app.GET(\"/live\", live) }\n",
+    );
+    assert!(engine.routes().iter().any(|route| matches!(
+        route,
+        crate::go::GoRoute::Gin { file, route }
+            if file == &route_file && route.handler == "live"
+    )));
+}
+
+#[test]
+fn config_entries_use_open_buffers_for_goravel() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("app");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("go.mod"),
+        "module example.com/app\n\nrequire github.com/goravel/framework v1.16.3\n",
+    )
+    .unwrap();
+    let config_file = root.join("config.go");
+    std::fs::write(&config_file, "package app\n").unwrap();
+    let mut engine = GoEngine::with_project(None);
+    engine.install(GoEngine::build(&root));
+    engine.open_document(
+        &config_file,
+        "package app\nimport \"github.com/goravel/framework/facades\"\nfunc config() { c := facades.Config(); c.Add(\"app\", map[string]any{\"name\": \"Galaxy\"}) }\n",
+    );
+    assert!(engine.config_entries().iter().any(|config| {
+        config.file == config_file
+            && config.entry.key == "app.name"
+            && config.entry.value == "\"Galaxy\""
+    }));
 }
 
 #[test]

@@ -13,6 +13,10 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use super::build::{BuildContext, eval_constraint, file_matches, go_files};
+use super::integration::{
+    GoConfigEntry, GoRoute, scan_fiber_routes, scan_gin_routes, scan_goravel_config,
+    scan_goravel_routes,
+};
 use super::integration::{GoIntegration, detect_all};
 use super::modules::{GoProject, discover_goroot};
 use super::parse::{FuncDecl, GoFile, TypeDecl, ValueDecl, exported, parse_file};
@@ -254,6 +258,110 @@ impl GoEngine {
     /// Frameworks and libraries declared by the project's module files.
     pub fn integrations(&self) -> &[GoIntegration] {
         &self.integrations
+    }
+
+    /// Routes found in the workspace's indexed or open Go source files.
+    /// Open text wins so route navigation reflects unsaved editor changes.
+    pub fn routes(&mut self) -> Vec<GoRoute> {
+        let fiber = self
+            .integrations
+            .iter()
+            .any(|integration| integration.module.starts_with("github.com/gofiber/fiber/"));
+        let goravel = self
+            .integrations
+            .iter()
+            .any(|integration| integration.module == "github.com/goravel/framework");
+        let gin = self
+            .integrations
+            .iter()
+            .any(|integration| integration.module == "github.com/gin-gonic/gin");
+        if !fiber && !gin && !goravel {
+            return Vec::new();
+        }
+        let mut files: Vec<PathBuf> = self
+            .module_package_paths()
+            .iter()
+            .filter_map(|path| self.project.as_ref()?.import_dir(path))
+            .flat_map(|dir| go_files(&dir, &self.ctx))
+            .collect();
+        files.extend(self.open_text.keys().cloned());
+        files.sort();
+        files.dedup();
+        files
+            .into_iter()
+            .flat_map(|path| {
+                let text = self
+                    .open_text(&path)
+                    .map(|text| text.to_string())
+                    .or_else(|| std::fs::read_to_string(&path).ok());
+                text.map_or_else(Vec::new, |text| {
+                    let mut routes = Vec::new();
+                    if fiber {
+                        routes.extend(scan_fiber_routes(&text).into_iter().map(|route| {
+                            GoRoute::Fiber {
+                                file: path.clone(),
+                                route,
+                            }
+                        }));
+                    }
+                    if gin {
+                        routes.extend(scan_gin_routes(&text).into_iter().map(|route| {
+                            GoRoute::Gin {
+                                file: path.clone(),
+                                route,
+                            }
+                        }));
+                    }
+                    if goravel {
+                        routes.extend(scan_goravel_routes(&text).into_iter().map(|route| {
+                            GoRoute::Goravel {
+                                file: path.clone(),
+                                route,
+                            }
+                        }));
+                    }
+                    routes
+                })
+            })
+            .collect()
+    }
+
+    /// Literal configuration keys from a detected Goravel workspace.
+    pub fn config_entries(&mut self) -> Vec<GoConfigEntry> {
+        if !self
+            .integrations
+            .iter()
+            .any(|integration| integration.module == "github.com/goravel/framework")
+        {
+            return Vec::new();
+        }
+        let mut files: Vec<PathBuf> = self
+            .module_package_paths()
+            .iter()
+            .filter_map(|path| self.project.as_ref()?.import_dir(path))
+            .flat_map(|dir| go_files(&dir, &self.ctx))
+            .collect();
+        files.extend(self.open_text.keys().cloned());
+        files.sort();
+        files.dedup();
+        files
+            .into_iter()
+            .flat_map(|file| {
+                let text = self
+                    .open_text(&file)
+                    .map(|text| text.to_string())
+                    .or_else(|| std::fs::read_to_string(&file).ok());
+                text.map_or_else(Vec::new, |text| {
+                    scan_goravel_config(&text)
+                        .into_iter()
+                        .map(|entry| GoConfigEntry {
+                            file: file.clone(),
+                            entry,
+                        })
+                        .collect()
+                })
+            })
+            .collect()
     }
 
     pub fn root(&self) -> &Path {

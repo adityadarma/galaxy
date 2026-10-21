@@ -161,6 +161,7 @@ enum MainMenu {
         runMenu.addItem(.separator())
         runMenu.addItem(withTitle: "Run Build Task", action: #selector(MainWindowController.runBuildTask(_:)), keyEquivalent: "")
         runMenu.addItem(withTitle: "Run Test Task", action: #selector(MainWindowController.runTestTask(_:)), keyEquivalent: "")
+        runMenu.addItem(withTitle: "Download Go Modules", action: #selector(MainWindowController.downloadGoModules(_:)), keyEquivalent: "")
         runItem.submenu = runMenu
 
         let terminalItem = NSMenuItem()

@@ -636,6 +636,19 @@ const BUILTIN: &[(&str, &str, &str, &[&str])] = &[
         &["unit", "cargo test", "npm test", "phpunit"],
     ),
     (
+        "galaxy.go.downloadModules",
+        "Run",
+        "Download Go Modules",
+        &[
+            "go",
+            "gomod",
+            "dependencies",
+            "modules",
+            "download",
+            "reindex",
+        ],
+    ),
+    (
         "workbench.action.terminal.new",
         "Terminal",
         "Create New Terminal",

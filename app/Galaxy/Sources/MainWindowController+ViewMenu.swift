@@ -120,6 +120,18 @@ extension MainWindowController {
     @objc func runBuildTask(_ sender: Any?) { runTask("build") { $0.build } }
     @objc func runTestTask(_ sender: Any?) { runTask("test") { $0.test } }
 
+    @objc func downloadGoModules(_ sender: Any?) {
+        guard let document = activeTab?.doc, document.path().lowercased().hasSuffix(".go") else {
+            statusLabel.stringValue = "Open a Go file inside the module to download."
+            return NSSound.beep()
+        }
+        guard bridge.core.downloadGoModules(root: document.path()) else {
+            statusLabel.stringValue = "No Go module found for this file."
+            return NSSound.beep()
+        }
+        statusLabel.stringValue = "Downloading Go modules for the active Go module..."
+    }
+
     /// Sends the project's build or test command to the panel terminal.
     private func runTask(_ name: String, pick: (RunTasks.Detected) -> String?) {
         guard let workspace else { return NSSound.beep() }

@@ -24,7 +24,7 @@ fn fake_goroot(root: &Path) -> std::path::PathBuf {
     put(
         &g,
         "src/fmt/fmt.go",
-        "package fmt\n\nfunc Sprintf(format string, a ...any) string { return \"\" }\n",
+        "package fmt\n\nfunc Sprintf(format string, a ...any) string { return \"\" }\n\nfunc Identity[T any](value T) T { return value }\n",
     );
     put(
         &g,
@@ -450,6 +450,19 @@ fn generic_explicit_instantiation() {
 }
 
 #[test]
+fn generic_explicit_instantiation_is_a_function_value() {
+    assert_eq!(generic("", "Zero[int]"), "func() int");
+    // Ordinary bracket expressions remain indexes.
+    assert_eq!(generic("xs := []string{}", "xs[0]"), "string");
+}
+
+#[test]
+fn imported_generic_function_is_a_function_value() {
+    let main = body("import \"fmt\"", "", "\t/*|*/");
+    assert_eq!(eval(&main, "fmt.Identity[string]"), "func(string) string");
+}
+
+#[test]
 fn generic_unbound_stays_unknown() {
     assert_eq!(generic("", "Zero()"), "?");
     assert_eq!(generic("", "First()"), "?");
@@ -470,6 +483,14 @@ fn generic_named_type_argument() {
 fn generic_struct_method_result() {
     let main = body("", GENERICS, "\tb := &Box[*User]{}\n\tb.Get()./*|*/");
     assert_eq!(show(&main), "*app.User");
+}
+
+#[test]
+fn generic_method_expression_has_receiver_argument() {
+    assert_eq!(
+        generic("", "(*Box[string]).Get"),
+        "func(*app.Box[string]) string"
+    );
 }
 
 #[test]

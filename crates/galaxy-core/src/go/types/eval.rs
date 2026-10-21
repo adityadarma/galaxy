@@ -122,6 +122,9 @@ impl Eval<'_> {
             "selector_expression" => self.eval_selector(ctx, src, node),
             "call_expression" => self.eval_call(ctx, src, node),
             "index_expression" => {
+                if let Some(value) = self.generic_value(ctx, src, node) {
+                    return value;
+                }
                 let operand = self.eval_field(ctx, src, node, "operand");
                 self.index_ty(&operand)
             }
@@ -206,6 +209,10 @@ impl Eval<'_> {
     }
 
     pub(super) fn func_decl_ty(&mut self, ctx: &Ctx, decl: &FuncDecl) -> Ty {
+        self.func_decl_ty_with_env(ctx, decl, &Env::new())
+    }
+
+    pub(super) fn func_decl_ty_with_env(&mut self, ctx: &Ctx, decl: &FuncDecl, env: &Env) -> Ty {
         let mut variadic = false;
         let mut params = Vec::with_capacity(decl.params.len());
         for p in &decl.params {
@@ -214,11 +221,11 @@ impl Eval<'_> {
                 None => (p.ty.as_str(), p.variadic),
             };
             variadic |= rest;
-            params.push(self.ty(ctx, elem));
+            params.push(self.ty_of_text(ctx, elem, env));
         }
         let mut results = Vec::with_capacity(decl.results.len());
         for r in &decl.results {
-            results.push(self.ty(ctx, &r.ty));
+            results.push(self.ty_of_text(ctx, &r.ty, env));
         }
         Ty::Func {
             params,
@@ -416,9 +423,27 @@ impl Eval<'_> {
         ) else {
             return Ty::Unknown;
         };
-        // `T.Method` is a method expression.
-        if self.as_type(ctx, src, operand).is_some() {
-            return Ty::Unknown;
+        // An instantiated `T.Method` is a method expression, whose first
+        // parameter is `T`. Keep ordinary type selectors out of value space.
+        if let Some(recv) = self.as_type(ctx, src, operand)
+            && matches!(recv.deref(), Ty::Named { args, .. } if !args.is_empty())
+        {
+            let method = self.member_ty(&recv, text(src, field));
+            return match method {
+                Some(Ty::Func {
+                    mut params,
+                    results,
+                    variadic,
+                }) => {
+                    params.insert(0, recv);
+                    Ty::Func {
+                        params,
+                        results,
+                        variadic,
+                    }
+                }
+                _ => Ty::Unknown,
+            };
         }
         let recv = self.eval_node(ctx, src, operand);
         let name = text(src, field);
@@ -436,11 +461,11 @@ impl Eval<'_> {
         if let Some(result) = self.builtin_call(ctx, src, node, function) {
             return result;
         }
-        if let Some(converted) = self.as_type(ctx, src, function) {
-            return converted;
-        }
         if let Some(result) = self.generic_call(ctx, src, node, function) {
             return result;
+        }
+        if let Some(converted) = self.as_type(ctx, src, function) {
+            return converted;
         }
         let callee = self.eval_node(ctx, src, function);
         let callee = match callee {

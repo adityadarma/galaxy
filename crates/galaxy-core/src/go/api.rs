@@ -5,22 +5,26 @@
 use std::path::{Path, PathBuf};
 
 use super::engine::GoEngine;
+use super::modules::GoProject;
 use super::parse::parse;
 use super::types::{Symbol, callee_at, resolve_at};
 use super::{actions, complete, diag, refs};
 use crate::lang::{Action, Completion, HoverResult, Occurrence, Problem, Signature, Target};
 
-/// The directory a Go file belongs to as a project: the workspace that holds
-/// the nearest `go.mod`, else the nearest `.git`, else the file's directory.
+/// The directory a Go file belongs to as a project. A `go.work` root is used
+/// only when it declares the nearest module; this keeps unrelated monorepo
+/// services from sharing an engine or module-download target.
 pub fn project_root(file: &Path) -> PathBuf {
     let start = file.parent().unwrap_or(file);
-    let module = start.ancestors().find(|dir| dir.join("go.mod").is_file());
-    if let Some(module) = module {
-        let workspace = module
-            .ancestors()
-            .skip(1)
-            .find(|dir| dir.join("go.work").is_file());
-        return workspace.unwrap_or(module).to_path_buf();
+    if let Some(project) = GoProject::detect(file) {
+        if let Some(workspace) = project.root().ancestors().skip(1).find(|dir| {
+            dir.join("go.work").is_file()
+                && GoProject::detect(dir)
+                    .is_some_and(|candidate| candidate.module_for_file(file).is_some())
+        }) {
+            return workspace.to_path_buf();
+        }
+        return project.root().to_path_buf();
     }
     start
         .ancestors()

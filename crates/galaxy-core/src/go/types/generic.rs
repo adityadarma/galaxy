@@ -29,14 +29,7 @@ impl Eval<'_> {
     ) -> Option<Ty> {
         let (name_node, explicit) = self.split_instantiation(src, call, function);
         let generic = self.generic_decl(ctx, src, name_node)?;
-        let mut env = Env::new();
-        for tp in &generic.decl.type_params {
-            env.insert(tp.name.clone(), Ty::Unknown);
-        }
-        for (tp, text) in generic.decl.type_params.iter().zip(&explicit) {
-            let bound = self.ty(ctx, text);
-            env.insert(tp.name.clone(), bound);
-        }
+        let mut env = self.generic_env(ctx, &generic, &explicit);
         let names: Vec<String> = generic
             .decl
             .type_params
@@ -72,6 +65,31 @@ impl Eval<'_> {
             [one] => one.clone(),
             many => Ty::Tuple(many.to_vec()),
         })
+    }
+
+    /// The function value produced by an explicit instantiation such as
+    /// `F[int]`. This is intentionally separate from indexing: only a known
+    /// generic declaration turns bracket syntax into an instantiation.
+    pub(super) fn generic_value(&mut self, ctx: &Ctx, src: &str, node: Node<'_>) -> Option<Ty> {
+        let (name_node, explicit) = self.split_instantiation(src, node, node);
+        if explicit.is_empty() {
+            return None;
+        }
+        let generic = self.generic_decl(ctx, src, name_node)?;
+        let env = self.generic_env(ctx, &generic, &explicit);
+        Some(self.func_decl_ty_with_env(&generic.ctx, &generic.decl, &env))
+    }
+
+    fn generic_env(&mut self, ctx: &Ctx, generic: &Generic, explicit: &[String]) -> Env {
+        let mut env = Env::new();
+        for tp in &generic.decl.type_params {
+            env.insert(tp.name.clone(), Ty::Unknown);
+        }
+        for (tp, text) in generic.decl.type_params.iter().zip(explicit) {
+            let bound = self.ty(ctx, text);
+            env.insert(tp.name.clone(), bound);
+        }
+        env
     }
 
     /// The callee node and the type argument texts of `F[int, string]`.

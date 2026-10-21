@@ -363,11 +363,18 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         reloadKeybindings(force: true)
 
         bridge.onEvent = { [weak self] event in
-            if case let .pong(message) = event {
+            switch event {
+            case let .pong(message):
                 // Don't overwrite the status of an open document.
                 if self?.editorView.document == nil {
                     self?.statusLabel.stringValue = "Core \(bridge.version) connected (\(message))"
                 }
+            case .goModulesStarted:
+                self?.statusLabel.stringValue = "Downloading Go modules..."
+            case .goModulesFinished:
+                self?.statusLabel.stringValue = "Go modules downloaded; reindexing..."
+            case let .goModulesFailed(_, message):
+                self?.statusLabel.stringValue = "Go module download failed: \(message)"
             }
         }
         statusBar.onGitClick = { [weak self] in self?.showGitBranchPicker() }

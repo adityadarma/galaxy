@@ -46,8 +46,10 @@ extension MainWindowController: NSMenuItemValidation {
         case #selector(splitEditorRight(_:)), #selector(splitEditorDown(_:)):
             return activeTab?.isDocument == true
         case #selector(moveTerminalToEditor(_:)), #selector(createTerminalEditor(_:)), #selector(createTerminal(_:)),
-             #selector(runBuildTask(_:)), #selector(runTestTask(_:)):
+              #selector(runBuildTask(_:)), #selector(runTestTask(_:)):
             return workspace != nil
+        case #selector(downloadGoModules(_:)):
+            return activeTab?.isDocument == true && activeTab?.doc.path().lowercased().hasSuffix(".go") == true
         case #selector(splitTerminal(_:)):
             return workspace != nil
         case #selector(moveTerminalToNewWindow(_:)), #selector(renameTerminal(_:)), #selector(changeTerminalColor(_:)),

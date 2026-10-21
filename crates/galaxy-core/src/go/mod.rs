@@ -31,7 +31,12 @@ pub use build::{BuildContext, constraint_of, eval_constraint, file_matches, go_f
 pub use complete::complete;
 pub use diag::diagnostics;
 pub use engine::{Built, FileSymbol, GoEngine, Member, MemberKind, Members, Package};
-pub use integration::{GoIntegration, GoIntegrationKind};
+pub use integration::{
+    FiberRoute, FiberRoutePath, GinRoute, GinRoutePath, GoConfigEntry, GoIntegration,
+    GoIntegrationKind, GoRoute, GoravelConfigEntry, GoravelRoute, GoravelRoutePath,
+    scan_fiber_routes, scan_fiber_tree, scan_gin_routes, scan_gin_tree, scan_goravel_config,
+    scan_goravel_config_tree, scan_goravel_routes, scan_goravel_tree,
+};
 pub use modules::{GoProject, Module, discover_goroot, discover_modcache, escape_module_path};
 pub use outline::outline;
 pub use parse::{

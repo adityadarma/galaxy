@@ -27,15 +27,17 @@ fn at(text: &str, needle: &str, extra: usize) -> (u32, u32) {
 }
 
 #[test]
-fn project_root_prefers_go_work_then_go_mod_then_git() {
+fn project_root_uses_workspace_only_when_it_declares_the_module() {
     let tmp = tempfile::tempdir().unwrap();
     let work = tmp.path().join("ws");
     let module = work.join("svc");
     std::fs::create_dir_all(module.join("pkg")).unwrap();
     std::fs::write(module.join("go.mod"), "module x\n").unwrap();
     assert_eq!(project_root(&module.join("pkg/a.go")), module);
-    std::fs::write(work.join("go.work"), "go 1.22\n").unwrap();
+    std::fs::write(work.join("go.work"), "go 1.22\n\nuse ./svc\n").unwrap();
     assert_eq!(project_root(&module.join("pkg/a.go")), work);
+    std::fs::write(work.join("go.work"), "go 1.22\n\nuse ./other\n").unwrap();
+    assert_eq!(project_root(&module.join("pkg/a.go")), module);
     let loose = tmp.path().join("loose");
     std::fs::create_dir_all(loose.join(".git")).unwrap();
     assert_eq!(project_root(&loose.join("a.go")), loose);

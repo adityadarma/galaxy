@@ -2,10 +2,21 @@ import AppKit
 import os
 
 extension MainWindowController {
+    /// Cancels a pending hover as well as hiding its card. Without clearing
+    /// the request position, the polling loop can immediately reopen it.
+    func dismissHover() {
+        hoverPopover.isHidden = true
+        hoverDocument = nil
+        hoverRequestPosition = nil
+        hoverShownRange = nil
+        hoverShownContents = nil
+        hoverShownPosition = nil
+    }
+
     func beginHover(at position: TextPos, point: NSPoint) {
         if handleBlameHover(point: point) { return }
         guard position.line != UInt64.max, let document = activeTab?.doc else {
-            hoverPopover.isHidden = true
+            dismissHover()
             return
         }
         // Same spot: skip unless the last answer was empty (the server may
