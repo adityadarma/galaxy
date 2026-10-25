@@ -21,7 +21,6 @@ final class StatusBar: NSView {
     var onGitGraphClick: (() -> Void)?
     let workspaceScan = StatusBar.label("workspace-scan")
     private var scanRoot: String?
-    private var scans = Set<String>()
     let cursor = StatusBar.label("status-cursor")
     let language = StatusBar.label("status-language")
     let indent = StatusBar.label("status-indent")
@@ -159,31 +158,29 @@ final class StatusBar: NSView {
 
     func resetWorkspaceScan(root: String) {
         scanRoot = root
-        scans.removeAll()
-        updateWorkspaceScan()
+        workspaceScan.stringValue = ""
+        workspaceScan.isHidden = true
     }
 
-    func workspaceScanStarted(root: String, label: String) {
+    func workspaceIndexStarted(root: String, total: UInt64) {
         guard root == scanRoot else { return }
-        scans.insert(label)
-        updateWorkspaceScan()
+        workspaceScan.isHidden = false
+        workspaceScan.stringValue = total == 0
+            ? "Indexing files..."
+            : "Indexing 0 of \(total) files"
     }
 
-    func workspaceScanFinished(root: String, label: String) {
+    func workspaceIndexProgress(root: String, completed: UInt64, total: UInt64) {
         guard root == scanRoot else { return }
-        scans.remove(label)
-        updateWorkspaceScan()
+        workspaceScan.isHidden = false
+        workspaceScan.stringValue = "Indexing \(completed) of \(total) files"
     }
 
-    private func updateWorkspaceScan() {
-        workspaceScan.isHidden = scans.isEmpty
-        guard !scans.isEmpty else {
-            workspaceScan.stringValue = ""
-            return
-        }
-        workspaceScan.stringValue = scans.count == 1
-            ? "Scanning \(scans.first!)..."
-            : "Scanning \(scans.count) engines..."
+    func workspaceIndexFinished(root: String, total: UInt64, changed: UInt64) {
+        guard root == scanRoot else { return }
+        _ = changed
+        workspaceScan.stringValue = ""
+        workspaceScan.isHidden = true
     }
 
     @objc private func gitClicked(_ sender: Any?) { onGitClick?() }

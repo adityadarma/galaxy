@@ -4,6 +4,7 @@
 //! batched events through `CoreListener`. No per-character FFI chatter.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -78,12 +79,33 @@ impl From<std::io::Error> for CoreError {
 /// Events pushed from the core to the UI.
 #[derive(Debug, Clone, PartialEq, uniffi::Enum)]
 pub enum CoreEvent {
-    Pong { message: String },
-    GoModulesStarted { root: String },
-    GoModulesFinished { root: String },
-    GoModulesFailed { root: String, message: String },
-    WorkspaceScanStarted { root: String, label: String },
-    WorkspaceScanFinished { root: String, label: String },
+    Pong {
+        message: String,
+    },
+    GoModulesStarted {
+        root: String,
+    },
+    GoModulesFinished {
+        root: String,
+    },
+    GoModulesFailed {
+        root: String,
+        message: String,
+    },
+    WorkspaceIndexStarted {
+        root: String,
+        total: u64,
+    },
+    WorkspaceIndexProgress {
+        root: String,
+        completed: u64,
+        total: u64,
+    },
+    WorkspaceIndexFinished {
+        root: String,
+        total: u64,
+        changed: u64,
+    },
 }
 
 /// Implemented in Swift. Called from core threads, so the Swift side must
@@ -560,7 +582,7 @@ impl Core {
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .reset_index();
-                        spawn_go_index(&engine, &root, listener.clone());
+                        spawn_go_index(&engine, &root);
                         if let Some(listener) = &listener {
                             listener.on_event(CoreEvent::GoModulesFinished {
                                 root: root.to_string_lossy().into_owned(),
@@ -607,7 +629,7 @@ impl Core {
         let ws = CoreWorkspace::open(PathBuf::from(&path))?;
         tracing::info!(path = %ws.root().display(), "opened workspace");
         spawn_workspace_indexing(
-            ws.root(),
+            ws.clone(),
             Arc::clone(&self.typescript_navigation),
             Arc::clone(&self.go),
             Arc::clone(&self.php),
@@ -1562,14 +1584,7 @@ impl Core {
             .unwrap_or_else(|e| e.into_inner())
             .wants_index(Duration::from_secs(120));
         if fresh || stale {
-            spawn_go_index(
-                &engine,
-                &root,
-                self.listener
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone(),
-            );
+            spawn_go_index(&engine, &root);
         }
         Some(engine)
     }
@@ -1698,14 +1713,7 @@ impl Core {
             .unwrap_or_else(|e| e.into_inner())
             .wants_index(Duration::from_secs(60));
         if fresh || stale {
-            spawn_php_index(
-                &engine,
-                &root,
-                self.listener
-                    .read()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clone(),
-            );
+            spawn_php_index(&engine, &root);
         }
         Some(engine)
     }
@@ -2443,60 +2451,167 @@ impl TypeScriptNavigationCache {
     }
 }
 
-const TYPESCRIPT_SCAN_LABEL: &str = "TypeScript";
-const GO_SCAN_LABEL: &str = "Go";
-const PHP_SCAN_LABEL: &str = "PHP";
-
-fn workspace_scan_event(
-    listener: &Option<Arc<dyn CoreListener>>,
-    root: &Path,
-    label: &str,
-    started: bool,
-) {
-    if let Some(listener) = listener {
-        let root = root.to_string_lossy().into_owned();
-        listener.on_event(if started {
-            CoreEvent::WorkspaceScanStarted {
-                root,
-                label: label.into(),
-            }
-        } else {
-            CoreEvent::WorkspaceScanFinished {
-                root,
-                label: label.into(),
-            }
-        });
-    }
-}
-
 fn spawn_workspace_indexing(
-    root: &Path,
+    workspace: CoreWorkspace,
     cache: Arc<Mutex<TypeScriptNavigationCache>>,
     go_engines: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<GoEngine>>>>>,
     php_engines: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<PhpEngine>>>>>,
     listener: Option<Arc<dyn CoreListener>>,
 ) {
-    let root = root.to_path_buf();
+    let root = workspace.root().to_path_buf();
     let _ = std::thread::Builder::new()
         .name("workspace-indexing".into())
         .spawn(move || {
+            send_workspace_index_started(&listener, &root);
+            let (total, changed) = refresh_workspace_index(&workspace, &listener);
+            let mut workers = Vec::new();
             if typescript_workspace_detected(&root) {
-                spawn_typescript_navigation_warmup(&root, cache, listener.clone());
+                workers.push(spawn_typescript_navigation_warmup(&root, cache));
             }
             if let Some(project) = go::GoProject::detect(&root) {
                 let project_root = project.root().to_path_buf();
                 let (engine, fresh) = pending_go_engine(&go_engines, &project_root);
                 if fresh {
-                    spawn_go_index(&engine, &project_root, listener.clone());
+                    workers.push(spawn_go_index(&engine, &project_root));
                 }
             }
             if root.join("composer.json").is_file() {
                 let (engine, fresh) = pending_php_engine(&php_engines, &root);
                 if fresh {
-                    spawn_php_index(&engine, &root, listener);
+                    workers.push(spawn_php_index(&engine, &root));
                 }
             }
+            for worker in workers.into_iter().flatten() {
+                let _ = worker.join();
+            }
+            send_workspace_index_finished(&listener, &root, total, changed);
         });
+}
+
+fn send_workspace_index_started(listener: &Option<Arc<dyn CoreListener>>, root: &Path) {
+    if let Some(listener) = listener {
+        listener.on_event(CoreEvent::WorkspaceIndexStarted {
+            root: root.to_string_lossy().into_owned(),
+            total: 0,
+        });
+    }
+}
+
+fn send_workspace_index_finished(
+    listener: &Option<Arc<dyn CoreListener>>,
+    root: &Path,
+    total: u64,
+    changed: u64,
+) {
+    if let Some(listener) = listener {
+        listener.on_event(CoreEvent::WorkspaceIndexFinished {
+            root: root.to_string_lossy().into_owned(),
+            total,
+            changed,
+        });
+    }
+}
+
+/// One manifest is shared by every language service. It records the current
+/// workspace file set and freshness, while language engines own their semantic
+/// payloads. Reopening a workspace always walks it again and updates this
+/// cache incrementally, so additions and removals are never missed.
+fn refresh_workspace_index(
+    workspace: &CoreWorkspace,
+    listener: &Option<Arc<dyn CoreListener>>,
+) -> (u64, u64) {
+    let root = workspace.root();
+    let root_text = root.to_string_lossy().into_owned();
+    let paths = workspace.build_file_index().paths().collect::<Vec<_>>();
+    let total = paths.len() as u64;
+    if let Some(listener) = listener {
+        listener.on_event(CoreEvent::WorkspaceIndexProgress {
+            root: root_text.clone(),
+            completed: 0,
+            total,
+        });
+    }
+    let previous = load_workspace_manifest(root);
+    let mut current = BTreeMap::new();
+    let mut changed = 0_u64;
+    for (offset, path) in paths.iter().enumerate() {
+        let Some(freshness) = workspace_file_freshness(&root.join(path)) else {
+            continue;
+        };
+        if previous.get(path) != Some(&freshness) {
+            changed += 1;
+        }
+        current.insert(path.clone(), freshness);
+        let completed = (offset + 1) as u64;
+        if (completed == total || completed.is_multiple_of(32))
+            && let Some(listener) = listener
+        {
+            listener.on_event(CoreEvent::WorkspaceIndexProgress {
+                root: root_text.clone(),
+                completed,
+                total,
+            });
+        }
+    }
+    changed += previous
+        .keys()
+        .filter(|path| !current.contains_key(*path))
+        .count() as u64;
+    save_workspace_manifest(root, &current);
+    (total, changed)
+}
+
+fn workspace_file_freshness(path: &Path) -> Option<String> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let modified = metadata
+        .modified()
+        .ok()?
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()?;
+    Some(format!("{}:{}", metadata.len(), modified.as_nanos()))
+}
+
+fn workspace_manifest_path(root: &Path) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    root.hash(&mut hasher);
+    Some(
+        PathBuf::from(home)
+            .join("Library/Caches/Galaxy/workspace-index")
+            .join(format!("{:016x}.manifest", hasher.finish())),
+    )
+}
+
+fn load_workspace_manifest(root: &Path) -> BTreeMap<String, String> {
+    let Some(path) = workspace_manifest_path(root) else {
+        return BTreeMap::new();
+    };
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return BTreeMap::new();
+    };
+    contents
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .map(|(path, freshness)| (path.to_owned(), freshness.to_owned()))
+        .collect()
+}
+
+fn save_workspace_manifest(root: &Path, manifest: &BTreeMap<String, String>) {
+    let Some(path) = workspace_manifest_path(root) else {
+        return;
+    };
+    let Some(parent) = path.parent() else { return };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let contents = manifest
+        .iter()
+        .map(|(path, freshness)| format!("{path}\t{freshness}\n"))
+        .collect::<String>();
+    let temporary = path.with_extension("tmp");
+    if std::fs::write(&temporary, contents).is_ok() {
+        let _ = std::fs::rename(temporary, path);
+    }
 }
 
 /// A JavaScript package or an explicit JS/TS project configuration opts the
@@ -2510,17 +2625,13 @@ fn typescript_workspace_detected(root: &Path) -> bool {
 fn spawn_typescript_navigation_warmup(
     root: &Path,
     cache: Arc<Mutex<TypeScriptNavigationCache>>,
-    listener: Option<Arc<dyn CoreListener>>,
-) {
+) -> Option<std::thread::JoinHandle<()>> {
     let root = root.to_path_buf();
-    workspace_scan_event(&listener, &root, TYPESCRIPT_SCAN_LABEL, true);
-    let _ = std::thread::Builder::new()
+    std::thread::Builder::new()
         .name("typescript-navigation-warmup".into())
         // Keep opening a workspace instant while bounding work in large repositories.
-        .spawn(move || {
-            warm_typescript_navigation(&root, &cache);
-            workspace_scan_event(&listener, &root, TYPESCRIPT_SCAN_LABEL, false);
-        });
+        .spawn(move || warm_typescript_navigation(&root, &cache))
+        .ok()
 }
 
 fn warm_typescript_navigation(root: &Path, cache: &Mutex<TypeScriptNavigationCache>) {
@@ -3370,12 +3481,10 @@ fn pending_php_engine(
 fn spawn_go_index(
     engine: &Arc<Mutex<GoEngine>>,
     root: &Path,
-    listener: Option<Arc<dyn CoreListener>>,
-) {
+) -> Option<std::thread::JoinHandle<()>> {
     let engine = Arc::clone(engine);
     let root = root.to_path_buf();
-    workspace_scan_event(&listener, &root, GO_SCAN_LABEL, true);
-    let _ = std::thread::Builder::new()
+    std::thread::Builder::new()
         .name("go-index".into())
         .spawn(move || {
             let built = GoEngine::build(&root);
@@ -3383,8 +3492,8 @@ fn spawn_go_index(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .install(built);
-            workspace_scan_event(&listener, &root, GO_SCAN_LABEL, false);
-        });
+        })
+        .ok()
 }
 
 fn is_blade_path(path: &Path) -> bool {
@@ -3396,12 +3505,10 @@ fn is_blade_path(path: &Path) -> bool {
 fn spawn_php_index(
     engine: &Arc<Mutex<PhpEngine>>,
     root: &Path,
-    listener: Option<Arc<dyn CoreListener>>,
-) {
+) -> Option<std::thread::JoinHandle<()>> {
     let engine = Arc::clone(engine);
     let root = root.to_path_buf();
-    workspace_scan_event(&listener, &root, PHP_SCAN_LABEL, true);
-    let _ = std::thread::Builder::new()
+    std::thread::Builder::new()
         .name("php-index".into())
         .spawn(move || {
             let built = php::build(&root);
@@ -3409,8 +3516,8 @@ fn spawn_php_index(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .install(built);
-            workspace_scan_event(&listener, &root, PHP_SCAN_LABEL, false);
-        });
+        })
+        .ok()
 }
 
 /// An outline entry in the shape the language servers use; `kind` is the
@@ -6969,7 +7076,7 @@ mod tests {
     }
 
     #[test]
-    fn opening_workspace_indexes_only_detected_engine_projects() {
+    fn opening_workspace_indexes_all_files_with_shared_progress() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
         std::fs::write(dir.path().join("tsconfig.json"), "{}\n").unwrap();
@@ -6989,35 +7096,42 @@ mod tests {
             .unwrap();
 
         let root = dir.path().to_string_lossy().into_owned();
-        let expected = [TYPESCRIPT_SCAN_LABEL, GO_SCAN_LABEL, PHP_SCAN_LABEL];
         let deadline = Instant::now() + Duration::from_secs(5);
-        let mut started = HashSet::new();
-        let mut finished = HashSet::new();
-        while Instant::now() < deadline && finished.len() < expected.len() {
+        let mut started = None;
+        let mut progress = 0;
+        let mut finished = None;
+        while Instant::now() < deadline && finished.is_none() {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let Ok(event) = rx.recv_timeout(remaining) else {
                 break;
             };
             match event {
-                CoreEvent::WorkspaceScanStarted {
+                CoreEvent::WorkspaceIndexStarted {
                     root: event_root,
-                    label,
+                    total,
                 } if event_root == root => {
-                    started.insert(label);
+                    started = Some(total);
                 }
-                CoreEvent::WorkspaceScanFinished {
+                CoreEvent::WorkspaceIndexProgress {
                     root: event_root,
-                    label,
+                    completed,
+                    ..
                 } if event_root == root => {
-                    finished.insert(label);
+                    progress = completed;
+                }
+                CoreEvent::WorkspaceIndexFinished {
+                    root: event_root,
+                    total,
+                    ..
+                } if event_root == root => {
+                    finished = Some(total);
                 }
                 _ => {}
             }
         }
-        for label in expected {
-            assert!(started.contains(label), "{label} scan did not start");
-            assert!(finished.contains(label), "{label} scan did not finish");
-        }
+        assert_eq!(started, Some(0));
+        assert_eq!(finished, Some(6));
+        assert_eq!(progress, 6);
 
         let plain = tempfile::tempdir().unwrap();
         let (tx, rx) = mpsc::channel();
@@ -7025,14 +7139,9 @@ mod tests {
         core.set_listener(Arc::new(ChannelListener(Mutex::new(tx))));
         core.open_workspace(plain.path().to_string_lossy().into_owned())
             .unwrap();
-        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
-
-        std::fs::write(plain.path().join("jsconfig.json"), "{}\n").unwrap();
-        core.open_workspace(plain.path().to_string_lossy().into_owned())
-            .unwrap();
         assert!(matches!(
             rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            CoreEvent::WorkspaceScanStarted { label, .. } if label == TYPESCRIPT_SCAN_LABEL
+            CoreEvent::WorkspaceIndexStarted { total: 0, .. }
         ));
     }
 

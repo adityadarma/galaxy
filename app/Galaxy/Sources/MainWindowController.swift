@@ -379,10 +379,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 self?.statusLabel.stringValue = "Go modules downloaded; reindexing..."
             case let .goModulesFailed(_, message):
                 self?.statusLabel.stringValue = "Go module download failed: \(message)"
-            case let .workspaceScanStarted(root, label):
-                self?.statusBar.workspaceScanStarted(root: root, label: label)
-            case let .workspaceScanFinished(root, label):
-                self?.statusBar.workspaceScanFinished(root: root, label: label)
+            case let .workspaceIndexStarted(root, total):
+                self?.statusBar.workspaceIndexStarted(root: root, total: total)
+            case let .workspaceIndexProgress(root, completed, total):
+                self?.statusBar.workspaceIndexProgress(root: root, completed: completed, total: total)
+            case let .workspaceIndexFinished(root, total, changed):
+                self?.statusBar.workspaceIndexFinished(root: root, total: total, changed: changed)
             }
         }
         statusBar.onGitClick = { [weak self] in self?.showGitBranchPicker() }

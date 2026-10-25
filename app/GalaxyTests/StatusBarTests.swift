@@ -37,19 +37,21 @@ final class StatusBarTests: XCTestCase {
         XCTAssertTrue(bar.gitGraph.isHidden)
     }
 
-    func testWorkspaceScanShowsConcurrentEnginesAndIgnoresStaleWorkspace() {
+    func testWorkspaceIndexShowsFileProgressAndIgnoresStaleWorkspace() {
         let bar = StatusBar()
         bar.resetWorkspaceScan(root: "/one")
-        bar.workspaceScanStarted(root: "/one", label: "TypeScript")
+        bar.workspaceIndexStarted(root: "/one", total: 0)
         XCTAssertFalse(bar.workspaceScan.isHidden)
-        XCTAssertEqual(bar.workspaceScan.stringValue, "Scanning TypeScript...")
-        bar.workspaceScanStarted(root: "/one", label: "Go")
-        XCTAssertEqual(bar.workspaceScan.stringValue, "Scanning 2 engines...")
+        XCTAssertEqual(bar.workspaceScan.stringValue, "Indexing files...")
+        bar.workspaceIndexProgress(root: "/one", completed: 0, total: 120)
+        XCTAssertEqual(bar.workspaceScan.stringValue, "Indexing 0 of 120 files")
+        bar.workspaceIndexProgress(root: "/one", completed: 64, total: 120)
+        XCTAssertEqual(bar.workspaceScan.stringValue, "Indexing 64 of 120 files")
         bar.resetWorkspaceScan(root: "/two")
-        bar.workspaceScanFinished(root: "/one", label: "TypeScript")
+        bar.workspaceIndexFinished(root: "/one", total: 120, changed: 3)
         XCTAssertTrue(bar.workspaceScan.isHidden)
-        bar.workspaceScanStarted(root: "/two", label: "PHP")
-        bar.workspaceScanFinished(root: "/two", label: "PHP")
+        bar.workspaceIndexStarted(root: "/two", total: 1)
+        bar.workspaceIndexFinished(root: "/two", total: 1, changed: 1)
         XCTAssertTrue(bar.workspaceScan.isHidden)
     }
 

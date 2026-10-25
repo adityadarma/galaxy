@@ -158,6 +158,12 @@ impl WorkspaceIndex {
         let id = self.arena.intern(rel);
         self.files.push(id);
     }
+
+    /// Relative paths in this index. Workspace-wide services share this list
+    /// so they apply the same ignore and symlink rules as Go to File.
+    pub fn paths(&self) -> impl Iterator<Item = String> + '_ {
+        self.files.iter().filter_map(|&id| self.arena.display(id))
+    }
 }
 
 /// How the Go to File index changes after some paths changed on disk.
