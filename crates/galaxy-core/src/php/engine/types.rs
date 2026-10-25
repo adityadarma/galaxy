@@ -399,7 +399,8 @@ impl PhpEngine {
                         let re = param_doc_regex(var);
                         let caps = re.captures(doc)?;
                         resolve_type(&caps[1], &ctx.file.namespace, &ctx.file.uses, self_fqn)
-                    });
+                    })
+                    .or_else(|| self.builder_callback_parameter_type(ctx, scope, var, depth));
                 offer(scope.start_byte(), Source::Resolved(declared));
             }
         }
@@ -540,5 +541,35 @@ impl PhpEngine {
             }
         }
         Lookup::Found(None)
+    }
+
+    /// The type of the sole closure parameter `var` when a framework knows
+    /// what the called method passes to its callback. The engine only finds
+    /// the call and the receiver type; frameworks decide the answer.
+    fn builder_callback_parameter_type(
+        &mut self,
+        ctx: &Ctx<'_>,
+        scope: Node<'_>,
+        var: &str,
+        depth: u8,
+    ) -> Option<String> {
+        let parameters = scope.child_by_field_name("parameters")?;
+        let mut cursor = parameters.walk();
+        let first = parameters
+            .named_children(&mut cursor)
+            .find_map(|parameter| parameter.child_by_field_name("name"))?;
+        if &ctx.src[first.byte_range()] != var {
+            return None;
+        }
+        let call = std::iter::successors(scope.parent(), |node| node.parent())
+            .find(|node| node.kind() == "member_call_expression")?;
+        let method = &ctx.src[call.child_by_field_name("name")?.byte_range()];
+        let receiver = call.child_by_field_name("object")?;
+        let ty = self.eval(ctx, &ctx.src[receiver.byte_range()], depth + 1)?;
+        let chain = self.lineage_env(&ty);
+        let frameworks = self.frameworks.clone();
+        frameworks
+            .iter()
+            .find_map(|fw| fw.callback_parameter_type(self, method, &ty, &chain))
     }
 }

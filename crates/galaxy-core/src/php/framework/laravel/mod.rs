@@ -149,6 +149,16 @@ impl Framework for LaravelFramework {
         eloquent::forwarded_method(engine, class, name)
     }
 
+    fn callback_parameter_type(
+        &self,
+        engine: &mut PhpEngine,
+        method: &str,
+        receiver: &str,
+        chain: &[(Arc<ClassInfo>, HashMap<String, String>)],
+    ) -> Option<String> {
+        eloquent::callback_parameter_type(engine, method, receiver, chain)
+    }
+
     fn forwarding_builder(
         &self,
         engine: &mut PhpEngine,

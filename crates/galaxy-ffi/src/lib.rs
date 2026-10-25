@@ -3,7 +3,7 @@
 //! Design rule: the UI calls in with coarse-grained commands and receives
 //! batched events through `CoreListener`. No per-character FFI chatter.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
@@ -41,13 +41,24 @@ use galaxy_core::selection::{Selection, SelectionSet};
 use galaxy_core::snippets;
 use galaxy_core::syntax::{self, SyntaxLanguage, SyntaxService, SyntaxSnapshot};
 use galaxy_core::terminal::TerminalSession;
-use galaxy_core::typescript::{
-    DeclarationKind, DocumentIndex, ImportBinding, ImportKind, TypeMemberTarget,
-};
+use galaxy_core::typescript::DocumentIndex;
 use galaxy_core::viewport;
 use galaxy_core::watcher::WorkspaceWatcher;
 use galaxy_core::workspace::{
     SearchMatch as CoreSearchMatch, SearchOptions as CoreSearchOptions, Workspace as CoreWorkspace,
+};
+
+mod typescript_editor;
+mod typescript_navigation;
+
+use typescript_editor::{
+    typescript_completions, typescript_hover_markdown, typescript_outline_symbol,
+};
+use typescript_navigation::{
+    TypeScriptNavigationCache, module_root_location, resolve_typescript_definition_import,
+    resolve_typescript_export, resolve_typescript_import_uncached, resolve_typescript_type_export,
+    spawn_warmup, typescript_import_target, typescript_type_member_target, typescript_type_target,
+    workspace_detected,
 };
 
 uniffi::setup_scaffolding!();
@@ -1973,17 +1984,6 @@ impl Core {
         .map(|target| vec![target])
         .unwrap_or_default();
         if locations.is_empty() {
-            locations = index
-                .symbol_at(line as usize, character as usize)
-                .map(|symbol| {
-                    vec![LspDefinitionLocation {
-                        uri: uri.to_owned(),
-                        range: typescript_range(symbol.declaration),
-                    }]
-                })
-                .unwrap_or_default();
-        }
-        if locations.is_empty() {
             locations = typescript_import_target(
                 &self.typescript_navigation,
                 &path,
@@ -1993,6 +1993,17 @@ impl Core {
             )
             .map(|(target, _)| vec![target])
             .unwrap_or_default();
+        }
+        if locations.is_empty() {
+            locations = index
+                .symbol_at(line as usize, character as usize)
+                .map(|symbol| {
+                    vec![LspDefinitionLocation {
+                        uri: uri.to_owned(),
+                        range: typescript_range(symbol.declaration),
+                    }]
+                })
+                .unwrap_or_default();
         }
         if locations.is_empty()
             && let Some((import, binding)) =
@@ -2344,113 +2355,6 @@ fn typescript_range(range: galaxy_core::typescript::Utf16Range) -> LspRange {
     }
 }
 
-const MAX_TYPESCRIPT_NAVIGATION_CACHE_ENTRIES: usize = 256;
-const MAX_TYPESCRIPT_WARM_SOURCE_CANDIDATES: usize = 5000;
-const MAX_TYPESCRIPT_WARM_IMPORT_TARGETS: usize = 512;
-const TYPESCRIPT_WARM_EXCLUDED_DIRECTORIES: &[&str] = &[
-    "node_modules",
-    ".git",
-    ".hg",
-    ".svn",
-    "target",
-    "dist",
-    "build",
-    ".next",
-    "coverage",
-    "vendor",
-];
-
-#[derive(Clone, PartialEq, Eq)]
-struct FileFreshness {
-    modified: Option<SystemTime>,
-    len: u64,
-}
-
-impl FileFreshness {
-    fn read(path: &Path) -> Option<Self> {
-        let metadata = std::fs::metadata(path).ok()?;
-        Some(Self {
-            modified: metadata.modified().ok(),
-            len: metadata.len(),
-        })
-    }
-}
-
-#[derive(Clone)]
-struct CachedTypeScriptIndex {
-    freshness: FileFreshness,
-    index: Arc<DocumentIndex>,
-}
-
-#[derive(Clone)]
-struct CachedTypeScriptResolution {
-    target: PathBuf,
-    dependencies: Vec<(PathBuf, Option<FileFreshness>)>,
-}
-
-#[derive(Default)]
-struct TypeScriptNavigationCache {
-    indexes: HashMap<PathBuf, CachedTypeScriptIndex>,
-    resolutions: HashMap<(PathBuf, String), CachedTypeScriptResolution>,
-}
-
-impl TypeScriptNavigationCache {
-    fn index(&mut self, path: &Path) -> Option<Arc<DocumentIndex>> {
-        let path = module_identity(path);
-        let freshness = FileFreshness::read(&path)?;
-        if let Some(cached) = self.indexes.get(&path)
-            && cached.freshness == freshness
-        {
-            return Some(Arc::clone(&cached.index));
-        }
-        let text = std::fs::read_to_string(&path).ok()?;
-        let index = Arc::new(DocumentIndex::parse(&path, &text));
-        if self.indexes.len() >= MAX_TYPESCRIPT_NAVIGATION_CACHE_ENTRIES {
-            self.indexes.clear();
-        }
-        self.indexes.insert(
-            path,
-            CachedTypeScriptIndex {
-                freshness,
-                index: Arc::clone(&index),
-            },
-        );
-        Some(index)
-    }
-
-    fn resolve(&mut self, importer: &Path, specifier: &str) -> Option<PathBuf> {
-        let importer = module_identity(importer);
-        let key = (importer.clone(), specifier.to_owned());
-        if let Some(cached) = self.resolutions.get(&key)
-            && cached.target.is_file()
-            && cached
-                .dependencies
-                .iter()
-                .all(|(path, freshness)| FileFreshness::read(path) == *freshness)
-        {
-            return Some(cached.target.clone());
-        }
-        self.resolutions.remove(&key);
-        let target = resolve_typescript_import_uncached(&importer, specifier)?;
-        let target = prefer_typescript_declaration(target);
-        if !target.is_file() {
-            return None;
-        }
-        let dependencies = typescript_resolution_dependencies(&importer, specifier);
-        if self.resolutions.len() >= MAX_TYPESCRIPT_NAVIGATION_CACHE_ENTRIES {
-            self.resolutions.clear();
-        }
-        self.resolutions.insert(
-            key,
-            CachedTypeScriptResolution {
-                target: target.clone(),
-                dependencies,
-            },
-        );
-        Some(target)
-    }
-}
-
 fn spawn_workspace_indexing(
     workspace: CoreWorkspace,
     cache: Arc<Mutex<TypeScriptNavigationCache>>,
@@ -2465,8 +2369,8 @@ fn spawn_workspace_indexing(
             send_workspace_index_started(&listener, &root);
             let (total, changed) = refresh_workspace_index(&workspace, &listener);
             let mut workers = Vec::new();
-            if typescript_workspace_detected(&root) {
-                workers.push(spawn_typescript_navigation_warmup(&root, cache));
+            if workspace_detected(&root) {
+                workers.push(spawn_warmup(&root, cache));
             }
             if let Some(project) = go::GoProject::detect(&root) {
                 let project_root = project.root().to_path_buf();
@@ -2614,781 +2518,9 @@ fn save_workspace_manifest(root: &Path, manifest: &BTreeMap<String, String>) {
     }
 }
 
-/// A JavaScript package or an explicit JS/TS project configuration opts the
-/// workspace into the JavaScript/TypeScript navigation warm-up.
-fn typescript_workspace_detected(root: &Path) -> bool {
-    ["package.json", "tsconfig.json", "jsconfig.json"]
-        .into_iter()
-        .any(|name| root.join(name).is_file())
-}
-
-fn spawn_typescript_navigation_warmup(
-    root: &Path,
-    cache: Arc<Mutex<TypeScriptNavigationCache>>,
-) -> Option<std::thread::JoinHandle<()>> {
-    let root = root.to_path_buf();
-    std::thread::Builder::new()
-        .name("typescript-navigation-warmup".into())
-        // Keep opening a workspace instant while bounding work in large repositories.
-        .spawn(move || warm_typescript_navigation(&root, &cache))
-        .ok()
-}
-
-fn warm_typescript_navigation(root: &Path, cache: &Mutex<TypeScriptNavigationCache>) {
-    let mut sources = vec![root.to_path_buf()];
-    let mut seen_imports = HashSet::new();
-    let mut candidates = 0;
-    let mut warmed = 0;
-
-    while let Some(path) = sources.pop() {
-        let Ok(entries) = std::fs::read_dir(&path) else {
-            continue;
-        };
-        for entry in entries.filter_map(Result::ok) {
-            let path = entry.path();
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if file_type.is_symlink() {
-                continue;
-            }
-            if file_type.is_dir() {
-                if !typescript_warm_excluded_directory(&path)
-                    && sources.len() < MAX_TYPESCRIPT_WARM_SOURCE_CANDIDATES
-                {
-                    sources.push(path);
-                }
-                continue;
-            }
-            if !file_type.is_file() || !is_typescript_path(&path) {
-                continue;
-            }
-            candidates += 1;
-            if candidates > MAX_TYPESCRIPT_WARM_SOURCE_CANDIDATES {
-                return;
-            }
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let index = DocumentIndex::parse(&path, &text);
-            let specifiers = index
-                .imports
-                .iter()
-                .filter(|import| index.import_is_syntax_valid(import))
-                .map(|import| import.specifier.as_str())
-                .chain(
-                    index
-                        .exports
-                        .iter()
-                        .filter_map(|export| export.specifier.as_deref()),
-                );
-            for specifier in specifiers {
-                if warmed == MAX_TYPESCRIPT_WARM_IMPORT_TARGETS {
-                    return;
-                }
-                let importer = module_identity(&path);
-                if !seen_imports.insert((importer, specifier.to_owned())) {
-                    continue;
-                }
-                let Some(target) = resolve_typescript_definition_import(cache, &path, specifier)
-                else {
-                    continue;
-                };
-                if !is_typescript_path(&target) {
-                    continue;
-                }
-                warmed += 1;
-                warm_typescript_declaration_chain(
-                    cache,
-                    target,
-                    0,
-                    &mut warmed,
-                    &mut HashSet::new(),
-                );
-            }
-        }
-    }
-}
-
-fn typescript_warm_excluded_directory(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| TYPESCRIPT_WARM_EXCLUDED_DIRECTORIES.contains(&name))
-}
-
-fn warm_typescript_declaration_chain(
-    cache: &Mutex<TypeScriptNavigationCache>,
-    path: PathBuf,
-    depth: usize,
-    warmed: &mut usize,
-    visited: &mut HashSet<PathBuf>,
-) {
-    if depth == MAX_TYPESCRIPT_REEXPORT_DEPTH
-        || *warmed == MAX_TYPESCRIPT_WARM_IMPORT_TARGETS
-        || !visited.insert(module_identity(&path))
-    {
-        return;
-    }
-    let Some(index) = cache.lock().unwrap_or_else(|e| e.into_inner()).index(&path) else {
-        return;
-    };
-    let specifiers = index
-        .exports
-        .iter()
-        .filter_map(|export| export.specifier.as_deref())
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
-    for specifier in specifiers {
-        if *warmed == MAX_TYPESCRIPT_WARM_IMPORT_TARGETS {
-            return;
-        }
-        if let Some(target) = resolve_typescript_definition_import(cache, &path, &specifier) {
-            if !is_typescript_path(&target) {
-                continue;
-            }
-            *warmed += 1;
-            warm_typescript_declaration_chain(cache, target, depth + 1, warmed, visited);
-        }
-    }
-}
-
-fn typescript_resolution_dependencies(
-    importer: &Path,
-    specifier: &str,
-) -> Vec<(PathBuf, Option<FileFreshness>)> {
-    let mut dependencies = vec![(importer.to_path_buf(), FileFreshness::read(importer))];
-    let mut directory = importer.parent();
-    while let Some(path) = directory {
-        for name in ["package.json", "tsconfig.json"] {
-            let dependency = path.join(name);
-            dependencies.push((dependency.clone(), FileFreshness::read(&dependency)));
-        }
-        directory = path.parent();
-    }
-    if !javascript::is_relative_typescript_specifier(specifier) && !specifier.starts_with("node:") {
-        let package = specifier
-            .split('/')
-            .take(if specifier.starts_with('@') { 2 } else { 1 })
-            .collect::<Vec<_>>()
-            .join("/");
-        let mut directory = importer.parent();
-        while let Some(path) = directory {
-            let manifest = path
-                .join("node_modules")
-                .join(&package)
-                .join("package.json");
-            dependencies.push((manifest.clone(), FileFreshness::read(&manifest)));
-            directory = path.parent();
-        }
-    }
-    dependencies
-}
-
-fn prefer_typescript_declaration(target: PathBuf) -> PathBuf {
-    let declaration = target.with_extension("d.ts");
-    if target
-        .extension()
-        .is_some_and(|extension| extension == "js")
-        && declaration.is_file()
-    {
-        declaration
-    } else {
-        javascript::package_types_declaration(&target).unwrap_or(target)
-    }
-}
-
-fn typescript_import_target(
-    cache: &Mutex<TypeScriptNavigationCache>,
-    importer_path: &str,
-    index: &DocumentIndex,
-    line: usize,
-    character: usize,
-) -> Option<(
-    LspDefinitionLocation,
-    Vec<galaxy_core::typescript::Utf16Range>,
-)> {
-    let (import, binding, occurrences) = index.imports.iter().find_map(|import| {
-        index
-            .import_is_syntax_valid(import)
-            .then_some(import)
-            .and_then(|import| {
-                import.bindings.iter().find_map(|binding| {
-                    let position = Utf16Position::new(line, character);
-                    let occurrences = index.import_binding_occurrences(binding).unwrap_or(
-                        galaxy_core::typescript::SymbolOccurrences {
-                            name: binding.local_name.clone(),
-                            kind: DeclarationKind::Variable,
-                            declaration: binding.range,
-                            occurrences: vec![binding.range],
-                        },
-                    );
-                    (binding.range.start <= position && position < binding.range.end
-                        || occurrences
-                            .occurrences
-                            .iter()
-                            .any(|range| range.start <= position && position < range.end))
-                    .then_some((import, binding, occurrences))
-                })
-            })
-    })?;
-    let imported_name = direct_imported_name(binding)?;
-    let importer = Path::new(importer_path);
-    let target_path = resolve_typescript_definition_import(cache, importer, &import.specifier)?;
-    if !is_typescript_path(&target_path) {
-        return None;
-    }
-    let location = resolve_typescript_export(cache, target_path.clone(), imported_name)
-        .map(|(path, declaration)| LspDefinitionLocation {
-            uri: file_uri(&path),
-            range: typescript_range(declaration.range),
-        })
-        .unwrap_or_else(|| module_root_location(&target_path));
-    Some((location, occurrences.occurrences))
-}
-
-fn typescript_type_target(
-    cache: &Mutex<TypeScriptNavigationCache>,
-    importer_path: &str,
-    index: &DocumentIndex,
-    line: usize,
-    character: usize,
-) -> Option<LspDefinitionLocation> {
-    let position = Utf16Position::new(line, character);
-    let (import, binding) = index.imports.iter().find_map(|import| {
-        index
-            .import_is_syntax_valid(import)
-            .then_some(import)
-            .and_then(|import| {
-                import
-                    .bindings
-                    .iter()
-                    .find(|binding| {
-                        binding.type_only
-                            && (binding.range.start <= position && position < binding.range.end
-                                || index.import_binding_occurrences(binding).is_some_and(
-                                    |occurrences| {
-                                        occurrences.occurrences.iter().any(|range| {
-                                            range.start <= position && position < range.end
-                                        })
-                                    },
-                                ))
-                    })
-                    .map(|binding| (import, binding))
-            })
-    })?;
-    let imported_name = binding.imported_name.as_deref()?;
-    if !binding.type_only || !matches!(binding.kind, ImportKind::Named | ImportKind::Default) {
-        return None;
-    }
-    let target =
-        resolve_typescript_definition_import(cache, Path::new(importer_path), &import.specifier)?;
-    Some(
-        resolve_typescript_type_export(cache, target.clone(), imported_name)
-            .or_else(|| resolve_typescript_export(cache, target.clone(), imported_name))
-            .map(|(path, declaration)| LspDefinitionLocation {
-                uri: file_uri(&path),
-                range: typescript_range(declaration.range),
-            })
-            .unwrap_or_else(|| module_root_location(&target)),
-    )
-}
-
-fn typescript_type_member_target(
-    cache: &Mutex<TypeScriptNavigationCache>,
-    importer_path: &str,
-    index: &DocumentIndex,
-    line: usize,
-    character: usize,
-) -> Option<LspDefinitionLocation> {
-    let usage = index.type_member_at(line, character)?;
-    resolve_typescript_type_member_target(
-        cache,
-        importer_path,
-        index,
-        &usage.target,
-        &usage.member_name,
-    )
-}
-
-fn resolve_typescript_type_member_target(
-    cache: &Mutex<TypeScriptNavigationCache>,
-    importer_path: &str,
-    index: &DocumentIndex,
-    target: &TypeMemberTarget,
-    member_name: &str,
-) -> Option<LspDefinitionLocation> {
-    match target {
-        TypeMemberTarget::Inline(members) => {
-            unique_type_member_location(members, member_name, Path::new(importer_path))
-        }
-        TypeMemberTarget::Named(range) => {
-            let member = index
-                .type_declaration_at(*range)?
-                .iter()
-                .filter(|member| member.name == member_name)
-                .collect::<Vec<_>>();
-            let [member] = member.as_slice() else {
-                return None;
-            };
-            Some(LspDefinitionLocation {
-                uri: file_uri(Path::new(importer_path)),
-                range: typescript_range(member.range),
-            })
-        }
-        TypeMemberTarget::Imported(range) => {
-            let (import, binding) = index.import_binding_by_range(*range)?;
-            if !binding.type_only
-                || !matches!(binding.kind, ImportKind::Named | ImportKind::Default)
-            {
-                return None;
-            }
-            let imported_name = binding.imported_name.as_deref()?;
-            let target = resolve_typescript_definition_import(
-                cache,
-                Path::new(importer_path),
-                &import.specifier,
-            )?;
-            let (path, declaration) = resolve_typescript_type_export(cache, target, imported_name)?;
-            let target_index = cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .index(&path)?;
-            let member = target_index.type_member(&declaration.name, member_name)?;
-            Some(LspDefinitionLocation {
-                uri: file_uri(&path),
-                range: typescript_range(member.range),
-            })
-        }
-        TypeMemberTarget::SuperImported(range) => {
-            let (import, binding) = index.import_binding_by_range(*range)?;
-            if binding.type_only || !matches!(binding.kind, ImportKind::Named | ImportKind::Default)
-            {
-                return None;
-            }
-            let imported_name = binding.imported_name.as_deref()?;
-            let target = resolve_typescript_definition_import(
-                cache,
-                Path::new(importer_path),
-                &import.specifier,
-            )?;
-            let (path, declaration) = resolve_typescript_export(cache, target, imported_name)?;
-            if declaration.kind != DeclarationKind::Class {
-                return None;
-            }
-            let target_index = cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .index(&path)?;
-            let member = target_index.type_member(&declaration.name, member_name)?;
-            Some(LspDefinitionLocation {
-                uri: file_uri(&path),
-                range: typescript_range(member.range),
-            })
-        }
-        TypeMemberTarget::SuperMember {
-            binding,
-            member_name: property,
-        } => {
-            let (import, binding) = index.import_binding_by_range(*binding)?;
-            let imported_name = binding.imported_name.as_deref()?;
-            let superclass_path = resolve_typescript_definition_import(
-                cache,
-                Path::new(importer_path),
-                &import.specifier,
-            )?;
-            let (superclass_path, superclass) =
-                resolve_typescript_export(cache, superclass_path, imported_name)?;
-            let superclass_index = cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .index(&superclass_path)?;
-            let property = superclass_index.type_member(&superclass.name, property)?;
-            let (namespace, type_name) = property.type_reference.as_ref()?;
-            let type_import = superclass_index.imports.iter().find(|import| {
-                import
-                    .bindings
-                    .iter()
-                    .any(|binding| binding.local_name == *namespace)
-            })?;
-            let target = resolve_typescript_definition_import(
-                cache,
-                &superclass_path,
-                &type_import.specifier,
-            )?;
-            let target_index = cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .index(&target)?;
-            let member = target_index.type_member(type_name, member_name)?;
-            Some(LspDefinitionLocation {
-                uri: file_uri(&target),
-                range: typescript_range(member.range),
-            })
-        }
-        TypeMemberTarget::SuperMemberCallback {
-            binding,
-            member_name: property,
-            callback_name,
-            chain,
-        } => {
-            let (import, binding) = index.import_binding_by_range(*binding)?;
-            let imported_name = binding.imported_name.as_deref()?;
-            let superclass_path = resolve_typescript_definition_import(
-                cache,
-                Path::new(importer_path),
-                &import.specifier,
-            )?;
-            let (superclass_path, superclass) =
-                resolve_typescript_export(cache, superclass_path, imported_name)?;
-            let superclass_index = cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .index(&superclass_path)?;
-            let property = superclass_index.type_member(&superclass.name, property)?;
-            let (namespace, type_name) = property.type_reference.as_ref()?;
-            let type_import = superclass_index.imports.iter().find(|import| {
-                import
-                    .bindings
-                    .iter()
-                    .any(|binding| binding.type_only && binding.local_name == *namespace)
-            })?;
-            let target = resolve_typescript_definition_import(
-                cache,
-                &superclass_path,
-                &type_import.specifier,
-            )?;
-            let target_index = cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .index(&target)?;
-            let callback = target_index.type_member(type_name, callback_name)?;
-            let callback_type = callback.callback_parameter_type.as_deref()?;
-            let final_type =
-                chain
-                    .iter()
-                    .try_fold(callback_type.to_owned(), |type_name, method| {
-                        target_index
-                            .type_member(&type_name, method)?
-                            .return_type
-                            .clone()
-                    })?;
-            let member = target_index.type_member(&final_type, member_name)?;
-            Some(LspDefinitionLocation {
-                uri: file_uri(&target),
-                range: typescript_range(member.range),
-            })
-        }
-        TypeMemberTarget::Union(arms) => {
-            let mut locations = arms.iter().map(|arm| match arm {
-                TypeMemberTarget::Inline(_) => None,
-                _ => resolve_typescript_type_member_target(
-                    cache,
-                    importer_path,
-                    index,
-                    arm,
-                    member_name,
-                ),
-            });
-            let first = locations.next()??;
-            locations
-                .all(|location| location.as_ref() == Some(&first))
-                .then_some(first)
-        }
-    }
-}
-
-fn unique_type_member_location(
-    members: &[galaxy_core::typescript::TypeMember],
-    member_name: &str,
-    path: &Path,
-) -> Option<LspDefinitionLocation> {
-    let matches = members
-        .iter()
-        .filter(|member| member.name == member_name)
-        .collect::<Vec<_>>();
-    let [member] = matches.as_slice() else {
-        return None;
-    };
-    Some(LspDefinitionLocation {
-        uri: file_uri(path),
-        range: typescript_range(member.range),
-    })
-}
-
-fn module_root_location(path: &Path) -> LspDefinitionLocation {
-    LspDefinitionLocation {
-        uri: file_uri(path),
-        range: LspRange {
-            start_line: 0,
-            start_character: 0,
-            end_line: 0,
-            end_character: 0,
-        },
-    }
-}
-
-const MAX_TYPESCRIPT_REEXPORT_DEPTH: usize = 32;
-
-fn resolve_typescript_export(
-    cache: &Mutex<TypeScriptNavigationCache>,
-    path: PathBuf,
-    name: &str,
-) -> Option<(PathBuf, galaxy_core::typescript::Declaration)> {
-    resolve_typescript_export_inner(cache, path, name, 0, &mut HashSet::new())
-}
-
-fn resolve_typescript_type_export(
-    cache: &Mutex<TypeScriptNavigationCache>,
-    path: PathBuf,
-    name: &str,
-) -> Option<(PathBuf, galaxy_core::typescript::Declaration)> {
-    resolve_typescript_type_export_inner(cache, path, name, 0, &mut HashSet::new())
-}
-
-fn resolve_typescript_type_export_inner(
-    cache: &Mutex<TypeScriptNavigationCache>,
-    path: PathBuf,
-    name: &str,
-    depth: usize,
-    visited: &mut HashSet<PathBuf>,
-) -> Option<(PathBuf, galaxy_core::typescript::Declaration)> {
-    if depth == MAX_TYPESCRIPT_REEXPORT_DEPTH || !visited.insert(module_identity(&path)) {
-        return None;
-    }
-    let index = cache
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .index(&path)?;
-    if let Some(declaration) = index.exported_type_declaration(name) {
-        return Some((path, declaration.clone()));
-    }
-    if let Some(declaration) = index.export_assignment_namespace(name) {
-        return Some((path, declaration.clone()));
-    }
-    let candidates = index
-        .exports
-        .iter()
-        .filter_map(|export| {
-            (export.type_only && export.exported_name.as_deref() == Some(name))
-                .then_some((export.specifier.as_deref()?, export.name.as_deref()?))
-        })
-        .filter_map(|(specifier, imported_name)| {
-            resolve_typescript_definition_import(cache, &path, specifier).and_then(|target| {
-                resolve_typescript_type_export_inner(
-                    cache,
-                    target,
-                    imported_name,
-                    depth + 1,
-                    visited,
-                )
-            })
-        })
-        .collect::<Vec<_>>();
-    (candidates.len() == 1).then(|| candidates.into_iter().next().unwrap())
-}
-
-fn resolve_typescript_export_inner(
-    cache: &Mutex<TypeScriptNavigationCache>,
-    path: PathBuf,
-    name: &str,
-    depth: usize,
-    visited: &mut HashSet<PathBuf>,
-) -> Option<(PathBuf, galaxy_core::typescript::Declaration)> {
-    if depth == MAX_TYPESCRIPT_REEXPORT_DEPTH || !visited.insert(module_identity(&path)) {
-        return None;
-    }
-    let index = cache
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .index(&path)?;
-    if let Some(declaration) = index.exported_declaration(name) {
-        return Some((path, declaration.clone()));
-    }
-    let mut candidates: Vec<(PathBuf, galaxy_core::typescript::Declaration)> = Vec::new();
-    for export in index.exports.iter().filter(|export| !export.type_only) {
-        let Some(specifier) = export.specifier.as_deref() else {
-            continue;
-        };
-        let imported_name = if export.exported_name.as_deref() == Some(name) {
-            export.name.as_deref()
-        } else if export.exported_name.is_none() {
-            Some(name)
-        } else {
-            None
-        };
-        let Some(imported_name) = imported_name else {
-            continue;
-        };
-        let Some(target) = resolve_typescript_definition_import(cache, &path, specifier) else {
-            continue;
-        };
-        if let Some(candidate) =
-            resolve_typescript_export_inner(cache, target, imported_name, depth + 1, visited)
-            && !candidates.iter().any(|(candidate_path, declaration)| {
-                candidate_path == &candidate.0 && declaration.range == candidate.1.range
-            })
-        {
-            candidates.push(candidate);
-        }
-    }
-    (candidates.len() == 1).then(|| candidates.remove(0))
-}
-
-fn module_identity(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-}
-
-const MAX_TYPESCRIPT_COMPLETIONS: usize = 100;
-
-fn typescript_completions(
-    path: &str,
-    text: &str,
-    line: usize,
-    character: usize,
-) -> Vec<LspCompletionItem> {
-    let Some(prefix) = typescript_identifier_prefix(text, line, character) else {
-        return Vec::new();
-    };
-    let index = DocumentIndex::parse(path, text);
-    let mut items = BTreeMap::new();
-    if character > 0
-        && let Some(symbol) = index.symbol_at(line, character - 1)
-        && symbol.name.starts_with(&prefix)
-    {
-        items
-            .entry(symbol.name.clone())
-            .or_insert_with(|| typescript_completion_item(&symbol.name, symbol.kind));
-    }
-    for declaration in &index.declarations {
-        if declaration.name.starts_with(&prefix) {
-            items
-                .entry(declaration.name.clone())
-                .or_insert_with(|| typescript_completion_item(&declaration.name, declaration.kind));
-        }
-    }
-    for import in &index.imports {
-        for binding in &import.bindings {
-            if !binding.type_only && binding.local_name.starts_with(&prefix) {
-                items.entry(binding.local_name.clone()).or_insert_with(|| {
-                    typescript_completion_item(&binding.local_name, DeclarationKind::Variable)
-                });
-            }
-        }
-    }
-    items
-        .into_values()
-        .take(MAX_TYPESCRIPT_COMPLETIONS)
-        .collect()
-}
-
-fn typescript_identifier_prefix(text: &str, line: usize, character: usize) -> Option<String> {
-    let line = text.lines().nth(line)?;
-    let mut column = 0;
-    let mut byte = 0;
-    for (offset, ch) in line.char_indices() {
-        let width = ch.len_utf16();
-        if column + width > character {
-            return None;
-        }
-        column += width;
-        byte = offset + ch.len_utf8();
-        if column == character {
-            break;
-        }
-    }
-    if column != character {
-        return None;
-    }
-    let prefix = &line[..byte];
-    let start = prefix
-        .char_indices()
-        .rev()
-        .find(|(_, ch)| !is_typescript_identifier_char(*ch))
-        .map_or(0, |(offset, ch)| offset + ch.len_utf8());
-    Some(prefix[start..].to_owned())
-}
-
-fn is_typescript_identifier_char(ch: char) -> bool {
-    ch == '_' || ch == '$' || ch.is_ascii_alphanumeric()
-}
-
-fn typescript_completion_item(name: &str, kind: DeclarationKind) -> LspCompletionItem {
-    LspCompletionItem {
-        label: name.to_owned(),
-        detail: Some(typescript_declaration_kind(kind).to_owned()),
-        insert_text: name.to_owned(),
-        is_snippet: false,
-        sort_text: Some(name.to_owned()),
-        additional_edits: Vec::new(),
-        replace_from: None,
-        kind: Some(typescript_completion_kind(kind)),
-    }
-}
-
-fn typescript_hover_markdown(kind: DeclarationKind, name: &str, path: &Path) -> String {
-    format!(
-        "**{} `{}`**\n\n`{}`",
-        typescript_declaration_kind(kind),
-        name,
-        path.display()
-    )
-}
-
-fn typescript_declaration_kind(kind: DeclarationKind) -> &'static str {
-    match kind {
-        DeclarationKind::Function => "function",
-        DeclarationKind::Class => "class",
-        DeclarationKind::Interface => "interface",
-        DeclarationKind::Type => "type",
-        DeclarationKind::Enum => "enum",
-        DeclarationKind::Namespace => "namespace",
-        DeclarationKind::Variable => "variable",
-        DeclarationKind::Parameter => "parameter",
-    }
-}
-
-fn typescript_completion_kind(kind: DeclarationKind) -> u64 {
-    match kind {
-        DeclarationKind::Class => 7,
-        DeclarationKind::Interface => 8,
-        DeclarationKind::Enum => 13,
-        DeclarationKind::Function => 3,
-        DeclarationKind::Variable | DeclarationKind::Parameter => 6,
-        DeclarationKind::Type | DeclarationKind::Namespace => 9,
-    }
-}
-
 fn typescript_import_is_type_only(import: &galaxy_core::typescript::Import) -> bool {
     import.type_only
         || (!import.bindings.is_empty() && import.bindings.iter().all(|binding| binding.type_only))
-}
-
-fn resolve_typescript_import_uncached(importer: &Path, specifier: &str) -> Option<PathBuf> {
-    if javascript::is_relative_typescript_specifier(specifier) {
-        return javascript::resolve_relative_import(specifier, importer);
-    }
-    if specifier.starts_with("node:") {
-        return javascript::resolve_node_types_specifier(specifier, importer);
-    }
-    let project = javascript::TypeScriptProject::detect(importer)?;
-    javascript::resolve_typescript_specifier(&project, specifier, importer)
-}
-
-fn resolve_typescript_definition_import(
-    cache: &Mutex<TypeScriptNavigationCache>,
-    importer: &Path,
-    specifier: &str,
-) -> Option<PathBuf> {
-    cache
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .resolve(importer, specifier)
-}
-
-fn direct_imported_name(binding: &ImportBinding) -> Option<&str> {
-    (!binding.type_only && matches!(binding.kind, ImportKind::Named | ImportKind::Default))
-        .then_some(binding.imported_name.as_deref())
-        .flatten()
 }
 
 fn valid_javascript_identifier(name: &str) -> bool {
@@ -3556,34 +2688,6 @@ fn php_outline_symbol(
             .iter()
             .map(|child| php_outline_symbol(child, uri))
             .collect(),
-    }
-}
-
-fn typescript_outline_symbol(
-    declaration: &galaxy_core::typescript::Declaration,
-    uri: &str,
-) -> galaxy_core::analysis::DocumentSymbolInfo {
-    let kind = match declaration.kind {
-        DeclarationKind::Function => 12,
-        DeclarationKind::Class => 5,
-        DeclarationKind::Interface => 11,
-        DeclarationKind::Type => 26,
-        DeclarationKind::Enum => 10,
-        DeclarationKind::Namespace => 3,
-        DeclarationKind::Variable => 13,
-        DeclarationKind::Parameter => 13,
-    };
-    galaxy_core::analysis::DocumentSymbolInfo {
-        uri: Some(uri.to_owned()),
-        name: declaration.name.clone(),
-        kind,
-        range: LspRange {
-            start_line: declaration.range.start.line as u64,
-            start_character: declaration.range.start.col as u64,
-            end_line: declaration.range.end.line as u64,
-            end_character: declaration.range.end.col as u64,
-        },
-        children: Vec::new(),
     }
 }
 
@@ -6665,88 +5769,6 @@ mod tests {
     }
 
     #[test]
-    fn typescript_navigation_warmup_caches_import_targets_and_reexports() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
-        let package = dir.path().join("node_modules/pkg");
-        std::fs::create_dir_all(&package).unwrap();
-        std::fs::write(package.join("package.json"), r#"{"exports":"./entry.js"}"#).unwrap();
-        std::fs::write(
-            package.join("entry.js"),
-            "export { value } from './types.js';\n",
-        )
-        .unwrap();
-        std::fs::write(
-            package.join("entry.d.ts"),
-            "export { value } from './types.js';\n",
-        )
-        .unwrap();
-        std::fs::write(
-            package.join("types.d.ts"),
-            "export declare const value: number;\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join("main.ts"),
-            "import { value } from 'pkg';\nvalue;\n",
-        )
-        .unwrap();
-
-        let cache = Mutex::new(TypeScriptNavigationCache::default());
-        warm_typescript_navigation(dir.path(), &cache);
-
-        let cache = cache.lock().unwrap();
-        assert!(
-            cache
-                .resolutions
-                .values()
-                .any(|resolution| resolution.target.ends_with("entry.d.ts"))
-        );
-        assert!(
-            cache
-                .indexes
-                .keys()
-                .any(|path| path.ends_with("entry.d.ts"))
-        );
-        assert!(
-            cache
-                .indexes
-                .keys()
-                .any(|path| path.ends_with("types.d.ts"))
-        );
-    }
-
-    #[test]
-    fn typescript_navigation_warmup_excludes_node_modules_sources() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
-        let ignored = dir.path().join("node_modules/ignored");
-        std::fs::create_dir_all(&ignored).unwrap();
-        std::fs::write(
-            ignored.join("package.json"),
-            r#"{"exports":"./entry.d.ts"}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            ignored.join("entry.d.ts"),
-            "export declare const ignored: number;\n",
-        )
-        .unwrap();
-        std::fs::write(
-            ignored.join("source.ts"),
-            "import { ignored } from 'ignored';\nignored;\n",
-        )
-        .unwrap();
-
-        let cache = Mutex::new(TypeScriptNavigationCache::default());
-        warm_typescript_navigation(dir.path(), &cache);
-
-        let cache = cache.lock().unwrap();
-        assert!(cache.resolutions.is_empty());
-        assert!(cache.indexes.is_empty());
-    }
-
-    #[test]
     fn syntax_is_detected_and_arrives_without_blocking_viewport() {
         let dir = tempfile::tempdir().unwrap();
         let rust = dir.path().join("main.rs");
@@ -8039,6 +7061,183 @@ mod tests {
         let unsigned = core.definition_locations(document);
         assert_eq!(unsigned.len(), 1);
         assert_eq!((unsigned[0].line, unsigned[0].column), (6, 109));
+    }
+
+    #[test]
+    fn typescript_definition_resolves_regular_declaration_import_with_js_specifier() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir
+            .path()
+            .join("node_modules/@adonisjs/lucid/build/src/orm/base_model");
+        let types = dir
+            .path()
+            .join("node_modules/@adonisjs/lucid/build/src/types");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&types).unwrap();
+        let source = "import { LucidModel, QueryScopeCallback, QueryScope } from '../../types/model.js';\nexport declare const BaseModel: LucidModel;\n";
+        let index = base.join("index.d.ts");
+        std::fs::write(&index, source).unwrap();
+        std::fs::write(
+            types.join("model.d.ts"),
+            "export interface LucidModel { boot(): void }\nexport interface QueryScopeCallback {}\nexport interface QueryScope {}\n",
+        )
+        .unwrap();
+        let target = types.join("model.d.ts");
+        assert_eq!(
+            resolve_typescript_import_uncached(&index, "../../types/model.js"),
+            Some(target.clone())
+        );
+        let core = Core::new();
+        let document = core
+            .open_document(index.to_string_lossy().into_owned())
+            .unwrap();
+        let column = source.find("LucidModel").unwrap() as u64;
+        assert!(core.request_definition(document.clone(), 0, column));
+        let definitions = core.definition_locations(document);
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(
+            definitions[0].uri,
+            file_uri(&std::fs::canonicalize(&target).unwrap())
+        );
+        assert_eq!((definitions[0].line, definitions[0].column), (0, 7));
+    }
+
+    #[test]
+    fn typescript_definition_follows_adonis_on_query_callback() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+        let package = dir.path().join("node_modules/@adonisjs/lucid");
+        let lucid = package.join("build/src");
+        std::fs::create_dir_all(lucid.join("orm/decorators")).unwrap();
+        std::fs::create_dir_all(lucid.join("types")).unwrap();
+        std::fs::write(
+            package.join("package.json"),
+            r##"{"exports":{"./orm":"./build/src/orm/decorators/index.js","./types/*":"./build/src/types/*.js"}}"##,
+        )
+        .unwrap();
+        std::fs::write(lucid.join("orm/decorators/index.js"), "").unwrap();
+        std::fs::write(lucid.join("types/querybuilder.js"), "").unwrap();
+        std::fs::write(
+            lucid.join("orm/decorators/index.d.ts"),
+            "export declare const hasMany: unknown;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            lucid.join("types/querybuilder.d.ts"),
+            "export interface ChainableContract { where: unknown; orWhere: unknown; }\n",
+        )
+        .unwrap();
+        let path = dir.path().join("app/models/user.ts");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let source = "import { hasMany } from '@adonisjs/lucid/orm'\n\nclass User {\n  @hasMany(() => Position, {\n    onQuery(query) {\n      query.where((subQuery) => {\n        subQuery.where('status', 'hold')\n        subQuery.orWhere('status', 'waiting')\n      })\n      query.where('market_type', 'future')\n    },\n  })\n  declare positions: Position[]\n}\nclass Position {}\n";
+        std::fs::write(&path, source).unwrap();
+        let core = Core::new();
+        let document = core
+            .open_document(path.to_string_lossy().into_owned())
+            .unwrap();
+        for (line, column, expected) in [
+            (5, 12, "where"),
+            (6, 17, "where"),
+            (7, 17, "orWhere"),
+            (9, 12, "where"),
+        ] {
+            assert!(
+                core.request_definition(document.clone(), line, column),
+                "{expected}"
+            );
+            let definitions = core.definition_locations(document.clone());
+            assert_eq!(definitions.len(), 1);
+            assert!(definitions[0].uri.ends_with("types/querybuilder.d.ts"));
+            assert_eq!(definitions[0].line, 0);
+        }
+    }
+
+    #[test]
+    fn typescript_adonis_on_query_fails_closed_outside_lucid_relations() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+        let package = dir.path().join("node_modules/other");
+        std::fs::create_dir_all(package.join("types")).unwrap();
+        std::fs::write(
+            package.join("package.json"),
+            r#"{"exports":{".":"./index.js"}}"#,
+        )
+        .unwrap();
+        std::fs::write(package.join("index.js"), "").unwrap();
+        std::fs::write(
+            package.join("index.d.ts"),
+            "export declare const hasMany: unknown;\n",
+        )
+        .unwrap();
+        let path = dir.path().join("app/user.ts");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Same names, but the decorator is not imported from Lucid; and an
+        // `onQuery` option on a plain call.
+        let source = "import { hasMany } from 'other'\nfunction run(opts: unknown) {}\nclass User {\n  @hasMany(() => User, {\n    onQuery(query) {\n      query.where('a', 1)\n    },\n  })\n  declare rows: User[]\n}\nrun({ onQuery(query) { query.where('a', 1) } })\n";
+        std::fs::write(&path, source).unwrap();
+        let core = Core::new();
+        let document = core
+            .open_document(path.to_string_lossy().into_owned())
+            .unwrap();
+        for (line, column) in [(5, 12), (10, 28)] {
+            core.request_definition(document.clone(), line, column);
+            assert!(core.definition_locations(document.clone()).is_empty());
+        }
+    }
+
+    #[test]
+    fn typescript_definition_resolves_enum_member_through_package_import_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("app/enums")).unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r##"{"imports":{"#enums/*":"./app/enums/*.js"}}"##,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("app/enums/status.ts"),
+            "export enum Status {\n  NEW = 'new',\n  HOLD = 'hold',\n  DONE,\n}\nexport const Local = { HOLD: 1 }\n",
+        )
+        .unwrap();
+        let path = dir.path().join("app/use.ts");
+        let source = "import { Status, Local } from '#enums/status'\nenum Own { A }\nStatus.HOLD\nStatus.DONE\nStatus.MISSING\nLocal.HOLD\nOwn.A\nfunction f(Status: { HOLD: number }) { return Status.HOLD }\n";
+        std::fs::write(&path, source).unwrap();
+        let core = Core::new();
+        let document = core
+            .open_document(path.to_string_lossy().into_owned())
+            .unwrap();
+        // (line, column, expected file suffix, expected target line)
+        for (line, column, suffix, target) in [
+            (2, 8, "enums/status.ts", 2),
+            (3, 8, "enums/status.ts", 3),
+            (6, 4, "app/use.ts", 1),
+        ] {
+            assert!(
+                core.request_definition(document.clone(), line, column),
+                "{line}:{column}"
+            );
+            let definitions = core.definition_locations(document.clone());
+            assert_eq!(definitions.len(), 1);
+            assert!(
+                definitions[0].uri.ends_with(suffix),
+                "{line}:{column} -> {} @{}:{}",
+                definitions[0].uri,
+                definitions[0].line,
+                definitions[0].column
+            );
+            assert_eq!(definitions[0].line, target, "{line}:{column}");
+        }
+        // Missing member, non-enum export, and a shadowing parameter stay unresolved.
+        for (line, column) in [(4, 10), (5, 8), (7, 54)] {
+            core.request_definition(document.clone(), line, column);
+            let definitions = core.definition_locations(document.clone());
+            assert!(
+                definitions
+                    .iter()
+                    .all(|item| !item.uri.ends_with("enums/status.ts")),
+                "{line}:{column}"
+            );
+        }
     }
 
     #[test]

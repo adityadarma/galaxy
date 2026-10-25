@@ -677,6 +677,9 @@ class Builder
     public function where($column, $operator = null) { return $this; }
 
     /** @return $this */
+    public function when($value, $callback) { return $this; }
+
+    /** @return $this */
     public function latest($column = null) { return $this; }
 
     /** @return TModel */
@@ -752,6 +755,7 @@ class Run
         $j = User::where('a', 1)->first()->isActive();
     }
 }
+
 ";
     let lines: Vec<&str> = text.lines().collect();
     let cases = [
@@ -800,6 +804,47 @@ class Run
         }
     }
     assert!(failures.is_empty(), "{failures:#?}");
+}
+
+#[test]
+fn query_builder_callbacks_resolve_untyped_parameters() {
+    let dir = query_builder_project();
+    let mut engine = PhpEngine::with_frameworks(dir.path(), eloquent());
+    let main = dir.path().join("app/Run.php");
+    let text = "<?php
+namespace App;
+
+class Run
+{
+    public function go()
+    {
+        User::query()->where(function ($query) {
+            $query->where('active', true);
+            $query->when(true, fn ($q) => $q->where('published', true));
+        });
+    }
+}
+";
+    let at = |engine: &mut PhpEngine, line: usize, needle: &str| {
+        let source_line = text.lines().nth(line).unwrap();
+        let column = source_line.rfind(needle).unwrap() as u32;
+        engine.definition(&main, text, line as u32, column)
+    };
+    let where_method = at(&mut engine, 8, "where");
+    assert!(
+        where_method[0].path.ends_with("lib/Eloquent/Builder.php"),
+        "{where_method:?}"
+    );
+    let when = at(&mut engine, 9, "when");
+    assert!(
+        when[0].path.ends_with("lib/Eloquent/Builder.php"),
+        "{when:?}"
+    );
+    let nested_where = at(&mut engine, 9, "where");
+    assert!(
+        nested_where[0].path.ends_with("lib/Eloquent/Builder.php"),
+        "{nested_where:?}"
+    );
 }
 
 /// The mock projects below have no `artisan` script or Laravel

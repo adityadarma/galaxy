@@ -11,6 +11,20 @@ use crate::php::parse::{ClassInfo, Member};
 const MODEL: &str = "Illuminate\\Database\\Eloquent\\Model";
 const RELATION: &str = "Illuminate\\Database\\Eloquent\\Relations\\Relation";
 const BUILDER: &str = "Illuminate\\Database\\Eloquent\\Builder";
+const QUERY_BUILDER: &str = "Illuminate\\Database\\Query\\Builder";
+
+/// Builder methods that hand their own builder to a closure.
+const CALLBACK_METHODS: [&str; 9] = [
+    "where",
+    "orwhere",
+    "when",
+    "unless",
+    "wherehas",
+    "orwherehas",
+    "withwherehas",
+    "wherehasmorph",
+    "orwherehasmorph",
+];
 
 /// `Model::create()` and friends: Eloquent models forward calls they do
 /// not declare to a query builder through `__call` and `__callStatic`.
@@ -40,4 +54,23 @@ pub(super) fn forwarding_builder(
         env.get("TRelatedModel").filter(|m| !m.is_empty())?.clone()
     };
     Some(format!("{BUILDER}<{model}>"))
+}
+
+/// `where(function ($query) {})`, `when($v, fn ($q) => ...)`: the closure
+/// receives the builder it was called on. Only a receiver that is provably
+/// an Eloquent or query builder qualifies, so no parameter name is trusted.
+pub(super) fn callback_parameter_type(
+    _engine: &mut PhpEngine,
+    method: &str,
+    receiver: &str,
+    chain: &[(Arc<ClassInfo>, HashMap<String, String>)],
+) -> Option<String> {
+    let method = method.to_ascii_lowercase();
+    if !CALLBACK_METHODS.contains(&method.as_str()) {
+        return None;
+    }
+    chain
+        .iter()
+        .any(|(class, _)| class.fqn == BUILDER || class.fqn == QUERY_BUILDER)
+        .then(|| receiver.to_owned())
 }

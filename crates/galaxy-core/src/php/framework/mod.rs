@@ -111,6 +111,20 @@ pub trait Framework: Send + Sync + std::fmt::Debug {
         None
     }
 
+    /// The type of the sole untyped parameter of a closure passed to
+    /// `method` on a receiver whose type is `receiver` (`chain` is its
+    /// lineage). Laravel passes the same builder back to `where(fn ($q))`.
+    /// `None` leaves the parameter untyped.
+    fn callback_parameter_type(
+        &self,
+        _engine: &mut PhpEngine,
+        _method: &str,
+        _receiver: &str,
+        _chain: &[(Arc<ClassInfo>, HashMap<String, String>)],
+    ) -> Option<String> {
+        None
+    }
+
     /// The type that calls `chain` does not declare are forwarded to, when
     /// `chain` (a class with its ancestors and template bindings) is one
     /// the framework forwards.
