@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds the Rust core as a static library and generates Swift bindings.
 #
-# Usage: scripts/build-core.sh [debug|release] [--universal]
+# Usage: scripts/build-core.sh [debug|release]
 #
 # Outputs:
 #   app/Galaxy/FFI/libgalaxy_ffi.a          static lib linked by Xcode
@@ -19,18 +19,13 @@ cd "$ROOT"
 export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 PROFILE="debug"
-UNIVERSAL=0
 if [[ "${CONFIGURATION:-}" == "Release" ]]; then PROFILE="release"; fi
 for arg in "$@"; do
   case "$arg" in
     debug|release) PROFILE="$arg" ;;
-    --universal) UNIVERSAL=1 ;;
     *) echo "unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
-
-# Under Xcode, follow $ARCHS (Release builds arm64 + x86_64).
-if [[ -n "${ARCHS:-}" && "${ARCHS}" == *x86_64* ]]; then UNIVERSAL=1; fi
 
 CARGO_FLAGS=(-p galaxy-ffi --locked)
 [[ "$PROFILE" == "release" ]] && CARGO_FLAGS+=(--release)
@@ -41,27 +36,14 @@ FFI_DIR="$ROOT/app/Galaxy/FFI"
 GEN_DIR="$ROOT/app/Galaxy/Generated"
 mkdir -p "$FFI_DIR/include" "$GEN_DIR"
 
-if [[ "$UNIVERSAL" == 1 ]]; then
-  TARGETS=(aarch64-apple-darwin x86_64-apple-darwin)
-  LIBS=()
-  for t in "${TARGETS[@]}"; do
-    if ! rustup target list --installed | grep -qx "$t"; then
-      rustup target add "$t" >/dev/null
-    fi
-    cargo build "${CARGO_FLAGS[@]}" --target "$t"
-    LIBS+=("$ROOT/target/$t/$PROFILE/libgalaxy_ffi.a")
-  done
-  lipo -create "${LIBS[@]}" -output "$FFI_DIR/libgalaxy_ffi.a.tmp"
-  DYLIB="$ROOT/target/aarch64-apple-darwin/$PROFILE/libgalaxy_ffi.dylib"
-else
-  cargo build "${CARGO_FLAGS[@]}"
-  cp "$ROOT/target/$PROFILE/libgalaxy_ffi.a" "$FFI_DIR/libgalaxy_ffi.a.tmp"
-  DYLIB="$ROOT/target/$PROFILE/libgalaxy_ffi.dylib"
-fi
+cargo build "${CARGO_FLAGS[@]}"
+cp "$ROOT/target/$PROFILE/libgalaxy_ffi.a" "$FFI_DIR/libgalaxy_ffi.a.tmp"
+DYLIB="$ROOT/target/$PROFILE/libgalaxy_ffi.dylib"
 mv "$FFI_DIR/libgalaxy_ffi.a.tmp" "$FFI_DIR/libgalaxy_ffi.a"
 
-# Generate bindings into a temp dir, then copy only on change so Xcode
-# does not recompile Swift every build.
+# Generate bindings into a temp dir. The static library and generated Swift
+# wrappers are one ABI unit, so refresh the wrapper timestamps with each Rust
+# build. Otherwise Xcode can retain an object built against an older ABI.
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 cargo run -q -p uniffi-bindgen --locked -- generate \
@@ -70,10 +52,10 @@ cargo run -q -p uniffi-bindgen --locked -- generate \
 mv "$TMP/galaxy_ffiFFI.modulemap" "$TMP/module.modulemap"
 
 sync_file() {
-  if ! cmp -s "$1" "$2"; then cp "$1" "$2"; fi
+  cp "$1" "$2"
 }
 sync_file "$TMP/galaxy_ffi.swift" "$GEN_DIR/galaxy_ffi.swift"
 sync_file "$TMP/galaxy_ffiFFI.h" "$FFI_DIR/include/galaxy_ffiFFI.h"
 sync_file "$TMP/module.modulemap" "$FFI_DIR/include/module.modulemap"
 
-echo "galaxy core built ($PROFILE$([[ $UNIVERSAL == 1 ]] && echo ', universal'))"
+echo "galaxy core built ($PROFILE, $(uname -m))"

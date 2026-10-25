@@ -17,9 +17,10 @@ fi
 
 rm -rf "$OUT"
 mkdir -p "$OUT"
-(cd "$ROOT/app" && /opt/homebrew/bin/xcodegen generate --quiet)
+(cd "$ROOT/app" && xcodegen generate --quiet)
 xcodebuild -project "$ROOT/app/Galaxy.xcodeproj" -scheme Galaxy \
-  -configuration Release -derivedDataPath "$ROOT/app/build" \
+  -configuration Release -destination "platform=macOS,arch=$(uname -m)" \
+  -derivedDataPath "$ROOT/app/build" \
   CODE_SIGN_IDENTITY="$IDENTITY" CODE_SIGN_STYLE=Manual build -quiet
 
 codesign --deep --force --options runtime --timestamp --sign "$IDENTITY" "$APP"

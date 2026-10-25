@@ -42,6 +42,8 @@ targets:
         optional: true
     settings:
       base:
+        ARCHS: $(NATIVE_ARCH_ACTUAL)
+        ONLY_ACTIVE_ARCH: YES
         PRODUCT_BUNDLE_IDENTIFIER: dev.adityadarma.galaxy
         PRODUCT_NAME: Galaxy
         MARKETING_VERSION: "0.1.0"
@@ -67,6 +69,11 @@ targets:
         outputFiles:
           - $(PROJECT_DIR)/Galaxy/FFI/libgalaxy_ffi.a
           - $(PROJECT_DIR)/Galaxy/Generated/galaxy_ffi.swift
+    postBuildScripts:
+      - name: Refresh App Bundle Timestamp
+        script: |
+          touch "${TARGET_BUILD_DIR}/${WRAPPER_NAME}"
+        basedOnDependencyAnalysis: false
     dependencies:
       - target: GalaxyCLI
     copyFiles:

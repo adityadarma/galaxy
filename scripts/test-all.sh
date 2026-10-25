@@ -24,7 +24,7 @@ step "Swift unit tests"
 # and the test bundle into the host app (~30 MB), which would otherwise
 # leave app/build's Galaxy.app bigger than a plain build.
 xcodebuild -project app/Galaxy.xcodeproj -scheme Galaxy -configuration Debug \
-  -derivedDataPath app/build-test test 2>&1 \
+  -destination "platform=macOS,arch=$(uname -m)" -derivedDataPath app/build-test test 2>&1 \
   | grep -vE "linkd.autoShortcut" \
   | grep -E "error:|Test Case .*failed|Executed [0-9]+ tests.*\) seconds$|\*\* TEST" \
   | sort -u

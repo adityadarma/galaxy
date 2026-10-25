@@ -1,0 +1,61 @@
+name: Build macOS
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Intel hosted runner.
+          - arch: x86_64
+            runner: macos-13
+          # ARM64 hosted runner. If the repository uses private runners,
+          # replace this label with its ARM64 runner label.
+          - arch: arm64
+            runner: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify runner architecture
+        run: test "$(uname -m)" = "${{ matrix.arch }}"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: macos-${{ matrix.arch }}
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate --spec app/project.yml --project app
+
+      - name: Build Release app
+        run: >-
+          xcodebuild -project app/Galaxy.xcodeproj -scheme Galaxy
+          -configuration Release
+          -destination "platform=macOS,arch=$(uname -m)"
+          ARCHS="$(uname -m)" ONLY_ACTIVE_ARCH=YES
+          -derivedDataPath app/build-${{ matrix.arch }}
+          CODE_SIGN_IDENTITY=- CODE_SIGN_STYLE=Manual build -quiet
+
+      - name: Upload app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Galaxy-macos-${{ matrix.arch }}
+          path: app/build-${{ matrix.arch }}/Build/Products/Release/Galaxy.app
+          if-no-files-found: error
