@@ -829,8 +829,17 @@ enum FileGlyph {
         return glyph
     }
 
-    private static func namedFileKey(_ name: String) -> String? {
-        switch name {
+    static func namedFileKey(_ name: String) -> String? {
+        if name.hasPrefix("dockerfile.") { return "dockerfile" }
+        if name.hasPrefix(".env.") { return ".env" }
+        if name.hasPrefix("nginx") && name.hasSuffix(".conf") { return "nginx" }
+        if name.hasPrefix("supervisord.") { return "supervisor" }
+        if name.hasPrefix("firebase") { return "firebase" }
+        if name.hasPrefix("supabase") { return "supabase" }
+        if name.hasPrefix("vercel") { return "vercel" }
+        if name.hasPrefix("netlify") { return "netlify" }
+        if name.hasPrefix("crontab") { return "crontab" }
+        return switch name {
         case "dockerfile", "docker-compose.yml", "docker-compose.yaml",
             "package.json", "package-lock.json", "npm-shrinkwrap.json",
             "pnpm-lock.yaml", "yarn.lock", "bun.lockb", "bun.lock",
@@ -838,9 +847,10 @@ enum FileGlyph {
             ".eslintrc", ".eslintrc.json", ".eslintrc.js", "eslint.config.js", "eslint.config.mjs",
             ".prettierrc", ".prettierrc.json", ".prettierrc.js", "prettier.config.js",
             "readme.md", "readme", "license", "license.md", "copying",
-            ".dockerignore", ".editorconfig", ".env", ".env.example", ".prettierignore",
+            ".dockerignore", ".editorconfig", ".env", ".env.example", ".npmignore", ".prettierignore",
             ".gitignore", ".gitattributes", ".gitmodules", ".gitlab-ci.yml",
-            ".gitlab-ci_gitlab.yml", ".gitlab-ci_release.yml":
+            ".gitlab-ci_gitlab.yml", ".gitlab-ci_release.yml", "artisan", "crontab", "www.conf",
+            "firebase.json", "supabase.toml", "vercel.json", "netlify.toml", ".npmrc", "composer.json":
             name
         default:
             nil
@@ -864,9 +874,20 @@ enum FileGlyph {
         case ".dockerignore": ("docker", "shippingbox", .labelColor)
         case ".editorconfig": ("settings", "slider.horizontal.3", .labelColor)
         case ".env", ".env.example": ("lock", "lock", .labelColor)
+        case ".npmignore": ("npm", "shippingbox", .labelColor)
+        case ".npmrc": ("npm", "shippingbox", .labelColor)
+        case "composer.json": ("json", "curlybraces", .labelColor)
         case ".prettierignore": ("prettier", "paintbrush", .labelColor)
         case ".gitignore", ".gitattributes", ".gitmodules": ("git", "arrow.triangle.branch", .labelColor)
         case ".gitlab-ci.yml", ".gitlab-ci_gitlab.yml", ".gitlab-ci_release.yml": ("gitlab", "arrow.triangle.branch", .labelColor)
+        case "nginx", "www.conf": ("nginx", "network", .labelColor)
+        case "supervisor", "crontab": ("settings", "gearshape", .labelColor)
+        case "artisan": ("laravel", "hammer", .labelColor)
+        case "firebase": ("firebase", "flame", .labelColor)
+        case "supabase": ("supabase", "bolt", .labelColor)
+        case "vercel": ("vercel", "triangle", .labelColor)
+        case "netlify": ("netlify", "network", .labelColor)
+        case "tf", "tfvars": ("terraform", "cube", .labelColor)
         case "php", "phtml": ("php", "doc", .labelColor)
         case "blade.php": ("laravel", "doc", .labelColor)
         case "rs": ("rust", "gearshape.fill", .labelColor)
