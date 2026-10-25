@@ -217,7 +217,8 @@ extension EditorView {
     /// Shows or clears the Cmd-hover link for the word under the mouse.
     func updateDefinitionLink(commandHeld: Bool) {
         guard commandHeld, onDefinitionClick != nil, let point = lastMousePoint,
-              point.x >= gutterWidth + gutterShift, let document, lineCount > 0 else {
+              point.x >= gutterWidth + gutterShift, let document,
+              Self.supportsDefinitionNavigation(document), lineCount > 0 else {
             definitionLink = nil
             return
         }
@@ -292,6 +293,16 @@ extension EditorView {
         ["TypeScript", "TSX", "JavaScript"].contains(document.syntaxLanguage() ?? "")
     }
 
+    /// Cmd-hover is for source code only. Configuration and markup grammars
+    /// classify words for coloring, but their tokens have no definitions to open.
+    static func supportsDefinitionNavigation(_ document: DocumentHandle) -> Bool {
+        isPHP(document) || [
+            "TypeScript", "TSX", "JavaScript", "Rust", "Go", "Python", "Bash",
+            "C", "C++", "C#", "Java", "Ruby", "Lua", "Swift", "SQL", "PowerShell",
+            "Dart", "R",
+        ].contains(document.syntaxLanguage() ?? "")
+    }
+
     /// Module path inside the quotes of `import x from 'p'`, `export * from 'p'`,
     /// `import 'p'`, `require('p')` and `import('p')`; `nil` for any other string.
     static func importSpecifierRange(in text: String, stringStart: Int, stringEnd: Int) -> Range<Int>? {
@@ -353,7 +364,7 @@ extension EditorView {
     /// Identifier under `pos` unless Tree-sitter marks it as a keyword,
     /// comment, number or operator.
     func navigableRange(at pos: TextPos, text: String? = nil) -> Range<Int>? {
-        guard let document else { return nil }
+        guard let document, Self.supportsDefinitionNavigation(document) else { return nil }
         let text = text ?? document.displayLine(line: pos.line)
         // Module paths in imports are links as a whole, punctuation included.
         if let specifier = importSpecifier(at: pos, text: text) { return specifier.range }

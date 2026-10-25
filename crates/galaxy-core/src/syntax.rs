@@ -41,6 +41,7 @@ pub enum SyntaxLanguage {
     Html,
     Css,
     Bash,
+    Nginx,
     Php,
     C,
     Cpp,
@@ -64,7 +65,7 @@ pub enum SyntaxLanguage {
 }
 
 impl SyntaxLanguage {
-    pub const ALL: [Self; 30] = [
+    pub const ALL: [Self; 31] = [
         Self::Rust,
         Self::TypeScript,
         Self::Tsx,
@@ -78,6 +79,7 @@ impl SyntaxLanguage {
         Self::Html,
         Self::Css,
         Self::Bash,
+        Self::Nginx,
         Self::Php,
         Self::C,
         Self::Cpp,
@@ -112,6 +114,7 @@ impl SyntaxLanguage {
             Self::Html => "HTML",
             Self::Css => "CSS",
             Self::Bash => "Bash",
+            Self::Nginx => "Nginx",
             Self::Php => "PHP",
             Self::C => "C",
             Self::Cpp => "C++",
@@ -137,7 +140,7 @@ impl SyntaxLanguage {
     pub fn comment_marker(self) -> Option<&'static str> {
         match self {
             Self::Rust | Self::TypeScript | Self::Tsx | Self::JavaScript | Self::Go => Some("//"),
-            Self::Toml | Self::Yaml | Self::Python | Self::Bash => Some("#"),
+            Self::Toml | Self::Yaml | Self::Python | Self::Bash | Self::Nginx => Some("#"),
             Self::Ruby | Self::Make | Self::PowerShell | Self::R => Some("#"),
             Self::C | Self::Cpp | Self::CSharp | Self::Java | Self::Swift | Self::Dart => {
                 Some("//")
@@ -172,6 +175,7 @@ impl SyntaxLanguage {
             }
             Self::Css => tree_sitter_css::LANGUAGE.into(),
             Self::Bash => tree_sitter_bash::LANGUAGE.into(),
+            Self::Nginx => tree_sitter_nginx::LANGUAGE.into(),
             Self::Php => tree_sitter_php::LANGUAGE_PHP.into(),
             Self::C => tree_sitter_c::LANGUAGE.into(),
             Self::Cpp => tree_sitter_cpp::LANGUAGE.into(),
@@ -208,6 +212,7 @@ impl SyntaxLanguage {
             }
             Self::Css => tree_sitter_css::HIGHLIGHTS_QUERY,
             Self::Bash => BASH_HIGHLIGHTS,
+            Self::Nginx => NGINX_HIGHLIGHTS,
             Self::Php => php_highlights(),
             Self::C => tree_sitter_c::HIGHLIGHT_QUERY,
             Self::Cpp => tree_sitter_cpp::HIGHLIGHT_QUERY,
@@ -259,7 +264,8 @@ impl SyntaxLanguage {
             .unwrap_or(path)
             .to_ascii_lowercase();
         let by_name = match name.as_str() {
-            "dockerfile" => None,
+            "dockerfile" => Some(Self::Bash),
+            "www.conf" => Some(Self::Ini),
             "cargo.toml" => Some(Self::Toml),
             "makefile" | "gnumakefile" => Some(Self::Make),
             "gemfile" | "rakefile" => Some(Self::Ruby),
@@ -270,6 +276,12 @@ impl SyntaxLanguage {
         }
         if name.ends_with(".blade.php") {
             return Some(Self::Blade);
+        }
+        if name.starts_with("dockerfile.") {
+            return Some(Self::Bash);
+        }
+        if name == "nginx.conf" {
+            return Some(Self::Nginx);
         }
         let extension = name.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("");
         let by_extension = match extension {
@@ -537,6 +549,25 @@ const BASH_HIGHLIGHTS: &str = r#"
 [("if") ("then") ("else") ("elif") ("fi") ("for") ("while") ("do") ("done") ("case") ("esac") ("function") ("in")] @keyword
 [("|") ("||") ("&&") (";") ("&")] @operator
 [("(") (")") ("{") ("}") (";")] @punctuation
+"#;
+
+const NGINX_HIGHLIGHTS: &str = r#"
+(comment) @comment
+(value) @variable
+(attribute (keyword) @attribute)
+[(location_modifier) "="] @operator
+[(keyword) "location"] @keyword
+["if" "map"] @keyword.conditional
+(directive (keyword) @constant)
+(boolean) @boolean
+[(auto) (constant) (level) (connection_method) (var) condition: (condition)] @variable.builtin
+[(string_literal) (quoted_string_literal) (file) (mask)] @string
+(directive (variable) @variable.parameter)
+(directive (variable (keyword) @variable.parameter))
+(location_route) @string.special
+";" @punctuation.delimiter
+[(numeric_literal) (time) (size) (cpumask)] @number
+["{" "}"] @punctuation.bracket
 "#;
 
 /// Semantic color categories. Themes map these scopes to concrete colors in
@@ -2013,6 +2044,23 @@ mod tests {
             SyntaxLanguage::detect("src/App.svelte", ""),
             Some(SyntaxLanguage::Svelte)
         );
+        assert_eq!(
+            SyntaxLanguage::detect("Dockerfile", ""),
+            Some(SyntaxLanguage::Bash)
+        );
+        assert_eq!(
+            SyntaxLanguage::detect("Dockerfile.production", ""),
+            Some(SyntaxLanguage::Bash)
+        );
+        assert_eq!(
+            SyntaxLanguage::detect(".docker/nginx-logrotate.conf", ""),
+            None
+        );
+        assert_eq!(
+            SyntaxLanguage::detect(".docker/nginx.conf", ""),
+            Some(SyntaxLanguage::Nginx)
+        );
+        assert_eq!(SyntaxLanguage::detect("php-fpm/www.conf", ""), Some(SyntaxLanguage::Ini));
         for (path, expected) in [
             ("main.c", SyntaxLanguage::C),
             ("main.cpp", SyntaxLanguage::Cpp),

@@ -832,7 +832,7 @@ enum FileGlyph {
     static func namedFileKey(_ name: String) -> String? {
         if name.hasPrefix("dockerfile.") { return "dockerfile" }
         if name.hasPrefix(".env.") { return ".env" }
-        if name.hasPrefix("nginx") && name.hasSuffix(".conf") { return "nginx" }
+        if name.contains("logrotate") { return "logrotate" }
         if name.hasPrefix("supervisord.") { return "supervisor" }
         if name.hasPrefix("firebase") { return "firebase" }
         if name.hasPrefix("supabase") { return "supabase" }
@@ -849,7 +849,7 @@ enum FileGlyph {
             "readme.md", "readme", "license", "license.md", "copying",
             ".dockerignore", ".editorconfig", ".env", ".env.example", ".npmignore", ".prettierignore",
             ".gitignore", ".gitattributes", ".gitmodules", ".gitlab-ci.yml",
-            ".gitlab-ci_gitlab.yml", ".gitlab-ci_release.yml", "artisan", "crontab", "www.conf",
+            ".gitlab-ci_gitlab.yml", ".gitlab-ci_release.yml", "artisan", "crontab", "nginx.conf", "www.conf",
             "firebase.json", "supabase.toml", "vercel.json", "netlify.toml", ".npmrc", "composer.json":
             name
         default:
@@ -880,7 +880,9 @@ enum FileGlyph {
         case ".prettierignore": ("prettier", "paintbrush", .labelColor)
         case ".gitignore", ".gitattributes", ".gitmodules": ("git", "arrow.triangle.branch", .labelColor)
         case ".gitlab-ci.yml", ".gitlab-ci_gitlab.yml", ".gitlab-ci_release.yml": ("gitlab", "arrow.triangle.branch", .labelColor)
-        case "nginx", "www.conf": ("nginx", "network", .labelColor)
+        case "nginx.conf": ("nginx", "network", .labelColor)
+        case "logrotate": (nil, "arrow.triangle.2.circlepath", .systemOrange)
+        case "www.conf": ("php", "doc", .labelColor)
         case "supervisor", "crontab": ("settings", "gearshape", .labelColor)
         case "artisan": ("laravel", "hammer", .labelColor)
         case "firebase": ("firebase", "flame", .labelColor)

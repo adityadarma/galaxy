@@ -196,6 +196,18 @@ final class NavigationTests: XCTestCase {
         XCTAssertEqual(v.definitionLink?.end, 18)
     }
 
+    func testCommandHoverSkipsConfigurationLanguages() throws {
+        let c = try makeController(text: "server { listen 80; }")
+        let v = c.editorView
+        v.document?.setPath(path: "/tmp/nginx.conf")
+        v.onDefinitionClick = { _ in true }
+        v.lastMousePoint = NSPoint(x: v.textOriginX + 10, y: v.metrics.lineHeight / 2)
+
+        v.updateDefinitionLink(commandHeld: true)
+
+        XCTAssertNil(v.definitionLink)
+    }
+
     func testImportSpecifierRangeCoversOnlyModulePaths() {
         func range(_ text: String, _ literal: String) -> String? {
             let ns = text as NSString
