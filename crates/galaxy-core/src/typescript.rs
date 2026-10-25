@@ -154,6 +154,38 @@ pub struct TypeMemberUse {
     pub member_range: Utf16Range,
 }
 
+/// An object key passed to a directly imported decorator invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecoratorOptionUse {
+    pub binding_range: Utf16Range,
+    /// The directly called member, when the imported binding is an object.
+    pub member_name: Option<String>,
+    pub key_name: String,
+    pub key_range: Utf16Range,
+}
+
+/// The directly stated option shape of a callable type alias.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecoratorOptionType {
+    pub members: Vec<TypeMember>,
+    pub references: Vec<String>,
+}
+
+/// An explicit named callable type annotation on a variable declaration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallableTypeAnnotation {
+    pub name: String,
+    pub type_name: String,
+}
+
+/// An explicit named callable type annotation on a direct object member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallableMemberTypeAnnotation {
+    pub object_name: String,
+    pub member_name: String,
+    pub type_name: String,
+}
+
 /// The declaration target of a direct type member use.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeMemberTarget {
@@ -253,6 +285,10 @@ pub struct DocumentIndex {
     qualified_type_imports: Vec<QualifiedTypeImport>,
     type_member_uses: Vec<TypeMemberUse>,
     type_declarations: Vec<TypeDeclaration>,
+    decorator_option_uses: Vec<DecoratorOptionUse>,
+    decorator_option_types: Vec<(String, DecoratorOptionType)>,
+    callable_type_annotations: Vec<CallableTypeAnnotation>,
+    callable_member_type_annotations: Vec<CallableMemberTypeAnnotation>,
 }
 
 impl DocumentIndex {
@@ -293,6 +329,9 @@ impl DocumentIndex {
 
         let mut type_declarations = Vec::new();
         collect_type_navigation_declarations(root, text, &locations, &mut type_declarations);
+        let decorator_option_types = collect_decorator_option_types(root, text, &locations);
+        let callable_type_annotations = collect_callable_type_annotations(root, text);
+        let callable_member_type_annotations = collect_callable_member_type_annotations(root, text);
         let symbols = resolve_symbols(text, root, &locations, false);
         let import_symbols = resolve_symbols(text, root, &locations, true);
         let type_import_references =
@@ -325,6 +364,8 @@ impl DocumentIndex {
             &symbols,
             &import_symbols,
         );
+        let decorator_option_uses =
+            collect_decorator_option_uses(root, text, &locations, &imports, &import_symbols);
         let framework_uses = framework::collect_uses(
             root,
             &framework::Context {
@@ -364,6 +405,10 @@ impl DocumentIndex {
             qualified_type_imports,
             type_member_uses,
             type_declarations,
+            decorator_option_uses,
+            decorator_option_types,
+            callable_type_annotations,
+            callable_member_type_annotations,
         }
     }
 
@@ -408,8 +453,9 @@ impl DocumentIndex {
         })
     }
 
-    /// Returns a type-only named/default import whose lexical reference is at
-    /// the cursor, including a use in a property or parameter annotation.
+    /// Returns a named/default import used in a type position at the cursor,
+    /// including a property or parameter annotation. TypeScript permits a
+    /// regular import for interfaces in declaration files.
     pub fn type_import_binding_at(
         &self,
         line: usize,
@@ -423,7 +469,6 @@ impl DocumentIndex {
                     .iter()
                     .find(|binding| {
                         binding.range == binding_range
-                            && binding.type_only
                             && matches!(binding.kind, ImportKind::Named | ImportKind::Default)
                     })
                     .map(|binding| (import, binding))
@@ -639,6 +684,63 @@ impl DocumentIndex {
         self.type_member_uses
             .iter()
             .find(|item| contains(item.member_range, position))
+    }
+
+    /// Returns an object option key used with a directly imported decorator.
+    pub fn decorator_option_at(&self, line: usize, col: usize) -> Option<&DecoratorOptionUse> {
+        let position = Utf16Position::new(line, col);
+        self.decorator_option_uses
+            .iter()
+            .find(|use_| contains(use_.key_range, position))
+    }
+
+    /// Returns a callable type alias's directly stated option members and references.
+    pub fn decorator_option_type(&self, name: &str) -> Option<&DecoratorOptionType> {
+        let types = self
+            .decorator_option_types
+            .iter()
+            .filter(|(candidate, _)| candidate == name)
+            .map(|(_, option)| option)
+            .collect::<Vec<_>>();
+        if types.len() == 1 {
+            Some(types[0])
+        } else {
+            None
+        }
+    }
+
+    /// Returns a variable's direct named callable type annotation.
+    pub fn callable_type_annotation(&self, name: &str) -> Option<&str> {
+        let annotations = self
+            .callable_type_annotations
+            .iter()
+            .filter(|annotation| annotation.name == name)
+            .collect::<Vec<_>>();
+        if annotations.len() == 1 {
+            Some(annotations[0].type_name.as_str())
+        } else {
+            None
+        }
+    }
+
+    /// Returns an object's direct member callable type annotation.
+    pub fn callable_member_type_annotation(
+        &self,
+        object_name: &str,
+        member_name: &str,
+    ) -> Option<&str> {
+        let annotations = self
+            .callable_member_type_annotations
+            .iter()
+            .filter(|annotation| {
+                annotation.object_name == object_name && annotation.member_name == member_name
+            })
+            .collect::<Vec<_>>();
+        if annotations.len() == 1 {
+            Some(annotations[0].type_name.as_str())
+        } else {
+            None
+        }
     }
 
     /// Returns a local interface, object type alias, or class with direct members.

@@ -252,7 +252,7 @@ pub(super) fn typescript_type_target(
             })
     })?;
     let imported_name = binding.imported_name.as_deref()?;
-    if !binding.type_only || !matches!(binding.kind, ImportKind::Named | ImportKind::Default) {
+    if !matches!(binding.kind, ImportKind::Named | ImportKind::Default) {
         return None;
     }
     let target =
@@ -283,6 +283,123 @@ pub(super) fn typescript_type_member_target(
         &usage.target,
         &usage.member_name,
     )
+}
+
+pub(super) fn typescript_decorator_option_target(
+    cache: &Mutex<TypeScriptNavigationCache>,
+    importer_path: &str,
+    index: &DocumentIndex,
+    line: usize,
+    character: usize,
+) -> Option<LspDefinitionLocation> {
+    let usage = index.decorator_option_at(line, character)?;
+    let (import, binding) = index.import_binding_by_range(usage.binding_range)?;
+    let imported_name = direct_imported_name(binding)?;
+    let decorator_path =
+        resolve_typescript_definition_import(cache, Path::new(importer_path), &import.specifier)?;
+    let (decorator_path, decorator) =
+        resolve_typescript_export(cache, decorator_path, imported_name)?;
+    let decorator_index = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .index(&decorator_path)?;
+    let type_name = match usage.member_name.as_deref() {
+        Some(member_name) => {
+            decorator_index.callable_member_type_annotation(&decorator.name, member_name)?
+        }
+        None => decorator_index.callable_type_annotation(&decorator.name)?,
+    };
+    let (type_path, type_name) =
+        resolve_decorator_type(cache, &decorator_path, &decorator_index, type_name)?;
+    let member = resolve_decorator_option_member(
+        cache,
+        &type_path,
+        &type_name,
+        &usage.key_name,
+        0,
+        &mut HashSet::new(),
+    )?;
+    Some(LspDefinitionLocation {
+        uri: file_uri(&member.0),
+        range: typescript_range(member.1),
+    })
+}
+
+fn resolve_decorator_type(
+    cache: &Mutex<TypeScriptNavigationCache>,
+    path: &Path,
+    index: &DocumentIndex,
+    name: &str,
+) -> Option<(PathBuf, String)> {
+    if index.decorator_option_type(name).is_some() || index.type_declaration(name).is_some() {
+        return Some((path.to_path_buf(), name.to_owned()));
+    }
+    let imports = index
+        .imports
+        .iter()
+        .flat_map(|import| import.bindings.iter().map(move |binding| (import, binding)))
+        .filter(|(_, binding)| {
+            binding.local_name == name
+                && matches!(binding.kind, ImportKind::Named | ImportKind::Default)
+        })
+        .collect::<Vec<_>>();
+    let [(import, binding)] = imports.as_slice() else {
+        return None;
+    };
+    let imported_name = binding.imported_name.as_deref()?;
+    let path = resolve_typescript_definition_import(cache, path, &import.specifier)?;
+    let (path, declaration) = resolve_typescript_type_export(cache, path, imported_name)?;
+    Some((path, declaration.name))
+}
+
+fn resolve_decorator_option_member(
+    cache: &Mutex<TypeScriptNavigationCache>,
+    path: &Path,
+    type_name: &str,
+    member_name: &str,
+    depth: usize,
+    visited: &mut HashSet<(PathBuf, String)>,
+) -> Option<(PathBuf, galaxy_core::typescript::Utf16Range)> {
+    if depth == MAX_TYPESCRIPT_REEXPORT_DEPTH
+        || !visited.insert((module_identity(path), type_name.to_owned()))
+    {
+        return None;
+    }
+    let index = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .index(path)?;
+    let mut candidates = Vec::new();
+    if let Some(option) = index.decorator_option_type(type_name) {
+        candidates.extend(
+            option
+                .members
+                .iter()
+                .filter(|member| member.name == member_name)
+                .map(|member| (path.to_path_buf(), member.range)),
+        );
+        for reference in &option.references {
+            let Some((reference_path, reference_name)) =
+                resolve_decorator_type(cache, path, &index, reference)
+            else {
+                continue;
+            };
+            if let Some(candidate) = resolve_decorator_option_member(
+                cache,
+                &reference_path,
+                &reference_name,
+                member_name,
+                depth + 1,
+                visited,
+            ) && !candidates.contains(&candidate)
+            {
+                candidates.push(candidate);
+            }
+        }
+    } else if let Some(member) = index.type_member(type_name, member_name) {
+        candidates.push((path.to_path_buf(), member.range));
+    }
+    (candidates.len() == 1).then(|| candidates.remove(0))
 }
 
 pub(super) fn resolve_typescript_type_member_target(
@@ -687,8 +804,8 @@ pub(super) fn workspace_detected(root: &Path) -> bool {
         "app.config.js",
         "app.config.ts",
     ]
-        .into_iter()
-        .any(|name| root.join(name).is_file())
+    .into_iter()
+    .any(|name| root.join(name).is_file())
 }
 
 pub(super) fn spawn_warmup(

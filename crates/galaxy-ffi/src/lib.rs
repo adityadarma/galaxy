@@ -52,13 +52,14 @@ mod typescript_editor;
 mod typescript_navigation;
 
 use typescript_editor::{
-    typescript_completions, typescript_hover_markdown, typescript_outline_symbol,
+    TypeScriptWorkspaceExports, typescript_completions, typescript_hover_markdown,
+    typescript_outline_symbol,
 };
 use typescript_navigation::{
     TypeScriptNavigationCache, module_root_location, resolve_typescript_definition_import,
     resolve_typescript_export, resolve_typescript_import_uncached, resolve_typescript_type_export,
-    spawn_warmup, typescript_import_target, typescript_type_member_target, typescript_type_target,
-    workspace_detected,
+    spawn_warmup, typescript_decorator_option_target, typescript_import_target,
+    typescript_type_member_target, typescript_type_target, workspace_detected,
 };
 
 uniffi::setup_scaffolding!();
@@ -450,6 +451,8 @@ pub struct Core {
     typescript_checked: Mutex<HashMap<String, u64>>,
     /// Parsed disk documents and successful module resolutions used by TypeScript navigation.
     typescript_navigation: Arc<Mutex<TypeScriptNavigationCache>>,
+    /// Parsed direct exports from visible workspace TypeScript sources.
+    typescript_workspace_exports: Arc<Mutex<TypeScriptWorkspaceExports>>,
 }
 
 impl Default for Core {
@@ -463,6 +466,9 @@ impl Default for Core {
             php_checked: Mutex::new(HashMap::new()),
             typescript_checked: Mutex::new(HashMap::new()),
             typescript_navigation: Arc::new(Mutex::new(TypeScriptNavigationCache::default())),
+            typescript_workspace_exports: Arc::new(Mutex::new(
+                TypeScriptWorkspaceExports::default(),
+            )),
         }
     }
 }
@@ -642,6 +648,7 @@ impl Core {
         spawn_workspace_indexing(
             ws.clone(),
             Arc::clone(&self.typescript_navigation),
+            Arc::clone(&self.typescript_workspace_exports),
             Arc::clone(&self.go),
             Arc::clone(&self.php),
             self.listener
@@ -858,7 +865,12 @@ impl Core {
         let uri = file_uri(Path::new(&path));
         if is_typescript_path(Path::new(&path)) {
             let text = document.lock().editor.doc.text();
-            let items = typescript_completions(&path, &text, line as usize, character as usize);
+            let exports = self
+                .typescript_workspace_exports
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let items =
+                typescript_completions(&path, &text, line as usize, character as usize, &exports);
             let answered = !items.is_empty();
             self.analysis
                 .lock()
@@ -2057,6 +2069,17 @@ impl Core {
             });
         }
         if locations.is_empty() {
+            locations = typescript_decorator_option_target(
+                &self.typescript_navigation,
+                &path,
+                &index,
+                line as usize,
+                character as usize,
+            )
+            .map(|target| vec![target])
+            .unwrap_or_default();
+        }
+        if locations.is_empty() {
             locations = typescript_type_member_target(
                 &self.typescript_navigation,
                 &path,
@@ -2359,9 +2382,19 @@ fn php_workspace_detected(root: &Path) -> bool {
         return true;
     }
     [
-        "app", "src", "application", "modules", "packages", "libraries",
-        "common", "backend", "frontend", "web/modules", "sites/all/modules",
-        "wp-content/plugins", "wp-content/themes",
+        "app",
+        "src",
+        "application",
+        "modules",
+        "packages",
+        "libraries",
+        "common",
+        "backend",
+        "frontend",
+        "web/modules",
+        "sites/all/modules",
+        "wp-content/plugins",
+        "wp-content/themes",
     ]
     .into_iter()
     .any(|path| contains_php_source(&root.join(path), 2))
@@ -2373,7 +2406,10 @@ fn contains_php_source(dir: &Path, depth: u8) -> bool {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("php")) {
+        if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("php"))
+        {
             return true;
         }
         if depth > 0
@@ -2398,6 +2434,7 @@ fn typescript_range(range: galaxy_core::typescript::Utf16Range) -> LspRange {
 fn spawn_workspace_indexing(
     workspace: CoreWorkspace,
     cache: Arc<Mutex<TypeScriptNavigationCache>>,
+    typescript_exports: Arc<Mutex<TypeScriptWorkspaceExports>>,
     go_engines: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<GoEngine>>>>>,
     php_engines: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<PhpEngine>>>>>,
     listener: Option<Arc<dyn CoreListener>>,
@@ -2407,6 +2444,10 @@ fn spawn_workspace_indexing(
         .name("workspace-indexing".into())
         .spawn(move || {
             let paths = workspace.build_file_index().paths().collect::<Vec<_>>();
+            typescript_exports
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .refresh(&root, &paths);
             send_workspace_index_started(&listener, &root, paths.len() as u64);
             let (total, changed) = refresh_workspace_index(&workspace, &paths, &listener);
             let mut workers = Vec::new();
@@ -6211,17 +6252,29 @@ mod tests {
     fn detects_php_frameworks_without_composer() {
         let laravel = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(laravel.path().join("app/Http")).unwrap();
-        std::fs::write(laravel.path().join("app/Http/Controller.php"), "<?php class Controller {}\n").unwrap();
+        std::fs::write(
+            laravel.path().join("app/Http/Controller.php"),
+            "<?php class Controller {}\n",
+        )
+        .unwrap();
         assert!(php_workspace_detected(laravel.path()));
 
         let symfony = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(symfony.path().join("src/Controller")).unwrap();
-        std::fs::write(symfony.path().join("src/Controller/Home.php"), "<?php class Home {}\n").unwrap();
+        std::fs::write(
+            symfony.path().join("src/Controller/Home.php"),
+            "<?php class Home {}\n",
+        )
+        .unwrap();
         assert!(php_workspace_detected(symfony.path()));
 
         let plain = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(plain.path().join("node_modules/pkg")).unwrap();
-        std::fs::write(plain.path().join("node_modules/pkg/Library.php"), "<?php class Library {}\n").unwrap();
+        std::fs::write(
+            plain.path().join("node_modules/pkg/Library.php"),
+            "<?php class Library {}\n",
+        )
+        .unwrap();
         assert!(!php_workspace_detected(plain.path()));
     }
 
@@ -6883,6 +6936,193 @@ mod tests {
     }
 
     #[test]
+    fn typescript_workspace_completion_imports_unique_exports() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("app/models");
+        let controllers = dir.path().join("app/controllers");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::create_dir_all(&controllers).unwrap();
+        std::fs::write(models.join("user.ts"), "export class User {}\n").unwrap();
+        let consumer = controllers.join("auth.ts");
+        std::fs::write(&consumer, "Us\n").unwrap();
+        let core = Core::new();
+        core.open_workspace(dir.path().to_string_lossy().into_owned())
+            .unwrap();
+        let document = core
+            .open_document(consumer.to_string_lossy().into_owned())
+            .unwrap();
+
+        until("workspace TypeScript completion", || {
+            core.request_completion(document.clone(), 0, 2)
+        });
+        let item = core
+            .completions(document)
+            .into_iter()
+            .find(|item| item.label == "User")
+            .unwrap();
+        assert_eq!(item.detail.as_deref(), Some("class - app/models/user.ts"));
+        assert_eq!(item.insert_text, "User");
+        assert_eq!(item.additional_edits.len(), 1);
+        assert_eq!(item.additional_edits[0].line, 0);
+        assert_eq!(item.additional_edits[0].column, 0);
+        assert_eq!(
+            item.additional_edits[0].text,
+            "import { User } from '../models/user.js';\n"
+        );
+    }
+
+    #[test]
+    fn typescript_workspace_completion_handles_default_and_suppresses_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("app/models")).unwrap();
+        std::fs::create_dir_all(dir.path().join("app/controllers")).unwrap();
+        std::fs::write(
+            dir.path().join("app/models/session.ts"),
+            "export default class Session {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("app/models/one.ts"),
+            "export class Duplicate {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("app/models/two.ts"),
+            "export class Duplicate {}\n",
+        )
+        .unwrap();
+        let consumer = dir.path().join("app/controllers/auth.ts");
+        std::fs::write(
+            &consumer,
+            "import { Session } from '../models/session.js';\n\nSe\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        core.open_workspace(dir.path().to_string_lossy().into_owned())
+            .unwrap();
+        let imported_document = core
+            .open_document(consumer.to_string_lossy().into_owned())
+            .unwrap();
+
+        let default_consumer = dir.path().join("app/controllers/default.ts");
+        std::fs::write(&default_consumer, "Se\n").unwrap();
+        let document = core
+            .open_document(default_consumer.to_string_lossy().into_owned())
+            .unwrap();
+        until("workspace TypeScript default completion", || {
+            core.request_completion(document.clone(), 0, 2)
+        });
+        let item = core
+            .completions(document)
+            .into_iter()
+            .find(|item| item.label == "Session")
+            .unwrap();
+        assert_eq!(
+            item.additional_edits[0].text,
+            "import Session from '../models/session.js';\n"
+        );
+
+        assert!(core.request_completion(imported_document.clone(), 2, 2));
+        let items = core.completions(imported_document);
+        let session = items.iter().find(|item| item.label == "Session").unwrap();
+        assert!(session.additional_edits.is_empty());
+        assert!(!items.iter().any(|item| item.label == "Duplicate"));
+    }
+
+    #[test]
+    fn typescript_workspace_completion_offers_existing_default_import_without_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("intrade/app/models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("user.ts"), "export default class User {}\n").unwrap();
+        let consumer = models.join("market.ts");
+        std::fs::write(&consumer, "import User from './user.js';\n\nUser\n").unwrap();
+        let core = Core::new();
+        core.open_workspace(dir.path().to_string_lossy().into_owned())
+            .unwrap();
+        let document = core
+            .open_document(consumer.to_string_lossy().into_owned())
+            .unwrap();
+
+        until("existing TypeScript import completion", || {
+            core.request_completion(document.clone(), 2, 4)
+        });
+        let item = core
+            .completions(document)
+            .into_iter()
+            .find(|item| item.label == "User")
+            .expect("User completion");
+        assert!(item.additional_edits.is_empty());
+    }
+
+    #[test]
+    fn typescript_workspace_completion_offers_only_local_import_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let models = dir.path().join("app/models");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::write(models.join("user.ts"), "export class User {}\n").unwrap();
+        let consumer = dir.path().join("app/models/market.ts");
+        std::fs::write(
+            &consumer,
+            "import { User as MarketUser } from './user.js';\n\nMarket\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        core.open_workspace(dir.path().to_string_lossy().into_owned())
+            .unwrap();
+        let document = core
+            .open_document(consumer.to_string_lossy().into_owned())
+            .unwrap();
+
+        until("aliased TypeScript import completion", || {
+            core.request_completion(document.clone(), 2, 6)
+        });
+        let items = core.completions(document);
+        let item = items
+            .iter()
+            .find(|item| item.label == "MarketUser")
+            .expect("MarketUser completion");
+        assert!(item.additional_edits.is_empty());
+        assert!(!items.iter().any(|item| item.label == "User"));
+    }
+
+    #[test]
+    fn typescript_workspace_completion_imports_default_class_extending_a_call_expression() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("app/models")).unwrap();
+        std::fs::create_dir_all(dir.path().join("app/controllers")).unwrap();
+        std::fs::write(
+            dir.path().join("app/models/user.ts"),
+            "import { compose } from '@adonisjs/core/helpers';\nimport { BaseModel, column } from '@adonisjs/lucid/orm';\nimport { Trait } from '#mixins/trait';\n\nexport default class User extends compose(\n  BaseModel,\n  Trait\n) {\n  @column({ isPrimary: true })\n  declare id: string\n}\n",
+        )
+        .unwrap();
+        let consumer = dir.path().join("app/controllers/auth.ts");
+        std::fs::write(&consumer, "Us\n").unwrap();
+        let core = Core::new();
+        core.open_workspace(dir.path().to_string_lossy().into_owned())
+            .unwrap();
+        let document = core
+            .open_document(consumer.to_string_lossy().into_owned())
+            .unwrap();
+
+        until("workspace TypeScript Adonis model completion", || {
+            core.request_completion(document.clone(), 0, 2)
+        });
+        let item = core
+            .completions(document)
+            .into_iter()
+            .find(|item| item.label == "User")
+            .expect("User completion");
+        assert_eq!(item.detail.as_deref(), Some("class - app/models/user.ts"));
+        assert_eq!(item.insert_text, "User");
+        assert_eq!(item.additional_edits.len(), 1);
+        assert_eq!(
+            item.additional_edits[0].text,
+            "import User from '../models/user.js';\n"
+        );
+    }
+
+    #[test]
     fn typescript_definition_follows_migration_table_callback_parameter() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("database/migrations/create_roles_table.ts");
@@ -7149,15 +7389,19 @@ mod tests {
         let document = core
             .open_document(index.to_string_lossy().into_owned())
             .unwrap();
-        let column = source.find("LucidModel").unwrap() as u64;
-        assert!(core.request_definition(document.clone(), 0, column));
-        let definitions = core.definition_locations(document);
-        assert_eq!(definitions.len(), 1);
-        assert_eq!(
-            definitions[0].uri,
-            file_uri(&std::fs::canonicalize(&target).unwrap())
-        );
-        assert_eq!((definitions[0].line, definitions[0].column), (0, 7));
+        for (line, column) in [
+            (0, source.find("LucidModel").unwrap() as u64),
+            (1, "export declare const BaseModel: ".len() as u64),
+        ] {
+            assert!(core.request_definition(document.clone(), line, column));
+            let definitions = core.definition_locations(document.clone());
+            assert_eq!(definitions.len(), 1);
+            assert_eq!(
+                definitions[0].uri,
+                file_uri(&std::fs::canonicalize(&target).unwrap())
+            );
+            assert_eq!((definitions[0].line, definitions[0].column), (0, 7));
+        }
     }
 
     #[test]
@@ -7695,6 +7939,123 @@ mod tests {
                 "cursor {line}:{column}"
             );
         }
+    }
+
+    #[test]
+    fn typescript_navigation_resolves_imported_decorator_option_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("app/decorators")).unwrap();
+        std::fs::create_dir_all(dir.path().join("app/models")).unwrap();
+        std::fs::create_dir_all(dir.path().join("types")).unwrap();
+        std::fs::write(
+            dir.path().join("tsconfig.json"),
+            r##"{"compilerOptions":{"baseUrl":".","paths":{"#decorators/*":["app/decorators/*"],"#types/*":["types/*"]}}}"##,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("types/lucid.ts"),
+            "export interface ColumnOptions { columnName?: string }\n\
+             export type EpochDecorator = (option?: Partial<ColumnOptions & {\n\
+               autoCreate: boolean;\n\
+               autoUpdate: boolean;\n\
+             }>) => DecoratorEpochFn\n\
+             type DecoratorEpochFn = () => void\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("app/decorators/lucid.ts"),
+            "import { EpochDecorator } from '#types/lucid'\n\
+             export const epochTime: EpochDecorator = () => () => {}\n\
+             export const unrelated = () => () => {}\n",
+        )
+        .unwrap();
+        let model_path = dir.path().join("app/models/foo.ts");
+        std::fs::write(
+            &model_path,
+            "import { epochTime, unrelated } from '#decorators/lucid'\n\
+             @epochTime({ autoCreate: true, autoUpdate: true, columnName: 'created_at' })\n\
+             class Model {}\n\
+             @unrelated({ autoCreate: true })\n\
+             class Other {}\n\
+             epochTime({ autoCreate: true })\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let model = core
+            .open_document(model_path.to_string_lossy().into_owned())
+            .unwrap();
+
+        for (column, target_line, target_column) in [(14, 2, 0), (32, 3, 0), (50, 0, 33)] {
+            assert!(
+                core.request_definition(model.clone(), 1, column),
+                "cursor 1:{column}"
+            );
+            let definition = core.definition_locations(model.clone());
+            assert_eq!(definition.len(), 1);
+            assert!(definition[0].uri.ends_with("types/lucid.ts"));
+            assert_eq!(
+                (definition[0].line, definition[0].column),
+                (target_line, target_column)
+            );
+        }
+
+        for (line, column) in [(3, 13), (5, 12)] {
+            assert!(
+                !core.request_definition(model.clone(), line, column),
+                "cursor {line}:{column}"
+            );
+        }
+    }
+
+    #[test]
+    fn typescript_navigation_resolves_imported_object_member_decorator_option_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+        let package = dir.path().join("node_modules/decorators");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("index.d.ts"),
+            "export type Options = { autoCreate: boolean; autoUpdate: boolean }\n\
+             export type DateColumnDecorator = (option?: Partial<Options>) => () => void\n\
+             export type DateTimeDecorator = DateColumnDecorator\n\
+             export type BaseDecorator = () => void\n\
+             export declare const column: BaseDecorator & { dateTime: DateTimeDecorator }\n\
+             export declare const ordinary: { dateTime: (option?: { autoCreate: boolean }) => void }\n",
+        )
+        .unwrap();
+        let model_path = dir.path().join("model.ts");
+        std::fs::write(
+            &model_path,
+            "import { column, ordinary } from 'decorators'\n\
+             @column.dateTime({ autoCreate: true, autoUpdate: true })\n\
+             class Model {}\n\
+             @ordinary.dateTime({ autoCreate: true })\n\
+             class Other {}\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let model = core
+            .open_document(model_path.to_string_lossy().into_owned())
+            .unwrap();
+
+        for (column, target_column) in [(19, 24), (37, 45)] {
+            assert!(
+                core.request_definition(model.clone(), 1, column),
+                "cursor 1:{column}"
+            );
+            let definition = core.definition_locations(model.clone());
+            assert_eq!(definition.len(), 1);
+            assert!(
+                definition[0]
+                    .uri
+                    .ends_with("node_modules/decorators/index.d.ts")
+            );
+            assert_eq!(
+                (definition[0].line, definition[0].column),
+                (0, target_column)
+            );
+        }
+        assert!(!core.request_definition(model, 3, 22));
     }
 
     #[test]

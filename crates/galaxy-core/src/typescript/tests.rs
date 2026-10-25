@@ -70,6 +70,23 @@ fn indexes_typescript_declarations_imports_and_exports() {
 }
 
 #[test]
+fn indexes_named_default_class_extending_a_call_expression() {
+    let index = DocumentIndex::parse(
+        "app/models/user.ts",
+        "export default class User extends compose(\n  BaseModel,\n  Trait\n) {}",
+    );
+
+    let declaration = index
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "User")
+        .expect("named default class declaration");
+    assert_eq!(declaration.kind, DeclarationKind::Class);
+    assert!(declaration.exported);
+    assert!(declaration.default);
+}
+
+#[test]
 fn indexes_exact_static_module_specifier_ranges() {
     let index = DocumentIndex::parse(
         "main.ts",

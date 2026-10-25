@@ -114,6 +114,190 @@ pub(super) fn type_members_from_body(
     Some(members)
 }
 
+pub(super) fn collect_decorator_option_types(
+    root: Node<'_>,
+    text: &str,
+    locations: &Locations,
+) -> Vec<(String, DecoratorOptionType)> {
+    let mut types = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "type_alias_declaration"
+            && let Some(name) = node.child_by_field_name("name")
+            && let Some(name) = node_text(text, name)
+            && let Some(option) = callable_decorator_option_type(node, text, locations)
+        {
+            types.push((name.to_owned(), option));
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    types
+}
+
+fn callable_decorator_option_type(
+    node: Node<'_>,
+    text: &str,
+    locations: &Locations,
+) -> Option<DecoratorOptionType> {
+    let value = node.named_child(1)?;
+    if value.kind() == "type_identifier" {
+        return Some(DecoratorOptionType {
+            members: Vec::new(),
+            references: vec![node_text(text, value)?.to_owned()],
+        });
+    }
+    let function = (value.kind() == "function_type").then_some(value)?;
+    let parameters = function.child_by_field_name("parameters")?;
+    let parameter = sole_type_parameter(parameters)?;
+    let annotation = parameter.child_by_field_name("type")?;
+    decorator_option_shape(annotation.named_child(0)?, text, locations)
+}
+
+pub(super) fn collect_callable_type_annotations(
+    root: Node<'_>,
+    text: &str,
+) -> Vec<CallableTypeAnnotation> {
+    let mut annotations = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "variable_declarator"
+            && let Some(name) = node.child_by_field_name("name")
+            && name.kind() == "identifier"
+            && let Some(variable_name) = node_text(text, name)
+            && let Some(annotation) = node.child_by_field_name("type")
+            && let Some(type_name) = annotation
+                .named_child(0)
+                .filter(|node| node.kind() == "type_identifier")
+                .and_then(|node| node_text(text, node))
+        {
+            annotations.push(CallableTypeAnnotation {
+                name: variable_name.to_owned(),
+                type_name: type_name.to_owned(),
+            });
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    annotations
+}
+
+pub(super) fn collect_callable_member_type_annotations(
+    root: Node<'_>,
+    text: &str,
+) -> Vec<CallableMemberTypeAnnotation> {
+    let mut annotations = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "variable_declarator"
+            && let Some(name) = node.child_by_field_name("name")
+            && name.kind() == "identifier"
+            && let Some(object_name) = node_text(text, name)
+            && let Some(annotation) = node.child_by_field_name("type")
+            && let Some(type_node) = annotation.named_child(0)
+        {
+            collect_callable_members_from_type(type_node, object_name, text, &mut annotations);
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    annotations
+}
+
+fn collect_callable_members_from_type(
+    node: Node<'_>,
+    object_name: &str,
+    text: &str,
+    annotations: &mut Vec<CallableMemberTypeAnnotation>,
+) {
+    match node.kind() {
+        "intersection_type" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_callable_members_from_type(child, object_name, text, annotations);
+            }
+        }
+        "object_type" => {
+            let mut cursor = node.walk();
+            for member in node.named_children(&mut cursor) {
+                if member.kind() != "property_signature" {
+                    continue;
+                }
+                let Some(name) = member.child_by_field_name("name") else {
+                    continue;
+                };
+                let Some(annotation) = member.child_by_field_name("type") else {
+                    continue;
+                };
+                let Some(type_name) = annotation
+                    .named_child(0)
+                    .filter(|node| node.kind() == "type_identifier")
+                    .and_then(|node| node_text(text, node))
+                else {
+                    continue;
+                };
+                let Some(member_name) = node_text(text, name) else {
+                    continue;
+                };
+                annotations.push(CallableMemberTypeAnnotation {
+                    object_name: object_name.to_owned(),
+                    member_name: member_name.to_owned(),
+                    type_name: type_name.to_owned(),
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+fn decorator_option_shape(
+    node: Node<'_>,
+    text: &str,
+    locations: &Locations,
+) -> Option<DecoratorOptionType> {
+    let mut members = Vec::new();
+    let mut references = Vec::new();
+    collect_decorator_option_shape(node, text, locations, &mut members, &mut references)?;
+    Some(DecoratorOptionType {
+        members,
+        references,
+    })
+}
+
+fn collect_decorator_option_shape(
+    node: Node<'_>,
+    text: &str,
+    locations: &Locations,
+    members: &mut Vec<TypeMember>,
+    references: &mut Vec<String>,
+) -> Option<()> {
+    match node.kind() {
+        "object_type" => members.extend(type_members_from_body(node, text, locations)?),
+        "intersection_type" => {
+            let mut cursor = node.walk();
+            for child in node.named_children(&mut cursor) {
+                collect_decorator_option_shape(child, text, locations, members, references)?;
+            }
+        }
+        "type_identifier" => references.push(node_text(text, node)?.to_owned()),
+        "generic_type" => {
+            let base = node.named_child(0)?;
+            if node_text(text, base) != Some("Partial") {
+                return None;
+            }
+            let arguments = node.named_child(1)?;
+            let mut cursor = arguments.walk();
+            let arguments = arguments.named_children(&mut cursor).collect::<Vec<_>>();
+            let [argument] = arguments.as_slice() else {
+                return None;
+            };
+            collect_decorator_option_shape(*argument, text, locations, members, references)?;
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
 pub(super) fn member_return_type(member: Node<'_>, text: &str) -> Option<String> {
     let annotation = member.child_by_field_name("return_type")?;
     let mut names = Vec::new();

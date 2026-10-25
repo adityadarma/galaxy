@@ -4,7 +4,8 @@ use super::*;
 
 /// Type identifiers in declaration fields are not consistently included in
 /// Tree-sitter's lexical reference set. Index only an unshadowed, unique
-/// `import type` binding so Definition remains conservative.
+/// named/default import in a type position so Definition remains conservative.
+/// Declaration files may use a regular import for interfaces.
 pub(super) fn collect_type_import_references(
     root: Node<'_>,
     text: &str,
@@ -26,8 +27,7 @@ pub(super) fn collect_type_import_references(
                 .iter()
                 .flat_map(|import| import.bindings.iter())
                 .filter(|binding| {
-                    binding.type_only
-                        && matches!(binding.kind, ImportKind::Named | ImportKind::Default)
+                    matches!(binding.kind, ImportKind::Named | ImportKind::Default)
                         && binding.local_name == name
                 })
                 .collect::<Vec<_>>();
@@ -186,6 +186,113 @@ pub(super) fn collect_import_bindings(
                 collect_import_bindings(text, child, statement_type_only, locations, bindings);
             }
         }
+    }
+}
+
+pub(super) fn collect_decorator_option_uses(
+    root: Node<'_>,
+    text: &str,
+    locations: &Locations,
+    imports: &[Import],
+    import_symbols: &[SymbolOccurrences],
+) -> Vec<DecoratorOptionUse> {
+    let mut uses = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "decorator"
+            && let Some(call) = node
+                .named_child(0)
+                .filter(|node| node.kind() == "call_expression")
+            && let Some(function) = call.child_by_field_name("function")
+            && let Some((name, member_name)) = decorator_callee(text, function)
+            && let Some(binding_occurrence) = decorator_binding_occurrence(function)
+            && let Some(arguments) = call.child_by_field_name("arguments")
+            && let Some(object) = arguments
+                .named_child(0)
+                .filter(|node| node.kind() == "object")
+            && arguments.named_child(1).is_none()
+            && let Some(binding) = imported_value_binding(
+                name,
+                locations.range(binding_occurrence),
+                imports,
+                import_symbols,
+            )
+        {
+            let mut cursor = object.walk();
+            for property in object.named_children(&mut cursor) {
+                if property.kind() != "pair" {
+                    continue;
+                }
+                let Some(key) = property.child_by_field_name("key") else {
+                    continue;
+                };
+                if !matches!(key.kind(), "property_identifier" | "identifier") {
+                    continue;
+                }
+                if let Some(key_name) = node_text(text, key) {
+                    uses.push(DecoratorOptionUse {
+                        binding_range: binding.range,
+                        member_name: member_name.map(ToOwned::to_owned),
+                        key_name: key_name.to_owned(),
+                        key_range: locations.range(key),
+                    });
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    uses
+}
+
+/// Accept only an imported identifier or one direct named member of one.
+fn decorator_callee<'a>(text: &'a str, function: Node<'_>) -> Option<(&'a str, Option<&'a str>)> {
+    if function.kind() == "identifier" {
+        return Some((node_text(text, function)?, None));
+    }
+    if function.kind() != "member_expression" {
+        return None;
+    }
+    let object = function.child_by_field_name("object")?;
+    let property = function.child_by_field_name("property")?;
+    (object.kind() == "identifier" && property.kind() == "property_identifier")
+        .then(|| Some((node_text(text, object)?, Some(node_text(text, property)?))))?
+}
+
+fn decorator_binding_occurrence(function: Node<'_>) -> Option<Node<'_>> {
+    match function.kind() {
+        "identifier" => Some(function),
+        "member_expression" => function.child_by_field_name("object"),
+        _ => None,
+    }
+}
+
+fn imported_value_binding<'a>(
+    name: &str,
+    occurrence: Utf16Range,
+    imports: &'a [Import],
+    import_symbols: &[SymbolOccurrences],
+) -> Option<&'a ImportBinding> {
+    let symbols = import_symbols
+        .iter()
+        .filter(|symbol| symbol.name == name && symbol.occurrences.contains(&occurrence))
+        .collect::<Vec<_>>();
+    let [symbol] = symbols.as_slice() else {
+        return None;
+    };
+    let bindings = imports
+        .iter()
+        .flat_map(|import| import.bindings.iter())
+        .filter(|binding| {
+            binding.range == symbol.declaration
+                && !binding.type_only
+                && matches!(binding.kind, ImportKind::Named | ImportKind::Default)
+        })
+        .collect::<Vec<_>>();
+    if bindings.len() == 1 {
+        Some(bindings[0])
+    } else {
+        None
     }
 }
 
