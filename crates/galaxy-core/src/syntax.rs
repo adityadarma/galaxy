@@ -59,10 +59,12 @@ pub enum SyntaxLanguage {
     Blade,
     /// `.vue`: HTML grammar plus `<script>`/`<style>` injection.
     Vue,
+    /// `.svelte`: HTML grammar plus `<script>`/`<style>` and template expression injection.
+    Svelte,
 }
 
 impl SyntaxLanguage {
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 30] = [
         Self::Rust,
         Self::TypeScript,
         Self::Tsx,
@@ -92,6 +94,7 @@ impl SyntaxLanguage {
         Self::R,
         Self::Blade,
         Self::Vue,
+        Self::Svelte,
     ];
 
     pub fn name(self) -> &'static str {
@@ -125,6 +128,7 @@ impl SyntaxLanguage {
             Self::R => "R",
             Self::Blade => "Blade",
             Self::Vue => "Vue",
+            Self::Svelte => "Svelte",
         }
     }
 
@@ -140,7 +144,13 @@ impl SyntaxLanguage {
             }
             Self::Lua | Self::Sql => Some("--"),
             Self::Ini => Some(";"),
-            Self::Json | Self::Html | Self::Css | Self::Markdown | Self::Blade | Self::Vue => None,
+            Self::Json
+            | Self::Html
+            | Self::Css
+            | Self::Markdown
+            | Self::Blade
+            | Self::Vue
+            | Self::Svelte => None,
             Self::Php => Some("//"),
         }
     }
@@ -157,7 +167,9 @@ impl SyntaxLanguage {
             Self::Markdown => tree_sitter_md_025::LANGUAGE.into(),
             Self::Python => tree_sitter_python::LANGUAGE.into(),
             Self::Go => tree_sitter_go::LANGUAGE.into(),
-            Self::Html | Self::Blade | Self::Vue => tree_sitter_html::LANGUAGE.into(),
+            Self::Html | Self::Blade | Self::Vue | Self::Svelte => {
+                tree_sitter_html::LANGUAGE.into()
+            }
             Self::Css => tree_sitter_css::LANGUAGE.into(),
             Self::Bash => tree_sitter_bash::LANGUAGE.into(),
             Self::Php => tree_sitter_php::LANGUAGE_PHP.into(),
@@ -191,7 +203,9 @@ impl SyntaxLanguage {
             Self::Markdown => tree_sitter_md_025::HIGHLIGHT_QUERY_BLOCK,
             Self::Python => tree_sitter_python::HIGHLIGHTS_QUERY,
             Self::Go => tree_sitter_go::HIGHLIGHTS_QUERY,
-            Self::Html | Self::Blade | Self::Vue => tree_sitter_html::HIGHLIGHTS_QUERY,
+            Self::Html | Self::Blade | Self::Vue | Self::Svelte => {
+                tree_sitter_html::HIGHLIGHTS_QUERY
+            }
             Self::Css => tree_sitter_css::HIGHLIGHTS_QUERY,
             Self::Bash => BASH_HIGHLIGHTS,
             Self::Php => php_highlights(),
@@ -271,6 +285,7 @@ impl SyntaxLanguage {
             "go" => Some(Self::Go),
             "html" | "htm" => Some(Self::Html),
             "vue" => Some(Self::Vue),
+            "svelte" => Some(Self::Svelte),
             "css" => Some(Self::Css),
             "sh" | "bash" | "zsh" => Some(Self::Bash),
             "php" => Some(Self::Php),
@@ -327,7 +342,11 @@ pub struct OutlineSymbol {
 pub fn is_markup_text(doc: &Document, tree: &Tree, language: SyntaxLanguage, pos: usize) -> bool {
     let html = matches!(
         language,
-        SyntaxLanguage::Html | SyntaxLanguage::Php | SyntaxLanguage::Blade | SyntaxLanguage::Vue
+        SyntaxLanguage::Html
+            | SyntaxLanguage::Php
+            | SyntaxLanguage::Blade
+            | SyntaxLanguage::Vue
+            | SyntaxLanguage::Svelte
     );
     let jsx = matches!(language, SyntaxLanguage::Tsx | SyntaxLanguage::JavaScript);
     if !html && !jsx {
@@ -685,6 +704,11 @@ pub fn style_runs_for_viewport(
         spans = crate::php::framework::laravel::blade::subtract(spans, &overlay.claimed);
         spans.extend(overlay.spans);
     }
+    if language == SyntaxLanguage::Svelte {
+        let overlay = svelte_overlay(rope, tree, start_byte, end_byte);
+        spans = crate::php::framework::laravel::blade::subtract(spans, &overlay.claimed);
+        spans.extend(overlay.spans);
+    }
     let mut runs = Vec::new();
     for (start, end, scope) in spans {
         let start_char = rope.byte_to_char(start);
@@ -800,6 +824,31 @@ fn vue_overlay(
     overlay
 }
 
+/// Styles the embedded languages and braced template expressions of a Svelte
+/// component using the bundled HTML, JavaScript/TypeScript, and CSS grammars.
+fn svelte_overlay(
+    rope: &Rope,
+    tree: &Tree,
+    start_byte: usize,
+    end_byte: usize,
+) -> crate::php::framework::laravel::blade::Overlay {
+    let mut scan = SvelteScan {
+        rope,
+        window: (start_byte, end_byte),
+        overlay: crate::php::framework::laravel::blade::Overlay::default(),
+        blocks: Vec::new(),
+    };
+    scan.walk(tree.root_node());
+    scan.braced_expressions();
+    let mut overlay = scan.overlay;
+    overlay.spans.retain_mut(|span| {
+        span.0 = span.0.max(start_byte);
+        span.1 = span.1.min(end_byte);
+        span.0 < span.1
+    });
+    overlay
+}
+
 struct VueScan<'a> {
     rope: &'a Rope,
     window: (usize, usize),
@@ -897,7 +946,7 @@ impl VueScan<'_> {
         };
         let mut at = 0;
         while let Some(open) = text[at..].find("{{").map(|i| i + at) {
-            let Some(close) = text[open + 2..].find("}}").map(|i| i + open + 2) else {
+            let Some(close) = find_balanced_close(&text, open + 2, "}}") else {
                 break;
             };
             let scope = HighlightScope::Punctuation;
@@ -968,6 +1017,235 @@ impl VueScan<'_> {
             }
         }
     }
+}
+
+struct SvelteScan<'a> {
+    rope: &'a Rope,
+    window: (usize, usize),
+    overlay: crate::php::framework::laravel::blade::Overlay,
+    blocks: Vec<(usize, usize)>,
+}
+
+impl SvelteScan<'_> {
+    fn walk(&mut self, node: tree_sitter::Node) {
+        if node.end_byte() <= self.window.0 || node.start_byte() >= self.window.1 {
+            return;
+        }
+        match node.kind() {
+            "script_element" | "style_element" => return self.block(node),
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            self.walk(child);
+        }
+    }
+
+    fn block(&mut self, element: tree_sitter::Node) {
+        let mut cursor = element.walk();
+        let mut tag = None;
+        let mut raw = None;
+        for child in element.children(&mut cursor) {
+            match child.kind() {
+                "start_tag" => tag = Some(child),
+                "raw_text" => raw = Some(child),
+                _ => {}
+            }
+        }
+        let (Some(tag), Some(raw)) = (tag, raw) else {
+            return;
+        };
+        let Some(tag_text) = text_between(self.rope, tag.start_byte(), tag.end_byte()) else {
+            return;
+        };
+        let Some(language) = vue_block_language(element.kind(), &tag_text) else {
+            return;
+        };
+        self.blocks.push((raw.start_byte(), raw.end_byte()));
+        self.inject(language, raw.start_byte(), raw.end_byte());
+    }
+
+    fn inject(&mut self, language: SyntaxLanguage, from: usize, to: usize) {
+        if from >= to || to <= self.window.0 || from >= self.window.1 {
+            return;
+        }
+        let Some(text) = text_between(self.rope, from, to) else {
+            return;
+        };
+        let Some(tree) = cached_parse(language, &text) else {
+            return;
+        };
+        self.captures(language, &text, &tree, from, (from, to));
+    }
+
+    fn braced_expressions(&mut self) {
+        let Some(text) = text_between(self.rope, self.window.0, self.window.1) else {
+            return;
+        };
+        let mut at = 0;
+        while let Some(open) = text[at..].find('{').map(|i| i + at) {
+            let Some(close) = find_balanced_close(&text, open + 1, "}") else {
+                break;
+            };
+            let from = self.window.0 + open;
+            let to = self.window.0 + close + 1;
+            if self
+                .blocks
+                .iter()
+                .any(|&(start, end)| from >= start && from < end)
+            {
+                at = close + 1;
+                continue;
+            }
+            self.overlay.claimed.push((from, to));
+            self.overlay
+                .spans
+                .push((from, from + 1, HighlightScope::Punctuation));
+            self.overlay
+                .spans
+                .push((to - 1, to, HighlightScope::Punctuation));
+            self.expression(from + 1, to - 1);
+            at = close + 1;
+        }
+    }
+
+    fn expression(&mut self, from: usize, to: usize) {
+        let Some(expr) = text_between(self.rope, from, to) else {
+            return;
+        };
+        let expression = svelte_expression(&expr);
+        if expression.trim().is_empty() {
+            return;
+        }
+        let wrapped = format!("({expression})");
+        let Some(tree) = cached_parse(SyntaxLanguage::JavaScript, &wrapped) else {
+            return;
+        };
+        self.captures(
+            SyntaxLanguage::JavaScript,
+            &wrapped,
+            &tree,
+            from.saturating_sub(1),
+            (from, to),
+        );
+    }
+
+    fn captures(
+        &mut self,
+        language: SyntaxLanguage,
+        text: &str,
+        tree: &Tree,
+        offset: usize,
+        keep: (usize, usize),
+    ) {
+        let Some(query) = cached_highlight_query(language) else {
+            return;
+        };
+        let names = query.capture_names();
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(query, tree.root_node(), text.as_bytes());
+        while let Some(m) = matches.next() {
+            for capture in m.captures {
+                let Some(scope) = HighlightScope::from_capture(names[capture.index as usize])
+                else {
+                    continue;
+                };
+                let from = (capture.node.start_byte() + offset).max(keep.0);
+                let to = (capture.node.end_byte() + offset).min(keep.1);
+                if from < to {
+                    self.overlay.spans.push((from, to, scope));
+                }
+            }
+        }
+    }
+}
+
+/// Returns the JS expression within a Svelte braced construct. Prefixes are
+/// markup syntax; the remainder is parsed by the JavaScript grammar.
+fn svelte_expression(text: &str) -> &str {
+    let text = text.trim_start();
+    if let Some(rest) = text.strip_prefix("#each") {
+        return rest.trim_start().split_once(" as ").map_or_else(
+            || rest.trim_start(),
+            |(expression, _)| expression.trim_end(),
+        );
+    }
+    for prefix in [
+        "#if", ":else if", "#await", ":then", ":catch", "@html", "@const",
+    ] {
+        if let Some(rest) = text.strip_prefix(prefix) {
+            return rest.trim_start();
+        }
+    }
+    text
+}
+
+/// Finds a delimiter outside JavaScript strings, comments, template literals,
+/// and nested braces. Unterminated lexical sections return `None` safely.
+fn find_balanced_close(text: &str, start: usize, close: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut i = start;
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut line_comment = false;
+    let mut block_comment = false;
+    while i < bytes.len() {
+        if line_comment {
+            if bytes[i] == b'\n' {
+                line_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+        if block_comment {
+            if bytes.get(i..i + 2) == Some(b"*/") {
+                block_comment = false;
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if let Some(q) = quote {
+            if bytes[i] == b'\\' {
+                i += 2;
+                continue;
+            }
+            if bytes[i] == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if bytes.get(i..i + 2) == Some(b"//") {
+            line_comment = true;
+            i += 2;
+            continue;
+        }
+        if bytes.get(i..i + 2) == Some(b"/*") {
+            block_comment = true;
+            i += 2;
+            continue;
+        }
+        if matches!(bytes[i], b'\'' | b'\"' | b'`') {
+            quote = Some(bytes[i]);
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'{' {
+            depth += 1;
+            i += 1;
+            continue;
+        }
+        if bytes[i] == b'}' {
+            if depth == 0 && text[i..].starts_with(close) {
+                return Some(i);
+            }
+            depth = depth.saturating_sub(1);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Feeds Tree-sitter query predicates straight from Rope chunks, so a query
@@ -1581,6 +1859,10 @@ mod tests {
                 SyntaxLanguage::Vue,
                 "<template><p>{{ a }}</p></template>\n<script setup lang=\"ts\">\nconst a = 1\n</script>\n",
             ),
+            (
+                SyntaxLanguage::Svelte,
+                "<script>let a = 1;</script>\n<p>{a}</p>\n<style>p { color: red; }</style>\n",
+            ),
         ];
         assert_eq!(SyntaxLanguage::ALL.len(), samples.len());
         for (language, source) in samples {
@@ -1726,6 +2008,10 @@ mod tests {
         assert_eq!(
             SyntaxLanguage::detect("src/App.vue", ""),
             Some(SyntaxLanguage::Vue)
+        );
+        assert_eq!(
+            SyntaxLanguage::detect("src/App.svelte", ""),
+            Some(SyntaxLanguage::Svelte)
         );
         for (path, expected) in [
             ("main.c", SyntaxLanguage::C),
@@ -2008,6 +2294,49 @@ mod tests {
         let tree = parser.parse(plain.text(), None).unwrap();
         let runs = style_runs_for_viewport(&plain, &tree, language, 0, 1);
         assert!(runs.iter().any(|r| r.scope == HighlightScope::String));
+    }
+
+    #[test]
+    fn vue_interpolation_ignores_close_markers_in_javascript_strings() {
+        let src = "<p>{{ value + '}}' }}</p>";
+        let doc = Document::from_text(src);
+        let mut parser = Parser::new();
+        parser.set_language(&SyntaxLanguage::Vue.grammar()).unwrap();
+        let tree = parser.parse(doc.text(), None).unwrap();
+        let runs = style_runs_for_viewport(&doc, &tree, SyntaxLanguage::Vue, 0, 1);
+        assert!(runs.iter().any(|run| run.scope == HighlightScope::Variable));
+        let close = src.rfind("}}").unwrap();
+        let close_utf16 = src[..close].encode_utf16().count();
+        assert!(runs.iter().any(|run| {
+            run.scope == HighlightScope::Punctuation
+                && run.start == close_utf16
+                && run.end == close_utf16 + 2
+        }));
+    }
+
+    #[test]
+    fn svelte_injects_blocks_and_balanced_template_expressions() {
+        let src = "<script lang=\"ts\">const total: number = 1;</script>\n<style>.item { color: red; }</style>\n{#if total + ` ${value}`}{total}{:else if ready}{#each items as item}{item.name}{/each}{/if}\n{#await load()}{:then value}{@html value}{:catch error}{@const label = value}\n<button on:click={count++} class:active={ready}>{count}</button>";
+        let doc = Document::from_text(src);
+        let mut parser = Parser::new();
+        parser
+            .set_language(&SyntaxLanguage::Svelte.grammar())
+            .unwrap();
+        let tree = parser.parse(doc.text(), None).unwrap();
+        let runs = style_runs_for_viewport(&doc, &tree, SyntaxLanguage::Svelte, 0, 5);
+        let has = |text: &str, scope: HighlightScope| {
+            let start = src.find(text).unwrap();
+            let end = start + text.len();
+            runs.iter().any(|run| {
+                let line_start = doc.rope().line_to_byte(run.line);
+                run.scope == scope && line_start + run.start == start && line_start + run.end == end
+            })
+        };
+        assert!(has("const", HighlightScope::Keyword), "{runs:?}");
+        assert!(has("number", HighlightScope::Type), "{runs:?}");
+        assert!(has("color", HighlightScope::Property), "{runs:?}");
+        assert!(has("total", HighlightScope::Variable), "{runs:?}");
+        assert!(has("count", HighlightScope::Variable), "{runs:?}");
     }
 
     #[test]

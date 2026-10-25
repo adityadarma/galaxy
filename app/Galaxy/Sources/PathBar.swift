@@ -17,6 +17,10 @@ final class PathBar: NSView {
     let editedDot = NSTextField(labelWithString: "●")
     private(set) var components: [String] = []
     var isEdited: Bool { !editedDot.isHidden }
+    /// Supplies the menu for a clicked folder component. The final file name
+    /// deliberately has no menu because it is not a directory.
+    var menuForComponent: ((Int) -> NSMenu?)?
+    private let pathRow = NSStackView()
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -40,7 +44,10 @@ final class PathBar: NSView {
         editedDot.setAccessibilityIdentifier("path-edited")
         editedDot.isHidden = true
 
-        let row = NSStackView(views: [label, editedDot])
+        label.isHidden = true
+        pathRow.spacing = 2
+        pathRow.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let row = NSStackView(views: [pathRow, editedDot])
         row.spacing = 6
         row.translatesAutoresizingMaskIntoConstraints = false
         addSubview(row)
@@ -66,6 +73,10 @@ final class PathBar: NSView {
     /// VSCode's breadcrumbs.
     func show(_ components: [String]) {
         self.components = components
+        for view in pathRow.arrangedSubviews {
+            pathRow.removeArrangedSubview(view)
+            view.removeFromSuperview()
+        }
         let font = NSFont.systemFont(ofSize: 13)
         let text = NSMutableAttributedString()
         defer {
@@ -84,6 +95,28 @@ final class PathBar: NSView {
                                         color: Self.separatorColor, font: font))
                 text.append(NSAttributedString(string: " ", attributes: [.font: font]))
             }
+            let button = NSButton(title: part, target: self, action: #selector(selectComponent(_:)))
+            button.tag = i
+            button.isBordered = false
+            button.bezelStyle = .inline
+            button.font = font
+            button.contentTintColor = last ? .labelColor : Self.folderColor
+            button.setAccessibilityIdentifier("path-component-\(i)")
+            button.toolTip = last ? nil : "Show \(part)"
+            if last, let image = FileGlyph.for(name: part).image {
+                button.image = image
+                button.imagePosition = .imageLeading
+            }
+            pathRow.addArrangedSubview(button)
+            if !last {
+                let separator = NSTextField(labelWithString: "›")
+                separator.font = font
+                separator.textColor = Self.separatorColor
+                separator.alignment = .center
+                separator.setContentHuggingPriority(.required, for: .horizontal)
+                separator.widthAnchor.constraint(equalToConstant: 10).isActive = true
+                pathRow.addArrangedSubview(separator)
+            }
             if last {
                 let glyph = FileGlyph.for(name: part)
                 if let image = glyph.image {
@@ -97,6 +130,11 @@ final class PathBar: NSView {
             ]))
         }
         label.setAccessibilityLabel(components.joined(separator: " / "))
+    }
+
+    @objc private func selectComponent(_ sender: NSButton) {
+        guard sender.tag < components.count - 1, let menu = menuForComponent?(sender.tag) else { return }
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height), in: sender)
     }
 
     private static func symbol(_ name: String, size: CGFloat, weight: NSFont.Weight,

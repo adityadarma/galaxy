@@ -49,6 +49,9 @@ extension MainWindowController {
         snippetSession = nil
         snippetDocumentKey = nil
         showNoDocument()
+        // Set the root before Core starts detached scan workers. A fast worker
+        // may emit its start event before `openWorkspace` returns.
+        statusBar.resetWorkspaceScan(root: url.path)
         let ws = try bridge.core.openWorkspace(path: url.path)
         workspace = ws
         titleBar.setProjectTitle(ws.name())
@@ -156,6 +159,46 @@ extension MainWindowController {
         } catch {
             report(error, while: "open \(entry.relPath)")
         }
+    }
+
+    /// Lists the folder represented by a path-bar segment. Folder entries
+    /// stay lazy as submenus; choosing a file opens it in a regular tab.
+    func pathBarMenu(for component: Int) -> NSMenu? {
+        guard let workspace, component >= 0, component < pathBar.components.count - 1 else {
+            return nil
+        }
+        let folder = pathBar.components.prefix(component + 1).joined(separator: "/")
+        return pathBarMenu(workspace: workspace, folder: folder)
+    }
+
+    private func pathBarMenu(workspace: Workspace, folder: String) -> NSMenu? {
+        let entries: [FileEntry]
+        do {
+            entries = try workspace.listDir(relPath: folder)
+        } catch {
+            Log.ui.error("list path bar folder \(folder, privacy: .public) failed: \(String(describing: error), privacy: .public)")
+            return nil
+        }
+        let menu = NSMenu(title: folder)
+        for entry in entries {
+            let item = NSMenuItem(title: entry.name, action: nil, keyEquivalent: "")
+            item.image = FileGlyph.for(name: entry.name).image
+            let relPath = entry.relPath
+            if entry.isDir {
+                item.submenu = pathBarMenu(workspace: workspace, folder: relPath)
+            } else {
+                item.target = self
+                item.action = #selector(openPathBarFile(_:))
+                item.representedObject = entry
+            }
+            menu.addItem(item)
+        }
+        return menu
+    }
+
+    @objc private func openPathBarFile(_ sender: NSMenuItem) {
+        guard let workspace, let entry = sender.representedObject as? FileEntry else { return }
+        openWorkspaceFile(workspace, entry, preview: false)
     }
 
     private func describe(branch: String?) -> String {

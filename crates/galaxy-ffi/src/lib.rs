@@ -3,12 +3,13 @@
 //! Design rule: the UI calls in with coarse-grained commands and receives
 //! batched events through `CoreListener`. No per-character FFI chatter.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use galaxy_core::analysis::{
     BuiltinStore, CompletionItem as LspCompletionItem, DefinitionLocation as LspDefinitionLocation,
@@ -25,6 +26,7 @@ use galaxy_core::find::{FindError, FindOptions, Finder};
 use galaxy_core::fold::{self, FoldSet};
 use galaxy_core::go::{self, GoEngine};
 use galaxy_core::history::{EditKind, Editor};
+use galaxy_core::javascript;
 use galaxy_core::keymap::{self, Keymap};
 use galaxy_core::lang::{
     Action, Completion, HoverResult, OutlineSymbol as LangOutlineSymbol, Problem, Signature, Target,
@@ -38,6 +40,9 @@ use galaxy_core::selection::{Selection, SelectionSet};
 use galaxy_core::snippets;
 use galaxy_core::syntax::{self, SyntaxLanguage, SyntaxService, SyntaxSnapshot};
 use galaxy_core::terminal::TerminalSession;
+use galaxy_core::typescript::{
+    DeclarationKind, DocumentIndex, ImportBinding, ImportKind, TypeMemberTarget,
+};
 use galaxy_core::viewport;
 use galaxy_core::watcher::WorkspaceWatcher;
 use galaxy_core::workspace::{
@@ -77,6 +82,8 @@ pub enum CoreEvent {
     GoModulesStarted { root: String },
     GoModulesFinished { root: String },
     GoModulesFailed { root: String, message: String },
+    WorkspaceScanStarted { root: String, label: String },
+    WorkspaceScanFinished { root: String, label: String },
 }
 
 /// Implemented in Swift. Called from core threads, so the Swift side must
@@ -180,6 +187,31 @@ pub struct CommandInfo {
     pub id: String,
     pub category: String,
     pub title: String,
+}
+
+/// Static package metadata for JavaScript and TypeScript project context.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct JavaScriptProjectInfo {
+    pub root: String,
+    pub name: Option<String>,
+    pub frameworks: Vec<String>,
+    pub package_manager: String,
+}
+
+/// One framework component under a conventional JavaScript project source root.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct JavaScriptComponentInfo {
+    pub framework: String,
+    pub path: String,
+    pub name: String,
+    pub symbols: Vec<JavaScriptComponentSymbolInfo>,
+}
+
+/// A statically recognized component declaration and directly enumerable props.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct JavaScriptComponentSymbolInfo {
+    pub name: String,
+    pub props: Vec<String>,
 }
 
 /// One command palette row.
@@ -370,15 +402,17 @@ pub struct Core {
     /// What the built-in engines last answered, per document.
     analysis: Mutex<BuiltinStore>,
     /// Built-in PHP engines, one per project root.
-    php: Mutex<HashMap<PathBuf, Arc<Mutex<PhpEngine>>>>,
+    php: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<PhpEngine>>>>>,
     /// Built-in Go engines, one per project root.
-    go: Mutex<HashMap<PathBuf, Arc<Mutex<GoEngine>>>>,
-    /// Open PHP files, whether or not a language server serves them: the
-    /// built-in analysis covers all of them.
+    go: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<GoEngine>>>>>,
+    /// Open files handled by built-in analysis, whether or not a language
+    /// server serves them.
     php_documents: Mutex<HashMap<String, std::sync::Weak<DocumentHandle>>>,
     /// Per open PHP file: text revision last analysed, when it was first
     /// seen and whether the analysis ran.
     php_checked: Mutex<HashMap<String, (u64, Instant, bool)>>,
+    /// Parsed disk documents and successful module resolutions used by TypeScript navigation.
+    typescript_navigation: Arc<Mutex<TypeScriptNavigationCache>>,
 }
 
 impl Default for Core {
@@ -386,10 +420,11 @@ impl Default for Core {
         Self {
             listener: RwLock::new(None),
             analysis: Mutex::new(BuiltinStore::default()),
-            php: Mutex::new(HashMap::new()),
-            go: Mutex::new(HashMap::new()),
+            php: Arc::new(Mutex::new(HashMap::new())),
+            go: Arc::new(Mutex::new(HashMap::new())),
             php_documents: Mutex::new(HashMap::new()),
             php_checked: Mutex::new(HashMap::new()),
+            typescript_navigation: Arc::new(Mutex::new(TypeScriptNavigationCache::default())),
         }
     }
 }
@@ -403,6 +438,61 @@ impl Core {
 
     pub fn set_listener(&self, listener: Arc<dyn CoreListener>) {
         *self.listener.write().unwrap_or_else(|e| e.into_inner()) = Some(listener);
+    }
+
+    /// Reads the nearest `package.json` project for a file or directory.
+    /// This is metadata only; TypeScript semantic requests remain LSP-owned.
+    pub fn javascript_project(&self, path: String) -> Option<JavaScriptProjectInfo> {
+        javascript::Project::detect(Path::new(&path)).map(|project| JavaScriptProjectInfo {
+            root: project.root.to_string_lossy().into_owned(),
+            name: project.name,
+            frameworks: project
+                .frameworks
+                .into_iter()
+                .map(|framework| framework.name().to_owned())
+                .collect(),
+            package_manager: project.package_manager.name().to_owned(),
+        })
+    }
+
+    /// Components found for frameworks explicitly declared by the nearest
+    /// package manifest. This is an index for navigation/UI, not type analysis.
+    pub fn javascript_components(&self, path: String) -> Vec<JavaScriptComponentInfo> {
+        let Some(project) = javascript::Project::detect(Path::new(&path)) else {
+            return Vec::new();
+        };
+        javascript::scan_components(&project)
+            .into_iter()
+            .map(|component| JavaScriptComponentInfo {
+                framework: component.framework.name().to_owned(),
+                path: component.path.to_string_lossy().into_owned(),
+                name: component.name,
+                symbols: component
+                    .symbols
+                    .into_iter()
+                    .map(|symbol| JavaScriptComponentSymbolInfo {
+                        name: symbol.name,
+                        props: symbol.props,
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// Resolves only a relative JavaScript or TypeScript module specifier.
+    /// Bare packages remain for semantic tooling and are never guessed here.
+    pub fn resolve_javascript_relative_import(
+        &self,
+        specifier: String,
+        from_path: String,
+    ) -> Option<DefinitionLocation> {
+        javascript::resolve_relative_import(&specifier, Path::new(&from_path)).map(|path| {
+            DefinitionLocation {
+                uri: file_uri(&path),
+                line: 0,
+                column: 0,
+            }
+        })
     }
 
     /// Round-trip check for the callback path. Emits `Pong` from a
@@ -465,7 +555,7 @@ impl Core {
                             .lock()
                             .unwrap_or_else(|e| e.into_inner())
                             .reset_index();
-                        spawn_go_index(&engine, &root);
+                        spawn_go_index(&engine, &root, listener.clone());
                         if let Some(listener) = &listener {
                             listener.on_event(CoreEvent::GoModulesFinished {
                                 root: root.to_string_lossy().into_owned(),
@@ -511,6 +601,16 @@ impl Core {
     pub fn open_workspace(&self, path: String) -> Result<Arc<Workspace>, CoreError> {
         let ws = CoreWorkspace::open(PathBuf::from(&path))?;
         tracing::info!(path = %ws.root().display(), "opened workspace");
+        spawn_workspace_indexing(
+            ws.root(),
+            Arc::clone(&self.typescript_navigation),
+            Arc::clone(&self.go),
+            Arc::clone(&self.php),
+            self.listener
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        );
         Ok(Arc::new(Workspace { inner: ws }))
     }
 
@@ -544,7 +644,11 @@ impl Core {
             return false;
         }
         let path = Path::new(&path);
-        if !(is_php_path(path) || is_blade_path(path) || is_go_path(path)) {
+        if !(is_php_path(path)
+            || is_blade_path(path)
+            || is_go_path(path)
+            || is_typescript_path(path))
+        {
             return false;
         }
         self.php_documents
@@ -575,6 +679,7 @@ impl Core {
                 .collect()
         };
         self.check_php(&mut analysis, &documents);
+        self.check_typescript(&mut analysis, &documents);
         for (uri, document) in &documents {
             let diagnostics = analysis
                 .diagnostics(uri)
@@ -605,6 +710,53 @@ impl Core {
             return false;
         }
         let uri = file_uri(Path::new(&path));
+        if is_typescript_path(Path::new(&path)) {
+            let index = DocumentIndex::parse(&path, &document.lock().editor.doc.text());
+            let position = Utf16Position::new(line as usize, character as usize);
+            let hover = index
+                .symbol_at(position.line, position.col)
+                .and_then(|symbol| {
+                    let range = symbol
+                        .occurrences
+                        .iter()
+                        .copied()
+                        .find(|range| range.start <= position && position < range.end)?;
+                    Some(LspHoverInfo {
+                        contents: typescript_hover_markdown(
+                            symbol.kind,
+                            &symbol.name,
+                            Path::new(&path),
+                        ),
+                        range: Some(typescript_range(range)),
+                    })
+                })
+                .or_else(|| {
+                    let (target, occurrences) = typescript_import_target(
+                        &self.typescript_navigation,
+                        &path,
+                        &index,
+                        position.line,
+                        position.col,
+                    )?;
+                    let range = occurrences
+                        .iter()
+                        .copied()
+                        .find(|range| range.start <= position && position < range.end)?;
+                    Some(LspHoverInfo {
+                        contents: format!(
+                            "**import**\n\n`{}`",
+                            target.uri.strip_prefix("file://").unwrap_or(&target.uri)
+                        ),
+                        range: Some(typescript_range(range)),
+                    })
+                });
+            let answered = hover.is_some();
+            self.analysis
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_hover(&uri, hover);
+            return answered;
+        }
         let engine = if is_go_path(Path::new(&path)) {
             self.go_engine(Path::new(&path)).map(Engine::Go)
         } else {
@@ -662,6 +814,16 @@ impl Core {
             return false;
         }
         let uri = file_uri(Path::new(&path));
+        if is_typescript_path(Path::new(&path)) {
+            let text = document.lock().editor.doc.text();
+            let items = typescript_completions(&path, &text, line as usize, character as usize);
+            let answered = !items.is_empty();
+            self.analysis
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_completion(&uri, items);
+            return answered;
+        }
         let engine = if is_go_path(Path::new(&path)) {
             self.go_engine(Path::new(&path)).map(Engine::Go)
         } else {
@@ -777,7 +939,37 @@ impl Core {
             return false;
         }
         let uri = file_uri(Path::new(&path));
+        if is_typescript_path(Path::new(&path)) {
+            return self.typescript_definition(&document, &uri, line, character);
+        }
         self.php_definition(&document, &uri, line, character)
+    }
+
+    /// Uses a distinct UniFFI signature from the other position requests.
+    /// This prevents an out-of-date Swift object from dispatching Definition
+    /// through another `(DocumentHandle, UInt64, UInt64) -> Bool` entrypoint.
+    pub fn request_definition_for_navigation(
+        &self,
+        document: Arc<DocumentHandle>,
+        line: u64,
+        character: u64,
+        navigation_token: String,
+    ) -> bool {
+        let _ = navigation_token;
+        // Navigation must fail closed. UniFFI turns an escaping Rust panic into
+        // an error and the generated Swift wrapper uses `try!`, which crashes
+        // the editor. External declaration files are untrusted input.
+        catch_unwind(AssertUnwindSafe(|| {
+            self.request_definition(document.clone(), line, character)
+        }))
+        .unwrap_or_else(|_| {
+            let uri = file_uri(Path::new(&document.path()));
+            self.analysis
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_definitions(&uri, Vec::new());
+            false
+        })
     }
 
     pub fn definition_locations(&self, document: Arc<DocumentHandle>) -> Vec<DefinitionLocation> {
@@ -810,6 +1002,9 @@ impl Core {
             return false;
         }
         let uri = file_uri(Path::new(&path));
+        if is_typescript_path(Path::new(&path)) {
+            return self.typescript_references(&document, &uri, line, character);
+        }
         self.php_references(&document, &uri, line, character)
     }
 
@@ -844,6 +1039,9 @@ impl Core {
             return false;
         }
         let uri = file_uri(Path::new(&path));
+        if is_typescript_path(Path::new(&path)) {
+            return self.typescript_rename(&document, &uri, line, character, &new_name);
+        }
         self.php_rename(&document, &uri, line, character, &new_name)
     }
 
@@ -879,15 +1077,19 @@ impl Core {
         if path.is_empty() {
             return false;
         }
-        let uri = file_uri(Path::new(&path));
-        let engine = if is_go_path(Path::new(&path)) {
-            self.go_engine(Path::new(&path)).map(Engine::Go)
+        let path = Path::new(&path);
+        if !(is_go_path(path) || is_php_path(path) || is_blade_path(path)) {
+            return false;
+        }
+        let uri = file_uri(path);
+        let engine = if is_go_path(path) {
+            self.go_engine(path).map(Engine::Go)
         } else {
-            self.php_engine_any(Path::new(&path)).map(Engine::Php)
+            self.php_engine_any(path).map(Engine::Php)
         };
         if let Some(engine) = engine {
             let text = document.lock().editor.doc.text();
-            let found = engine.actions(Path::new(&path), &text, line as u32, character as u32);
+            let found = engine.actions(path, &text, line as u32, character as u32);
             let actions: Vec<galaxy_core::analysis::CodeActionInfo> = found
                 .into_iter()
                 .map(|action| galaxy_core::analysis::CodeActionInfo {
@@ -954,6 +1156,20 @@ impl Core {
             return false;
         }
         let uri = file_uri(Path::new(&path));
+        if is_typescript_path(Path::new(&path)) {
+            let index = DocumentIndex::parse(&path, &document.lock().editor.doc.text());
+            let symbols = index
+                .declarations
+                .iter()
+                .map(|declaration| typescript_outline_symbol(declaration, &uri))
+                .collect::<Vec<_>>();
+            let answered = !symbols.is_empty();
+            self.analysis
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_document_symbols(&uri, symbols);
+            return answered;
+        }
         let engine = if is_go_path(Path::new(&path)) {
             self.go_engine(Path::new(&path)).map(Engine::Go)
         } else {
@@ -1337,7 +1553,14 @@ impl Core {
             .unwrap_or_else(|e| e.into_inner())
             .wants_index(Duration::from_secs(120));
         if fresh || stale {
-            spawn_go_index(&engine, &root);
+            spawn_go_index(
+                &engine,
+                &root,
+                self.listener
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+            );
         }
         Some(engine)
     }
@@ -1466,7 +1689,14 @@ impl Core {
             .unwrap_or_else(|e| e.into_inner())
             .wants_index(Duration::from_secs(60));
         if fresh || stale {
-            spawn_php_index(&engine, &root);
+            spawn_php_index(
+                &engine,
+                &root,
+                self.listener
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+            );
         }
         Some(engine)
     }
@@ -1539,6 +1769,80 @@ impl Core {
                 })
                 .collect();
             analysis.set_diagnostics(uri, diagnostics);
+        }
+    }
+
+    fn check_typescript(
+        &self,
+        analysis: &mut BuiltinStore,
+        documents: &HashMap<String, Arc<DocumentHandle>>,
+    ) {
+        for (uri, document) in documents {
+            let path = document.path();
+            if !is_typescript_path(Path::new(&path)) {
+                continue;
+            }
+            let index = DocumentIndex::parse(&path, &document.lock().editor.doc.text());
+            let mut diagnostics: Vec<_> = index
+                .diagnostics
+                .iter()
+                .map(|diagnostic| galaxy_core::analysis::Diagnostic {
+                    uri: uri.clone(),
+                    range: LspRange {
+                        start_line: diagnostic.range.start.line as u64,
+                        start_character: diagnostic.range.start.col as u64,
+                        end_line: diagnostic.range.end.line as u64,
+                        end_character: diagnostic.range.end.col as u64,
+                    },
+                    severity: galaxy_core::analysis::DiagnosticSeverity::Error,
+                    message: diagnostic.message.clone(),
+                    source: Some("galaxy".into()),
+                    code: None,
+                    unnecessary: false,
+                })
+                .collect();
+            diagnostics.extend(index.type_diagnostics.iter().map(|diagnostic| {
+                galaxy_core::analysis::Diagnostic {
+                    uri: uri.clone(),
+                    range: typescript_range(diagnostic.range),
+                    severity: galaxy_core::analysis::DiagnosticSeverity::Error,
+                    message: diagnostic.message.clone(),
+                    source: Some("galaxy".into()),
+                    code: Some(diagnostic.code.clone()),
+                    unnecessary: false,
+                }
+            }));
+            diagnostics.extend(
+                index
+                    .imports
+                    .iter()
+                    .filter(|import| {
+                        !typescript_import_is_type_only(import)
+                            && resolve_typescript_import_uncached(
+                                Path::new(&path),
+                                &import.specifier,
+                            )
+                            .is_none()
+                    })
+                    .map(|import| galaxy_core::analysis::Diagnostic {
+                        uri: uri.clone(),
+                        range: typescript_range(import.range),
+                        severity: galaxy_core::analysis::DiagnosticSeverity::Warning,
+                        message: format!("Cannot resolve import '{}'", import.specifier),
+                        source: Some("galaxy".into()),
+                        code: None,
+                        unnecessary: false,
+                    }),
+            );
+            analysis.set_diagnostics(uri, diagnostics);
+            analysis.set_document_symbols(
+                uri,
+                index
+                    .declarations
+                    .iter()
+                    .map(|declaration| typescript_outline_symbol(declaration, uri))
+                    .collect(),
+            );
         }
     }
 
@@ -1618,6 +1922,275 @@ impl Core {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .set_references(uri, locations);
+        found
+    }
+
+    fn typescript_definition(
+        &self,
+        document: &Arc<DocumentHandle>,
+        uri: &str,
+        line: u64,
+        character: u64,
+    ) -> bool {
+        let path = document.path();
+        let index = DocumentIndex::parse(&path, &document.lock().editor.doc.text());
+        let mut locations = typescript_type_target(
+            &self.typescript_navigation,
+            &path,
+            &index,
+            line as usize,
+            character as usize,
+        )
+        .map(|target| vec![target])
+        .unwrap_or_default();
+        if locations.is_empty() {
+            locations = index
+                .symbol_at(line as usize, character as usize)
+                .map(|symbol| {
+                    vec![LspDefinitionLocation {
+                        uri: uri.to_owned(),
+                        range: typescript_range(symbol.declaration),
+                    }]
+                })
+                .unwrap_or_default();
+        }
+        if locations.is_empty() {
+            locations = typescript_import_target(
+                &self.typescript_navigation,
+                &path,
+                &index,
+                line as usize,
+                character as usize,
+            )
+            .map(|(target, _)| vec![target])
+            .unwrap_or_default();
+        }
+        if locations.is_empty()
+            && let Some((import, binding)) =
+                index.type_import_binding_at(line as usize, character as usize)
+            && let Some(imported_name) = binding.imported_name.as_deref()
+            && let Some(target) = resolve_typescript_definition_import(
+                &self.typescript_navigation,
+                Path::new(&path),
+                &import.specifier,
+            )
+        {
+            locations.push(
+                resolve_typescript_type_export(
+                    &self.typescript_navigation,
+                    target.clone(),
+                    imported_name,
+                )
+                .or_else(|| {
+                    resolve_typescript_export(
+                        &self.typescript_navigation,
+                        target.clone(),
+                        imported_name,
+                    )
+                })
+                .map(|(target, declaration)| LspDefinitionLocation {
+                    uri: file_uri(&target),
+                    range: typescript_range(declaration.range),
+                })
+                .unwrap_or_else(|| module_root_location(&target)),
+            );
+        }
+        if locations.is_empty()
+            && let Some((import, binding, member_name)) =
+                index.qualified_type_import_at(line as usize, character as usize)
+            && let Some(target) = resolve_typescript_definition_import(
+                &self.typescript_navigation,
+                Path::new(&path),
+                &import.specifier,
+            )
+            && binding.imported_name.is_some()
+            && let Some(target_index) = self
+                .typescript_navigation
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .index(&target)
+            && let Some(declaration_range) = target_index.unique_type_declaration_range(member_name)
+        {
+            locations.push(LspDefinitionLocation {
+                uri: file_uri(&target),
+                range: typescript_range(declaration_range),
+            });
+        }
+        if locations.is_empty() {
+            locations = typescript_type_member_target(
+                &self.typescript_navigation,
+                &path,
+                &index,
+                line as usize,
+                character as usize,
+            )
+            .map(|target| vec![target])
+            .unwrap_or_default();
+        }
+        if locations.is_empty()
+            && let Some(export) = index.named_reexport_at(line as usize, character as usize)
+            && let (Some(specifier), Some(imported_name)) =
+                (export.specifier.as_deref(), export.name.as_deref())
+            && let Some(target) = resolve_typescript_definition_import(
+                &self.typescript_navigation,
+                Path::new(&path),
+                specifier,
+            )
+        {
+            let declaration = if export.type_only {
+                resolve_typescript_type_export(
+                    &self.typescript_navigation,
+                    target.clone(),
+                    imported_name,
+                )
+            } else {
+                resolve_typescript_export(
+                    &self.typescript_navigation,
+                    target.clone(),
+                    imported_name,
+                )
+            };
+            locations.push(
+                declaration
+                    .map(|(path, declaration)| LspDefinitionLocation {
+                        uri: file_uri(&path),
+                        range: typescript_range(declaration.range),
+                    })
+                    .unwrap_or_else(|| module_root_location(&target)),
+            );
+        }
+        if locations.is_empty()
+            && let Some(specifier) = index.static_module_at(line as usize, character as usize)
+            && let Some(target) = resolve_typescript_definition_import(
+                &self.typescript_navigation,
+                Path::new(&path),
+                specifier,
+            )
+        {
+            locations.push(module_root_location(&target));
+        }
+        if locations.is_empty()
+            && let Some((import, binding, member)) =
+                index.namespace_member_at(line as usize, character as usize)
+            && !binding.type_only
+            && let Some(target) = resolve_typescript_definition_import(
+                &self.typescript_navigation,
+                Path::new(&path),
+                &import.specifier,
+            )
+            && is_typescript_path(&target)
+            && let Some((target, declaration)) =
+                resolve_typescript_export(&self.typescript_navigation, target, &member.member_name)
+        {
+            locations.push(LspDefinitionLocation {
+                uri: file_uri(&target),
+                range: typescript_range(declaration.range),
+            });
+        }
+        if locations.is_empty()
+            && let Some(import) = index.dynamic_import_at(line as usize, character as usize)
+            && let Some(target) = resolve_typescript_definition_import(
+                &self.typescript_navigation,
+                Path::new(&path),
+                &import.specifier,
+            )
+        {
+            locations.push(LspDefinitionLocation {
+                uri: file_uri(&target),
+                range: LspRange {
+                    start_line: 0,
+                    start_character: 0,
+                    end_line: 0,
+                    end_character: 0,
+                },
+            });
+        }
+        let found = !locations.is_empty();
+        self.analysis
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_definitions(uri, locations);
+        found
+    }
+
+    fn typescript_references(
+        &self,
+        document: &Arc<DocumentHandle>,
+        uri: &str,
+        line: u64,
+        character: u64,
+    ) -> bool {
+        let path = document.path();
+        let index = DocumentIndex::parse(&path, &document.lock().editor.doc.text());
+        let mut locations: Vec<LspDefinitionLocation> = index
+            .symbol_at(line as usize, character as usize)
+            .map(|symbol| {
+                symbol
+                    .occurrences
+                    .into_iter()
+                    .map(|range| LspDefinitionLocation {
+                        uri: uri.to_owned(),
+                        range: typescript_range(range),
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if locations.is_empty()
+            && let Some((target, occurrences)) = typescript_import_target(
+                &self.typescript_navigation,
+                &path,
+                &index,
+                line as usize,
+                character as usize,
+            )
+        {
+            locations.push(target);
+            locations.extend(occurrences.into_iter().map(|range| LspDefinitionLocation {
+                uri: uri.to_owned(),
+                range: typescript_range(range),
+            }));
+        }
+        let found = !locations.is_empty();
+        self.analysis
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_references(uri, locations);
+        found
+    }
+
+    fn typescript_rename(
+        &self,
+        document: &Arc<DocumentHandle>,
+        uri: &str,
+        line: u64,
+        character: u64,
+        new_name: &str,
+    ) -> bool {
+        let path = document.path();
+        let index = DocumentIndex::parse(&path, &document.lock().editor.doc.text());
+        let edits: Vec<LspRenameEdit> = if valid_javascript_identifier(new_name) {
+            index
+                .symbol_at(line as usize, character as usize)
+                .map(|symbol| {
+                    symbol
+                        .occurrences
+                        .into_iter()
+                        .map(|range| LspRenameEdit {
+                            uri: uri.to_owned(),
+                            range: typescript_range(range),
+                            new_text: new_name.to_owned(),
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let found = !edits.is_empty();
+        self.analysis
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_rename_edits(uri, edits);
         found
     }
 
@@ -1726,9 +2299,1061 @@ fn is_go_path(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("go"))
 }
 
-fn spawn_go_index(engine: &Arc<Mutex<GoEngine>>, root: &Path) {
+fn is_typescript_path(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs")
+    )
+}
+
+fn typescript_range(range: galaxy_core::typescript::Utf16Range) -> LspRange {
+    LspRange {
+        start_line: range.start.line as u64,
+        start_character: range.start.col as u64,
+        end_line: range.end.line as u64,
+        end_character: range.end.col as u64,
+    }
+}
+
+const MAX_TYPESCRIPT_NAVIGATION_CACHE_ENTRIES: usize = 256;
+const MAX_TYPESCRIPT_WARM_SOURCE_CANDIDATES: usize = 5000;
+const MAX_TYPESCRIPT_WARM_IMPORT_TARGETS: usize = 512;
+const TYPESCRIPT_WARM_EXCLUDED_DIRECTORIES: &[&str] = &[
+    "node_modules",
+    ".git",
+    ".hg",
+    ".svn",
+    "target",
+    "dist",
+    "build",
+    ".next",
+    "coverage",
+    "vendor",
+];
+
+#[derive(Clone, PartialEq, Eq)]
+struct FileFreshness {
+    modified: Option<SystemTime>,
+    len: u64,
+}
+
+impl FileFreshness {
+    fn read(path: &Path) -> Option<Self> {
+        let metadata = std::fs::metadata(path).ok()?;
+        Some(Self {
+            modified: metadata.modified().ok(),
+            len: metadata.len(),
+        })
+    }
+}
+
+#[derive(Clone)]
+struct CachedTypeScriptIndex {
+    freshness: FileFreshness,
+    index: Arc<DocumentIndex>,
+}
+
+#[derive(Clone)]
+struct CachedTypeScriptResolution {
+    target: PathBuf,
+    dependencies: Vec<(PathBuf, Option<FileFreshness>)>,
+}
+
+#[derive(Default)]
+struct TypeScriptNavigationCache {
+    indexes: HashMap<PathBuf, CachedTypeScriptIndex>,
+    resolutions: HashMap<(PathBuf, String), CachedTypeScriptResolution>,
+}
+
+impl TypeScriptNavigationCache {
+    fn index(&mut self, path: &Path) -> Option<Arc<DocumentIndex>> {
+        let path = module_identity(path);
+        let freshness = FileFreshness::read(&path)?;
+        if let Some(cached) = self.indexes.get(&path)
+            && cached.freshness == freshness
+        {
+            return Some(Arc::clone(&cached.index));
+        }
+        let text = std::fs::read_to_string(&path).ok()?;
+        let index = Arc::new(DocumentIndex::parse(&path, &text));
+        if self.indexes.len() >= MAX_TYPESCRIPT_NAVIGATION_CACHE_ENTRIES {
+            self.indexes.clear();
+        }
+        self.indexes.insert(
+            path,
+            CachedTypeScriptIndex {
+                freshness,
+                index: Arc::clone(&index),
+            },
+        );
+        Some(index)
+    }
+
+    fn resolve(&mut self, importer: &Path, specifier: &str) -> Option<PathBuf> {
+        let importer = module_identity(importer);
+        let key = (importer.clone(), specifier.to_owned());
+        if let Some(cached) = self.resolutions.get(&key)
+            && cached.target.is_file()
+            && cached
+                .dependencies
+                .iter()
+                .all(|(path, freshness)| FileFreshness::read(path) == *freshness)
+        {
+            return Some(cached.target.clone());
+        }
+        self.resolutions.remove(&key);
+        let target = resolve_typescript_import_uncached(&importer, specifier)?;
+        let target = prefer_typescript_declaration(target);
+        if !target.is_file() {
+            return None;
+        }
+        let dependencies = typescript_resolution_dependencies(&importer, specifier);
+        if self.resolutions.len() >= MAX_TYPESCRIPT_NAVIGATION_CACHE_ENTRIES {
+            self.resolutions.clear();
+        }
+        self.resolutions.insert(
+            key,
+            CachedTypeScriptResolution {
+                target: target.clone(),
+                dependencies,
+            },
+        );
+        Some(target)
+    }
+}
+
+const TYPESCRIPT_SCAN_LABEL: &str = "TypeScript";
+const GO_SCAN_LABEL: &str = "Go";
+const PHP_SCAN_LABEL: &str = "PHP";
+
+fn workspace_scan_event(
+    listener: &Option<Arc<dyn CoreListener>>,
+    root: &Path,
+    label: &str,
+    started: bool,
+) {
+    if let Some(listener) = listener {
+        let root = root.to_string_lossy().into_owned();
+        listener.on_event(if started {
+            CoreEvent::WorkspaceScanStarted {
+                root,
+                label: label.into(),
+            }
+        } else {
+            CoreEvent::WorkspaceScanFinished {
+                root,
+                label: label.into(),
+            }
+        });
+    }
+}
+
+fn spawn_workspace_indexing(
+    root: &Path,
+    cache: Arc<Mutex<TypeScriptNavigationCache>>,
+    go_engines: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<GoEngine>>>>>,
+    php_engines: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<PhpEngine>>>>>,
+    listener: Option<Arc<dyn CoreListener>>,
+) {
+    let root = root.to_path_buf();
+    let _ = std::thread::Builder::new()
+        .name("workspace-indexing".into())
+        .spawn(move || {
+            if typescript_workspace_detected(&root) {
+                spawn_typescript_navigation_warmup(&root, cache, listener.clone());
+            }
+            if let Some(project) = go::GoProject::detect(&root) {
+                let project_root = project.root().to_path_buf();
+                let (engine, fresh) = pending_go_engine(&go_engines, &project_root);
+                if fresh {
+                    spawn_go_index(&engine, &project_root, listener.clone());
+                }
+            }
+            if root.join("composer.json").is_file() {
+                let (engine, fresh) = pending_php_engine(&php_engines, &root);
+                if fresh {
+                    spawn_php_index(&engine, &root, listener);
+                }
+            }
+        });
+}
+
+/// A JavaScript package or an explicit JS/TS project configuration opts the
+/// workspace into the JavaScript/TypeScript navigation warm-up.
+fn typescript_workspace_detected(root: &Path) -> bool {
+    ["package.json", "tsconfig.json", "jsconfig.json"]
+        .into_iter()
+        .any(|name| root.join(name).is_file())
+}
+
+fn spawn_typescript_navigation_warmup(
+    root: &Path,
+    cache: Arc<Mutex<TypeScriptNavigationCache>>,
+    listener: Option<Arc<dyn CoreListener>>,
+) {
+    let root = root.to_path_buf();
+    workspace_scan_event(&listener, &root, TYPESCRIPT_SCAN_LABEL, true);
+    let _ = std::thread::Builder::new()
+        .name("typescript-navigation-warmup".into())
+        // Keep opening a workspace instant while bounding work in large repositories.
+        .spawn(move || {
+            warm_typescript_navigation(&root, &cache);
+            workspace_scan_event(&listener, &root, TYPESCRIPT_SCAN_LABEL, false);
+        });
+}
+
+fn warm_typescript_navigation(root: &Path, cache: &Mutex<TypeScriptNavigationCache>) {
+    let mut sources = vec![root.to_path_buf()];
+    let mut seen_imports = HashSet::new();
+    let mut candidates = 0;
+    let mut warmed = 0;
+
+    while let Some(path) = sources.pop() {
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                if !typescript_warm_excluded_directory(&path)
+                    && sources.len() < MAX_TYPESCRIPT_WARM_SOURCE_CANDIDATES
+                {
+                    sources.push(path);
+                }
+                continue;
+            }
+            if !file_type.is_file() || !is_typescript_path(&path) {
+                continue;
+            }
+            candidates += 1;
+            if candidates > MAX_TYPESCRIPT_WARM_SOURCE_CANDIDATES {
+                return;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let index = DocumentIndex::parse(&path, &text);
+            let specifiers = index
+                .imports
+                .iter()
+                .filter(|import| index.import_is_syntax_valid(import))
+                .map(|import| import.specifier.as_str())
+                .chain(
+                    index
+                        .exports
+                        .iter()
+                        .filter_map(|export| export.specifier.as_deref()),
+                );
+            for specifier in specifiers {
+                if warmed == MAX_TYPESCRIPT_WARM_IMPORT_TARGETS {
+                    return;
+                }
+                let importer = module_identity(&path);
+                if !seen_imports.insert((importer, specifier.to_owned())) {
+                    continue;
+                }
+                let Some(target) = resolve_typescript_definition_import(cache, &path, specifier)
+                else {
+                    continue;
+                };
+                if !is_typescript_path(&target) {
+                    continue;
+                }
+                warmed += 1;
+                warm_typescript_declaration_chain(
+                    cache,
+                    target,
+                    0,
+                    &mut warmed,
+                    &mut HashSet::new(),
+                );
+            }
+        }
+    }
+}
+
+fn typescript_warm_excluded_directory(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| TYPESCRIPT_WARM_EXCLUDED_DIRECTORIES.contains(&name))
+}
+
+fn warm_typescript_declaration_chain(
+    cache: &Mutex<TypeScriptNavigationCache>,
+    path: PathBuf,
+    depth: usize,
+    warmed: &mut usize,
+    visited: &mut HashSet<PathBuf>,
+) {
+    if depth == MAX_TYPESCRIPT_REEXPORT_DEPTH
+        || *warmed == MAX_TYPESCRIPT_WARM_IMPORT_TARGETS
+        || !visited.insert(module_identity(&path))
+    {
+        return;
+    }
+    let Some(index) = cache.lock().unwrap_or_else(|e| e.into_inner()).index(&path) else {
+        return;
+    };
+    let specifiers = index
+        .exports
+        .iter()
+        .filter_map(|export| export.specifier.as_deref())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    for specifier in specifiers {
+        if *warmed == MAX_TYPESCRIPT_WARM_IMPORT_TARGETS {
+            return;
+        }
+        if let Some(target) = resolve_typescript_definition_import(cache, &path, &specifier) {
+            if !is_typescript_path(&target) {
+                continue;
+            }
+            *warmed += 1;
+            warm_typescript_declaration_chain(cache, target, depth + 1, warmed, visited);
+        }
+    }
+}
+
+fn typescript_resolution_dependencies(
+    importer: &Path,
+    specifier: &str,
+) -> Vec<(PathBuf, Option<FileFreshness>)> {
+    let mut dependencies = vec![(importer.to_path_buf(), FileFreshness::read(importer))];
+    let mut directory = importer.parent();
+    while let Some(path) = directory {
+        for name in ["package.json", "tsconfig.json"] {
+            let dependency = path.join(name);
+            dependencies.push((dependency.clone(), FileFreshness::read(&dependency)));
+        }
+        directory = path.parent();
+    }
+    if !javascript::is_relative_typescript_specifier(specifier) && !specifier.starts_with("node:") {
+        let package = specifier
+            .split('/')
+            .take(if specifier.starts_with('@') { 2 } else { 1 })
+            .collect::<Vec<_>>()
+            .join("/");
+        let mut directory = importer.parent();
+        while let Some(path) = directory {
+            let manifest = path
+                .join("node_modules")
+                .join(&package)
+                .join("package.json");
+            dependencies.push((manifest.clone(), FileFreshness::read(&manifest)));
+            directory = path.parent();
+        }
+    }
+    dependencies
+}
+
+fn prefer_typescript_declaration(target: PathBuf) -> PathBuf {
+    let declaration = target.with_extension("d.ts");
+    if target
+        .extension()
+        .is_some_and(|extension| extension == "js")
+        && declaration.is_file()
+    {
+        declaration
+    } else {
+        javascript::package_types_declaration(&target).unwrap_or(target)
+    }
+}
+
+fn typescript_import_target(
+    cache: &Mutex<TypeScriptNavigationCache>,
+    importer_path: &str,
+    index: &DocumentIndex,
+    line: usize,
+    character: usize,
+) -> Option<(
+    LspDefinitionLocation,
+    Vec<galaxy_core::typescript::Utf16Range>,
+)> {
+    let (import, binding, occurrences) = index.imports.iter().find_map(|import| {
+        index
+            .import_is_syntax_valid(import)
+            .then_some(import)
+            .and_then(|import| {
+                import.bindings.iter().find_map(|binding| {
+                    let position = Utf16Position::new(line, character);
+                    let occurrences = index.import_binding_occurrences(binding).unwrap_or(
+                        galaxy_core::typescript::SymbolOccurrences {
+                            name: binding.local_name.clone(),
+                            kind: DeclarationKind::Variable,
+                            declaration: binding.range,
+                            occurrences: vec![binding.range],
+                        },
+                    );
+                    (binding.range.start <= position && position < binding.range.end
+                        || occurrences
+                            .occurrences
+                            .iter()
+                            .any(|range| range.start <= position && position < range.end))
+                    .then_some((import, binding, occurrences))
+                })
+            })
+    })?;
+    let imported_name = direct_imported_name(binding)?;
+    let importer = Path::new(importer_path);
+    let target_path = resolve_typescript_definition_import(cache, importer, &import.specifier)?;
+    if !is_typescript_path(&target_path) {
+        return None;
+    }
+    let location = resolve_typescript_export(cache, target_path.clone(), imported_name)
+        .map(|(path, declaration)| LspDefinitionLocation {
+            uri: file_uri(&path),
+            range: typescript_range(declaration.range),
+        })
+        .unwrap_or_else(|| module_root_location(&target_path));
+    Some((location, occurrences.occurrences))
+}
+
+fn typescript_type_target(
+    cache: &Mutex<TypeScriptNavigationCache>,
+    importer_path: &str,
+    index: &DocumentIndex,
+    line: usize,
+    character: usize,
+) -> Option<LspDefinitionLocation> {
+    let position = Utf16Position::new(line, character);
+    let (import, binding) = index.imports.iter().find_map(|import| {
+        index
+            .import_is_syntax_valid(import)
+            .then_some(import)
+            .and_then(|import| {
+                import
+                    .bindings
+                    .iter()
+                    .find(|binding| {
+                        binding.type_only
+                            && (binding.range.start <= position && position < binding.range.end
+                                || index.import_binding_occurrences(binding).is_some_and(
+                                    |occurrences| {
+                                        occurrences.occurrences.iter().any(|range| {
+                                            range.start <= position && position < range.end
+                                        })
+                                    },
+                                ))
+                    })
+                    .map(|binding| (import, binding))
+            })
+    })?;
+    let imported_name = binding.imported_name.as_deref()?;
+    if !binding.type_only || !matches!(binding.kind, ImportKind::Named | ImportKind::Default) {
+        return None;
+    }
+    let target =
+        resolve_typescript_definition_import(cache, Path::new(importer_path), &import.specifier)?;
+    Some(
+        resolve_typescript_type_export(cache, target.clone(), imported_name)
+            .or_else(|| resolve_typescript_export(cache, target.clone(), imported_name))
+            .map(|(path, declaration)| LspDefinitionLocation {
+                uri: file_uri(&path),
+                range: typescript_range(declaration.range),
+            })
+            .unwrap_or_else(|| module_root_location(&target)),
+    )
+}
+
+fn typescript_type_member_target(
+    cache: &Mutex<TypeScriptNavigationCache>,
+    importer_path: &str,
+    index: &DocumentIndex,
+    line: usize,
+    character: usize,
+) -> Option<LspDefinitionLocation> {
+    let usage = index.type_member_at(line, character)?;
+    resolve_typescript_type_member_target(
+        cache,
+        importer_path,
+        index,
+        &usage.target,
+        &usage.member_name,
+    )
+}
+
+fn resolve_typescript_type_member_target(
+    cache: &Mutex<TypeScriptNavigationCache>,
+    importer_path: &str,
+    index: &DocumentIndex,
+    target: &TypeMemberTarget,
+    member_name: &str,
+) -> Option<LspDefinitionLocation> {
+    match target {
+        TypeMemberTarget::Inline(members) => {
+            unique_type_member_location(members, member_name, Path::new(importer_path))
+        }
+        TypeMemberTarget::Named(range) => {
+            let member = index
+                .type_declaration_at(*range)?
+                .iter()
+                .filter(|member| member.name == member_name)
+                .collect::<Vec<_>>();
+            let [member] = member.as_slice() else {
+                return None;
+            };
+            Some(LspDefinitionLocation {
+                uri: file_uri(Path::new(importer_path)),
+                range: typescript_range(member.range),
+            })
+        }
+        TypeMemberTarget::Imported(range) => {
+            let (import, binding) = index.import_binding_by_range(*range)?;
+            if !binding.type_only
+                || !matches!(binding.kind, ImportKind::Named | ImportKind::Default)
+            {
+                return None;
+            }
+            let imported_name = binding.imported_name.as_deref()?;
+            let target = resolve_typescript_definition_import(
+                cache,
+                Path::new(importer_path),
+                &import.specifier,
+            )?;
+            let (path, declaration) = resolve_typescript_type_export(cache, target, imported_name)?;
+            let target_index = cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .index(&path)?;
+            let member = target_index.type_member(&declaration.name, member_name)?;
+            Some(LspDefinitionLocation {
+                uri: file_uri(&path),
+                range: typescript_range(member.range),
+            })
+        }
+        TypeMemberTarget::SuperImported(range) => {
+            let (import, binding) = index.import_binding_by_range(*range)?;
+            if binding.type_only || !matches!(binding.kind, ImportKind::Named | ImportKind::Default)
+            {
+                return None;
+            }
+            let imported_name = binding.imported_name.as_deref()?;
+            let target = resolve_typescript_definition_import(
+                cache,
+                Path::new(importer_path),
+                &import.specifier,
+            )?;
+            let (path, declaration) = resolve_typescript_export(cache, target, imported_name)?;
+            if declaration.kind != DeclarationKind::Class {
+                return None;
+            }
+            let target_index = cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .index(&path)?;
+            let member = target_index.type_member(&declaration.name, member_name)?;
+            Some(LspDefinitionLocation {
+                uri: file_uri(&path),
+                range: typescript_range(member.range),
+            })
+        }
+        TypeMemberTarget::SuperMember {
+            binding,
+            member_name: property,
+        } => {
+            let (import, binding) = index.import_binding_by_range(*binding)?;
+            let imported_name = binding.imported_name.as_deref()?;
+            let superclass_path = resolve_typescript_definition_import(
+                cache,
+                Path::new(importer_path),
+                &import.specifier,
+            )?;
+            let (superclass_path, superclass) =
+                resolve_typescript_export(cache, superclass_path, imported_name)?;
+            let superclass_index = cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .index(&superclass_path)?;
+            let property = superclass_index.type_member(&superclass.name, property)?;
+            let (namespace, type_name) = property.type_reference.as_ref()?;
+            let type_import = superclass_index.imports.iter().find(|import| {
+                import
+                    .bindings
+                    .iter()
+                    .any(|binding| binding.local_name == *namespace)
+            })?;
+            let target = resolve_typescript_definition_import(
+                cache,
+                &superclass_path,
+                &type_import.specifier,
+            )?;
+            let target_index = cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .index(&target)?;
+            let member = target_index.type_member(type_name, member_name)?;
+            Some(LspDefinitionLocation {
+                uri: file_uri(&target),
+                range: typescript_range(member.range),
+            })
+        }
+        TypeMemberTarget::SuperMemberCallback {
+            binding,
+            member_name: property,
+            callback_name,
+            chain,
+        } => {
+            let (import, binding) = index.import_binding_by_range(*binding)?;
+            let imported_name = binding.imported_name.as_deref()?;
+            let superclass_path = resolve_typescript_definition_import(
+                cache,
+                Path::new(importer_path),
+                &import.specifier,
+            )?;
+            let (superclass_path, superclass) =
+                resolve_typescript_export(cache, superclass_path, imported_name)?;
+            let superclass_index = cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .index(&superclass_path)?;
+            let property = superclass_index.type_member(&superclass.name, property)?;
+            let (namespace, type_name) = property.type_reference.as_ref()?;
+            let type_import = superclass_index.imports.iter().find(|import| {
+                import
+                    .bindings
+                    .iter()
+                    .any(|binding| binding.type_only && binding.local_name == *namespace)
+            })?;
+            let target = resolve_typescript_definition_import(
+                cache,
+                &superclass_path,
+                &type_import.specifier,
+            )?;
+            let target_index = cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .index(&target)?;
+            let callback = target_index.type_member(type_name, callback_name)?;
+            let callback_type = callback.callback_parameter_type.as_deref()?;
+            let final_type =
+                chain
+                    .iter()
+                    .try_fold(callback_type.to_owned(), |type_name, method| {
+                        target_index
+                            .type_member(&type_name, method)?
+                            .return_type
+                            .clone()
+                    })?;
+            let member = target_index.type_member(&final_type, member_name)?;
+            Some(LspDefinitionLocation {
+                uri: file_uri(&target),
+                range: typescript_range(member.range),
+            })
+        }
+        TypeMemberTarget::Union(arms) => {
+            let mut locations = arms.iter().map(|arm| match arm {
+                TypeMemberTarget::Inline(_) => None,
+                _ => resolve_typescript_type_member_target(
+                    cache,
+                    importer_path,
+                    index,
+                    arm,
+                    member_name,
+                ),
+            });
+            let first = locations.next()??;
+            locations
+                .all(|location| location.as_ref() == Some(&first))
+                .then_some(first)
+        }
+    }
+}
+
+fn unique_type_member_location(
+    members: &[galaxy_core::typescript::TypeMember],
+    member_name: &str,
+    path: &Path,
+) -> Option<LspDefinitionLocation> {
+    let matches = members
+        .iter()
+        .filter(|member| member.name == member_name)
+        .collect::<Vec<_>>();
+    let [member] = matches.as_slice() else {
+        return None;
+    };
+    Some(LspDefinitionLocation {
+        uri: file_uri(path),
+        range: typescript_range(member.range),
+    })
+}
+
+fn module_root_location(path: &Path) -> LspDefinitionLocation {
+    LspDefinitionLocation {
+        uri: file_uri(path),
+        range: LspRange {
+            start_line: 0,
+            start_character: 0,
+            end_line: 0,
+            end_character: 0,
+        },
+    }
+}
+
+const MAX_TYPESCRIPT_REEXPORT_DEPTH: usize = 32;
+
+fn resolve_typescript_export(
+    cache: &Mutex<TypeScriptNavigationCache>,
+    path: PathBuf,
+    name: &str,
+) -> Option<(PathBuf, galaxy_core::typescript::Declaration)> {
+    resolve_typescript_export_inner(cache, path, name, 0, &mut HashSet::new())
+}
+
+fn resolve_typescript_type_export(
+    cache: &Mutex<TypeScriptNavigationCache>,
+    path: PathBuf,
+    name: &str,
+) -> Option<(PathBuf, galaxy_core::typescript::Declaration)> {
+    resolve_typescript_type_export_inner(cache, path, name, 0, &mut HashSet::new())
+}
+
+fn resolve_typescript_type_export_inner(
+    cache: &Mutex<TypeScriptNavigationCache>,
+    path: PathBuf,
+    name: &str,
+    depth: usize,
+    visited: &mut HashSet<PathBuf>,
+) -> Option<(PathBuf, galaxy_core::typescript::Declaration)> {
+    if depth == MAX_TYPESCRIPT_REEXPORT_DEPTH || !visited.insert(module_identity(&path)) {
+        return None;
+    }
+    let index = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .index(&path)?;
+    if let Some(declaration) = index.exported_type_declaration(name) {
+        return Some((path, declaration.clone()));
+    }
+    if let Some(declaration) = index.export_assignment_namespace(name) {
+        return Some((path, declaration.clone()));
+    }
+    let candidates = index
+        .exports
+        .iter()
+        .filter_map(|export| {
+            (export.type_only && export.exported_name.as_deref() == Some(name))
+                .then_some((export.specifier.as_deref()?, export.name.as_deref()?))
+        })
+        .filter_map(|(specifier, imported_name)| {
+            resolve_typescript_definition_import(cache, &path, specifier).and_then(|target| {
+                resolve_typescript_type_export_inner(
+                    cache,
+                    target,
+                    imported_name,
+                    depth + 1,
+                    visited,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    (candidates.len() == 1).then(|| candidates.into_iter().next().unwrap())
+}
+
+fn resolve_typescript_export_inner(
+    cache: &Mutex<TypeScriptNavigationCache>,
+    path: PathBuf,
+    name: &str,
+    depth: usize,
+    visited: &mut HashSet<PathBuf>,
+) -> Option<(PathBuf, galaxy_core::typescript::Declaration)> {
+    if depth == MAX_TYPESCRIPT_REEXPORT_DEPTH || !visited.insert(module_identity(&path)) {
+        return None;
+    }
+    let index = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .index(&path)?;
+    if let Some(declaration) = index.exported_declaration(name) {
+        return Some((path, declaration.clone()));
+    }
+    let mut candidates: Vec<(PathBuf, galaxy_core::typescript::Declaration)> = Vec::new();
+    for export in index.exports.iter().filter(|export| !export.type_only) {
+        let Some(specifier) = export.specifier.as_deref() else {
+            continue;
+        };
+        let imported_name = if export.exported_name.as_deref() == Some(name) {
+            export.name.as_deref()
+        } else if export.exported_name.is_none() {
+            Some(name)
+        } else {
+            None
+        };
+        let Some(imported_name) = imported_name else {
+            continue;
+        };
+        let Some(target) = resolve_typescript_definition_import(cache, &path, specifier) else {
+            continue;
+        };
+        if let Some(candidate) =
+            resolve_typescript_export_inner(cache, target, imported_name, depth + 1, visited)
+            && !candidates.iter().any(|(candidate_path, declaration)| {
+                candidate_path == &candidate.0 && declaration.range == candidate.1.range
+            })
+        {
+            candidates.push(candidate);
+        }
+    }
+    (candidates.len() == 1).then(|| candidates.remove(0))
+}
+
+fn module_identity(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+const MAX_TYPESCRIPT_COMPLETIONS: usize = 100;
+
+fn typescript_completions(
+    path: &str,
+    text: &str,
+    line: usize,
+    character: usize,
+) -> Vec<LspCompletionItem> {
+    let Some(prefix) = typescript_identifier_prefix(text, line, character) else {
+        return Vec::new();
+    };
+    let index = DocumentIndex::parse(path, text);
+    let mut items = BTreeMap::new();
+    if character > 0
+        && let Some(symbol) = index.symbol_at(line, character - 1)
+        && symbol.name.starts_with(&prefix)
+    {
+        items
+            .entry(symbol.name.clone())
+            .or_insert_with(|| typescript_completion_item(&symbol.name, symbol.kind));
+    }
+    for declaration in &index.declarations {
+        if declaration.name.starts_with(&prefix) {
+            items
+                .entry(declaration.name.clone())
+                .or_insert_with(|| typescript_completion_item(&declaration.name, declaration.kind));
+        }
+    }
+    for import in &index.imports {
+        for binding in &import.bindings {
+            if !binding.type_only && binding.local_name.starts_with(&prefix) {
+                items.entry(binding.local_name.clone()).or_insert_with(|| {
+                    typescript_completion_item(&binding.local_name, DeclarationKind::Variable)
+                });
+            }
+        }
+    }
+    items
+        .into_values()
+        .take(MAX_TYPESCRIPT_COMPLETIONS)
+        .collect()
+}
+
+fn typescript_identifier_prefix(text: &str, line: usize, character: usize) -> Option<String> {
+    let line = text.lines().nth(line)?;
+    let mut column = 0;
+    let mut byte = 0;
+    for (offset, ch) in line.char_indices() {
+        let width = ch.len_utf16();
+        if column + width > character {
+            return None;
+        }
+        column += width;
+        byte = offset + ch.len_utf8();
+        if column == character {
+            break;
+        }
+    }
+    if column != character {
+        return None;
+    }
+    let prefix = &line[..byte];
+    let start = prefix
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| !is_typescript_identifier_char(*ch))
+        .map_or(0, |(offset, ch)| offset + ch.len_utf8());
+    Some(prefix[start..].to_owned())
+}
+
+fn is_typescript_identifier_char(ch: char) -> bool {
+    ch == '_' || ch == '$' || ch.is_ascii_alphanumeric()
+}
+
+fn typescript_completion_item(name: &str, kind: DeclarationKind) -> LspCompletionItem {
+    LspCompletionItem {
+        label: name.to_owned(),
+        detail: Some(typescript_declaration_kind(kind).to_owned()),
+        insert_text: name.to_owned(),
+        is_snippet: false,
+        sort_text: Some(name.to_owned()),
+        additional_edits: Vec::new(),
+        replace_from: None,
+        kind: Some(typescript_completion_kind(kind)),
+    }
+}
+
+fn typescript_hover_markdown(kind: DeclarationKind, name: &str, path: &Path) -> String {
+    format!(
+        "**{} `{}`**\n\n`{}`",
+        typescript_declaration_kind(kind),
+        name,
+        path.display()
+    )
+}
+
+fn typescript_declaration_kind(kind: DeclarationKind) -> &'static str {
+    match kind {
+        DeclarationKind::Function => "function",
+        DeclarationKind::Class => "class",
+        DeclarationKind::Interface => "interface",
+        DeclarationKind::Type => "type",
+        DeclarationKind::Enum => "enum",
+        DeclarationKind::Namespace => "namespace",
+        DeclarationKind::Variable => "variable",
+        DeclarationKind::Parameter => "parameter",
+    }
+}
+
+fn typescript_completion_kind(kind: DeclarationKind) -> u64 {
+    match kind {
+        DeclarationKind::Class => 7,
+        DeclarationKind::Interface => 8,
+        DeclarationKind::Enum => 13,
+        DeclarationKind::Function => 3,
+        DeclarationKind::Variable | DeclarationKind::Parameter => 6,
+        DeclarationKind::Type | DeclarationKind::Namespace => 9,
+    }
+}
+
+fn typescript_import_is_type_only(import: &galaxy_core::typescript::Import) -> bool {
+    import.type_only
+        || (!import.bindings.is_empty() && import.bindings.iter().all(|binding| binding.type_only))
+}
+
+fn resolve_typescript_import_uncached(importer: &Path, specifier: &str) -> Option<PathBuf> {
+    if javascript::is_relative_typescript_specifier(specifier) {
+        return javascript::resolve_relative_import(specifier, importer);
+    }
+    if specifier.starts_with("node:") {
+        return javascript::resolve_node_types_specifier(specifier, importer);
+    }
+    let project = javascript::TypeScriptProject::detect(importer)?;
+    javascript::resolve_typescript_specifier(&project, specifier, importer)
+}
+
+fn resolve_typescript_definition_import(
+    cache: &Mutex<TypeScriptNavigationCache>,
+    importer: &Path,
+    specifier: &str,
+) -> Option<PathBuf> {
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .resolve(importer, specifier)
+}
+
+fn direct_imported_name(binding: &ImportBinding) -> Option<&str> {
+    (!binding.type_only && matches!(binding.kind, ImportKind::Named | ImportKind::Default))
+        .then_some(binding.imported_name.as_deref())
+        .flatten()
+}
+
+fn valid_javascript_identifier(name: &str) -> bool {
+    let mut characters = name.bytes();
+    matches!(characters.next(), Some(b'$' | b'_') | Some(b'a'..=b'z' | b'A'..=b'Z'))
+        && characters.all(
+            |character| matches!(character, b'$' | b'_' | b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9'),
+        )
+        && !matches!(
+            name,
+            "await"
+                | "break"
+                | "case"
+                | "catch"
+                | "class"
+                | "const"
+                | "continue"
+                | "debugger"
+                | "default"
+                | "delete"
+                | "do"
+                | "else"
+                | "enum"
+                | "export"
+                | "extends"
+                | "false"
+                | "finally"
+                | "for"
+                | "function"
+                | "if"
+                | "implements"
+                | "import"
+                | "in"
+                | "instanceof"
+                | "interface"
+                | "let"
+                | "new"
+                | "null"
+                | "package"
+                | "private"
+                | "protected"
+                | "public"
+                | "return"
+                | "static"
+                | "super"
+                | "switch"
+                | "this"
+                | "throw"
+                | "true"
+                | "try"
+                | "typeof"
+                | "var"
+                | "void"
+                | "while"
+                | "with"
+                | "yield"
+        )
+}
+
+fn pending_go_engine(
+    engines: &Mutex<HashMap<PathBuf, Arc<Mutex<GoEngine>>>>,
+    root: &Path,
+) -> (Arc<Mutex<GoEngine>>, bool) {
+    let mut engines = engines.lock().unwrap_or_else(|e| e.into_inner());
+    match engines.get(root) {
+        Some(engine) => (engine.clone(), false),
+        None => {
+            let engine = Arc::new(Mutex::new(GoEngine::pending(root)));
+            engines.insert(root.to_path_buf(), engine.clone());
+            (engine, true)
+        }
+    }
+}
+
+fn pending_php_engine(
+    engines: &Mutex<HashMap<PathBuf, Arc<Mutex<PhpEngine>>>>,
+    root: &Path,
+) -> (Arc<Mutex<PhpEngine>>, bool) {
+    let mut engines = engines.lock().unwrap_or_else(|e| e.into_inner());
+    match engines.get(root) {
+        Some(engine) => (engine.clone(), false),
+        None => {
+            let engine = Arc::new(Mutex::new(PhpEngine::pending(root)));
+            engines.insert(root.to_path_buf(), engine.clone());
+            (engine, true)
+        }
+    }
+}
+
+fn spawn_go_index(
+    engine: &Arc<Mutex<GoEngine>>,
+    root: &Path,
+    listener: Option<Arc<dyn CoreListener>>,
+) {
     let engine = Arc::clone(engine);
     let root = root.to_path_buf();
+    workspace_scan_event(&listener, &root, GO_SCAN_LABEL, true);
     let _ = std::thread::Builder::new()
         .name("go-index".into())
         .spawn(move || {
@@ -1737,6 +3362,7 @@ fn spawn_go_index(engine: &Arc<Mutex<GoEngine>>, root: &Path) {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .install(built);
+            workspace_scan_event(&listener, &root, GO_SCAN_LABEL, false);
         });
 }
 
@@ -1746,9 +3372,14 @@ fn is_blade_path(path: &Path) -> bool {
         .is_some_and(|name| name.to_ascii_lowercase().ends_with(".blade.php"))
 }
 
-fn spawn_php_index(engine: &Arc<Mutex<PhpEngine>>, root: &Path) {
+fn spawn_php_index(
+    engine: &Arc<Mutex<PhpEngine>>,
+    root: &Path,
+    listener: Option<Arc<dyn CoreListener>>,
+) {
     let engine = Arc::clone(engine);
     let root = root.to_path_buf();
+    workspace_scan_event(&listener, &root, PHP_SCAN_LABEL, true);
     let _ = std::thread::Builder::new()
         .name("php-index".into())
         .spawn(move || {
@@ -1757,6 +3388,7 @@ fn spawn_php_index(engine: &Arc<Mutex<PhpEngine>>, root: &Path) {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .install(built);
+            workspace_scan_event(&listener, &root, PHP_SCAN_LABEL, false);
         });
 }
 
@@ -1796,6 +3428,34 @@ fn php_outline_symbol(
             .iter()
             .map(|child| php_outline_symbol(child, uri))
             .collect(),
+    }
+}
+
+fn typescript_outline_symbol(
+    declaration: &galaxy_core::typescript::Declaration,
+    uri: &str,
+) -> galaxy_core::analysis::DocumentSymbolInfo {
+    let kind = match declaration.kind {
+        DeclarationKind::Function => 12,
+        DeclarationKind::Class => 5,
+        DeclarationKind::Interface => 11,
+        DeclarationKind::Type => 26,
+        DeclarationKind::Enum => 10,
+        DeclarationKind::Namespace => 3,
+        DeclarationKind::Variable => 13,
+        DeclarationKind::Parameter => 13,
+    };
+    galaxy_core::analysis::DocumentSymbolInfo {
+        uri: Some(uri.to_owned()),
+        name: declaration.name.clone(),
+        kind,
+        range: LspRange {
+            start_line: declaration.range.start.line as u64,
+            start_character: declaration.range.start.col as u64,
+            end_line: declaration.range.end.line as u64,
+            end_character: declaration.range.end.col as u64,
+        },
+        children: Vec::new(),
     }
 }
 
@@ -4831,6 +6491,134 @@ mod tests {
     }
 
     #[test]
+    fn typescript_navigation_cache_reuses_indexes_and_revalidates_disk_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let dependency = dir.path().join("dependency.ts");
+        std::fs::write(&dependency, "export const first = 1;\n").unwrap();
+        let mut cache = TypeScriptNavigationCache::default();
+
+        let first = cache.index(&dependency).unwrap();
+        let second = cache.index(&dependency).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+
+        std::fs::write(&dependency, "export const changed = 22;\n").unwrap();
+        let changed = cache.index(&dependency).unwrap();
+        assert!(!Arc::ptr_eq(&first, &changed));
+        assert!(changed.exported_declaration("changed").is_some());
+    }
+
+    #[test]
+    fn typescript_navigation_cache_revalidates_package_manifest_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+        let package = dir.path().join("node_modules/pkg");
+        std::fs::create_dir_all(&package).unwrap();
+        let manifest = package.join("package.json");
+        std::fs::write(&manifest, r#"{"exports":"./first.ts"}"#).unwrap();
+        std::fs::write(package.join("first.ts"), "export const value = 1;\n").unwrap();
+        std::fs::write(package.join("second.ts"), "export const value = 2;\n").unwrap();
+        let importer = dir.path().join("main.ts");
+        std::fs::write(&importer, "import { value } from 'pkg';\nvalue;\n").unwrap();
+        let mut cache = TypeScriptNavigationCache::default();
+
+        assert!(
+            cache
+                .resolve(&importer, "pkg")
+                .unwrap()
+                .ends_with("first.ts")
+        );
+        std::fs::write(&manifest, r#"{"exports":"./second.ts"}"#).unwrap();
+        assert!(
+            cache
+                .resolve(&importer, "pkg")
+                .unwrap()
+                .ends_with("second.ts")
+        );
+    }
+
+    #[test]
+    fn typescript_navigation_warmup_caches_import_targets_and_reexports() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+        let package = dir.path().join("node_modules/pkg");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("package.json"), r#"{"exports":"./entry.js"}"#).unwrap();
+        std::fs::write(
+            package.join("entry.js"),
+            "export { value } from './types.js';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("entry.d.ts"),
+            "export { value } from './types.js';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("types.d.ts"),
+            "export declare const value: number;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("main.ts"),
+            "import { value } from 'pkg';\nvalue;\n",
+        )
+        .unwrap();
+
+        let cache = Mutex::new(TypeScriptNavigationCache::default());
+        warm_typescript_navigation(dir.path(), &cache);
+
+        let cache = cache.lock().unwrap();
+        assert!(
+            cache
+                .resolutions
+                .values()
+                .any(|resolution| resolution.target.ends_with("entry.d.ts"))
+        );
+        assert!(
+            cache
+                .indexes
+                .keys()
+                .any(|path| path.ends_with("entry.d.ts"))
+        );
+        assert!(
+            cache
+                .indexes
+                .keys()
+                .any(|path| path.ends_with("types.d.ts"))
+        );
+    }
+
+    #[test]
+    fn typescript_navigation_warmup_excludes_node_modules_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+        let ignored = dir.path().join("node_modules/ignored");
+        std::fs::create_dir_all(&ignored).unwrap();
+        std::fs::write(
+            ignored.join("package.json"),
+            r#"{"exports":"./entry.d.ts"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            ignored.join("entry.d.ts"),
+            "export declare const ignored: number;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            ignored.join("source.ts"),
+            "import { ignored } from 'ignored';\nignored;\n",
+        )
+        .unwrap();
+
+        let cache = Mutex::new(TypeScriptNavigationCache::default());
+        warm_typescript_navigation(dir.path(), &cache);
+
+        let cache = cache.lock().unwrap();
+        assert!(cache.resolutions.is_empty());
+        assert!(cache.indexes.is_empty());
+    }
+
+    #[test]
     fn syntax_is_detected_and_arrives_without_blocking_viewport() {
         let dir = tempfile::tempdir().unwrap();
         let rust = dir.path().join("main.rs");
@@ -5157,6 +6945,74 @@ mod tests {
                 message: "hi".into()
             }
         );
+    }
+
+    #[test]
+    fn opening_workspace_indexes_only_detected_engine_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+        std::fs::write(dir.path().join("tsconfig.json"), "{}\n").unwrap();
+        std::fs::write(dir.path().join("main.ts"), "export const value = 1;\n").unwrap();
+        std::fs::write(
+            dir.path().join("go.mod"),
+            "module example.com/test\n\ngo 1.22\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("main.go"), "package test\n").unwrap();
+        std::fs::write(dir.path().join("composer.json"), "{}\n").unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let core = Core::new();
+        core.set_listener(Arc::new(ChannelListener(Mutex::new(tx))));
+        core.open_workspace(dir.path().to_string_lossy().into_owned())
+            .unwrap();
+
+        let root = dir.path().to_string_lossy().into_owned();
+        let expected = [TYPESCRIPT_SCAN_LABEL, GO_SCAN_LABEL, PHP_SCAN_LABEL];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut started = HashSet::new();
+        let mut finished = HashSet::new();
+        while Instant::now() < deadline && finished.len() < expected.len() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let Ok(event) = rx.recv_timeout(remaining) else {
+                break;
+            };
+            match event {
+                CoreEvent::WorkspaceScanStarted {
+                    root: event_root,
+                    label,
+                } if event_root == root => {
+                    started.insert(label);
+                }
+                CoreEvent::WorkspaceScanFinished {
+                    root: event_root,
+                    label,
+                } if event_root == root => {
+                    finished.insert(label);
+                }
+                _ => {}
+            }
+        }
+        for label in expected {
+            assert!(started.contains(label), "{label} scan did not start");
+            assert!(finished.contains(label), "{label} scan did not finish");
+        }
+
+        let plain = tempfile::tempdir().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let core = Core::new();
+        core.set_listener(Arc::new(ChannelListener(Mutex::new(tx))));
+        core.open_workspace(plain.path().to_string_lossy().into_owned())
+            .unwrap();
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err());
+
+        std::fs::write(plain.path().join("jsconfig.json"), "{}\n").unwrap();
+        core.open_workspace(plain.path().to_string_lossy().into_owned())
+            .unwrap();
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            CoreEvent::WorkspaceScanStarted { label, .. } if label == TYPESCRIPT_SCAN_LABEL
+        ));
     }
 
     #[test]
@@ -5646,6 +7502,58 @@ mod tests {
         (dir, main.to_string_lossy().into_owned())
     }
 
+    #[test]
+    fn javascript_project_and_components_are_manifest_gated() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"name":"web","dependencies":{"react":"19","vue":"3","svelte":"5"}}"#,
+        )
+        .unwrap();
+        let react = src.join("Button.tsx");
+        let vue = src.join("Panel.vue");
+        let svelte = src.join("Card.svelte");
+        std::fs::write(&react, "export const Button = () => null").unwrap();
+        std::fs::write(&vue, "<template><div /></template>").unwrap();
+        std::fs::write(&svelte, "<script>let value = 1;</script>").unwrap();
+        let core = Core::new();
+        let project = core
+            .javascript_project(react.to_string_lossy().into_owned())
+            .unwrap();
+        assert_eq!(project.name.as_deref(), Some("web"));
+        assert_eq!(project.frameworks, ["React", "Vue", "Svelte"]);
+        let components = core.javascript_components(vue.to_string_lossy().into_owned());
+        assert_eq!(
+            components
+                .iter()
+                .map(|component| (
+                    component.framework.as_str(),
+                    component.name.as_str(),
+                    component
+                        .symbols
+                        .iter()
+                        .map(|symbol| (symbol.name.as_str(), symbol.props.as_slice()))
+                        .collect::<Vec<_>>(),
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                ("React", "Button", vec![]),
+                ("Svelte", "Card", vec![("Card", &[][..])]),
+                ("Vue", "Panel", vec![("Panel", &[][..])]),
+            ]
+        );
+        assert_eq!(
+            core.resolve_javascript_relative_import(
+                "./Button.js".into(),
+                vue.to_string_lossy().into_owned(),
+            )
+            .map(|target| target.uri),
+            Some(file_uri(&react))
+        );
+    }
+
     /// Asks again until the index, built off-thread, is ready.
     fn until(what: &str, mut ask: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(20);
@@ -5667,6 +7575,1193 @@ mod tests {
             .open_document(notes.to_string_lossy().into_owned())
             .unwrap();
         assert!(!core.register_document(notes, "text".into(), String::new()));
+    }
+
+    #[test]
+    fn typescript_documents_provide_outline_and_parse_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outline.ts");
+        std::fs::write(
+            &path,
+            "export class App {}\nexport interface Config {}\nconst broken = (\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let document = core
+            .open_document(path.to_string_lossy().into_owned())
+            .unwrap();
+
+        assert!(core.register_document(document.clone(), "typescript".into(), String::new()));
+        assert_eq!(core.poll_analysis(), 1);
+        let diagnostics = document.lock().diagnostics.clone();
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].severity, 1);
+        assert!(diagnostics[0].message.contains("Syntax"), "{diagnostics:?}");
+
+        assert!(core.request_document_symbols(document.clone()));
+        let symbols: Vec<(String, String)> = core
+            .document_symbols(document)
+            .into_iter()
+            .map(|symbol| (symbol.name, symbol.kind))
+            .collect();
+        assert_eq!(
+            symbols,
+            vec![("App".into(), "5".into()), ("Config".into(), "11".into())]
+        );
+    }
+
+    #[test]
+    fn typescript_type_diagnostics_are_published_with_galaxy_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("types.ts");
+        std::fs::write(
+            &path,
+            "const value: number = 'wrong';\nconst unknown = other?.field;\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let document = core
+            .open_document(path.to_string_lossy().into_owned())
+            .unwrap();
+
+        assert!(core.register_document(document.clone(), "typescript".into(), String::new()));
+        core.poll_analysis();
+        let diagnostics = document.lock().diagnostics.clone();
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].severity, 1);
+        assert!(
+            diagnostics[0].message.contains("assignable"),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn typescript_completion_and_hover_are_local_and_range_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.ts");
+        std::fs::write(
+            &path,
+            "import { remoteValue } from './dep';\nconst localValue = 1;\nfunction run(parameter: string) { return parameter; }\nloc\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let document = core
+            .open_document(path.to_string_lossy().into_owned())
+            .unwrap();
+
+        assert!(core.request_completion(document.clone(), 3, 3));
+        let labels: Vec<_> = core
+            .completions(document.clone())
+            .into_iter()
+            .map(|item| item.label)
+            .collect();
+        assert_eq!(labels, ["localValue"]);
+
+        assert!(core.request_hover(document.clone(), 2, 9));
+        let hover = core.hover(document).unwrap();
+        assert!(hover.contents.contains("function `run`"), "{hover:?}");
+        assert!(hover.contents.contains("main.ts"), "{hover:?}");
+        assert_eq!(
+            (
+                hover.start_line,
+                hover.start_character,
+                hover.end_line,
+                hover.end_character
+            ),
+            (Some(2), Some(9), Some(2), Some(12))
+        );
+    }
+
+    #[test]
+    fn typescript_definition_follows_migration_table_callback_parameter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("database/migrations/create_roles_table.ts");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "export default class {\n  async up() {\n    this.schema.createTable(this.tableName, (table) => {\n      table.uuid('id').primary()\n    })\n  }\n}\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let document = core
+            .open_document(path.to_string_lossy().into_owned())
+            .unwrap();
+
+        assert!(core.request_definition(document.clone(), 3, 7));
+        let definition = core.definition_locations(document);
+        assert_eq!(definition.len(), 1);
+        assert_eq!((definition[0].line, definition[0].column), (2, 45));
+    }
+
+    #[test]
+    fn typescript_definition_follows_migration_schema_builder_method() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+        let lucid = dir.path().join("node_modules/@adonisjs/lucid");
+        let knex = dir.path().join("node_modules/knex");
+        std::fs::create_dir_all(lucid.join("build/src/schema")).unwrap();
+        std::fs::create_dir_all(lucid.join("build/src/types")).unwrap();
+        std::fs::create_dir_all(knex.join("types")).unwrap();
+        std::fs::write(
+            lucid.join("package.json"),
+            r#"{"exports":{"./schema":"./build/src/schema/main.js"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            knex.join("package.json"),
+            r#"{"main":"knex.js","types":"types/index.d.ts"}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(knex.join("lib")).unwrap();
+        std::fs::write(
+            knex.join("knex.js"),
+            "module.exports = require('./lib/index');\n",
+        )
+        .unwrap();
+        std::fs::write(knex.join("lib/index.js"), "module.exports = {};\n").unwrap();
+        std::fs::write(
+            lucid.join("build/src/schema/main.d.ts"),
+            "import type { Knex } from 'knex';\nimport type { QueryClientContract } from '../types/database.js';\nimport type { RawQueryBindings } from '../types/querybuilder.js';\nexport declare class BaseSchema { db: QueryClientContract; get schema(): Knex.SchemaBuilder; raw(bindings: RawQueryBindings): Knex.Raw; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            lucid.join("build/src/types/database.d.ts"),
+            "export interface QueryClientContract { connectionName: string; }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            lucid.join("build/src/types/querybuilder.d.ts"),
+            "export type RawQueryBindings = Record<string, string>;\n",
+        )
+        .unwrap();
+        std::fs::write(lucid.join("build/src/schema/main.js"), "").unwrap();
+        std::fs::write(
+            knex.join("types/index.d.ts"),
+            "declare function knex(): Knex.Knex;\ndeclare namespace Knex {\n  export class SchemaBuilder {}\n  interface SchemaBuilder { createTable(name: string, callback: (tableBuilder: CreateTableBuilder) => any): void; }\n  interface CreateTableBuilder extends TableBuilder {}\n  interface TableBuilder { uuid(name: string): ColumnBuilder; string(name: string): ColumnBuilder; bigInteger(name: string): ColumnBuilder; }\n  interface ColumnBuilder { primary(): ColumnBuilder; notNullable(): ColumnBuilder; unique(): ColumnBuilder; unsigned(): ColumnBuilder; }\n}\nexport = knex;\n",
+        )
+        .unwrap();
+        let path = dir.path().join("database/migrations/create_roles_table.ts");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "import { BaseSchema } from '@adonisjs/lucid/schema'\n\nexport default class extends BaseSchema {\n  protected tableName = 'roles'\n\n  async up() {\n    this.schema.createTable(this.tableName, (table) => {\n      table.uuid('id').primary()\n      table.string('name').notNullable()\n      table.string('code').notNullable().unique()\n\n      table.bigInteger('created_at').unsigned()\n      table.bigInteger('updated_at').unsigned()\n    })\n  }\n}\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let declaration = DocumentIndex::parse(
+            lucid.join("build/src/schema/main.d.ts"),
+            "import type { Knex } from 'knex';\nimport type { QueryClientContract } from '../types/database.js';\nimport type { RawQueryBindings } from '../types/querybuilder.js';\nexport declare class BaseSchema { db: QueryClientContract; get schema(): Knex.SchemaBuilder; raw(bindings: RawQueryBindings): Knex.Raw; }\n",
+        );
+        assert!(declaration.exported_declaration("BaseSchema").is_some());
+        assert_eq!(
+            resolve_typescript_import_uncached(&path, "@adonisjs/lucid/schema"),
+            Some(lucid.join("build/src/schema/main.js"))
+        );
+        assert_eq!(
+            resolve_typescript_import_uncached(&lucid.join("build/src/schema/main.d.ts"), "knex"),
+            Some(knex.join("types/index.d.ts"))
+        );
+        let schema_document = core
+            .open_document(
+                lucid
+                    .join("build/src/schema/main.d.ts")
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+            .unwrap();
+        assert!(core.request_definition(schema_document.clone(), 0, 14));
+        let namespace = core.definition_locations(schema_document.clone());
+        assert_eq!(namespace.len(), 1);
+        assert_eq!(
+            namespace[0].uri,
+            file_uri(&std::fs::canonicalize(knex.join("types/index.d.ts")).unwrap())
+        );
+        assert_eq!((namespace[0].line, namespace[0].column), (1, 18));
+        assert!(core.request_definition(schema_document.clone(), 3, 73));
+        let schema_builder_namespace = core.definition_locations(schema_document.clone());
+        assert_eq!(schema_builder_namespace.len(), 1);
+        assert_eq!(schema_builder_namespace[0].uri, namespace[0].uri);
+        assert_eq!(
+            (
+                schema_builder_namespace[0].line,
+                schema_builder_namespace[0].column
+            ),
+            (1, 18)
+        );
+        assert!(core.request_definition(schema_document.clone(), 3, 78));
+        let schema_builder = core.definition_locations(schema_document.clone());
+        assert_eq!(schema_builder.len(), 1);
+        assert_eq!(
+            schema_builder[0].uri,
+            file_uri(&std::fs::canonicalize(knex.join("types/index.d.ts")).unwrap())
+        );
+        assert_eq!((schema_builder[0].line, schema_builder[0].column), (3, 12));
+        assert!(core.request_definition(schema_document.clone(), 0, 28));
+        let knex_module = core.definition_locations(schema_document.clone());
+        assert_eq!(knex_module.len(), 1);
+        assert_eq!(
+            knex_module[0].uri,
+            file_uri(&std::fs::canonicalize(knex.join("types/index.d.ts")).unwrap())
+        );
+        assert!(core.request_definition(schema_document.clone(), 1, 18));
+        let query_client = core.definition_locations(schema_document.clone());
+        assert_eq!(query_client.len(), 1);
+        assert_eq!(
+            query_client[0].uri,
+            file_uri(&std::fs::canonicalize(lucid.join("build/src/types/database.d.ts")).unwrap())
+        );
+        assert_eq!((query_client[0].line, query_client[0].column), (0, 7));
+        assert!(core.request_definition(schema_document.clone(), 3, 39));
+        let query_client_annotation = core.definition_locations(schema_document.clone());
+        assert_eq!(query_client_annotation.len(), 1);
+        assert_eq!(query_client_annotation[0].uri, query_client[0].uri);
+        assert_eq!(
+            (
+                query_client_annotation[0].line,
+                query_client_annotation[0].column
+            ),
+            (0, 7)
+        );
+        assert!(core.request_definition(schema_document.clone(), 2, 18));
+        let raw_bindings = core.definition_locations(schema_document.clone());
+        assert_eq!(raw_bindings.len(), 1);
+        assert_eq!(
+            raw_bindings[0].uri,
+            file_uri(
+                &std::fs::canonicalize(lucid.join("build/src/types/querybuilder.d.ts")).unwrap()
+            )
+        );
+        assert_eq!((raw_bindings[0].line, raw_bindings[0].column), (0, 7));
+        assert!(core.request_definition(schema_document.clone(), 2, 42));
+        let querybuilder_module = core.definition_locations(schema_document.clone());
+        assert_eq!(querybuilder_module.len(), 1);
+        assert_eq!(
+            querybuilder_module[0].uri,
+            file_uri(
+                &std::fs::canonicalize(lucid.join("build/src/types/querybuilder.d.ts")).unwrap()
+            )
+        );
+
+        let document = core
+            .open_document(path.to_string_lossy().into_owned())
+            .unwrap();
+        assert!(core.request_definition(document.clone(), 0, 10));
+        let base = core.definition_locations(document.clone());
+        assert_eq!(base.len(), 1);
+        assert_eq!(
+            base[0].uri,
+            file_uri(&std::fs::canonicalize(lucid.join("build/src/schema/main.d.ts")).unwrap())
+        );
+        assert!(core.request_definition(document.clone(), 6, 9));
+        let schema = core.definition_locations(document.clone());
+        assert_eq!(schema.len(), 1);
+        assert_eq!(
+            schema[0].uri,
+            file_uri(&std::fs::canonicalize(lucid.join("build/src/schema/main.d.ts")).unwrap())
+        );
+        let migration_line = "      table.uuid('id').primary()";
+        let method_column = |name: &str| {
+            migration_line.find(&format!("table.{name}")).unwrap() as u64 + "table.".len() as u64
+        };
+        assert!(core.request_definition(document.clone(), 7, method_column("uuid")));
+        let uuid = core.definition_locations(document.clone());
+        assert_eq!(uuid.len(), 1);
+        assert_eq!(
+            uuid[0].uri,
+            file_uri(&std::fs::canonicalize(knex.join("types/index.d.ts")).unwrap())
+        );
+        assert_eq!((uuid[0].line, uuid[0].column), (5, 27));
+        let string_line = "      table.string('name').notNullable()";
+        let string_column =
+            string_line.find("table.string").unwrap() as u64 + "table.".len() as u64;
+        assert!(core.request_definition(document.clone(), 8, string_column));
+        let string = core.definition_locations(document.clone());
+        assert_eq!(string.len(), 1);
+        assert_eq!((string[0].line, string[0].column), (5, 62));
+        let big_integer_line = "      table.bigInteger('created_at').unsigned()";
+        let big_integer_column =
+            big_integer_line.find("table.bigInteger").unwrap() as u64 + "table.".len() as u64;
+        assert!(core.request_definition(document.clone(), 11, big_integer_column));
+        let big_integer = core.definition_locations(document.clone());
+        assert_eq!(big_integer.len(), 1);
+        assert_eq!((big_integer[0].line, big_integer[0].column), (5, 99));
+        let chained_line = "      table.string('name').notNullable()";
+        let chained_column = |name: &str| chained_line.find(name).unwrap() as u64;
+        assert!(core.request_definition(document.clone(), 8, chained_column("notNullable")));
+        let not_nullable = core.definition_locations(document.clone());
+        assert_eq!(not_nullable.len(), 1);
+        assert_eq!((not_nullable[0].line, not_nullable[0].column), (6, 54));
+        let unique_line = "      table.string('code').notNullable().unique()";
+        assert!(core.request_definition(
+            document.clone(),
+            9,
+            unique_line.find("unique").unwrap() as u64
+        ));
+        let unique = core.definition_locations(document.clone());
+        assert_eq!(unique.len(), 1);
+        assert_eq!((unique[0].line, unique[0].column), (6, 84));
+        let unsigned_line = "      table.bigInteger('created_at').unsigned()";
+        assert!(core.request_definition(
+            document.clone(),
+            11,
+            unsigned_line.find("unsigned").unwrap() as u64
+        ));
+        let unsigned = core.definition_locations(document);
+        assert_eq!(unsigned.len(), 1);
+        assert_eq!((unsigned[0].line, unsigned[0].column), (6, 109));
+    }
+
+    #[test]
+    fn typescript_import_diagnostics_use_project_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tsconfig.json"),
+            r#"{"compilerOptions":{"baseUrl":".","paths":{"@lib/*":["src/*"]}}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/ok.ts"), "export const ok = 1;\n").unwrap();
+        let path = dir.path().join("main.ts");
+        std::fs::write(
+            &path,
+            "import { ok } from '@lib/ok';\nimport pkg from 'pkg';\nimport type { Type } from 'missing-types';\n",
+        )
+        .unwrap();
+        let package = dir.path().join("node_modules/pkg");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("package.json"), r#"{"exports":"./index.ts"}"#).unwrap();
+        std::fs::write(package.join("index.ts"), "export default 1;\n").unwrap();
+
+        let core = Core::new();
+        let document = core
+            .open_document(path.to_string_lossy().into_owned())
+            .unwrap();
+        assert!(core.register_document(document.clone(), "typescript".into(), String::new()));
+        core.poll_analysis();
+        assert!(
+            document.lock().diagnostics.is_empty(),
+            "{:?}",
+            document.lock().diagnostics
+        );
+
+        assert!(document.apply_rename_edits(vec![RenameEdit {
+            uri: String::new(),
+            start_line: 1,
+            start_character: 17,
+            end_line: 1,
+            end_character: 20,
+            new_text: "missing-pkg".into(),
+        }]));
+        core.poll_analysis();
+        let diagnostics = document.lock().diagnostics.clone();
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].severity, 2);
+        assert!(
+            diagnostics[0].message.contains("missing-pkg"),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn typescript_local_navigation_is_shadow_aware_and_renames_stable_occurrences() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shadow.ts");
+        std::fs::write(
+            &path,
+            "const emoji = '😀';\nconst value = 1;\n{ const value = 2; value; }\nvalue;\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let document = core
+            .open_document(path.to_string_lossy().into_owned())
+            .unwrap();
+
+        assert!(core.request_definition(document.clone(), 2, 19));
+        assert_eq!(
+            core.definition_locations(document.clone())
+                .into_iter()
+                .map(|location| (location.line, location.column))
+                .collect::<Vec<_>>(),
+            vec![(2, 8)]
+        );
+
+        assert!(core.request_references(document.clone(), 2, 19));
+        assert_eq!(
+            core.references(document.clone())
+                .into_iter()
+                .map(|location| (location.line, location.column))
+                .collect::<Vec<_>>(),
+            vec![(2, 8), (2, 19)]
+        );
+
+        assert!(core.request_rename(document.clone(), 2, 19, "innerValue".into()));
+        let edits = core.rename_edits(document.clone());
+        assert_eq!(edits.len(), 2);
+        assert!(edits.iter().all(|edit| edit.new_text == "innerValue"));
+        assert_eq!(
+            edits
+                .iter()
+                .map(|edit| (edit.start_line, edit.start_character, edit.end_character))
+                .collect::<Vec<_>>(),
+            vec![(2, 8, 13), (2, 19, 24)]
+        );
+        assert!(!core.request_rename(document.clone(), 2, 19, "1bad".into()));
+        assert!(core.rename_edits(document).is_empty());
+    }
+
+    #[test]
+    fn typescript_navigation_resolves_direct_imports_through_projects_only() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("tsconfig.json"),
+            r#"{"compilerOptions":{"baseUrl":".","paths":{"@lib/*":["src/*"]}}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("src/dep.ts"),
+            "const local = 1;\nexport { local as publicValue };\n",
+        )
+        .unwrap();
+        let main_path = dir.path().join("main.ts");
+        std::fs::write(
+            &main_path,
+            "import { publicValue as value } from '@lib/dep';\nvalue;\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let main = core
+            .open_document(main_path.to_string_lossy().into_owned())
+            .unwrap();
+
+        assert!(core.request_definition(main.clone(), 1, 1));
+        let definition = core.definition_locations(main.clone());
+        assert_eq!(definition.len(), 1);
+        assert!(definition[0].uri.ends_with("src/dep.ts"));
+        assert_eq!((definition[0].line, definition[0].column), (0, 6));
+
+        assert!(core.request_references(main.clone(), 1, 1));
+        assert_eq!(core.references(main.clone()).len(), 3);
+
+        std::fs::write(dir.path().join("src/unsafe.ts"), "export * from './dep';\n").unwrap();
+        let unsafe_path = dir.path().join("unsafe-main.ts");
+        std::fs::write(
+            &unsafe_path,
+            "import { publicValue } from '@lib/unsafe';\npublicValue;\n",
+        )
+        .unwrap();
+        let unsafe_document = core
+            .open_document(unsafe_path.to_string_lossy().into_owned())
+            .unwrap();
+        assert!(core.request_definition(unsafe_document.clone(), 1, 1));
+        assert!(
+            core.definition_locations(unsafe_document)[0]
+                .uri
+                .ends_with("src/dep.ts")
+        );
+    }
+
+    #[test]
+    fn typescript_navigation_resolves_package_exports_and_type_only_fallbacks() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+        let package = dir.path().join("node_modules/pkg");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("package.json"), r#"{"exports":"./entry.ts"}"#).unwrap();
+        std::fs::write(
+            package.join("entry.ts"),
+            "export default function run() {}\n",
+        )
+        .unwrap();
+        let main_path = dir.path().join("main.ts");
+        std::fs::write(&main_path, "import run from 'pkg';\nrun();\n").unwrap();
+        let core = Core::new();
+        let main = core
+            .open_document(main_path.to_string_lossy().into_owned())
+            .unwrap();
+        assert!(core.request_definition(main.clone(), 1, 1));
+        assert!(
+            core.definition_locations(main.clone())[0]
+                .uri
+                .ends_with("entry.ts")
+        );
+
+        let unsupported_path = dir.path().join("unsupported.ts");
+        std::fs::write(
+            &unsupported_path,
+            "import * as api from 'pkg';\nimport type Run from 'pkg';\napi.run();\n",
+        )
+        .unwrap();
+        let unsupported = core
+            .open_document(unsupported_path.to_string_lossy().into_owned())
+            .unwrap();
+        assert!(!core.request_definition(unsupported.clone(), 0, 13));
+        assert!(core.request_definition(unsupported, 1, 13));
+    }
+
+    #[test]
+    fn typescript_navigation_resolves_static_module_strings_and_namespace_members() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        std::fs::write(
+            dir.path().join("dep.ts"),
+            "export const value = 1;\nexport const Component = () => null;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("reexport.ts"),
+            "export { value } from './dep.js';\n",
+        )
+        .unwrap();
+        let main_path = dir.path().join("main.tsx");
+        std::fs::write(
+            &main_path,
+            "import * as api from './dep.js';\nimport './dep.js';\nexport { value } from './reexport.js';\nexport * from './dep.js';\napi.value;\nconst View = <api.Component />;\napi.value.deep;\nconst value = 1; ({ value });\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let main = core
+            .open_document(main_path.to_string_lossy().into_owned())
+            .unwrap();
+
+        for (line, column) in [(0, 25), (1, 9), (2, 28), (3, 17)] {
+            assert!(
+                core.request_definition(main.clone(), line, column),
+                "cursor {line}:{column}"
+            );
+            let locations = core.definition_locations(main.clone());
+            assert_eq!(locations.len(), 1);
+            assert!(
+                locations[0]
+                    .uri
+                    .ends_with(if line == 2 { "reexport.ts" } else { "dep.ts" })
+            );
+            assert_eq!((locations[0].line, locations[0].column), (0, 0));
+        }
+
+        assert!(core.request_definition(main.clone(), 4, 5));
+        let value = core.definition_locations(main.clone());
+        assert!(value[0].uri.ends_with("dep.ts"));
+        assert_eq!((value[0].line, value[0].column), (0, 13));
+
+        assert!(core.request_definition(main.clone(), 5, 21));
+        let component = core.definition_locations(main.clone());
+        assert!(component[0].uri.ends_with("dep.ts"));
+        assert_eq!((component[0].line, component[0].column), (1, 13));
+
+        assert!(!core.request_definition(main.clone(), 6, 5));
+        assert!(!core.request_definition(main, 7, 20));
+    }
+
+    #[test]
+    fn typescript_navigation_resolves_package_imports_reexports_and_literal_dynamic_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r##"{"imports":{"#alias/*":"./src/*.js"}}"##,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("src/value.ts"), "export const value = 1;\n").unwrap();
+        std::fs::write(
+            dir.path().join("src/named.ts"),
+            "export { value as named } from '#alias/value';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("src/star.ts"),
+            "export * from '#alias/named';\n",
+        )
+        .unwrap();
+        let main_path = dir.path().join("main.ts");
+        std::fs::write(
+            &main_path,
+            "import { named } from './src/star.js';\nnamed;\nimport('#alias/value');\nimport(alias);\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let main = core
+            .open_document(main_path.to_string_lossy().into_owned())
+            .unwrap();
+
+        assert!(core.request_definition(main.clone(), 1, 1));
+        let definition = core.definition_locations(main.clone());
+        assert_eq!(definition.len(), 1);
+        assert!(definition[0].uri.ends_with("src/value.ts"));
+        assert_eq!((definition[0].line, definition[0].column), (0, 13));
+
+        assert!(core.request_definition(main.clone(), 2, 10));
+        assert!(
+            core.definition_locations(main.clone())[0]
+                .uri
+                .ends_with("src/value.ts")
+        );
+        assert!(!core.request_definition(main, 3, 8));
+    }
+
+    #[test]
+    fn typescript_navigation_reexport_cycles_and_ambiguous_stars_fall_back_to_module_roots() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("a.ts"), "export * from './b.js';\n").unwrap();
+        std::fs::write(dir.path().join("b.ts"), "export * from './a.js';\n").unwrap();
+        std::fs::write(dir.path().join("one.ts"), "export const value = 1;\n").unwrap();
+        std::fs::write(dir.path().join("two.ts"), "export const value = 2;\n").unwrap();
+        std::fs::write(
+            dir.path().join("ambiguous.ts"),
+            "export * from './one.js';\nexport * from './two.js';\n",
+        )
+        .unwrap();
+        let main_path = dir.path().join("main.ts");
+        std::fs::write(
+            &main_path,
+            "import { value as cycle } from './a.js';\nimport { value } from './ambiguous.js';\ncycle;\nvalue;\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let main = core
+            .open_document(main_path.to_string_lossy().into_owned())
+            .unwrap();
+        for (line, target) in [(2, "a.ts"), (3, "ambiguous.ts")] {
+            assert!(core.request_definition(main.clone(), line, 1));
+            let definition = core.definition_locations(main.clone());
+            assert!(definition[0].uri.ends_with(target), "{:?}", definition[0]);
+            assert_eq!((definition[0].line, definition[0].column), (0, 0));
+        }
+    }
+
+    #[test]
+    fn typescript_navigation_resolves_type_imports_annotations_and_direct_members() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+        std::fs::write(
+            dir.path().join("types.ts"),
+            "export interface User { name: string; greet(): void }\nexport type Record = { title: string };\nexport const Value = 1;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("alias.ts"),
+            "export interface User { name: string; greet(): void }\nexport { User as Person };\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("reexport.ts"),
+            "export type { Record } from './types';\n",
+        )
+        .unwrap();
+        let main_path = dir.path().join("main.ts");
+        std::fs::write(
+            &main_path,
+            "import type { Person } from './alias';\nimport { type Record } from './reexport';\nimport { Value } from './types';\nconst user: Person = {} as Person;\nfunction use(record: Record) { user.name; user.greet(); record.title; }\nclass Box { user: Person; show() { return this.user.name; } }\nValue;\nconst union: Person | undefined = undefined; union?.name;\nuser['name']; user.name.deep;\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let main = core
+            .open_document(main_path.to_string_lossy().into_owned())
+            .unwrap();
+
+        for (line, column, target, target_line, target_column) in [
+            (0, 14, "alias.ts", 0, 7),
+            (1, 14, "types.ts", 1, 7),
+            (3, 12, "alias.ts", 0, 7),
+            (4, 36, "alias.ts", 0, 24),
+            (4, 47, "alias.ts", 0, 38),
+            (4, 63, "types.ts", 1, 23),
+            (5, 53, "alias.ts", 0, 24),
+        ] {
+            assert!(
+                core.request_definition(main.clone(), line, column),
+                "cursor {line}:{column}"
+            );
+            let definition = core.definition_locations(main.clone());
+            assert!(definition[0].uri.ends_with(target));
+            assert_eq!(
+                (definition[0].line, definition[0].column),
+                (target_line, target_column),
+                "cursor {line}:{column}"
+            );
+        }
+
+        assert!(core.request_definition(main.clone(), 6, 1));
+        assert!(
+            core.definition_locations(main.clone())[0]
+                .uri
+                .ends_with("types.ts")
+        );
+
+        for (line, column) in [(7, 51), (8, 5), (8, 24)] {
+            assert!(
+                !core.request_definition(main.clone(), line, column),
+                "cursor {line}:{column}"
+            );
+        }
+    }
+
+    #[test]
+    fn typescript_navigation_resolves_direct_inline_object_annotation_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main.ts");
+        std::fs::write(
+            &main_path,
+            "const value: { name: string; run(): void } = {} as never;\n\
+             value.name; value?.name; value[\"name\"]; value?.[\"name\"];\n\
+             function use(parameter: { name: string }) { parameter.name; }\n\
+             class Box { field: { name: string }; show() { return this.field.name; } }\n\
+             value.name.deep; value[key]; value[`name`];\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let main = core
+            .open_document(main_path.to_string_lossy().into_owned())
+            .unwrap();
+
+        for (line, column, target_line, target_column) in [
+            (1, 6, 0, 15),
+            (1, 19, 0, 15),
+            (1, 32, 0, 15),
+            (1, 48, 0, 15),
+            (2, 56, 2, 26),
+            (3, 65, 3, 21),
+        ] {
+            assert!(
+                core.request_definition(main.clone(), line, column),
+                "cursor {line}:{column}"
+            );
+            let definition = core.definition_locations(main.clone());
+            assert_eq!(definition.len(), 1);
+            assert_eq!(
+                (definition[0].line, definition[0].column),
+                (target_line, target_column),
+                "cursor {line}:{column}"
+            );
+        }
+
+        assert!(core.request_definition(main.clone(), 4, 6));
+        let definition = core.definition_locations(main.clone());
+        assert_eq!((definition[0].line, definition[0].column), (0, 15));
+        for (line, column) in [(4, 11), (4, 24), (4, 35)] {
+            assert!(
+                !core.request_definition(main.clone(), line, column),
+                "cursor {line}:{column}"
+            );
+        }
+    }
+
+    #[test]
+    fn typescript_navigation_resolves_imported_superclass_members() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+        std::fs::write(
+            dir.path().join("base.ts"),
+            "export class NamedBase { protected schema = 1; create(): void {} }\nexport default class DefaultBase { public schema() {} }\nexport const NotClass = { schema: 1 };\n",
+        )
+        .unwrap();
+        let main_path = dir.path().join("main.ts");
+        std::fs::write(
+            &main_path,
+            "import { NamedBase } from './base';\nimport DefaultBase from './base';\nimport type { NamedBase as TypeBase } from './base';\nimport { NotClass } from './base';\nclass Named extends NamedBase { use() { this.schema; this?.schema; this[\"schema\"]; this.schema.create; this.unknown; } }\nclass Default extends DefaultBase { use() { this.schema; } }\nclass Typed extends TypeBase { use() { this.schema; } }\nclass Value extends NotClass { use() { this.schema; } }\nexport default class extends NamedBase { use() { this.schema; } }\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let main = core
+            .open_document(main_path.to_string_lossy().into_owned())
+            .unwrap();
+
+        for (line, column, target_line, target_column) in [
+            (4, 45, 0, 35),
+            (4, 59, 0, 35),
+            (4, 74, 0, 35),
+            (5, 51, 1, 42),
+            (8, 55, 0, 35),
+        ] {
+            assert!(
+                core.request_definition(main.clone(), line, column),
+                "cursor {line}:{column}"
+            );
+            let definition = core.definition_locations(main.clone());
+            assert_eq!(definition.len(), 1);
+            assert!(definition[0].uri.ends_with("base.ts"));
+            assert_eq!(
+                (definition[0].line, definition[0].column),
+                (target_line, target_column)
+            );
+        }
+        for (line, column) in [(4, 81), (4, 94), (6, 43), (7, 43)] {
+            assert!(
+                !core.request_definition(main.clone(), line, column),
+                "cursor {line}:{column}"
+            );
+        }
+    }
+
+    #[test]
+    fn typescript_definition_prefers_adjacent_package_declarations() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+        let package = dir.path().join("node_modules/@adonisjs/lucid");
+        std::fs::create_dir_all(package.join("build/src/schema")).unwrap();
+        std::fs::write(
+            package.join("package.json"),
+            r#"{"exports":{"./schema":"./build/src/schema/main.js","./without-types":"./build/src/schema/without-types.js"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("build/src/schema/main.js"),
+            "export class BaseSchema { get schema() { return null } }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("build/src/schema/main.d.ts"),
+            "export class BaseSchema { schema: string }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("build/src/schema/without-types.js"),
+            "export class WithoutTypes {}\n",
+        )
+        .unwrap();
+        let main_path = dir.path().join("main.ts");
+        let migration = "export default class extends BaseSchema { up() { this.schema; this.schema; } }\nWithoutTypes;";
+        let source = format!(
+            "import {{ BaseSchema }} from '@adonisjs/lucid/schema';\nimport {{ WithoutTypes }} from '@adonisjs/lucid/without-types';\n{migration}\n"
+        );
+        std::fs::write(&main_path, source).unwrap();
+        let core = Core::new();
+        let main = core
+            .open_document(main_path.to_string_lossy().into_owned())
+            .unwrap();
+
+        assert!(core.request_definition(main.clone(), 0, 30));
+        assert!(
+            core.definition_locations(main.clone())[0]
+                .uri
+                .ends_with("build/src/schema/main.d.ts")
+        );
+
+        assert!(core.request_definition(main.clone(), 0, 10));
+        assert!(
+            core.definition_locations(main.clone())[0]
+                .uri
+                .ends_with("build/src/schema/main.d.ts")
+        );
+
+        let first = migration.find("this.schema").unwrap() + "this.".len();
+        let second = migration.rfind("this.schema").unwrap() + "this.".len();
+        for column in [first, second] {
+            assert!(
+                core.request_definition(main.clone(), 2, column as u64),
+                "cursor 2:{column}"
+            );
+            let definition = core.definition_locations(main.clone());
+            assert_eq!(definition.len(), 1);
+            assert!(definition[0].uri.ends_with("build/src/schema/main.d.ts"));
+        }
+        assert!(core.request_definition(main.clone(), 3, 1));
+        assert!(
+            core.definition_locations(main.clone())[0]
+                .uri
+                .ends_with("build/src/schema/without-types.js")
+        );
+        assert!(!core.request_definition(main, 2, (first + "schema".len()) as u64));
+    }
+
+    #[test]
+    fn typescript_definition_follows_package_declaration_reexports() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+        let adonis = dir
+            .path()
+            .join("node_modules/@adonisjs/core/build/src/helpers");
+        let poppinss = dir.path().join("node_modules/@poppinss/utils/build/src");
+        std::fs::create_dir_all(&adonis).unwrap();
+        std::fs::create_dir_all(&poppinss).unwrap();
+        std::fs::write(
+            dir.path().join("node_modules/@adonisjs/core/package.json"),
+            r#"{"exports":{"./helpers":"./build/src/helpers/main.js"}}"#,
+        )
+        .unwrap();
+        std::fs::write(adonis.join("main.js"), "").unwrap();
+        std::fs::write(
+            adonis.join("main.d.ts"),
+            "export { compose } from '@poppinss/utils';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("node_modules/@poppinss/utils/package.json"),
+            r#"{"exports":{".":"./build/index.js"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path()
+                .join("node_modules/@poppinss/utils/build/index.js"),
+            "",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path()
+                .join("node_modules/@poppinss/utils/build/index.d.ts"),
+            "export { compose } from './src/compose.js';\n",
+        )
+        .unwrap();
+        std::fs::write(
+            poppinss.join("compose.d.ts"),
+            "export declare function compose(): void;\n",
+        )
+        .unwrap();
+        let main_path = dir.path().join("app/models/order.ts");
+        std::fs::create_dir_all(main_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &main_path,
+            "import { DateTime } from 'luxon';\n\
+             import { BaseModel, beforeCreate, belongsTo, column } from '@adonisjs/lucid/orm';\n\
+             import { compose } from '@adonisjs/core/helpers';\n\
+             import { withAuthFinder } from '@adonisjs/auth/mixins/lucid';\n\
+             import hash from '@adonisjs/core/services/hash';\n\
+             import type { BelongsTo } from '@adonisjs/lucid/types/relations';\n\
+             import User from '#models/user';\n\
+             import Product from '#models/product';\n\
+             \n\
+             \n\
+             \n\
+             \n\
+             export default class Order extends compose(BaseModel, withAuthFinder(() => hash.use('scrypt'), {\n\
+               uids: ['email'],\n\
+               passwordColumn: 'password',\n\
+             })) {}\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let main = core
+            .open_document(main_path.to_string_lossy().into_owned())
+            .unwrap();
+
+        let compose_in_import = 10;
+        let compose_in_order_class = "export default class Order extends ".len() as u64;
+        for (line, column) in [(2, compose_in_import), (12, compose_in_order_class)] {
+            assert!(
+                core.request_definition(main.clone(), line, column),
+                "cursor {line}:{column}"
+            );
+            let definition = core.definition_locations(main.clone());
+            assert_eq!(definition.len(), 1);
+            assert!(
+                definition[0]
+                    .uri
+                    .ends_with("@poppinss/utils/build/src/compose.d.ts"),
+                "{definition:?}"
+            );
+            assert_eq!((definition[0].line, definition[0].column), (0, 24));
+        }
+    }
+
+    #[test]
+    fn typescript_definition_resolves_named_declaration_reexports() {
+        let dir = tempfile::tempdir().unwrap();
+        let strategies = dir.path().join("naming_strategies");
+        std::fs::create_dir_all(&strategies).unwrap();
+        std::fs::write(
+            strategies.join("camel_case.d.ts"),
+            "export declare class CamelCaseNamingStrategy {}\nexport declare class Internal {}\nexport interface Typed {}\n",
+        )
+        .unwrap();
+        let barrel_path = dir.path().join("main.d.ts");
+        std::fs::write(
+            &barrel_path,
+            "export { CamelCaseNamingStrategy } from './naming_strategies/camel_case.js';\nexport { Internal as Public } from './naming_strategies/camel_case.js';\nexport type { Typed } from './naming_strategies/camel_case.js';\nexport * from './naming_strategies/camel_case.js';\nexport { Broken as } from './naming_strategies/camel_case.js';\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let barrel = core
+            .open_document(barrel_path.to_string_lossy().into_owned())
+            .unwrap();
+
+        for (line, column, target_line, target_column) in [
+            (0, 10, 0, 21),
+            (1, 10, 1, 21),
+            (1, 22, 1, 21),
+            (2, 15, 2, 7),
+        ] {
+            assert!(
+                core.request_definition(barrel.clone(), line, column),
+                "cursor {line}:{column}"
+            );
+            let definition = core.definition_locations(barrel.clone());
+            assert_eq!(definition.len(), 1);
+            assert!(
+                definition[0]
+                    .uri
+                    .ends_with("naming_strategies/camel_case.d.ts")
+            );
+            assert_eq!(definition[0].line, target_line);
+            assert_eq!(definition[0].column, target_column);
+        }
+        assert!(!core.request_definition(barrel.clone(), 3, 7));
+        assert!(!core.request_definition(barrel, 4, 10));
+    }
+
+    #[test]
+    fn typescript_navigation_resolves_node_modules_declaration_imports_safely() {
+        let dir = tempfile::tempdir().unwrap();
+        let lucid = dir
+            .path()
+            .join("node_modules/@adonisjs/lucid/build/src/connection");
+        std::fs::create_dir_all(&lucid).unwrap();
+        std::fs::write(
+            dir.path().join("node_modules/@adonisjs/lucid/package.json"),
+            r#"{"types":"./build/src/connection/index.d.ts"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            lucid.join("types.d.ts"),
+            "export interface ConnectionConfig {}\nexport interface ConnectionContract {}\n",
+        )
+        .unwrap();
+        let tarn = dir.path().join("node_modules/tarn/dist");
+        std::fs::create_dir_all(&tarn).unwrap();
+        std::fs::write(
+            dir.path().join("node_modules/tarn/package.json"),
+            r#"{"types":"./dist/tarn.d.ts"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tarn.join("tarn.d.ts"),
+            "export * from './one.js';\nexport * from './two.js';\n",
+        )
+        .unwrap();
+        std::fs::write(tarn.join("one.js"), "").unwrap();
+        std::fs::write(tarn.join("two.js"), "").unwrap();
+        std::fs::write(tarn.join("one.d.ts"), "export declare class Pool {}\n").unwrap();
+        std::fs::write(tarn.join("two.d.ts"), "export declare class Other {}\n").unwrap();
+        let knex = dir.path().join("node_modules/knex/types");
+        std::fs::create_dir_all(&knex).unwrap();
+        std::fs::write(
+            dir.path().join("node_modules/knex/package.json"),
+            r#"{"types":"./types/index.d.ts"}"#,
+        )
+        .unwrap();
+        std::fs::write(knex.join("index.d.ts"), "declare namespace Knex {}\n").unwrap();
+        let core = dir.path().join("node_modules/@adonisjs/core");
+        std::fs::create_dir_all(core.join("build")).unwrap();
+        std::fs::write(
+            core.join("package.json"),
+            r#"{"exports":{"./logger":"./build/logger.js"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            core.join("build/logger.d.ts"),
+            "export as namespace Logger;\n",
+        )
+        .unwrap();
+        let node = dir.path().join("node_modules/@types/node");
+        std::fs::create_dir_all(&node).unwrap();
+        std::fs::write(
+            node.join("package.json"),
+            r#"{"exports":{"./events":"./events.d.ts"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            node.join("events.d.ts"),
+            "export declare class EventEmitter {}\n",
+        )
+        .unwrap();
+        let connection = lucid.join("index.d.ts");
+        std::fs::write(
+            &connection,
+            "const broken = ;\nimport type { ConnectionConfig, ConnectionContract } from './types.js';\nimport { Pool } from 'tarn';\nimport type Knex from 'knex';\nimport Logger from '@adonisjs/core/logger';\nimport { EventEmitter } from 'node:events';\nexport type UsesConfig = ConnectionConfig;\nexport type UsesContract = ConnectionContract;\nexport type UsesPool = Pool;\nexport type UsesKnex = Knex;\nexport type UsesLogger = Logger;\nexport type UsesEmitter = EventEmitter;\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let document = core
+            .open_document(connection.to_string_lossy().into_owned())
+            .unwrap();
+
+        for (line, column, target_line) in [(1, 14, 0), (1, 32, 1)] {
+            assert!(
+                core.request_definition(document.clone(), line, column),
+                "cursor {line}:{column}"
+            );
+            let definition = core.definition_locations(document.clone());
+            assert!(definition[0].uri.ends_with("connection/types.d.ts"));
+            assert_eq!((definition[0].line, definition[0].column), (target_line, 7));
+        }
+        for (line, column, target, target_position) in [
+            (2, 9, "tarn/dist/one.d.ts", (0, 21)),
+            (3, 12, "knex/types/index.d.ts", (0, 0)),
+            (4, 7, "@adonisjs/core/build/logger.d.ts", (0, 0)),
+            (5, 9, "@types/node/events.d.ts", (0, 21)),
+        ] {
+            assert!(
+                core.request_definition(document.clone(), line, column),
+                "cursor {line}:{column}"
+            );
+            let definition = core.definition_locations(document.clone());
+            assert!(definition[0].uri.ends_with(target));
+            assert_eq!((definition[0].line, definition[0].column), target_position);
+        }
+        let malformed = lucid.join("malformed.d.ts");
+        std::fs::write(&malformed, "import { Malformed from 'tarn';\n").unwrap();
+        let malformed = core
+            .open_document(malformed.to_string_lossy().into_owned())
+            .unwrap();
+        assert!(!core.request_definition(malformed, 0, 9));
+    }
+
+    #[test]
+    fn typescript_navigation_does_not_resolve_node_specifiers_without_local_types() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("node_modules/pkg/index.d.ts");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path.parent().unwrap().join("package.json"), "{}").unwrap();
+        std::fs::write(
+            &path,
+            "import { EventEmitter } from 'node:events';\nEventEmitter;\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let document = core
+            .open_document(path.to_string_lossy().into_owned())
+            .unwrap();
+        assert!(!core.request_definition(document, 0, 9));
+    }
+
+    #[test]
+    fn typescript_union_members_require_one_exact_definition() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+        std::fs::write(
+            dir.path().join("types.ts"),
+            "export interface User { name: string }\nexport interface Other { name: string }\n",
+        )
+        .unwrap();
+        let main_path = dir.path().join("main.ts");
+        std::fs::write(
+            &main_path,
+            "import type { User, Other } from './types';\n\
+             import { User as ValueUser } from './types';\n\
+             const same: User | User = {} as never; same.name;\n\
+             const different: User | Other = {} as never; different.name;\n\
+             const inline: { name: string } | { name: string } = {} as never; inline.name;\n\
+             const value: ValueUser = {} as never; value.name;\n\
+             { interface User { local: string } const local: User = {} as never; local.local; }\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let main = core
+            .open_document(main_path.to_string_lossy().into_owned())
+            .unwrap();
+
+        assert!(core.request_definition(main.clone(), 2, 45));
+        let same = core.definition_locations(main.clone());
+        assert_eq!(same.len(), 1);
+        assert!(same[0].uri.ends_with("types.ts"));
+        assert_eq!((same[0].line, same[0].column), (0, 24));
+        for (line, column) in [(3, 57), (4, 83), (5, 53)] {
+            assert!(
+                !core.request_definition(main.clone(), line, column),
+                "cursor {line}:{column}"
+            );
+        }
+        assert!(core.request_definition(main, 6, 78));
     }
 
     #[test]
@@ -5950,6 +9045,18 @@ mod tests {
             (3, 0, 4, 0)
         );
         assert!(edit.new_text.is_empty());
+    }
+
+    #[test]
+    fn typescript_code_actions_are_not_dispatched_to_the_php_engine() {
+        let core = Core::new();
+        let doc = doc_at(
+            "component.ts",
+            "import { Widget } from './widget';\nWidget;\n",
+            0,
+        );
+
+        assert!(!core.request_code_actions(doc, 42, 99));
     }
 
     #[test]

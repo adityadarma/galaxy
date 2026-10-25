@@ -360,14 +360,6 @@ extension EditorView {
         guard let range = Self.identifierRange(in: text, at: Int(pos.colUtf16)) else { return nil }
         // Words between tags (`<p>Recorded admin</p>`) are text, not names.
         if document.isMarkupText(line: pos.line, colUtf16: UInt64(range.lowerBound)) { return nil }
-        // Built-in types and literals share the `type`/`constant` scopes with
-        // classes and user constants, so filter them by name. PHP is
-        // case-insensitive here (`NULL`, `String`). Checked before the style
-        // lookup: a name without a style run would otherwise stay a link.
-        if let builtins = Self.builtins(for: document) {
-            let word = (text as NSString).substring(with: NSRange(location: range.lowerBound, length: range.count))
-            if builtins.names.contains(builtins.caseInsensitive ? word.lowercased() : word) { return nil }
-        }
         let styles = document.viewport(firstLine: pos.line, count: 1).styles.filter { $0.line == pos.line }
         // Look up the scope at the name itself: PHP grammars may style the
         // `$` of a variable as punctuation.
@@ -377,6 +369,12 @@ extension EditorView {
             return qualified(range, in: text, document: document)
         }
         if Self.nonNavigableScopes.contains(run.scope) { return nil }
+        // Filter primitives only when syntax marks them as types/constants.
+        // `table.string()` is a method, not the TypeScript `string` primitive.
+        if ["type", "constant"].contains(run.scope), let builtins = Self.builtins(for: document) {
+            let word = (text as NSString).substring(with: NSRange(location: range.lowerBound, length: range.count))
+            if builtins.names.contains(builtins.caseInsensitive ? word.lowercased() : word) { return nil }
+        }
         if run.scope == "string" {
             return Self.frameworkStringRange(in: text, stringStart: Int(run.start), stringEnd: Int(run.end))
         }

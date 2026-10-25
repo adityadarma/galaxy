@@ -180,6 +180,22 @@ final class NavigationTests: XCTestCase {
         XCTAssertNil(v.definitionLink)
     }
 
+    func testCommandHoverUnderlinesTypeScriptBuilderMethod() throws {
+        let text = "      table.string('name').notNullable()"
+        let c = try makeController(text: text)
+        let v = c.editorView
+        v.document?.setPath(path: "/tmp/migration.ts")
+        v.onDefinitionClick = { _ in true }
+        let column = (text as NSString).range(of: "string").location + 2
+        let x = v.textOriginX + v.xOffset(in: text, column: UInt64(column)) + 0.5
+        v.lastMousePoint = NSPoint(x: x, y: v.metrics.lineHeight / 2)
+
+        v.updateDefinitionLink(commandHeld: true)
+        XCTAssertEqual(v.definitionLink?.line, 0)
+        XCTAssertEqual(v.definitionLink?.start, 12)
+        XCTAssertEqual(v.definitionLink?.end, 18)
+    }
+
     func testImportSpecifierRangeCoversOnlyModulePaths() {
         func range(_ text: String, _ literal: String) -> String? {
             let ns = text as NSString
@@ -253,6 +269,39 @@ final class NavigationTests: XCTestCase {
         XCTAssertNotNil(link(line: 0, at: "/config"), "slashes are part of the link")
         XCTAssertNotNil(link(line: 1, at: "node:fs"), "package paths are links too")
         XCTAssertNil(link(line: 2, at: "hello"), "other strings are not links")
+    }
+
+    func testCommandClickFollowsMigrationCallbackParameter() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-migration-\(UUID().uuidString)")
+        let file = dir.appendingPathComponent("database/migrations/create_roles_table.ts")
+        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let source = """
+        export default class {
+          async up() {
+            this.schema.createTable(this.tableName, (table) => {
+              table.uuid('id').primary()
+            })
+          }
+        }
+        """
+        try source.write(to: file, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: dir) }
+
+        let controller = MainWindowController(bridge: CoreBridge())
+        controller.showWindow(nil)
+        defer { controller.window?.orderOut(nil) }
+        try controller.openFile(at: file)
+        let view = controller.editorView
+        let line = "      table.uuid('id').primary()"
+        let table = (line as NSString).range(of: "table")
+        click(view, line: 3, utf16Col: table.location + 1, flags: .command)
+
+        let deadline = Date().addingTimeInterval(2)
+        while (view.document?.primaryCursor().line, view.document?.primaryCursor().colUtf16) != (2, 45), Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
+        XCTAssertEqual(view.document?.primaryCursor().line, 2)
+        XCTAssertEqual(view.document?.primaryCursor().colUtf16, 45)
     }
 
     func testCommandHoverSkipsPrimitiveTypesOutsidePHPToo() throws {

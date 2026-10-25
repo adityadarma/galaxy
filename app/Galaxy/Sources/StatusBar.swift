@@ -19,6 +19,9 @@ final class StatusBar: NSView {
     /// Opens the Git Graph tab of the bottom panel; shown beside the branch.
     let gitGraph = NSButton()
     var onGitGraphClick: (() -> Void)?
+    let workspaceScan = StatusBar.label("workspace-scan")
+    private var scanRoot: String?
+    private var scans = Set<String>()
     let cursor = StatusBar.label("status-cursor")
     let language = StatusBar.label("status-language")
     let indent = StatusBar.label("status-indent")
@@ -70,7 +73,10 @@ final class StatusBar: NSView {
         gitGraph.action = #selector(gitGraphClicked(_:))
         gitGraph.isHidden = true
 
-        let left = NSStackView(views: [git, gitGraph, message, largeFileBadge])
+        workspaceScan.setAccessibilityLabel("Workspace scan status")
+        workspaceScan.isHidden = true
+
+        let left = NSStackView(views: [git, gitGraph, workspaceScan, message, largeFileBadge])
         left.spacing = 8
         let right = NSStackView(views: [cursor, language, indent, lineEnding, encoding])
         right.spacing = 14
@@ -149,6 +155,35 @@ final class StatusBar: NSView {
         git.title = text
         git.stringValue = text
         git.toolTip = branch
+    }
+
+    func resetWorkspaceScan(root: String) {
+        scanRoot = root
+        scans.removeAll()
+        updateWorkspaceScan()
+    }
+
+    func workspaceScanStarted(root: String, label: String) {
+        guard root == scanRoot else { return }
+        scans.insert(label)
+        updateWorkspaceScan()
+    }
+
+    func workspaceScanFinished(root: String, label: String) {
+        guard root == scanRoot else { return }
+        scans.remove(label)
+        updateWorkspaceScan()
+    }
+
+    private func updateWorkspaceScan() {
+        workspaceScan.isHidden = scans.isEmpty
+        guard !scans.isEmpty else {
+            workspaceScan.stringValue = ""
+            return
+        }
+        workspaceScan.stringValue = scans.count == 1
+            ? "Scanning \(scans.first!)..."
+            : "Scanning \(scans.count) engines..."
     }
 
     @objc private func gitClicked(_ sender: Any?) { onGitClick?() }

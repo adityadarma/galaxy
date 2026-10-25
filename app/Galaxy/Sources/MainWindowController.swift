@@ -375,6 +375,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 self?.statusLabel.stringValue = "Go modules downloaded; reindexing..."
             case let .goModulesFailed(_, message):
                 self?.statusLabel.stringValue = "Go module download failed: \(message)"
+            case let .workspaceScanStarted(root, label):
+                self?.statusBar.workspaceScanStarted(root: root, label: label)
+            case let .workspaceScanFinished(root, label):
+                self?.statusBar.workspaceScanFinished(root: root, label: label)
             }
         }
         statusBar.onGitClick = { [weak self] in self?.showGitBranchPicker() }
@@ -873,6 +877,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         explorer.onRename = { [weak self] entry, name in self?.renameEntry(entry, to: name) }
         explorer.contextMenu = { [weak self] in self?.explorerContextMenu() }
         explorer.outlineView.onKey = { [weak self] event in self?.explorerKey(event) ?? false }
+        pathBar.menuForComponent = { [weak self] index in self?.pathBarMenu(for: index) }
 
         sidebar.addSubview(sectionHeader)
         sidebar.addSubview(explorer.scrollView)

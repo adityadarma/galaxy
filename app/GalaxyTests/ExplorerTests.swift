@@ -378,6 +378,29 @@ final class ExplorerTests: XCTestCase {
         XCTAssertTrue(bar.isEdited)
     }
 
+    func testPathBarFolderMenuListsChildrenAndOpensFiles() throws {
+        let root = try makeTree()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let controller = MainWindowController(bridge: CoreBridge())
+        controller.showWindow(nil)
+        defer { controller.window?.orderOut(nil) }
+        controller.open(url: root)
+        controller.explorer.outlineView.selectRowIndexes([1], byExtendingSelection: false) // src
+        controller.explorer.outlineView.selectRowIndexes([3], byExtendingSelection: false) // src/main.rs
+
+        XCTAssertEqual(controller.pathBar.components, ["src", "main.rs"])
+        let menu = try XCTUnwrap(controller.pathBarMenu(for: 0))
+        let deep = try XCTUnwrap(menu.items.first { $0.title == "deep" })
+        XCTAssertNotNil(deep.submenu, "folder children remain submenus")
+        let main = try XCTUnwrap(menu.items.first { $0.title == "main.rs" })
+        XCTAssertEqual(main.representedObject as? FileEntry, try controller.workspace?.listDir(relPath: "src").first { $0.name == "main.rs" })
+
+        XCTAssertTrue(NSApp.sendAction(try XCTUnwrap(main.action), to: main.target, from: main))
+        XCTAssertEqual(controller.tabBar.items.last?.title, "main.rs")
+        XCTAssertFalse(controller.tabBar.items.last?.isPreview ?? true)
+        XCTAssertNil(controller.pathBarMenu(for: 1), "the file component has no menu")
+    }
+
     func testOpeningAFolderReplacesTheEmptyState() throws {
         let root = try makeTree()
         defer { try? FileManager.default.removeItem(at: root) }

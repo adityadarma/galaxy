@@ -37,6 +37,22 @@ final class StatusBarTests: XCTestCase {
         XCTAssertTrue(bar.gitGraph.isHidden)
     }
 
+    func testWorkspaceScanShowsConcurrentEnginesAndIgnoresStaleWorkspace() {
+        let bar = StatusBar()
+        bar.resetWorkspaceScan(root: "/one")
+        bar.workspaceScanStarted(root: "/one", label: "TypeScript")
+        XCTAssertFalse(bar.workspaceScan.isHidden)
+        XCTAssertEqual(bar.workspaceScan.stringValue, "Scanning TypeScript...")
+        bar.workspaceScanStarted(root: "/one", label: "Go")
+        XCTAssertEqual(bar.workspaceScan.stringValue, "Scanning 2 engines...")
+        bar.resetWorkspaceScan(root: "/two")
+        bar.workspaceScanFinished(root: "/one", label: "TypeScript")
+        XCTAssertTrue(bar.workspaceScan.isHidden)
+        bar.workspaceScanStarted(root: "/two", label: "PHP")
+        bar.workspaceScanFinished(root: "/two", label: "PHP")
+        XCTAssertTrue(bar.workspaceScan.isHidden)
+    }
+
     func testGitDecorationsAreRepresentedByViewModels() {
         let item = TabBar.Item(title: "main.rs", isPreview: false, isEdited: false, isGitChanged: true)
         XCTAssertTrue(item.isGitChanged)

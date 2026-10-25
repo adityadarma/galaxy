@@ -16,8 +16,8 @@ extension MainWindowController {
         // A relative import is a file on disk: open it without the server.
         // Packages (`node:fs`, `react`) go to the server below.
         if let specifier = editorView.importSpecifier(at: position),
-           let target = EditorView.resolveImport(specifier.path, from: document.path()) {
-            jump(to: DefinitionLocation(uri: URL(fileURLWithPath: target).absoluteString, line: 0, column: 0))
+           let target = bridge.resolveJavaScriptRelativeImport(specifier: specifier.path, fromPath: document.path()) {
+            jump(to: target)
             return true
         }
         definitionRequest = (document, position)
@@ -26,10 +26,10 @@ extension MainWindowController {
     }
 
     func refreshDefinition() {
-        guard let request = definitionRequest,
-              let location = bridge.definitionLocations(document: request.document).first else { return }
+        guard let request = definitionRequest else { return }
+        let location = bridge.definitionLocations(document: request.document).first
         definitionRequest = nil
-        jump(to: location)
+        if let location { jump(to: location) }
     }
 
     /// Opens `location` and records the jump for back/forward.

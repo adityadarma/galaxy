@@ -35,6 +35,18 @@ final class CoreBridge {
         core.newDocument()
     }
 
+    func javascriptProject(path: String) -> JavaScriptProjectInfo? {
+        core.javascriptProject(path: path)
+    }
+
+    func javascriptComponents(path: String) -> [JavaScriptComponentInfo] {
+        core.javascriptComponents(path: path)
+    }
+
+    func resolveJavaScriptRelativeImport(specifier: String, fromPath: String) -> DefinitionLocation? {
+        core.resolveJavascriptRelativeImport(specifier: specifier, fromPath: fromPath)
+    }
+
     func openDocument(path: String) throws -> DocumentHandle {
         try core.openDocument(path: path)
     }
@@ -88,7 +100,9 @@ final class CoreBridge {
     }
 
     func requestDefinition(document: DocumentHandle, line: UInt64, character: UInt64) {
-        _ = core.requestDefinition(document: document, line: line, character: character)
+        _ = core.requestDefinitionForNavigation(
+            document: document, line: line, character: character, navigationToken: "definition"
+        )
     }
 
     func definitionLocations(document: DocumentHandle) -> [DefinitionLocation] {
