@@ -98,6 +98,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     var blameCommit: BlameCommitInfo?
     var blameRefreshItem: DispatchWorkItem?
     var blameHideItem: DispatchWorkItem?
+    /// Scroll notifications can arrive much faster than display refresh.
+    /// Minimap and sticky scope updates are decorative, so coalesce them.
+    var scrollDecorationUpdatePending = false
+    var lastScrollDecorationUpdate = Date.distantPast
     /// Quiet time after the last edit before blame is recomputed.
     static let blameRefreshDelay: TimeInterval = 0.5
     let completionPopup = CompletionPopup()
@@ -534,7 +538,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 self?.refreshRename()
                 self?.refreshCodeActions()
                 self?.refreshDocumentSymbols()
-                self?.updateStickyScope()
                 self?.reloadSettings()
                 let problems = self?.bridge.core.problems() ?? []
                 self?.problemsPanel.update(problems)

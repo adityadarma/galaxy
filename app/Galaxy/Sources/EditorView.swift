@@ -206,6 +206,7 @@ final class EditorView: NSView {
     /// Drops derived Core Text caches while retaining the document.
     func releaseNonEssentialCaches() {
         layouts.removeAll()
+        syntaxLayouts.removeAll()
         caretRects.removeAll(keepingCapacity: false)
         needsDisplay = true
     }
@@ -214,6 +215,9 @@ final class EditorView: NSView {
     var forcedCaretVisible: Bool?
 
     private var layouts = TwoGenerationCache<String, CTLine>(capacity: 1024)
+    /// Colored layouts include resolved theme colors, so they need their own
+    /// cache key and are cleared when the font or appearance changes.
+    private var syntaxLayouts = TwoGenerationCache<String, CTLine>(capacity: 512)
     /// Caret rectangles from the last draw, keyed by line, so a blink only
     /// invalidates those few rects instead of the whole view.
     private var caretRects: [Int: [NSRect]] = [:]
@@ -362,6 +366,7 @@ final class EditorView: NSView {
         super.viewDidChangeEffectiveAppearance()
         // Syntax CTLines contain resolved theme colors, unlike the cached
         // monochrome layouts, so recreate them under the new appearance.
+        syntaxLayouts.removeAll()
         needsDisplay = true
     }
 
@@ -406,6 +411,7 @@ final class EditorView: NSView {
         font = newFont
         metrics = Metrics(font: newFont)
         layouts.removeAll()
+        syntaxLayouts.removeAll()
         contentTextWidth = 0
         reloadDocument()
     }
@@ -1168,15 +1174,14 @@ final class EditorView: NSView {
         return line
     }
 
-    /// A colored layout is intentionally not cached: style runs, selection
-    /// and macOS appearance change independently while plain layouts are
-    /// shared for drawing, hit-testing and scrolling.
     static let fadedAlpha: CGFloat = 0.45
 
     func syntaxLayout(for text: String, styles: [StyleRun], faded: [Range<Int>] = []) -> CTLine {
         // No `kCTForegroundColorFromContextAttributeName` here: it makes
         // CoreText draw every run in the context's fill color, so all syntax
         // colors came out as `textColor`. Unstyled text gets it explicitly.
+        let key = "\(effectiveAppearance.name.rawValue)\u{1f}\(text)\u{1f}\(styles.map { "\($0.start):\($0.end):\($0.scope)" }.joined(separator: ","))\u{1f}\(faded.map { "\($0.lowerBound):\($0.upperBound)" }.joined(separator: ","))"
+        if let cached = syntaxLayouts.value(for: key) { return cached }
         let base = Theme.editorForeground.resolved(for: effectiveAppearance)
         let attributed = NSMutableAttributedString(string: text, attributes: [.font: font, .foregroundColor: base])
         let length = (text as NSString).length
@@ -1199,7 +1204,10 @@ final class EditorView: NSView {
                 attributed.addAttribute(.foregroundColor, value: color.withAlphaComponent(Self.fadedAlpha), range: run)
             }
         }
-        return CTLineCreateWithAttributedString(attributed)
+        let line = CTLineCreateWithAttributedString(attributed)
+        syntaxLayouts.insert(line, for: key)
+        layoutsCreated += 1
+        return line
     }
 }
 

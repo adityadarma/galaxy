@@ -66,4 +66,13 @@ final class SyntaxThemeTests: XCTestCase {
         }
         XCTAssertGreaterThan(pink, 10, "keyword run must use its theme color, not the context fill")
     }
+
+    func testEditorCachesSyntaxLayoutsAcrossRedraws() {
+        let view = EditorView(frame: NSRect(x: 0, y: 0, width: 400, height: 100))
+        let styles = [StyleRun(line: 0, start: 0, end: 2, scope: "keyword")]
+        _ = view.syntaxLayout(for: "fn main", styles: styles)
+        let created = view.layoutsCreated
+        _ = view.syntaxLayout(for: "fn main", styles: styles)
+        XCTAssertEqual(view.layoutsCreated, created)
+    }
 }

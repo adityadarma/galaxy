@@ -26,8 +26,7 @@ extension MainWindowController {
             let center = NotificationCenter.default
             center.addObserver(forName: NSView.boundsDidChangeNotification, object: scrollView.contentView, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated {
-                    self?.minimap.needsDisplay = true
-                    self?.updateStickyScope()
+                    self?.scheduleScrollDecorationUpdate()
                 }
             }
             // The scroll view is created empty and sized by its split view
@@ -50,6 +49,23 @@ extension MainWindowController {
         let width = MinimapView.width
         minimap.frame = NSRect(x: scrollView.bounds.width - width, y: 0, width: width, height: scrollView.bounds.height)
         minimap.needsDisplay = true
+    }
+
+    /// Keeps scroll painting responsive when trackpads emit many bounds-change
+    /// notifications. The editor itself scrolls natively; only decorations are
+    /// rate-limited to 30 Hz.
+    func scheduleScrollDecorationUpdate() {
+        guard !scrollDecorationUpdatePending else { return }
+        scrollDecorationUpdatePending = true
+        let interval = 1.0 / 30.0
+        let delay = max(0, interval - Date().timeIntervalSince(lastScrollDecorationUpdate))
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            self.scrollDecorationUpdatePending = false
+            self.lastScrollDecorationUpdate = Date()
+            if !self.minimap.isHidden { self.minimap.needsDisplay = true }
+            self.updateStickyScope()
+        }
     }
 
     // MARK: Word wrap

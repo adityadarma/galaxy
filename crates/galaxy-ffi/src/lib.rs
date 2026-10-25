@@ -411,6 +411,10 @@ pub struct Core {
     /// Per open PHP file: text revision last analysed, when it was first
     /// seen and whether the analysis ran.
     php_checked: Mutex<HashMap<String, (u64, Instant, bool)>>,
+    /// Per open TypeScript file: buffer revision last indexed. Analysis is
+    /// polled frequently for other engines, but reparsing unchanged buffers
+    /// would traverse the whole Tree-sitter tree on every poll.
+    typescript_checked: Mutex<HashMap<String, u64>>,
     /// Parsed disk documents and successful module resolutions used by TypeScript navigation.
     typescript_navigation: Arc<Mutex<TypeScriptNavigationCache>>,
 }
@@ -424,6 +428,7 @@ impl Default for Core {
             go: Arc::new(Mutex::new(HashMap::new())),
             php_documents: Mutex::new(HashMap::new()),
             php_checked: Mutex::new(HashMap::new()),
+            typescript_checked: Mutex::new(HashMap::new()),
             typescript_navigation: Arc::new(Mutex::new(TypeScriptNavigationCache::default())),
         }
     }
@@ -673,6 +678,10 @@ impl Core {
                 open.remove(&uri);
                 analysis.forget(&uri);
                 self.release_go_buffer(&uri);
+                self.typescript_checked
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&uri);
             }
             open.iter()
                 .filter_map(|(uri, weak)| Some((uri.clone(), weak.upgrade()?)))
@@ -1777,12 +1786,23 @@ impl Core {
         analysis: &mut BuiltinStore,
         documents: &HashMap<String, Arc<DocumentHandle>>,
     ) {
+        let mut checked = self
+            .typescript_checked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for (uri, document) in documents {
             let path = document.path();
             if !is_typescript_path(Path::new(&path)) {
                 continue;
             }
-            let index = DocumentIndex::parse(&path, &document.lock().editor.doc.text());
+            let (revision, text) = {
+                let state = document.lock();
+                (state.editor.doc.revision(), state.editor.doc.text())
+            };
+            if checked.get(uri) == Some(&revision) {
+                continue;
+            }
+            let index = DocumentIndex::parse(&path, &text);
             let mut diagnostics: Vec<_> = index
                 .diagnostics
                 .iter()
@@ -1843,6 +1863,7 @@ impl Core {
                     .map(|declaration| typescript_outline_symbol(declaration, uri))
                     .collect(),
             );
+            checked.insert(uri.clone(), revision);
         }
     }
 
@@ -7943,6 +7964,14 @@ mod tests {
             "{:?}",
             document.lock().diagnostics
         );
+        let uri = file_uri(&path);
+        let first_revision = document.revision();
+        core.poll_analysis();
+        assert_eq!(
+            core.typescript_checked.lock().unwrap().get(&uri),
+            Some(&first_revision),
+            "unchanged TypeScript buffers must not be reparsed by every analysis poll"
+        );
 
         assert!(document.apply_rename_edits(vec![RenameEdit {
             uri: String::new(),
@@ -7953,6 +7982,11 @@ mod tests {
             new_text: "missing-pkg".into(),
         }]));
         core.poll_analysis();
+        assert_eq!(
+            core.typescript_checked.lock().unwrap().get(&uri),
+            Some(&document.revision()),
+            "an edit must invalidate the cached TypeScript analysis"
+        );
         let diagnostics = document.lock().diagnostics.clone();
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(diagnostics[0].severity, 2);

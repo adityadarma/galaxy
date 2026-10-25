@@ -107,4 +107,14 @@ final class MinimapTests: XCTestCase {
         let rep = try XCTUnwrap(minimap.bitmapImageRepForCachingDisplay(in: minimap.bounds))
         minimap.cacheDisplay(in: minimap.bounds, to: rep)
     }
+
+    func testScrollDecorationUpdatesAreCoalesced() throws {
+        let c = try makeWindow(lines: 100)
+        defer { c.window?.orderOut(nil) }
+        c.scheduleScrollDecorationUpdate()
+        c.scheduleScrollDecorationUpdate()
+        XCTAssertTrue(c.scrollDecorationUpdatePending)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+        XCTAssertFalse(c.scrollDecorationUpdatePending)
+    }
 }
