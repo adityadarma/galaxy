@@ -3,6 +3,28 @@ import XCTest
 
 @MainActor
 final class ExplorerTests: XCTestCase {
+    func testMaterialIconMappingsCoverCommonFilesAndFolders() {
+        XCTAssertEqual(FileGlyph.style(for: "package.json").0, "npm")
+        XCTAssertEqual(FileGlyph.style(for: "dockerfile").0, "docker")
+        XCTAssertEqual(FileGlyph.style(for: ".dockerignore").0, "docker")
+        XCTAssertEqual(FileGlyph.style(for: ".editorconfig").0, "settings")
+        XCTAssertEqual(FileGlyph.style(for: ".env.example").0, "lock")
+        XCTAssertEqual(FileGlyph.style(for: ".gitlab-ci_release.yml").0, "gitlab")
+        XCTAssertEqual(FileGlyph.style(for: ".prettierignore").0, "prettier")
+        XCTAssertEqual(FileGlyph.style(for: "tsx").0, "react_ts")
+        XCTAssertEqual(FileGlyph.style(for: "yaml").0, "yaml")
+        XCTAssertEqual(FileGlyph.style(for: "prisma").0, "prisma")
+        XCTAssertEqual(ExplorerIcon.folderAsset(named: "components"), "folder-components")
+        XCTAssertEqual(ExplorerIcon.folderAsset(named: ".docker"), "folder-docker")
+        XCTAssertEqual(ExplorerIcon.folderAsset(named: "Http"), "folder-routes")
+        XCTAssertEqual(ExplorerIcon.folderAsset(named: "bootstrap"), "folder-config")
+        XCTAssertEqual(ExplorerIcon.folderAsset(named: "factories"), "folder-migrations")
+        XCTAssertEqual(ExplorerIcon.folderAsset(named: "Feature"), "folder-test")
+        XCTAssertEqual(ExplorerIcon.folderAsset(named: "vendor"), "folder-packages")
+        XCTAssertEqual(ExplorerIcon.folderAsset(named: "migrations"), "folder-migrations")
+        XCTAssertEqual(ExplorerIcon.folderAsset(named: "node_modules"), "folder-node")
+    }
+
     private func makeTree() throws -> URL {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("galaxy-ws-\(UUID().uuidString)")

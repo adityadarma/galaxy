@@ -763,14 +763,39 @@ enum ExplorerIcon {
     private static var cache: [String: NSImage?] = [:]
 
     static func folder(named name: String) -> Icon {
-        let asset = ["src", "sources", "source"].contains(name.lowercased()) ? "folder-src" : "folder-base"
+        let asset = folderAsset(named: name) ?? "folder-base"
         return Icon(image: image(named: asset), isMaterial: true)
+    }
+
+    static func folderAsset(named name: String) -> String? {
+        switch name.lowercased() {
+        case "src", "sources", "source": "folder-src"
+        case "app": "folder-src"
+        case ".docker", "docker": "folder-docker"
+        case ".git": "folder-git"
+        case ".github", ".gitea": "folder-github"
+        case "config", "configs", "configuration", "settings", "bootstrap", "cache", "framework": "folder-config"
+        case "images", "image", "img", "icons", "media": "folder-images"
+        case "public", "static", "storage": "folder-public"
+        case "docs", "doc", "documentation": "folder-docs"
+        case "test", "tests", "spec", "specs", "__tests__", "feature", "unit": "folder-test"
+        case "components", "component", "models", "providers", "services", "views", "css", "js": "folder-components"
+        case "routes", "route", "http": "folder-routes"
+        case "database", "db": "folder-database"
+        case "migrations", "migration", "factories", "seeders": "folder-migrations"
+        case "resources": "folder-src"
+        case "scripts", "script", "bin": "folder-scripts"
+        case "node_modules": "folder-node"
+        case "packages", "package", "vendor": "folder-packages"
+        default: nil
+        }
     }
 
     static func image(named name: String) -> NSImage? {
         if let hit = cache[name] { return hit }
         // Xcode copies resource folders into the bundle's flat Resources root.
         let url = Bundle.main.url(forResource: name, withExtension: "svg")
+            ?? Bundle.main.url(forResource: name, withExtension: "svg", subdirectory: "MaterialIcons")
         let image = url.flatMap(NSImage.init(contentsOf:))
         // The SVGs only carry a viewBox (24 or 32 units), which NSImage takes
         // as point size. Pin them to the 16pt glyph size used everywhere;
@@ -792,8 +817,9 @@ enum FileGlyph {
     private static var cache: [String: Glyph] = [:]
 
     static func `for`(name: String) -> Glyph {
-        let ext = (name as NSString).pathExtension.lowercased()
-        let key = name.hasSuffix(".blade.php") ? "blade.php" : (name.hasPrefix(".git") ? ".git" : ext)
+        let lowercased = name.lowercased()
+        let ext = (lowercased as NSString).pathExtension
+        let key = namedFileKey(lowercased) ?? (lowercased.hasSuffix(".blade.php") ? "blade.php" : (lowercased.hasPrefix(".git") ? ".git" : ext))
         if let hit = cache[key] { return hit }
         let (asset, symbol, color) = style(for: key)
         let image = asset.flatMap(ExplorerIcon.image(named:)) ?? NSImage(systemSymbolName: symbol, accessibilityDescription: nil)?
@@ -803,23 +829,66 @@ enum FileGlyph {
         return glyph
     }
 
-    private static func style(for key: String) -> (String?, String, NSColor) {
+    private static func namedFileKey(_ name: String) -> String? {
+        switch name {
+        case "dockerfile", "docker-compose.yml", "docker-compose.yaml",
+            "package.json", "package-lock.json", "npm-shrinkwrap.json",
+            "pnpm-lock.yaml", "yarn.lock", "bun.lockb", "bun.lock",
+            "composer.lock", "cargo.lock", "gemfile.lock", "tsconfig.json", "jsconfig.json",
+            ".eslintrc", ".eslintrc.json", ".eslintrc.js", "eslint.config.js", "eslint.config.mjs",
+            ".prettierrc", ".prettierrc.json", ".prettierrc.js", "prettier.config.js",
+            "readme.md", "readme", "license", "license.md", "copying",
+            ".dockerignore", ".editorconfig", ".env", ".env.example", ".prettierignore",
+            ".gitignore", ".gitattributes", ".gitmodules", ".gitlab-ci.yml",
+            ".gitlab-ci_gitlab.yml", ".gitlab-ci_release.yml":
+            name
+        default:
+            nil
+        }
+    }
+
+    static func style(for key: String) -> (String?, String, NSColor) {
         switch key {
+        case "dockerfile", "docker-compose.yml", "docker-compose.yaml": ("docker", "shippingbox", .labelColor)
+        case "package.json": ("npm", "shippingbox", .labelColor)
+        case "package-lock.json", "npm-shrinkwrap.json": ("lock", "lock", .labelColor)
+        case "pnpm-lock.yaml": ("pnpm", "lock", .labelColor)
+        case "yarn.lock": ("yarn", "lock", .labelColor)
+        case "bun.lockb", "bun.lock": ("bun", "lock", .labelColor)
+        case "composer.lock", "cargo.lock", "gemfile.lock": ("lock", "lock", .labelColor)
+        case "tsconfig.json", "jsconfig.json": ("tsconfig", "gearshape", .labelColor)
+        case ".eslintrc", ".eslintrc.json", ".eslintrc.js", "eslint.config.js", "eslint.config.mjs": ("eslint", "checkmark.seal", .labelColor)
+        case ".prettierrc", ".prettierrc.json", ".prettierrc.js", "prettier.config.js": ("prettier", "paintbrush", .labelColor)
+        case "readme.md", "readme": ("readme", "book", .labelColor)
+        case "license", "license.md", "copying": ("license", "doc.text", .labelColor)
+        case ".dockerignore": ("docker", "shippingbox", .labelColor)
+        case ".editorconfig": ("settings", "slider.horizontal.3", .labelColor)
+        case ".env", ".env.example": ("lock", "lock", .labelColor)
+        case ".prettierignore": ("prettier", "paintbrush", .labelColor)
+        case ".gitignore", ".gitattributes", ".gitmodules": ("git", "arrow.triangle.branch", .labelColor)
+        case ".gitlab-ci.yml", ".gitlab-ci_gitlab.yml", ".gitlab-ci_release.yml": ("gitlab", "arrow.triangle.branch", .labelColor)
         case "php", "phtml": ("php", "doc", .labelColor)
         case "blade.php": ("laravel", "doc", .labelColor)
         case "rs": ("rust", "gearshape.fill", .labelColor)
         case "swift": ("swift", "swift", .labelColor)
-        case "md", "markdown": (nil, "info.circle.fill", .systemBlue)
-        case "json": (nil, "curlybraces", .systemYellow)
-        case "toml", "lock", "yml", "yaml", "ini", "cfg", "plist", "xcconfig":
-            (nil, "slider.horizontal.3", .secondaryLabelColor)
+        case "md", "markdown": ("markdown", "info.circle.fill", .labelColor)
+        case "json": ("json", "curlybraces", .labelColor)
+        case "toml": ("toml", "slider.horizontal.3", .labelColor)
+        case "yml", "yaml": ("yaml", "slider.horizontal.3", .labelColor)
+        case "ini", "cfg", "plist", "xcconfig": ("settings", "slider.horizontal.3", .labelColor)
         case "sh", "zsh", "bash", "fish": (nil, "terminal", .systemGreen)
-        case "js", "mjs", "cjs", "jsx": ("javascript", "j.square.fill", .labelColor)
-        case "ts", "tsx": ("typescript", "t.square.fill", .labelColor)
-        case "html", "htm", "xml": (nil, "chevron.left.forwardslash.chevron.right", .systemOrange)
-        case "css", "scss": ("css", "number", .labelColor)
+        case "jsx": ("react", "r.square.fill", .labelColor)
+        case "tsx": ("react_ts", "r.square.fill", .labelColor)
+        case "js", "mjs", "cjs": ("javascript", "j.square.fill", .labelColor)
+        case "ts": ("typescript", "t.square.fill", .labelColor)
+        case "html", "htm": ("html", "chevron.left.forwardslash.chevron.right", .labelColor)
+        case "xml": ("xml", "chevron.left.forwardslash.chevron.right", .labelColor)
+        case "css": ("css", "number", .labelColor)
+        case "scss", "sass", "less": ("sass", "number", .labelColor)
         case "py": ("python", "p.square.fill", .labelColor)
         case "go": ("go", "doc", .labelColor)
+        case "vue": ("vue", "v.square.fill", .labelColor)
+        case "prisma": ("prisma", "cylinder", .labelColor)
         case "c", "h", "cpp", "hpp", "m", "mm": (nil, "c.square.fill", .systemIndigo)
         case "png", "jpg", "jpeg", "gif", "svg", "webp", "icns": ("image", "photo", .labelColor)
         case ".git": (nil, "arrow.triangle.branch", .systemRed)

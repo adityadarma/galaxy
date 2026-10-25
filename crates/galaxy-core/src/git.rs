@@ -1056,8 +1056,18 @@ pub fn diff_lines(
         .map_err(io::Error::other)?
         .and_then(|entry| entry.object().ok())
         .and_then(|object| object.try_into_blob().ok())
-        .map(|mut blob| blob.take_data())
-        .unwrap_or_default();
+        .map(|mut blob| blob.take_data());
+    // Dependency trees are third-party code, not changes to the workspace.
+    // They are commonly ignored and absent from HEAD, which otherwise makes
+    // every line look newly added in the gutter.
+    if old.is_none()
+        && rel_path
+            .split('/')
+            .any(|part| matches!(part, "node_modules" | "vendor"))
+    {
+        return Ok(Vec::new());
+    }
+    let old = old.unwrap_or_default();
     let old = String::from_utf8_lossy(&old);
     let old_lines: Vec<_> = old.lines().collect();
     let new_lines: Vec<_> = working_text.lines().collect();
@@ -1452,6 +1462,37 @@ mod tests {
             deleted
                 .iter()
                 .any(|change| change.kind == GitLineChangeKind::Deleted)
+        );
+    }
+
+    #[test]
+    fn diff_lines_ignores_untracked_dependency_files() {
+        let dir = tempfile::tempdir().unwrap();
+        run(dir.path(), ["init", "-b", "main"]);
+        fs::write(dir.path().join("tracked.txt"), "one\n").unwrap();
+        run(dir.path(), ["add", "tracked.txt"]);
+        run(
+            dir.path(),
+            [
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        );
+
+        assert!(
+            diff_lines(dir.path(), "node_modules/pkg/index.ts", "export {};\n")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            diff_lines(dir.path(), "vendor/pkg/src/File.php", "<?php\n")
+                .unwrap()
+                .is_empty()
         );
     }
 
