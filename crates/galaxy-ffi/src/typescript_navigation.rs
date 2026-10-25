@@ -656,10 +656,37 @@ pub(super) fn direct_imported_name(binding: &ImportBinding) -> Option<&str> {
         .flatten()
 }
 
-/// A JavaScript package or an explicit JS/TS project configuration opts the
-/// workspace into the JavaScript/TypeScript navigation warm-up.
+/// A JavaScript package, project configuration, or common framework marker
+/// opts the workspace into the JavaScript/TypeScript navigation warm-up.
 pub(super) fn workspace_detected(root: &Path) -> bool {
-    ["package.json", "tsconfig.json", "jsconfig.json"]
+    [
+        "package.json",
+        "tsconfig.json",
+        "jsconfig.json",
+        // Next.js, Nuxt, NestJS, Remix, Gatsby, Astro, SvelteKit, Vite,
+        // Angular, React Native, and Expo.
+        "next.config.js",
+        "next.config.mjs",
+        "next.config.ts",
+        "nuxt.config.js",
+        "nuxt.config.ts",
+        "nest-cli.json",
+        "remix.config.js",
+        "remix.config.mjs",
+        "remix.config.ts",
+        "gatsby-config.js",
+        "gatsby-config.ts",
+        "astro.config.mjs",
+        "astro.config.ts",
+        "svelte.config.js",
+        "svelte.config.ts",
+        "vite.config.js",
+        "vite.config.ts",
+        "angular.json",
+        "app.json",
+        "app.config.js",
+        "app.config.ts",
+    ]
         .into_iter()
         .any(|name| root.join(name).is_file())
 }
@@ -797,6 +824,29 @@ fn warm_typescript_declaration_chain(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_common_typescript_frameworks_without_package_manifest() {
+        for marker in [
+            "next.config.ts",
+            "nuxt.config.ts",
+            "nest-cli.json",
+            "remix.config.ts",
+            "gatsby-config.ts",
+            "astro.config.mjs",
+            "svelte.config.js",
+            "vite.config.ts",
+            "angular.json",
+            "app.config.ts",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join(marker), "").unwrap();
+            assert!(workspace_detected(dir.path()), "{marker}");
+        }
+
+        let plain = tempfile::tempdir().unwrap();
+        assert!(!workspace_detected(plain.path()));
+    }
 
     #[test]
     fn warmup_caches_import_targets_and_reexports() {

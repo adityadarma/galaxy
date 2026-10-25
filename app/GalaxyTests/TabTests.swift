@@ -64,6 +64,23 @@ final class TabTests: XCTestCase {
         XCTAssertEqual(titles(c), ["a.txt", "Untitled", "b.txt"])
     }
 
+    func testStaticTabActionsMenuFollowsTheActiveTab() throws {
+        let c = makeController()
+        defer { c.window?.orderOut(nil) }
+        try c.openFile(at: file("a.txt"))
+        try c.openFile(at: file("b.txt"))
+
+        let menu = try XCTUnwrap(c.tabBar.activeTabMenuProvider?())
+        XCTAssertFalse(c.tabBar.moreButton.isHidden)
+        XCTAssertTrue(c.tabBar.moreButton.isEnabled)
+        XCTAssertTrue(menu.items.contains { $0.title == "Close to the Right" })
+        XCTAssertTrue(menu.items.contains { ($0.representedObject as? EditorTab) === c.tabs[1] })
+
+        c.selectTab(0)
+        let firstMenu = try XCTUnwrap(c.tabBar.activeTabMenuProvider?())
+        XCTAssertTrue(firstMenu.items.contains { ($0.representedObject as? EditorTab) === c.tabs[0] })
+    }
+
     func testInactiveSyntaxIsEvictedAndResumedWhenSelected() throws {
         try "fn first() {}".write(to: file("first.rs"), atomically: true, encoding: .utf8)
         try "fn second() {}".write(to: file("second.rs"), atomically: true, encoding: .utf8)
@@ -526,10 +543,21 @@ final class TabTests: XCTestCase {
         return bar
     }
 
+    func testStaticTabActionsButtonStaysAtTheRightEdge() {
+        let bar = crowdedBar(tabs: 30, width: 600)
+        XCTAssertTrue(bar.moreButton.isEnabled)
+        XCTAssertEqual(bar.moreButton.frame.maxX, bar.bounds.maxX - 6, accuracy: 0.5)
+        XCTAssertLessThanOrEqual(bar.scrollView.frame.maxX, bar.moreButton.frame.minX - 4)
+
+        bar.set(items: [], selected: nil)
+        XCTAssertFalse(bar.moreButton.isHidden)
+        XCTAssertFalse(bar.moreButton.isEnabled)
+    }
+
     func testManyTabsKeepTheirWidthAndTheStripScrolls() {
         let bar = crowdedBar(tabs: 30, width: 600)
         XCTAssertGreaterThan(bar.contentWidth, 600, "tabs are not squeezed to fit")
-        XCTAssertEqual(bar.scrollView.frame.width, 600, accuracy: 0.5, "the strip fills the bar")
+        XCTAssertLessThan(bar.scrollView.frame.width, 600, "the static actions button reserves space")
         XCTAssertEqual(bar.scrollView.documentView?.frame.width ?? 0, bar.contentWidth, accuracy: 0.5)
         XCTAssertTrue(bar.tabViews.allSatisfy { $0.frame.width >= TabBar.minTabWidth - 0.5 }, "no tab is squeezed under the minimum")
         XCTAssertEqual(bar.scrollView.contentView.bounds.origin.x, 0)
@@ -560,7 +588,21 @@ final class TabTests: XCTestCase {
         bar.scrollView.scroll(toX: -500)
         XCTAssertEqual(bar.scrollView.contentView.bounds.origin.x, 0, "it stops at the first tab")
         bar.scrollView.scroll(toX: 1_000_000)
-        XCTAssertEqual(bar.scrollView.contentView.bounds.origin.x, bar.contentWidth - 600, accuracy: 0.5, "and at the last")
+        XCTAssertEqual(bar.scrollView.contentView.bounds.origin.x, bar.contentWidth - bar.scrollView.frame.width, accuracy: 0.5, "and at the last")
+    }
+
+    func testClosingOffscreenTabKeepsTheViewportAtTheRight() {
+        let bar = crowdedBar(tabs: 30, width: 600)
+        bar.scrollView.scroll(toX: .greatestFiniteMagnitude)
+        let items = Array(bar.items.dropLast())
+
+        bar.set(items: items, selected: 0)
+        bar.layoutSubtreeIfNeeded()
+
+        XCTAssertEqual(bar.scrollView.contentView.bounds.origin.x,
+                       bar.contentWidth - bar.scrollView.frame.width,
+                       accuracy: 0.5,
+                       "closing a tab at the right does not reveal the active left tab")
     }
 
     func testFewTabsLeaveRoomToDragTheWindow() {

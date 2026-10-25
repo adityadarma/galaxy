@@ -95,6 +95,10 @@ extension MainWindowController {
             guard let self, let group else { return nil }
             return self.menu(forTab: i, in: group)
         }
+        pane.tabBar.activeTabMenuProvider = { [weak self, weak group] in
+            guard let self, let group, let index = group.activeIndex else { return nil }
+            return self.menu(forTab: index, in: group)
+        }
         pane.onActivate = { [weak self, weak group] event in
             guard let self, let group else { return }
             self.paneClicked(group, event: event)

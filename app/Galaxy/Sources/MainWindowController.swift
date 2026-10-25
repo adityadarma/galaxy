@@ -755,6 +755,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
         editorTerminalView.onExit = { [weak self] in self?.editorTerminalExited() }
         tabBar.menuForTab = { [weak self] index in self?.menu(forTab: index) }
+        tabBar.activeTabMenuProvider = { [weak self] in
+            guard let self, let index = self.activeIndex else { return nil }
+            return self.menu(forTab: index)
+        }
         hoverPopover.isHidden = true
         blamePopover.isHidden = true
         blamePopover.translatesAutoresizingMaskIntoConstraints = true

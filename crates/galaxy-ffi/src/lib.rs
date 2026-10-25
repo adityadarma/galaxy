@@ -2346,6 +2346,46 @@ fn is_typescript_path(path: &Path) -> bool {
     )
 }
 
+/// Detects PHP frameworks and conventional source roots without traversing
+/// dependency trees such as `vendor/`.
+fn php_workspace_detected(root: &Path) -> bool {
+    if root.join("composer.json").is_file()
+        || ["artisan", "yii", "spark", "wp-config.php"]
+            .into_iter()
+            .any(|name| root.join(name).is_file())
+        || root.join("bin/console").is_file()
+        || root.join("system/CodeIgniter.php").is_file()
+    {
+        return true;
+    }
+    [
+        "app", "src", "application", "modules", "packages", "libraries",
+        "common", "backend", "frontend", "web/modules", "sites/all/modules",
+        "wp-content/plugins", "wp-content/themes",
+    ]
+    .into_iter()
+    .any(|path| contains_php_source(&root.join(path), 2))
+}
+
+fn contains_php_source(dir: &Path, depth: u8) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("php")) {
+            return true;
+        }
+        if depth > 0
+            && entry.file_type().is_ok_and(|kind| kind.is_dir())
+            && contains_php_source(&path, depth - 1)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn typescript_range(range: galaxy_core::typescript::Utf16Range) -> LspRange {
     LspRange {
         start_line: range.start.line as u64,
@@ -2366,8 +2406,9 @@ fn spawn_workspace_indexing(
     let _ = std::thread::Builder::new()
         .name("workspace-indexing".into())
         .spawn(move || {
-            send_workspace_index_started(&listener, &root);
-            let (total, changed) = refresh_workspace_index(&workspace, &listener);
+            let paths = workspace.build_file_index().paths().collect::<Vec<_>>();
+            send_workspace_index_started(&listener, &root, paths.len() as u64);
+            let (total, changed) = refresh_workspace_index(&workspace, &paths, &listener);
             let mut workers = Vec::new();
             if workspace_detected(&root) {
                 workers.push(spawn_warmup(&root, cache));
@@ -2379,7 +2420,7 @@ fn spawn_workspace_indexing(
                     workers.push(spawn_go_index(&engine, &project_root));
                 }
             }
-            if root.join("composer.json").is_file() {
+            if php_workspace_detected(&root) {
                 let (engine, fresh) = pending_php_engine(&php_engines, &root);
                 if fresh {
                     workers.push(spawn_php_index(&engine, &root));
@@ -2392,11 +2433,11 @@ fn spawn_workspace_indexing(
         });
 }
 
-fn send_workspace_index_started(listener: &Option<Arc<dyn CoreListener>>, root: &Path) {
+fn send_workspace_index_started(listener: &Option<Arc<dyn CoreListener>>, root: &Path, total: u64) {
     if let Some(listener) = listener {
         listener.on_event(CoreEvent::WorkspaceIndexStarted {
             root: root.to_string_lossy().into_owned(),
-            total: 0,
+            total,
         });
     }
 }
@@ -2422,11 +2463,11 @@ fn send_workspace_index_finished(
 /// cache incrementally, so additions and removals are never missed.
 fn refresh_workspace_index(
     workspace: &CoreWorkspace,
+    paths: &[String],
     listener: &Option<Arc<dyn CoreListener>>,
 ) -> (u64, u64) {
     let root = workspace.root();
     let root_text = root.to_string_lossy().into_owned();
-    let paths = workspace.build_file_index().paths().collect::<Vec<_>>();
     let total = paths.len() as u64;
     if let Some(listener) = listener {
         listener.on_event(CoreEvent::WorkspaceIndexProgress {
@@ -2439,17 +2480,16 @@ fn refresh_workspace_index(
     let mut current = BTreeMap::new();
     let mut changed = 0_u64;
     for (offset, path) in paths.iter().enumerate() {
-        let Some(freshness) = workspace_file_freshness(&root.join(path)) else {
-            continue;
-        };
-        if previous.get(path) != Some(&freshness) {
-            changed += 1;
+        if let Some(freshness) = workspace_file_freshness(&root.join(path)) {
+            if previous.get(path) != Some(&freshness) {
+                changed += 1;
+            }
+            current.insert(path.clone(), freshness);
         }
-        current.insert(path.clone(), freshness);
         let completed = (offset + 1) as u64;
-        if (completed == total || completed.is_multiple_of(32))
-            && let Some(listener) = listener
-        {
+        // Each event represents a file whose freshness was actually read. The
+        // UI can choose how often to render these precise counts.
+        if let Some(listener) = listener {
             listener.on_event(CoreEvent::WorkspaceIndexProgress {
                 root: root_text.clone(),
                 completed,
@@ -6151,7 +6191,7 @@ mod tests {
                 _ => {}
             }
         }
-        assert_eq!(started, Some(0));
+        assert_eq!(started, Some(6));
         assert_eq!(finished, Some(6));
         assert_eq!(progress, 6);
 
@@ -6165,6 +6205,24 @@ mod tests {
             rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             CoreEvent::WorkspaceIndexStarted { total: 0, .. }
         ));
+    }
+
+    #[test]
+    fn detects_php_frameworks_without_composer() {
+        let laravel = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(laravel.path().join("app/Http")).unwrap();
+        std::fs::write(laravel.path().join("app/Http/Controller.php"), "<?php class Controller {}\n").unwrap();
+        assert!(php_workspace_detected(laravel.path()));
+
+        let symfony = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(symfony.path().join("src/Controller")).unwrap();
+        std::fs::write(symfony.path().join("src/Controller/Home.php"), "<?php class Home {}\n").unwrap();
+        assert!(php_workspace_detected(symfony.path()));
+
+        let plain = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(plain.path().join("node_modules/pkg")).unwrap();
+        std::fs::write(plain.path().join("node_modules/pkg/Library.php"), "<?php class Library {}\n").unwrap();
+        assert!(!php_workspace_detected(plain.path()));
     }
 
     #[test]

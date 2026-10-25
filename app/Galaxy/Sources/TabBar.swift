@@ -156,10 +156,15 @@ final class TabBar: NSView {
     var menuForTab: ((Int) -> NSMenu?)?
     /// The preview button (shown for Markdown files) was clicked.
     var onTogglePreview: (() -> Void)?
+    /// Menu for the active tab, shown from the static button at the strip's end.
+    var activeTabMenuProvider: (() -> NSMenu?)?
 
     /// Toggle at the right end of the bar, like VS Code's "Open Preview to the Side".
     let previewButton = NSButton()
     static let previewButtonWidth: CGFloat = 36
+    /// Static menu button at the right edge, independent of the tab strip's scroll position.
+    let moreButton = NSButton()
+    static let moreButtonWidth: CGFloat = 36
 
     let scrollView = TabScrollView()
     /// Document view of `scrollView`: as wide as all the tabs together.
@@ -213,12 +218,30 @@ final class TabBar: NSView {
         previewButton.translatesAutoresizingMaskIntoConstraints = false
         addSubview(previewButton)
 
+        moreButton.setButtonType(.momentaryChange)
+        moreButton.isBordered = false
+        moreButton.imagePosition = .imageOnly
+        moreButton.image = NSImage(systemSymbolName: "ellipsis", accessibilityDescription: "More Tab Actions")?
+            .withSymbolConfiguration(.init(pointSize: 14, weight: .regular))
+        moreButton.contentTintColor = .secondaryLabelColor
+        moreButton.toolTip = "More Tab Actions"
+        moreButton.setAccessibilityLabel("More Tab Actions")
+        moreButton.setAccessibilityIdentifier("tab-actions-menu")
+        moreButton.target = self
+        moreButton.action = #selector(moreButtonClicked(_:))
+        moreButton.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(moreButton, positioned: .above, relativeTo: scrollView)
+
         rule.boxType = .separator
         rule.translatesAutoresizingMaskIntoConstraints = false
         addSubview(rule, positioned: .below, relativeTo: scrollView)
 
         NSLayoutConstraint.activate([
-            previewButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
+            moreButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -6),
+            moreButton.centerYAnchor.constraint(equalTo: centerYAnchor),
+            moreButton.widthAnchor.constraint(equalToConstant: 26),
+            moreButton.heightAnchor.constraint(equalToConstant: 24),
+            previewButton.trailingAnchor.constraint(equalTo: moreButton.leadingAnchor, constant: -4),
             previewButton.centerYAnchor.constraint(equalTo: centerYAnchor),
             previewButton.widthAnchor.constraint(equalToConstant: 26),
             previewButton.heightAnchor.constraint(equalToConstant: 24),
@@ -245,7 +268,8 @@ final class TabBar: NSView {
         strip.setFrameSize(NSSize(width: max(contentWidth, 1), height: bounds.height))
         // The scroll view only covers the tabs, so the empty strip after them
         // stays a title bar to drag the window by.
-        let reserved = previewButton.isHidden ? 0 : Self.previewButtonWidth
+        let reserved = (previewButton.isHidden ? 0 : Self.previewButtonWidth)
+            + (moreButton.isHidden ? 0 : Self.moreButtonWidth)
         scrollView.frame = NSRect(x: 0, y: 0, width: min(contentWidth, max(0, bounds.width - reserved)), height: bounds.height)
         guard bounds.width > 0 else { return }
         // Keep the offset valid after the bar grows or tabs close.
@@ -294,6 +318,11 @@ final class TabBar: NSView {
 
     @objc private func previewButtonClicked(_ sender: Any?) { onTogglePreview?() }
 
+    @objc private func moreButtonClicked(_ sender: NSButton) {
+        guard let menu = activeTabMenuProvider?() else { return }
+        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.maxY + 4), in: sender)
+    }
+
     /// Replaces all tabs. Cheap enough: tab counts are small, and per-key
     /// updates go through `setEdited` instead.
     func set(items: [Item], selected: Int?) {
@@ -308,10 +337,13 @@ final class TabBar: NSView {
                 return view
             }
         }
-        if selected != selectedIndex || items.count != self.items.count { needsReveal = true }
+        // Closing an off-screen tab must preserve the current viewport. Reveal
+        // only when selection changes, matching VS Code's tab-strip behavior.
+        if selected != selectedIndex { needsReveal = true }
         self.items = items
         selectedIndex = selected
         rule.isHidden = items.isEmpty
+        moreButton.isEnabled = selected != nil
         needsLayout = true
         for (i, view) in tabViews.enumerated() {
             view.index = i

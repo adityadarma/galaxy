@@ -43,6 +43,8 @@ final class EditorGroupTests: XCTestCase {
         XCTAssertEqual(titles(c.groups[1]), ["b.txt"])
         XCTAssertEqual(c.tabBar.items.map(\.title), ["b.txt"], "the tab bar shows the active group")
         XCTAssertEqual(c.groups[0].pane?.tabBar.items.map(\.title), ["a.txt"])
+        let leftMenu = try XCTUnwrap(c.groups[0].pane?.tabBar.activeTabMenuProvider?())
+        XCTAssertTrue(leftMenu.items.contains { ($0.representedObject as? EditorTab) === c.groups[0].activeTab })
     }
 
     func testSplitRightOfAGroupsOnlyTabOpensItTwice() throws {

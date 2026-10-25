@@ -40,9 +40,9 @@ final class StatusBarTests: XCTestCase {
     func testWorkspaceIndexShowsFileProgressAndIgnoresStaleWorkspace() {
         let bar = StatusBar()
         bar.resetWorkspaceScan(root: "/one")
-        bar.workspaceIndexStarted(root: "/one", total: 0)
+        bar.workspaceIndexStarted(root: "/one", total: 120)
         XCTAssertFalse(bar.workspaceScan.isHidden)
-        XCTAssertEqual(bar.workspaceScan.stringValue, "Indexing files...")
+        XCTAssertEqual(bar.workspaceScan.stringValue, "Indexing 0 of 120 files")
         bar.workspaceIndexProgress(root: "/one", completed: 0, total: 120)
         XCTAssertEqual(bar.workspaceScan.stringValue, "Indexing 0 of 120 files")
         bar.workspaceIndexProgress(root: "/one", completed: 64, total: 120)
