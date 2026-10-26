@@ -286,7 +286,7 @@ impl SyntaxLanguage {
         let extension = name.rsplit_once('.').map(|(_, ext)| ext).unwrap_or("");
         let by_extension = match extension {
             "rs" => Some(Self::Rust),
-            "ts" => Some(Self::TypeScript),
+            "ts" | "mts" | "cts" => Some(Self::TypeScript),
             "tsx" => Some(Self::Tsx),
             "js" | "mjs" | "cjs" | "jsx" => Some(Self::JavaScript),
             "json" | "jsonc" => Some(Self::Json),
@@ -508,6 +508,8 @@ const TYPESCRIPT_HIGHLIGHTS: &str = r#"
 (method_definition name: (property_identifier) @function)
 (function_expression name: (identifier) @function)
 (arrow_function) @function
+[(this) (this_type)] @variable.builtin
+(undefined) @constant
 (identifier) @variable
 [
   "async" "await" "break" "case" "catch" "class" "const" "continue"
@@ -1978,7 +1980,7 @@ mod tests {
     #[test]
     fn typescript_query_emits_editor_token_scopes() {
         let language = SyntaxLanguage::TypeScript;
-        let source = "import Database from 'better-sqlite3';\nexport async function backup(db: Database.Database, destination: string): Promise<void> {\n  const count: number = 42;\n  return db.backup(destination);\n}\n";
+        let source = "import Database from 'better-sqlite3';\nexport async function backup(db: Database.Database, destination: string): Promise<void> {\n  const count: number | undefined = 42;\n  return db.backup(destination);\n}\n";
         let mut parser = Parser::new();
         parser.set_language(&language.grammar()).unwrap();
         let tree = parser.parse(source, None).unwrap();
@@ -2001,6 +2003,7 @@ mod tests {
             HighlightScope::Type,
             HighlightScope::Number,
             HighlightScope::Property,
+            HighlightScope::Constant,
         ] {
             assert!(
                 scopes.contains(&expected),
@@ -2045,6 +2048,10 @@ mod tests {
             Some(SyntaxLanguage::Svelte)
         );
         assert_eq!(
+            SyntaxLanguage::detect("node_modules/vue/dist/vue.d.mts", ""),
+            Some(SyntaxLanguage::TypeScript)
+        );
+        assert_eq!(
             SyntaxLanguage::detect("Dockerfile", ""),
             Some(SyntaxLanguage::Bash)
         );
@@ -2054,7 +2061,7 @@ mod tests {
         );
         assert_eq!(
             SyntaxLanguage::detect(".docker/nginx-logrotate.conf", ""),
-            None
+            Some(SyntaxLanguage::Ini)
         );
         assert_eq!(
             SyntaxLanguage::detect(".docker/nginx.conf", ""),

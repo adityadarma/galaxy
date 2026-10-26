@@ -414,14 +414,22 @@ pub(super) fn resolve_typescript_type_member_target(
             unique_type_member_location(members, member_name, Path::new(importer_path))
         }
         TypeMemberTarget::Named(range) => {
-            let member = index
-                .type_declaration_at(*range)?
-                .iter()
-                .filter(|member| member.name == member_name)
-                .collect::<Vec<_>>();
-            let [member] = member.as_slice() else {
-                return None;
-            };
+            let member = index.type_member_by_declaration(*range, member_name)?;
+            Some(LspDefinitionLocation {
+                uri: file_uri(Path::new(importer_path)),
+                range: typescript_range(member.range),
+            })
+        }
+        TypeMemberTarget::SuperLocal(range) => {
+            let member = index.type_member_by_declaration(*range, member_name)?;
+            Some(LspDefinitionLocation {
+                uri: file_uri(Path::new(importer_path)),
+                range: typescript_range(member.range),
+            })
+        }
+        TypeMemberTarget::SuperLocalChain { declaration, chain } => {
+            let type_name = index.type_name_by_declaration(*declaration)?;
+            let member = resolve_fluent_member(index, type_name, chain, member_name)?;
             Some(LspDefinitionLocation {
                 uri: file_uri(Path::new(importer_path)),
                 range: typescript_range(member.range),
@@ -470,6 +478,31 @@ pub(super) fn resolve_typescript_type_member_target(
                 .unwrap_or_else(|e| e.into_inner())
                 .index(&path)?;
             let member = target_index.type_member(&declaration.name, member_name)?;
+            Some(LspDefinitionLocation {
+                uri: file_uri(&path),
+                range: typescript_range(member.range),
+            })
+        }
+        TypeMemberTarget::SuperImportedChain { binding, chain } => {
+            let (import, binding) = index.import_binding_by_range(*binding)?;
+            let imported_name = binding.imported_name.as_deref()?;
+            if binding.type_only || !matches!(binding.kind, ImportKind::Named | ImportKind::Default) {
+                return None;
+            }
+            let target = resolve_typescript_definition_import(
+                cache,
+                Path::new(importer_path),
+                &import.specifier,
+            )?;
+            let (path, declaration) = resolve_typescript_export(cache, target, imported_name)?;
+            if declaration.kind != DeclarationKind::Class {
+                return None;
+            }
+            let target_index = cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .index(&path)?;
+            let member = resolve_fluent_member(&target_index, &declaration.name, chain, member_name)?;
             Some(LspDefinitionLocation {
                 uri: file_uri(&path),
                 range: typescript_range(member.range),
@@ -603,6 +636,23 @@ pub(super) fn resolve_typescript_type_member_target(
     }
 }
 
+fn resolve_fluent_member<'a>(
+    index: &'a DocumentIndex,
+    initial_type: &str,
+    chain: &[String],
+    member_name: &str,
+) -> Option<&'a galaxy_core::typescript::TypeMember> {
+    let type_name = chain.iter().try_fold(initial_type.to_owned(), |type_name, method| {
+        let return_type = index.type_member(&type_name, method)?.return_type.as_deref()?;
+        Some(if return_type == "this" {
+            type_name
+        } else {
+            return_type.to_owned()
+        })
+    })?;
+    index.type_member(&type_name, member_name)
+}
+
 fn unique_type_member_location(
     members: &[galaxy_core::typescript::TypeMember],
     member_name: &str,
@@ -639,6 +689,116 @@ pub(super) fn resolve_typescript_export(
     name: &str,
 ) -> Option<(PathBuf, galaxy_core::typescript::Declaration)> {
     resolve_typescript_export_inner(cache, path, name, 0, &mut HashSet::new())
+}
+
+/// Lists matching value exports from one imported package without walking all dependencies.
+pub(super) fn typescript_package_exports(
+    cache: &Mutex<TypeScriptNavigationCache>,
+    importer: &Path,
+    specifier: &str,
+    prefix: &str,
+) -> Vec<(String, DeclarationKind)> {
+    let Some(target) = resolve_typescript_definition_import(cache, importer, specifier) else {
+        return Vec::new();
+    };
+    let mut exports = HashMap::new();
+    package_exports_inner(cache, &target, prefix, 0, &mut HashSet::new(), &mut exports);
+    exports.into_iter().collect()
+}
+
+/// Reads declared packages only; package source is opened later for a matching completion.
+pub(super) fn typescript_dependency_packages(importer: &Path) -> Vec<String> {
+    let mut packages = HashSet::new();
+    let mut directory = importer.parent();
+    while let Some(path) = directory {
+        let manifest = path.join("package.json");
+        if let Ok(text) = std::fs::read_to_string(manifest) {
+            for section in ["dependencies", "devDependencies", "peerDependencies"] {
+                packages.extend(package_names_in_section(&text, section));
+            }
+            break;
+        }
+        directory = path.parent();
+    }
+    let mut packages = packages.into_iter().collect::<Vec<_>>();
+    packages.sort();
+    packages
+}
+
+fn package_names_in_section(manifest: &str, section: &str) -> Vec<String> {
+    let Some(start) = manifest.find(&format!("\"{section}\"")) else {
+        return Vec::new();
+    };
+    let Some(open) = manifest[start..].find('{').map(|offset| start + offset) else {
+        return Vec::new();
+    };
+    let mut depth = 0usize;
+    let mut end = open;
+    for (offset, character) in manifest[open..].char_indices() {
+        match character {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = open + offset;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    manifest[open + 1..end]
+        .split(',')
+        .filter_map(|entry| entry.split_once(':'))
+        .filter_map(|(name, _)| name.trim().strip_prefix('"')?.strip_suffix('"'))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn package_exports_inner(
+    cache: &Mutex<TypeScriptNavigationCache>,
+    path: &Path,
+    prefix: &str,
+    depth: usize,
+    visited: &mut HashSet<PathBuf>,
+    exports: &mut HashMap<String, DeclarationKind>,
+) {
+    if depth == MAX_TYPESCRIPT_REEXPORT_DEPTH || !visited.insert(module_identity(path)) {
+        return;
+    }
+    let Some(index) = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .index(path)
+    else {
+        return;
+    };
+    for declaration in index
+        .declarations
+        .iter()
+        .filter(|declaration| declaration.exported && declaration.name.starts_with(prefix))
+    {
+        exports
+            .entry(declaration.name.clone())
+            .or_insert(declaration.kind);
+    }
+    for export in index.exports.iter().filter(|export| !export.type_only) {
+        let Some(specifier) = export.specifier.as_deref() else {
+            continue;
+        };
+        let Some(target) = resolve_typescript_definition_import(cache, path, specifier) else {
+            continue;
+        };
+        if export.exported_name.is_none() {
+            package_exports_inner(cache, &target, prefix, depth + 1, visited, exports);
+        } else if let (Some(exported_name), Some(name)) =
+            (export.exported_name.as_deref(), export.name.as_deref())
+            && exported_name.starts_with(prefix)
+            && let Some((_, declaration)) = resolve_typescript_export(cache, target, name)
+        {
+            exports.entry(exported_name.to_owned()).or_insert(declaration.kind);
+        }
+    }
 }
 
 pub(super) fn resolve_typescript_type_export(

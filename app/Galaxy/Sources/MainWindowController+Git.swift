@@ -304,7 +304,7 @@ extension MainWindowController {
             isDiffPaneShown = true
             updateWrapState()
             updateMinimap()
-            markdownPreview.removeFromSuperview()
+            removeMarkdownPreviewIfLoaded()
             secondaryScrollView.removeFromSuperview()
             editorSplitView.isVertical = true
             editorSplitView.addSubview(secondaryScrollView, positioned: .below, relativeTo: scrollView)

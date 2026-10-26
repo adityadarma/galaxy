@@ -201,7 +201,7 @@ final class StatusBar: NSView {
             "m": "Objective-C", "mm": "Objective-C++", "go": "Go", "py": "Python", "rb": "Ruby", "java": "Java",
             "kt": "Kotlin", "kts": "Kotlin", "cs": "C#", "php": "PHP", "sh": "Shell Script", "bash": "Shell Script",
             "zsh": "Shell Script", "fish": "Fish", "js": "JavaScript", "mjs": "JavaScript", "cjs": "JavaScript",
-            "ts": "TypeScript", "tsx": "TypeScript React", "jsx": "JavaScript React", "html": "HTML", "htm": "HTML", "vue": "Vue", "svelte": "Svelte",
+            "ts": "TypeScript", "mts": "TypeScript", "cts": "TypeScript", "tsx": "TypeScript React", "jsx": "JavaScript React", "html": "HTML", "htm": "HTML", "vue": "Vue", "svelte": "Svelte",
             "css": "CSS", "scss": "SCSS", "sass": "Sass", "less": "Less", "json": "JSON", "jsonc": "JSON with Comments",
             "toml": "TOML", "yaml": "YAML", "yml": "YAML", "xml": "XML", "md": "Markdown", "markdown": "Markdown",
             "txt": "Plain Text", "csv": "CSV", "sql": "SQL", "graphql": "GraphQL", "gql": "GraphQL", "lua": "Lua",

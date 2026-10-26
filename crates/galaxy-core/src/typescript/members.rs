@@ -299,7 +299,20 @@ fn collect_decorator_option_shape(
 }
 
 pub(super) fn member_return_type(member: Node<'_>, text: &str) -> Option<String> {
-    let annotation = member.child_by_field_name("return_type")?;
+    let annotation = member.child_by_field_name("return_type");
+    if annotation.is_none()
+        && member.kind() == "method_definition"
+        && method_returns_this(member)
+    {
+        return Some("this".to_owned());
+    }
+    let annotation = annotation?;
+    if annotation
+        .named_child(0)
+        .is_some_and(|node| node.kind() == "this_type")
+    {
+        return Some("this".to_owned());
+    }
     let mut names = Vec::new();
     let mut stack = vec![annotation];
     while let Some(node) = stack.pop() {
@@ -311,6 +324,25 @@ pub(super) fn member_return_type(member: Node<'_>, text: &str) -> Option<String>
         stack.extend(children.into_iter().rev());
     }
     matches!(names.as_slice(), [_] | [_, _]).then(|| names.pop().unwrap())
+}
+
+fn method_returns_this(member: Node<'_>) -> bool {
+    let Some(body) = member.child_by_field_name("body") else {
+        return false;
+    };
+    let mut stack = vec![body];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "return_statement"
+            && node
+                .named_child(0)
+                .is_some_and(|value| value.kind() == "this")
+        {
+            return true;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    false
 }
 
 pub(super) fn member_callback_parameter_type(member: Node<'_>, text: &str) -> Option<String> {

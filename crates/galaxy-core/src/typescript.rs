@@ -196,6 +196,18 @@ pub enum TypeMemberTarget {
     ImportedValue(Utf16Range),
     /// A direct member of `this` in a class extending this value import.
     SuperImported(Utf16Range),
+    /// A direct member of `this` in a class extending a local superclass.
+    SuperLocal(Utf16Range),
+    /// A member reached through one or more fluent method calls on an imported superclass.
+    SuperImportedChain {
+        binding: Utf16Range,
+        chain: Vec<String>,
+    },
+    /// A member reached through one or more fluent method calls on a local superclass.
+    SuperLocalChain {
+        declaration: Utf16Range,
+        chain: Vec<String>,
+    },
     /// A member reached through a typed property of an imported superclass.
     SuperMember {
         binding: Utf16Range,
@@ -778,6 +790,25 @@ impl DocumentIndex {
         self.type_member_inner(type_name, member_name, &mut Vec::new())
     }
 
+    pub fn type_member_by_declaration(
+        &self,
+        declaration_range: Utf16Range,
+        member_name: &str,
+    ) -> Option<&TypeMember> {
+        let declaration = self
+            .type_declarations
+            .iter()
+            .find(|item| item.range == declaration_range)?;
+        self.type_member(&declaration.name, member_name)
+    }
+
+    pub fn type_name_by_declaration(&self, declaration_range: Utf16Range) -> Option<&str> {
+        self.type_declarations
+            .iter()
+            .find(|item| item.range == declaration_range)
+            .map(|item| item.name.as_str())
+    }
+
     fn type_member_inner(
         &self,
         type_name: &str,
@@ -844,6 +875,9 @@ impl DocumentIndex {
             TypeMemberTarget::Imported(_)
             | TypeMemberTarget::ImportedValue(_)
             | TypeMemberTarget::SuperImported(_)
+            | TypeMemberTarget::SuperLocal(_)
+            | TypeMemberTarget::SuperImportedChain { .. }
+            | TypeMemberTarget::SuperLocalChain { .. }
             | TypeMemberTarget::SuperMember { .. }
             | TypeMemberTarget::SuperMemberCallback { .. }
             | TypeMemberTarget::PackageDeclaration { .. }

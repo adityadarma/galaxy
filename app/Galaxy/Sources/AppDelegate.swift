@@ -35,49 +35,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         StartupProbe.mark("menu")
         let controller = makeWindowController()
         StartupProbe.mark("window_built")
-        // Left in full screen at the last quit: open in full screen again.
-        // The project is restored before the window appears, so the
-        // transition does not start from an empty window.
-        // Older sessions have no per-window flag; they used one global key.
         let savedSession = Self.shouldRestoreSession ? Session.load(from: controller.sessionURL) : nil
         let resumeFullScreen = Self.shouldRestoreSession
             && (savedSession?.fullScreen ?? UserDefaults.standard.bool(forKey: "MainWindowFullScreen"))
-        if !resumeFullScreen { showMainWindow(controller) }
-        // `Galaxy -OpenPath <file or folder>`; UI tests use this instead of
-        // driving the open panel.
         if pendingURL == nil, let path = Self.launchOpenPath {
             pendingURL = URL(fileURLWithPath: path)
         }
-        if let url = pendingURL {
-            pendingURL = nil
-            controller.open(url: url)
-        } else if Self.shouldRestoreSession, restoreSession(in: controller) {
-            // The prior workspace and its tabs are restored only after a quit.
+        // Restore the visible workspace and tabs before the first frame. This
+        // avoids flashing an empty editor when reopening the last project;
+        // background workspace services start after the window is presented.
+        let restoredSession: Bool
+        if pendingURL == nil, let savedSession {
+            pendingWindowSessions = savedSession.otherWindows ?? []
+            restoredSession = controller.restore(savedSession)
         } else {
-            controller.newDocument(nil)
+            restoredSession = false
         }
-        if resumeFullScreen { showMainWindow(controller) }
-        // Every window is shown on the regular desktop first. Then the ones
-        // that were full screen enter it in turn, each in its own Space.
-        var fullScreenWindows = resumeFullScreen ? [controller.window].compactMap { $0 } : []
-        fullScreenWindows += restorePendingWindows()
-        fullScreenQueue = fullScreenWindows
-        enterNextFullScreen()
-
-        // `scripts/measure-footprint.sh`: open extra files as tabs after the
-        // workspace, so the footprint covers a realistic editing session.
-        if let files = ProcessInfo.processInfo.environment["GALAXY_BENCH_OPEN_FILES"] {
-            for path in files.split(separator: ":") where !path.isEmpty {
-                controller.open(url: URL(fileURLWithPath: String(path)))
-            }
-        }
-
-        StartupProbe.mark("document_open")
+        showMainWindow(controller, concealedForFullScreen: resumeFullScreen)
         NSApp.activate()
         Log.app.info("window ready, core \(self.bridge.version, privacy: .public)")
 
         // Report after the first frame is committed, not just after showWindow.
-        DispatchQueue.main.async { StartupProbe.reportWindowReady() }
+        DispatchQueue.main.async { [weak self, weak controller] in
+            StartupProbe.reportWindowReady()
+            // Yield once more after the visible frame before restoring files.
+            DispatchQueue.main.async {
+                guard let self, let controller else { return }
+                self.restoreLaunchSession(
+                    in: controller,
+                    session: savedSession,
+                    resumeFullScreen: resumeFullScreen,
+                    restoredSession: restoredSession
+                )
+            }
+        }
 
         if let count = LatencyBench.requestedCount {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
@@ -91,6 +82,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // Verifies the Rust -> Swift callback path end-to-end.
         bridge.ping("startup")
+    }
+
+    private func restoreLaunchSession(
+        in controller: MainWindowController,
+        session: Session?,
+        resumeFullScreen: Bool,
+        restoredSession: Bool
+    ) {
+        // `Galaxy -OpenPath <file or folder>`; UI tests use this instead of
+        // driving the open panel.
+        if pendingURL == nil, let path = Self.launchOpenPath {
+            pendingURL = URL(fileURLWithPath: path)
+        }
+        if restoredSession {
+            // The primary workspace was restored before the window appeared.
+        } else if let url = pendingURL {
+            pendingURL = nil
+            controller.open(url: url)
+        } else if Self.shouldRestoreSession, let session, controller.restore(session) {
+            pendingWindowSessions = session.otherWindows ?? []
+            // The prior workspace and its tabs are restored only after a quit.
+        } else {
+            controller.newDocument(nil)
+        }
+
+        // Restore additional windows one per run-loop turn. Restoring all of
+        // them synchronously blocks drawing and makes a multi-window launch
+        // look frozen even when the primary editor is ready.
+        let fullScreenWindows = resumeFullScreen ? [controller.window].compactMap { $0 } : []
+        fullScreenQueue = fullScreenWindows
+        enterNextFullScreen()
+        restoreNextPendingWindow()
+
+        // `scripts/measure-footprint.sh`: open extra files as tabs after the
+        // workspace, so the footprint covers a realistic editing session.
+        if let files = ProcessInfo.processInfo.environment["GALAXY_BENCH_OPEN_FILES"] {
+            for path in files.split(separator: ":") where !path.isEmpty {
+                controller.open(url: URL(fileURLWithPath: String(path)))
+            }
+        }
+        StartupProbe.mark("document_open")
     }
 
     private static var launchOpenPath: String? {
@@ -131,7 +163,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return true
     }
 
-    private func showMainWindow(_ controller: MainWindowController) {
+    private func showMainWindow(
+        _ controller: MainWindowController,
+        concealedForFullScreen: Bool = false
+    ) {
+        if concealedForFullScreen { controller.window?.alphaValue = 0 }
         controller.showWindow(nil)
         controller.centerTrafficLights()
         StartupProbe.mark("window_shown")
@@ -143,19 +179,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return controller.restore(session)
     }
 
-    /// Reopens the windows that were open besides the first one at quit.
-    /// Returns those that were full screen.
-    private func restorePendingWindows() -> [NSWindow] {
-        let sessions = pendingWindowSessions
-        pendingWindowSessions = []
-        var fullScreen: [NSWindow] = []
-        for session in sessions {
-            let controller = makeWindowController()
-            if !controller.restore(session) { controller.newDocument(nil) }
-            showMainWindow(controller)
-            if session.fullScreen == true, let window = controller.window { fullScreen.append(window) }
+    /// Reopens one extra window per run-loop turn so AppKit can draw each
+    /// restored workspace before the next one starts opening files and tabs.
+    private func restoreNextPendingWindow() {
+        guard !pendingWindowSessions.isEmpty else {
+            enterNextFullScreen()
+            return
         }
-        return fullScreen
+        let session = pendingWindowSessions.removeFirst()
+        let controller = makeWindowController()
+        if !controller.restore(session) { controller.newDocument(nil) }
+        showMainWindow(controller, concealedForFullScreen: session.fullScreen == true)
+        if session.fullScreen == true, let window = controller.window {
+            fullScreenQueue.append(window)
+            enterNextFullScreen()
+        }
+        DispatchQueue.main.async { [weak self] in
+            self?.restoreNextPendingWindow()
+        }
     }
 
     /// The window whose full-screen transition is in flight.
@@ -184,6 +225,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func finishFullScreen(of window: NSWindow) {
         guard fullScreenPending === window else { return }
+        window.alphaValue = 1
         fullScreenPending = nil
         if let observer = fullScreenObserver {
             NotificationCenter.default.removeObserver(observer)

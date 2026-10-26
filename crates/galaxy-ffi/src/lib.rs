@@ -863,14 +863,36 @@ impl Core {
             return false;
         }
         let uri = file_uri(Path::new(&path));
-        if is_typescript_path(Path::new(&path)) {
+        if is_typescript_path(Path::new(&path)) || is_component_path(Path::new(&path)) {
             let text = document.lock().editor.doc.text();
+            let Some(source) = component_script_source(&path, &text, line as usize) else {
+                return false;
+            };
+            let script_insertion_line = component_script_insertion_line(&path, &text, line as usize)
+                .unwrap_or(0);
+            let index_path = if is_component_path(Path::new(&path)) {
+                format!("{path}.ts")
+            } else {
+                path.clone()
+            };
+            let component_extension = is_component_path(Path::new(&path))
+                .then(|| Path::new(&path).extension().and_then(|extension| extension.to_str()))
+                .flatten();
             let exports = self
                 .typescript_workspace_exports
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            let items =
-                typescript_completions(&path, &text, line as usize, character as usize, &exports);
+            let items = typescript_completions(
+                &index_path,
+                &uri,
+                &source,
+                line as usize,
+                character as usize,
+                &exports,
+                &self.typescript_navigation,
+                script_insertion_line,
+                component_extension,
+            );
             let answered = !items.is_empty();
             self.analysis
                 .lock()
@@ -993,7 +1015,7 @@ impl Core {
             return false;
         }
         let uri = file_uri(Path::new(&path));
-        if is_typescript_path(Path::new(&path)) {
+        if is_typescript_path(Path::new(&path)) || is_component_path(Path::new(&path)) {
             return self.typescript_definition(&document, &uri, line, character);
         }
         self.php_definition(&document, &uri, line, character)
@@ -1985,7 +2007,18 @@ impl Core {
         character: u64,
     ) -> bool {
         let path = document.path();
-        let index = DocumentIndex::parse(&path, &document.lock().editor.doc.text());
+        let text = document.lock().editor.doc.text();
+        let Some(source) = component_script_source(&path, &text, line as usize) else {
+            return false;
+        };
+        // Component scripts retain their original line and column offsets, so
+        // TypeScript locations can be returned directly to the editor.
+        let index_path = if is_component_path(Path::new(&path)) {
+            format!("{path}.ts")
+        } else {
+            path.clone()
+        };
+        let index = DocumentIndex::parse(index_path, &source);
         let mut locations = typescript_type_target(
             &self.typescript_navigation,
             &path,
@@ -2367,6 +2400,60 @@ fn is_typescript_path(path: &Path) -> bool {
         path.extension().and_then(|extension| extension.to_str()),
         Some("ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs")
     )
+}
+
+fn is_component_path(path: &Path) -> bool {
+    matches!(path.extension().and_then(|extension| extension.to_str()), Some("vue" | "svelte"))
+}
+
+/// Returns JavaScript/TypeScript source in a virtual document that preserves
+/// the component's original line and UTF-16 column coordinates. Only a cursor
+/// inside a `<script>` body produces source, keeping template markup out of
+/// definition navigation.
+fn component_script_source(path: &str, text: &str, line: usize) -> Option<String> {
+    if !is_component_path(Path::new(path)) {
+        return Some(text.to_owned());
+    }
+    let mut search = 0;
+    while let Some(relative_start) = text[search..].find("<script") {
+        let start = search + relative_start;
+        let tag_end = text[start..].find('>')? + start;
+        let body_start = tag_end + 1;
+        let body_end = text[body_start..].find("</script>")? + body_start;
+        let start_line = text[..body_start].bytes().filter(|byte| *byte == b'\n').count();
+        let end_line = start_line + text[body_start..body_end].bytes().filter(|byte| *byte == b'\n').count();
+        if (start_line..=end_line).contains(&line) {
+            let mut virtual_source = String::with_capacity(body_end);
+            virtual_source.extend(text[..body_start].chars().map(|character| if character == '\n' { '\n' } else { ' ' }));
+            virtual_source.push_str(&text[body_start..body_end]);
+            return Some(virtual_source);
+        }
+        search = body_end + "</script>".len();
+    }
+    None
+}
+
+/// Returns the first body line for the script containing `line`.
+fn component_script_insertion_line(path: &str, text: &str, line: usize) -> Option<usize> {
+    if !is_component_path(Path::new(path)) {
+        return Some(0);
+    }
+    let mut search = 0;
+    while let Some(relative_start) = text[search..].find("<script") {
+        let start = search + relative_start;
+        let tag_end = text[start..].find('>')? + start;
+        let body_start = tag_end + 1;
+        let body_end = text[body_start..].find("</script>")? + body_start;
+        let start_line = text[..body_start].bytes().filter(|byte| *byte == b'\n').count();
+        let end_line = start_line + text[body_start..body_end].bytes().filter(|byte| *byte == b'\n').count();
+        if (start_line..=end_line).contains(&line) {
+            // A newline directly after the opening tag begins the script body
+            // on the next document line, not the tag's line.
+            return Some(start_line + usize::from(text[body_start..].starts_with('\n')));
+        }
+        search = body_end + "</script>".len();
+    }
+    None
 }
 
 /// Detects PHP frameworks and conventional source roots without traversing
@@ -5804,6 +5891,28 @@ mod tests {
     }
 
     #[test]
+    fn component_script_source_preserves_script_positions_and_rejects_templates() {
+        let source = "<template>\n  <Button />\n</template>\n<script lang=\"ts\">\nconst count = 1\n</script>\n";
+        let virtual_source = component_script_source("Counter.vue", source, 4).unwrap();
+        assert_eq!(virtual_source.lines().nth(4), Some("const count = 1"));
+        assert!(component_script_source("Counter.vue", source, 1).is_none());
+        assert!(component_script_source("Counter.svelte", source, 1).is_none());
+    }
+
+    #[test]
+    fn component_script_source_accepts_svelte_scripts() {
+        let source = "<h1>{count}</h1>\n<script>\nlet count = 0\n</script>\n";
+        let virtual_source = component_script_source("Counter.svelte", source, 2).unwrap();
+        assert_eq!(virtual_source.lines().nth(2), Some("let count = 0"));
+    }
+
+    #[test]
+    fn component_script_insertion_line_stays_inside_script_setup() {
+        let source = "<script setup lang=\"ts\">\nconst value = 1\n</script>\n";
+        assert_eq!(component_script_insertion_line("Counter.vue", source, 1), Some(1));
+    }
+
+    #[test]
     fn typescript_navigation_cache_reuses_indexes_and_revalidates_disk_changes() {
         let dir = tempfile::tempdir().unwrap();
         let dependency = dir.path().join("dependency.ts");
@@ -6972,6 +7081,36 @@ mod tests {
     }
 
     #[test]
+    fn vue_completion_auto_imports_dependency_exports() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("node_modules/vue");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"dependencies":{"vue":"3"}}"#,
+        )
+        .unwrap();
+        std::fs::write(package.join("package.json"), r#"{"exports":"./index.d.ts"}"#)
+            .unwrap();
+        std::fs::write(package.join("index.d.ts"), "export declare function computed(): void;\n")
+            .unwrap();
+        let path = dir.path().join("Counter.vue");
+        std::fs::write(&path, "<script setup>\ncomp\n</script>\n").unwrap();
+        let core = Core::new();
+        let document = core.open_document(path.to_string_lossy().into_owned()).unwrap();
+
+        assert!(core.request_completion(document.clone(), 1, 4));
+        let item = core
+            .completions(document)
+            .into_iter()
+            .find(|item| item.label == "computed")
+            .unwrap();
+        assert_eq!(item.insert_text, "computed");
+        assert_eq!(item.additional_edits[0].line, 1);
+        assert_eq!(item.additional_edits[0].text, "import { computed } from 'vue';\n");
+    }
+
+    #[test]
     fn typescript_workspace_completion_handles_default_and_suppresses_conflicts() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("app/models")).unwrap();
@@ -7942,6 +8081,33 @@ mod tests {
     }
 
     #[test]
+    fn typescript_navigation_resolves_normal_imports_in_type_assertions() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+        std::fs::write(
+            dir.path().join("lucid_model.d.ts"),
+            "export declare class LucidModel { static columnsDefinitions: Map<string, unknown> }\n",
+        )
+        .unwrap();
+        let main_path = dir.path().join("main.ts");
+        std::fs::write(
+            &main_path,
+            "import { LucidModel } from './lucid_model';\nconst model = this.constructor as LucidModel;\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let main = core
+            .open_document(main_path.to_string_lossy().into_owned())
+            .unwrap();
+
+        assert!(core.request_definition(main.clone(), 1, 35));
+        let definition = core.definition_locations(main);
+        assert_eq!(definition.len(), 1);
+        assert!(definition[0].uri.ends_with("lucid_model.d.ts"));
+        assert_eq!((definition[0].line, definition[0].column), (0, 21));
+    }
+
+    #[test]
     fn typescript_navigation_resolves_imported_decorator_option_keys() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("app/decorators")).unwrap();
@@ -8153,6 +8319,60 @@ mod tests {
                 "cursor {line}:{column}"
             );
         }
+    }
+
+    #[test]
+    fn typescript_navigation_resolves_local_superclass_methods() {
+        let text = "class baseService { setMessage() {} }\nclass Service extends baseService { use() { this.setMessage(); } }\n";
+        let (_dir, path, document) = file_doc(text);
+        let core = Core::new();
+        let handle = core.open_document(path.to_string_lossy().into_owned()).unwrap();
+
+        assert!(core.request_definition(handle.clone(), 1, 53));
+        let definition = core.definition_locations(handle);
+        assert_eq!(definition.len(), 1);
+        assert_eq!((definition[0].line, definition[0].column), (0, 20));
+        drop(document);
+    }
+
+    #[test]
+    fn typescript_navigation_resolves_fluent_local_superclass_methods() {
+        let text = "declare class baseService { protected setCode(code: number): this; protected setMessage(message: string): this; }\nclass Service extends baseService { use() { return this.setCode(200).setMessage('ok'); } }\n";
+        let (_dir, path, _document) = file_doc(text);
+        let core = Core::new();
+        let handle = core.open_document(path.to_string_lossy().into_owned()).unwrap();
+
+        assert!(core.request_definition(handle.clone(), 1, 70));
+        let definition = core.definition_locations(handle);
+        assert_eq!(definition.len(), 1);
+        assert_eq!((definition[0].line, definition[0].column), (0, 77));
+    }
+
+    #[test]
+    fn typescript_navigation_resolves_fluent_imported_declaration_methods() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+        std::fs::write(
+            dir.path().join("base.d.ts"),
+            "export declare class BaseService { protected setCode(code: number): this; protected setMessage(message: string): this; }\n",
+        )
+        .unwrap();
+        let main_path = dir.path().join("main.ts");
+        std::fs::write(
+            &main_path,
+            "import { BaseService } from './base';\nclass Service extends BaseService { use() { return this.setCode(200).setMessage('ok'); } }\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let handle = core
+            .open_document(main_path.to_string_lossy().into_owned())
+            .unwrap();
+
+        assert!(core.request_definition(handle.clone(), 1, 74));
+        let definition = core.definition_locations(handle);
+        assert_eq!(definition.len(), 1);
+        assert!(definition[0].uri.ends_with("base.d.ts"));
+        assert_eq!((definition[0].line, definition[0].column), (0, 84));
     }
 
     #[test]

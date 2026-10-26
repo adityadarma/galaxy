@@ -6,6 +6,11 @@ use galaxy_core::analysis::{
 };
 use galaxy_core::typescript::{Declaration, DeclarationKind, DocumentIndex};
 
+use crate::typescript_navigation::{
+    TypeScriptNavigationCache, typescript_dependency_packages, typescript_package_exports,
+};
+use std::sync::Mutex;
+
 const MAX_TYPESCRIPT_COMPLETIONS: usize = 100;
 const MAX_WORKSPACE_TYPESCRIPT_FILES: usize = 10_000;
 const MAX_WORKSPACE_TYPESCRIPT_FILE_BYTES: u64 = 1_048_576;
@@ -82,15 +87,20 @@ impl TypeScriptWorkspaceExports {
 
 pub(super) fn typescript_completions(
     path: &str,
+    edit_uri: &str,
     text: &str,
     line: usize,
     character: usize,
     workspace_exports: &TypeScriptWorkspaceExports,
+    navigation_cache: &Mutex<TypeScriptNavigationCache>,
+    script_insertion_line: usize,
+    component_extension: Option<&str>,
 ) -> Vec<LspCompletionItem> {
     let Some(prefix) = typescript_identifier_prefix(text, line, character) else {
         return Vec::new();
     };
     let index = DocumentIndex::parse(path, text);
+    let insertion = import_insertion_point(&index, script_insertion_line);
     let mut items = BTreeMap::new();
     if character > 0
         && let Some(symbol) = index.symbol_at(line, character - 1)
@@ -153,7 +163,6 @@ pub(super) fn typescript_completions(
             } else {
                 format!("import {{ {} }} from '{specifier}';\n", export.name)
             };
-            let insertion = import_insertion_point(&index);
             items
                 .entry(export.name.clone())
                 .or_insert_with(|| LspCompletionItem {
@@ -163,7 +172,7 @@ pub(super) fn typescript_completions(
                         export.path
                     )),
                     additional_edits: vec![RenameEdit {
-                        uri: super::file_uri(document_path),
+                        uri: edit_uri.to_owned(),
                         range: LspRange {
                             start_line: insertion as u64,
                             start_character: 0,
@@ -176,9 +185,91 @@ pub(super) fn typescript_completions(
                 });
         }
     }
+    let mut package_specifiers = index
+        .imports
+        .iter()
+        .map(|import| import.specifier.as_str())
+        .filter(|specifier| !specifier.starts_with('.') && !specifier.starts_with('/') && !specifier.starts_with("node:"))
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    let extension = component_extension
+        .or_else(|| document_path.extension().and_then(|extension| extension.to_str()));
+    for (name, specifier) in framework_component_completions(extension, &prefix) {
+        if unavailable.contains(name) {
+            continue;
+        }
+        items.entry(name.to_owned()).or_insert_with(|| LspCompletionItem {
+            detail: Some(format!("function - {specifier}")),
+            additional_edits: vec![RenameEdit {
+                uri: edit_uri.to_owned(),
+                range: LspRange {
+                    start_line: insertion as u64,
+                    start_character: 0,
+                    end_line: insertion as u64,
+                    end_character: 0,
+                },
+                new_text: format!("import {{ {name} }} from '{specifier}';\n"),
+            }],
+            ..typescript_completion_item(name, DeclarationKind::Function)
+        });
+    }
+    if !matches!(extension, Some("vue" | "svelte")) && prefix.len() >= 3 {
+        package_specifiers.extend(typescript_dependency_packages(document_path));
+    }
+    package_specifiers.retain(|specifier| {
+        !(extension == Some("vue") && specifier == "vue")
+            && !(extension == Some("svelte") && specifier == "svelte")
+    });
+    for specifier in package_specifiers {
+        for (name, kind) in typescript_package_exports(navigation_cache, document_path, &specifier, &prefix) {
+            if unavailable.contains(name.as_str()) {
+                continue;
+            }
+            items.entry(name.clone()).or_insert_with(|| LspCompletionItem {
+                detail: Some(format!("{} - {specifier}", typescript_declaration_kind(kind))),
+                additional_edits: vec![RenameEdit {
+                    uri: edit_uri.to_owned(),
+                    range: LspRange {
+                        start_line: insertion as u64,
+                        start_character: 0,
+                        end_line: insertion as u64,
+                        end_character: 0,
+                    },
+                    new_text: format!("import {{ {name} }} from '{specifier}';\n"),
+                }],
+                ..typescript_completion_item(&name, kind)
+            });
+        }
+    }
     items
         .into_values()
         .take(MAX_TYPESCRIPT_COMPLETIONS)
+        .collect()
+}
+
+fn framework_component_completions<'a>(extension: Option<&str>, prefix: &str) -> Vec<(&'a str, &'a str)> {
+    let (package, names): (&str, &[&str]) = match extension {
+        Some("vue") => (
+            "vue",
+            &[
+                "computed", "ref", "reactive", "readonly", "watch", "watchEffect", "watchPostEffect",
+                "watchSyncEffect", "toRef", "toRefs", "unref", "isRef", "nextTick", "onMounted",
+                "onUnmounted", "onUpdated", "onBeforeMount", "onBeforeUnmount", "onBeforeUpdate",
+                "defineProps", "defineEmits", "defineExpose", "defineModel", "defineOptions",
+                "provide", "inject", "useTemplateRef",
+            ],
+        ),
+        Some("svelte") => (
+            "svelte",
+            &["onMount", "onDestroy", "beforeUpdate", "afterUpdate", "tick", "createEventDispatcher"],
+        ),
+        _ => return Vec::new(),
+    };
+    names
+        .iter()
+        .copied()
+        .filter(|name| name.starts_with(prefix))
+        .map(|name| (name, package))
         .collect()
 }
 
@@ -189,13 +280,13 @@ fn is_source_path(path: &str) -> bool {
             .any(|extension| path.ends_with(extension))
 }
 
-fn import_insertion_point(index: &DocumentIndex) -> usize {
+fn import_insertion_point(index: &DocumentIndex, fallback: usize) -> usize {
     index
         .imports
         .iter()
         .map(|import| import.range.end.line + 1)
         .max()
-        .unwrap_or(0)
+        .unwrap_or(fallback)
 }
 
 fn workspace_module_specifier(document: &Path, exported_path: &str) -> Option<String> {

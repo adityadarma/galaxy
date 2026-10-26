@@ -82,6 +82,64 @@ pub(super) fn collect_inherited_member_uses(
                 member_range: locations.range(property),
             });
         }
+        if matches!(node.kind(), "member_expression" | "subscript_expression")
+            && let (Some(object), Some(property)) = (
+                node.child_by_field_name("object"),
+                node.child_by_field_name(if node.kind() == "member_expression" {
+                    "property"
+                } else {
+                    "index"
+                }),
+            )
+            && object.kind() == "this"
+            && let Some(member_name) = direct_member_name(text, property)
+            && let Some(class) = enclosing_class(node)
+            && imported_superclass_binding(
+                class,
+                text,
+                locations,
+                imports,
+                symbols,
+                import_symbols,
+            )
+            .is_none()
+            && let Some(declaration_range) = local_superclass_declaration(
+                class, text, locations, symbols,
+            )
+        {
+            uses.push(TypeMemberUse {
+                target: TypeMemberTarget::SuperLocal(declaration_range),
+                member_name,
+                member_range: locations.range(property),
+            });
+        }
+        if node.kind() == "member_expression"
+            && let Some(property) = node.child_by_field_name("property")
+            && let Some(member_name) = direct_member_name(text, property)
+            && let Some(object) = node.child_by_field_name("object")
+            && let Some((chain, class)) = fluent_this_method_chain(object, text)
+        {
+            if let Some(binding) = imported_superclass_binding(
+                class,
+                text,
+                locations,
+                imports,
+                symbols,
+                import_symbols,
+            ) {
+                uses.push(TypeMemberUse {
+                    target: TypeMemberTarget::SuperImportedChain { binding, chain },
+                    member_name,
+                    member_range: locations.range(property),
+                });
+            } else if let Some(declaration) = local_superclass_declaration(class, text, locations, symbols) {
+                uses.push(TypeMemberUse {
+                    target: TypeMemberTarget::SuperLocalChain { declaration, chain },
+                    member_name,
+                    member_range: locations.range(property),
+                });
+            }
+        }
         if node.kind() == "member_expression"
             && let (Some(object), Some(property)) = (
                 node.child_by_field_name("object"),
@@ -120,6 +178,53 @@ pub(super) fn collect_inherited_member_uses(
         stack.extend(node.named_children(&mut cursor));
     }
     uses
+}
+
+fn fluent_this_method_chain<'a>(
+    node: Node<'a>,
+    text: &str,
+) -> Option<(Vec<String>, Node<'a>)> {
+    let call = (node.kind() == "call_expression").then_some(node)?;
+    let function = call.child_by_field_name("function")?;
+    let property = function.child_by_field_name("property")?;
+    let method = direct_member_name(text, property)?;
+    let object = function.child_by_field_name("object")?;
+    if object.kind() == "this" {
+        return Some((vec![method], enclosing_class(node)?));
+    }
+    let (mut chain, class) = fluent_this_method_chain(object, text)?;
+    chain.push(method);
+    Some((chain, class))
+}
+
+fn local_superclass_declaration(
+    class: Node<'_>,
+    text: &str,
+    locations: &Locations,
+    symbols: &[SymbolOccurrences],
+) -> Option<Utf16Range> {
+    let mut cursor = class.walk();
+    let heritage = class
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "class_heritage")?;
+    let mut cursor = heritage.walk();
+    let clause = heritage
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "extends_clause")?;
+    let mut cursor = clause.walk();
+    let base = clause
+        .named_children(&mut cursor)
+        .find(|child| matches!(child.kind(), "identifier" | "type_identifier"))?;
+    let name = node_text(text, base)?;
+    let base_range = locations.range(base);
+    symbols
+        .iter()
+        .find(|symbol| {
+            symbol.name == name
+                && symbol.kind == DeclarationKind::Class
+                && symbol.occurrences.contains(&base_range)
+        })
+        .map(|symbol| symbol.declaration)
 }
 
 pub(super) fn sole_callback_parameter(node: Node<'_>) -> Option<Node<'_>> {

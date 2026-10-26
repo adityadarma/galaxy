@@ -196,6 +196,22 @@ final class NavigationTests: XCTestCase {
         XCTAssertEqual(v.definitionLink?.end, 18)
     }
 
+    func testCommandHoverUnderlinesVueImportSpecifier() throws {
+        let text = "import { usePage } from '@inertiajs/vue3'"
+        let c = try makeController(text: text)
+        let v = c.editorView
+        v.document?.setPath(path: "/tmp/Page.vue")
+        v.onDefinitionClick = { _ in true }
+        let specifier = (text as NSString).range(of: "@inertiajs/vue3")
+        let x = v.textOriginX + v.xOffset(in: text, column: UInt64(specifier.location + 2)) + 0.5
+        v.lastMousePoint = NSPoint(x: x, y: v.metrics.lineHeight / 2)
+
+        v.updateDefinitionLink(commandHeld: true)
+
+        XCTAssertEqual(v.definitionLink?.start, UInt64(specifier.location))
+        XCTAssertEqual(v.definitionLink?.end, UInt64(specifier.location + specifier.length))
+    }
+
     func testCommandHoverSkipsConfigurationLanguages() throws {
         let c = try makeController(text: "server { listen 80; }")
         let v = c.editorView

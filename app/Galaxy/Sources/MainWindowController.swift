@@ -58,10 +58,21 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     var statusLabel: NSTextField { statusBar.message }
     let scrollView = DiagnosticScrollView()
     let secondaryScrollView = DiagnosticScrollView()
-    let markdownPreview = MarkdownPreviewView()
+    private var loadedMarkdownPreview: MarkdownPreviewView?
+    var markdownPreview: MarkdownPreviewView {
+        if let preview = loadedMarkdownPreview { return preview }
+        let preview = MarkdownPreviewView()
+        preview.onUserScroll = { [weak self] line in self?.syncEditorToPreview(line: line) }
+        loadedMarkdownPreview = preview
+        return preview
+    }
     /// User asked for the Markdown preview; it shows whenever the active tab is Markdown.
     var isMarkdownPreviewOn = false
-    var isMarkdownPreviewShown: Bool { markdownPreview.superview != nil }
+    var isMarkdownPreviewShown: Bool { loadedMarkdownPreview?.superview != nil }
+
+    func removeMarkdownPreviewIfLoaded() {
+        loadedMarkdownPreview?.removeFromSuperview()
+    }
     let editorSplitView = NSSplitView()
     let problemsPanel = ProblemsPanel()
     let referencesPanel = ReferencesPanel()
@@ -501,7 +512,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         secondaryEditorView.autoresizingMask = [.width]
         secondaryScrollView.documentView = secondaryEditorView
         installDiffScrollSync()
-        markdownPreview.onUserScroll = { [weak self] line in self?.syncEditorToPreview(line: line) }
         editorSplitView.isVertical = true
         editorSplitView.dividerStyle = .thin
         editorSplitView.translatesAutoresizingMaskIntoConstraints = false

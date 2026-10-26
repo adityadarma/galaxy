@@ -290,16 +290,16 @@ extension EditorView {
     }
 
     static func isJavaScriptFamily(_ document: DocumentHandle) -> Bool {
-        ["TypeScript", "TSX", "JavaScript"].contains(document.syntaxLanguage() ?? "")
+        ["TypeScript", "TSX", "JavaScript", "Vue", "Svelte"].contains(document.syntaxLanguage() ?? "")
     }
 
     /// Cmd-hover is for source code only. Configuration and markup grammars
     /// classify words for coloring, but their tokens have no definitions to open.
     static func supportsDefinitionNavigation(_ document: DocumentHandle) -> Bool {
         isPHP(document) || [
-            "TypeScript", "TSX", "JavaScript", "Rust", "Go", "Python", "Bash",
+            "TypeScript", "TSX", "JavaScript", "Rust", "Go", "Python",
             "C", "C++", "C#", "Java", "Ruby", "Lua", "Swift", "SQL", "PowerShell",
-            "Dart", "R",
+            "Dart", "R", "Vue", "Svelte",
         ].contains(document.syntaxLanguage() ?? "")
     }
 

@@ -61,10 +61,6 @@ extension MainWindowController {
         recentFiles = []
         if isQuickOpenVisible { closeGoToFile() }
         loadedQuickOpen?.finder = nil
-        // Ready by the time ⌘P is pressed in all but huge folders.
-        rebuildFileFinder()
-        startWatching(ws)
-        refreshGitStatus()
         // Apply files.exclude before the explorer lists the new root.
         reloadSettings(force: true)
         explorer.setWorkspace(ws)
@@ -76,6 +72,14 @@ extension MainWindowController {
         resetBottomPanelForNewWorkspace()
         if let session = Session.load(from: Session.workspaceURL(for: ws.root())) {
             restoreTabs(from: session)
+        }
+        // Git, filesystem watching, and the Go to File index are not needed
+        // for the restored editor frame. Start them after AppKit presents it.
+        DispatchQueue.main.async { [weak self, weak ws] in
+            guard let self, let ws, self.workspace === ws else { return }
+            self.rebuildFileFinder()
+            self.startWatching(ws)
+            self.refreshGitStatus()
         }
     }
 

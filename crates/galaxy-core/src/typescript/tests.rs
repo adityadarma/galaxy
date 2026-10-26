@@ -591,3 +591,35 @@ fn indexes_direct_this_members_of_imported_superclasses() {
         })
     ));
 }
+
+#[test]
+fn indexes_direct_this_members_of_local_superclasses() {
+    let index = DocumentIndex::parse(
+        "main.ts",
+        "class baseService { setMessage() {} }\nclass Service extends baseService { use() { this.setMessage(); } }",
+    );
+    assert!(matches!(
+        index.type_member_at(1, 53),
+        Some(TypeMemberUse {
+            target: TypeMemberTarget::SuperLocal(_),
+            member_name,
+            ..
+        }) if member_name == "setMessage"
+    ));
+}
+
+#[test]
+fn indexes_fluent_this_members_of_local_superclasses() {
+    let index = DocumentIndex::parse(
+        "main.ts",
+        "declare class baseService { protected setCode(code: number): this; protected setMessage(message: string): this; }\nclass Service extends baseService { use() { return this.setCode(200).setMessage('ok'); } }",
+    );
+    assert!(matches!(
+        index.type_member_at(1, 70),
+        Some(TypeMemberUse {
+            target: TypeMemberTarget::SuperLocalChain { chain, .. },
+            member_name,
+            ..
+        }) if chain.as_slice() == ["setCode"] && member_name == "setMessage"
+    ));
+}
