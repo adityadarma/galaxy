@@ -37,6 +37,12 @@ targets:
   Galaxy:
     type: application
     platform: macOS
+    entitlements:
+      path: Galaxy/Resources/Galaxy.entitlements
+      properties:
+        # Sparkle is a separately signed updater framework. Hardened Runtime
+        # otherwise rejects it when local builds use an ad-hoc signature.
+        com.apple.security.cs.disable-library-validation: true
     info:
       path: Galaxy/Resources/Info.plist
       properties:
@@ -75,6 +81,11 @@ targets:
           - $(PROJECT_DIR)/Galaxy/FFI/libgalaxy_ffi.a
           - $(PROJECT_DIR)/Galaxy/Generated/galaxy_ffi.swift
     postBuildScripts:
+      - name: Embed Sparkle
+        script: |
+          ditto "${BUILT_PRODUCTS_DIR}/Sparkle.framework" "${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}/Sparkle.framework"
+          codesign --force --deep --sign "${EXPANDED_CODE_SIGN_IDENTITY}" --options runtime --timestamp=none "${TARGET_BUILD_DIR}/${FRAMEWORKS_FOLDER_PATH}/Sparkle.framework"
+        basedOnDependencyAnalysis: false
       - name: Refresh App Bundle Timestamp
         script: |
           touch "${TARGET_BUILD_DIR}/${WRAPPER_NAME}"
@@ -83,7 +94,9 @@ targets:
       - target: GalaxyCLI
       - package: Sparkle
         product: Sparkle
-        embed: true
+        # XcodeGen emits `Sparkle` instead of `Sparkle.framework` in its
+        # generated embed phase. Copy the SwiftPM framework explicitly above.
+        embed: false
     copyFiles:
       - destination: executables
         files:

@@ -23,6 +23,7 @@ use super::parse::{
     parse_with_tree, resolve_name, resolve_type,
 };
 use super::stubs::{Stubs, is_stub_path, materialize};
+use super::version::{VersionSelection, for_project};
 
 mod assist;
 mod complete;
@@ -96,7 +97,9 @@ pub struct Built {
 pub fn build(root: &Path) -> Built {
     let autoload = Autoload::load(root);
     let mut names = autoload.all_classes();
-    names.extend(Stubs::get().class_names().iter().cloned());
+    if let VersionSelection::Supported(version) = for_project(root) {
+        names.extend(Stubs::for_version(version).class_names().iter().cloned());
+    }
     let mut scanned = HashMap::new();
     if autoload.is_empty() {
         for (fqn, path) in scan_sources(root) {
@@ -148,6 +151,7 @@ pub struct PhpEngine {
     frameworks: Vec<Arc<dyn Framework>>,
     /// Nesting of return types worked out from method bodies.
     infer_depth: u8,
+    php_version: VersionSelection,
 }
 
 impl PhpEngine {
@@ -170,6 +174,7 @@ impl PhpEngine {
             functions: None,
             frameworks,
             infer_depth: 0,
+            php_version: for_project(root),
         }
     }
 
@@ -199,6 +204,7 @@ impl PhpEngine {
             functions: None,
             frameworks: Vec::new(),
             infer_depth: 0,
+            php_version: for_project(root),
         }
     }
 

@@ -203,6 +203,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             return
         }
         let session = pendingWindowSessions.removeFirst()
+        if let root = session.workspace,
+           let existing = windowController(forWorkspaceAt: root) {
+            existing.showWindow(nil)
+            existing.window?.makeKeyAndOrderFront(nil)
+            restoreNextPendingWindow()
+            return
+        }
         let controller = makeWindowController()
         if !controller.restore(session) { controller.newDocument(nil) }
         showMainWindow(controller, concealedForFullScreen: session.fullScreen == true)
@@ -315,12 +322,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
     private func makeWindowController() -> MainWindowController {
         let controller = MainWindowController(bridge: bridge)
+        controller.openExistingWorkspace = { [weak self] url in
+            guard let self, let existing = self.windowController(forWorkspaceAt: url.path) else {
+                return false
+            }
+            existing.showWindow(nil)
+            existing.window?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return true
+        }
         controller.openTerminalInNewWindow = { [weak self] terminal, root in
             guard let self else { return }
             let fromFullScreen = self.isActiveWindowFullScreen
             let window = self.makeWindowController()
             window.showWindow(nil)
-            try? window.openWorkspace(at: root)
+            // Keep the terminal's process and working directory, but do not
+            // attach the same workspace to a second window.
             window.adoptTerminal(terminal)
             NSApp.activate(ignoringOtherApps: true)
             self.moveToRegularDesktop(window, fromFullScreen)
@@ -334,5 +351,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         }
         windowControllers.append(controller)
         return controller
+    }
+
+    private func windowController(
+        forWorkspaceAt path: String,
+        excluding excluded: MainWindowController? = nil
+    ) -> MainWindowController? {
+        guard let root = MainWindowController.fileKey(path) else { return nil }
+        return windowControllers.first {
+            $0 !== excluded && MainWindowController.fileKey($0.workspace?.root() ?? "") == root
+        }
     }
 }

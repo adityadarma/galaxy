@@ -300,10 +300,7 @@ fn collect_decorator_option_shape(
 
 pub(super) fn member_return_type(member: Node<'_>, text: &str) -> Option<String> {
     let annotation = member.child_by_field_name("return_type");
-    if annotation.is_none()
-        && member.kind() == "method_definition"
-        && method_returns_this(member)
-    {
+    if annotation.is_none() && member.kind() == "method_definition" && method_returns_this(member) {
         return Some("this".to_owned());
     }
     let annotation = annotation?;

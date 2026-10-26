@@ -1,7 +1,6 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use super::*;
-use crate::go::modules::GoProject;
+use super::{GoEngine, GoProject, byte_at, project_root};
 
 const MAIN: &str = "package main\n\ntype User struct {\n\tName string\n}\n\n// Greet says hello.\nfunc (u *User) Greet(greeting string, times int) string {\n\treturn greeting + u.Name\n}\n\nfunc main() {\n\tu := &User{Name: \"a\"}\n\tu.Greet(\"hi\", 1)\n}\n";
 
@@ -24,6 +23,14 @@ fn at(text: &str, needle: &str, extra: usize) -> (u32, u32) {
     let line = text[..offset].matches('\n').count() as u32;
     let start = text[..offset].rfind('\n').map_or(0, |i| i + 1);
     (line, text[start..offset].encode_utf16().count() as u32)
+}
+
+#[test]
+fn byte_at_counts_utf16_columns() {
+    let text = "a😀b\nxy";
+    assert_eq!(byte_at(text, 0, 3), "a😀".len());
+    assert_eq!(byte_at(text, 1, 1), text.len() - 1);
+    assert_eq!(byte_at(text, 9, 0), text.len());
 }
 
 #[test]
@@ -115,13 +122,4 @@ fn unsaved_text_wins_over_the_disk() {
     let edited = MAIN.replace("greeting + u.Name", "greeting");
     engine.diagnostics(&file, &edited);
     assert_eq!(engine.open_text(&file).as_deref(), Some(edited.as_str()));
-    let _: &Path = &file;
-}
-
-#[test]
-fn byte_at_counts_utf16_columns() {
-    let text = "a😀b\nxy";
-    assert_eq!(byte_at(text, 0, 3), "a😀".len());
-    assert_eq!(byte_at(text, 1, 1), text.len() - 1);
-    assert_eq!(byte_at(text, 9, 0), text.len());
 }

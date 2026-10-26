@@ -101,6 +101,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     var nextTerminalGroup = 0
     /// Set by the app delegate: opens a window that takes over a terminal.
     var openTerminalInNewWindow: ((PanelTerminal, URL) -> Void)?
+    /// The app delegate can activate an existing window for this workspace.
+    /// `true` means the open request was handled elsewhere.
+    var openExistingWorkspace: ((URL) -> Bool)?
     let hoverPopover = HoverPopover()
     let blamePopover = BlamePopover()
     /// `editor.gitBlame`, or the View > Toggle Git Blame override of it.

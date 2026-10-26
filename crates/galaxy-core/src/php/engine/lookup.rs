@@ -2,6 +2,7 @@
 //! files and the bundled stubs.
 
 use super::*;
+use crate::php::version::VersionSelection;
 
 impl PhpEngine {
     // ---- lookup -----------------------------------------------------
@@ -80,7 +81,10 @@ impl PhpEngine {
         if self.deferred && self.built_at.is_none() {
             NONE.get_or_init(Stubs::default)
         } else {
-            Stubs::get()
+            match self.php_version {
+                VersionSelection::Supported(version) => Stubs::for_version(version),
+                VersionSelection::Unsupported => NONE.get_or_init(Stubs::default),
+            }
         }
     }
 

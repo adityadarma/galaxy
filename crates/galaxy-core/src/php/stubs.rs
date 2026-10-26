@@ -1,6 +1,6 @@
 //! PHP's own classes and functions (`Exception`, `ArrayAccess`, `strlen`,
-//! `DateTime`, ...), read from JetBrains' phpstorm-stubs embedded in the
-//! binary. They are parsed once per process, on first use.
+//! `DateTime`, ...), read from official php-src declarations embedded in the
+//! binary. Each selected PHP baseline is parsed once per process.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -9,9 +9,10 @@ use std::sync::{Arc, OnceLock};
 use super::composer::ClassName;
 use super::parse::{ClassInfo, FunctionInfo, parse_file};
 use super::stub_files::FILES;
+use super::version::PhpVersion;
 
 /// `empty()` and `isset()` look like functions but are language constructs,
-/// so the phpstorm stubs leave them out. Declared here so they can be
+/// so php-src declarations leave them out. Declared here so they can be
 /// hovered and opened like any other call.
 const CONSTRUCTS: (&str, &str) = (
     "Core/constructs.php",
@@ -58,14 +59,29 @@ pub struct Stubs {
 impl Stubs {
     /// Parsed stubs, shared by every engine. The first call parses them
     /// all, so run it on a worker thread.
-    pub fn get() -> &'static Stubs {
-        static STUBS: OnceLock<Stubs> = OnceLock::new();
-        STUBS.get_or_init(Stubs::parse)
+    pub fn for_version(version: PhpVersion) -> &'static Stubs {
+        static STUBS: [OnceLock<Stubs>; 6] = [
+            OnceLock::new(),
+            OnceLock::new(),
+            OnceLock::new(),
+            OnceLock::new(),
+            OnceLock::new(),
+            OnceLock::new(),
+        ];
+        let index = match version {
+            PhpVersion::V80 => 0,
+            PhpVersion::V81 => 1,
+            PhpVersion::V82 => 2,
+            PhpVersion::V83 => 3,
+            PhpVersion::V84 => 4,
+            PhpVersion::V85 => 5,
+        };
+        STUBS[index].get_or_init(|| Stubs::parse(FILES[index]))
     }
 
-    fn parse() -> Stubs {
+    fn parse(files: &[(&str, &str)]) -> Stubs {
         let mut stubs = Stubs::default();
-        for (name, text) in FILES.iter().chain(std::iter::once(&CONSTRUCTS)) {
+        for (name, text) in files.iter().chain(std::iter::once(&CONSTRUCTS)) {
             let path = PathBuf::from(format!("{SCHEME}{name}"));
             let file = parse_file(&path, text);
             for class in &file.classes {
@@ -118,6 +134,7 @@ pub fn materialize(path: &Path) -> Option<PathBuf> {
     let name = path.to_str()?.strip_prefix(SCHEME)?;
     let (_, text) = FILES
         .iter()
+        .flat_map(|files| files.iter())
         .chain(std::iter::once(&CONSTRUCTS))
         .find(|(file, _)| *file == name)?;
     let target = std::env::temp_dir().join("galaxy-php-stubs").join(name);

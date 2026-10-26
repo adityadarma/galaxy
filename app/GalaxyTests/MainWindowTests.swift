@@ -109,4 +109,43 @@ final class MainWindowTests: XCTestCase {
         XCTAssertEqual(view.lastDrawnLines.lowerBound, 0)
         XCTAssertGreaterThan(view.lastDrawnLines.count, 10)
     }
+
+    func testOpeningWorkspaceHandledByAnotherWindowKeepsCurrentWorkspace() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("galaxy-workspace-\(UUID().uuidString)", isDirectory: true)
+        let other = root.appendingPathComponent("other", isDirectory: true)
+        try FileManager.default.createDirectory(at: other, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let controller = MainWindowController(bridge: CoreBridge())
+        try controller.openWorkspace(at: root)
+        var handledURL: URL?
+        controller.openExistingWorkspace = { url in
+            handledURL = url
+            return true
+        }
+
+        try controller.openWorkspace(at: other)
+
+        XCTAssertEqual(handledURL?.path, other.path)
+        XCTAssertEqual(controller.workspace?.root(), root.path)
+    }
+
+    func testOpeningTheCurrentWorkspaceDoesNotReloadIt() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("galaxy-workspace-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let controller = MainWindowController(bridge: CoreBridge())
+        try controller.openWorkspace(at: root)
+        let workspace = try XCTUnwrap(controller.workspace)
+        controller.openExistingWorkspace = { url in
+            url.path == root.path
+        }
+
+        try controller.openWorkspace(at: root)
+
+        XCTAssertTrue(controller.workspace === workspace)
+    }
 }

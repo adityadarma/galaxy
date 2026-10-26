@@ -486,7 +486,8 @@ pub(super) fn resolve_typescript_type_member_target(
         TypeMemberTarget::SuperImportedChain { binding, chain } => {
             let (import, binding) = index.import_binding_by_range(*binding)?;
             let imported_name = binding.imported_name.as_deref()?;
-            if binding.type_only || !matches!(binding.kind, ImportKind::Named | ImportKind::Default) {
+            if binding.type_only || !matches!(binding.kind, ImportKind::Named | ImportKind::Default)
+            {
                 return None;
             }
             let target = resolve_typescript_definition_import(
@@ -502,7 +503,8 @@ pub(super) fn resolve_typescript_type_member_target(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .index(&path)?;
-            let member = resolve_fluent_member(&target_index, &declaration.name, chain, member_name)?;
+            let member =
+                resolve_fluent_member(&target_index, &declaration.name, chain, member_name)?;
             Some(LspDefinitionLocation {
                 uri: file_uri(&path),
                 range: typescript_range(member.range),
@@ -642,14 +644,19 @@ fn resolve_fluent_member<'a>(
     chain: &[String],
     member_name: &str,
 ) -> Option<&'a galaxy_core::typescript::TypeMember> {
-    let type_name = chain.iter().try_fold(initial_type.to_owned(), |type_name, method| {
-        let return_type = index.type_member(&type_name, method)?.return_type.as_deref()?;
-        Some(if return_type == "this" {
-            type_name
-        } else {
-            return_type.to_owned()
-        })
-    })?;
+    let type_name = chain
+        .iter()
+        .try_fold(initial_type.to_owned(), |type_name, method| {
+            let return_type = index
+                .type_member(&type_name, method)?
+                .return_type
+                .as_deref()?;
+            Some(if return_type == "this" {
+                type_name
+            } else {
+                return_type.to_owned()
+            })
+        })?;
     index.type_member(&type_name, member_name)
 }
 
@@ -766,11 +773,7 @@ fn package_exports_inner(
     if depth == MAX_TYPESCRIPT_REEXPORT_DEPTH || !visited.insert(module_identity(path)) {
         return;
     }
-    let Some(index) = cache
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .index(path)
-    else {
+    let Some(index) = cache.lock().unwrap_or_else(|e| e.into_inner()).index(path) else {
         return;
     };
     for declaration in index
@@ -796,7 +799,9 @@ fn package_exports_inner(
             && exported_name.starts_with(prefix)
             && let Some((_, declaration)) = resolve_typescript_export(cache, target, name)
         {
-            exports.entry(exported_name.to_owned()).or_insert(declaration.kind);
+            exports
+                .entry(exported_name.to_owned())
+                .or_insert(declaration.kind);
         }
     }
 }

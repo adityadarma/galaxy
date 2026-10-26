@@ -14,6 +14,7 @@ mod generics;
 pub mod parse;
 mod stub_files;
 mod stubs;
+mod version;
 
 pub use engine::{
     Action, Built, Completion, Edit, HoverResult, Insertion, ItemKind, Occurrence, OutlineSymbol,

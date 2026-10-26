@@ -189,44 +189,26 @@ pub(super) fn typescript_completions(
         .imports
         .iter()
         .map(|import| import.specifier.as_str())
-        .filter(|specifier| !specifier.starts_with('.') && !specifier.starts_with('/') && !specifier.starts_with("node:"))
+        .filter(|specifier| {
+            !specifier.starts_with('.')
+                && !specifier.starts_with('/')
+                && !specifier.starts_with("node:")
+        })
         .map(str::to_owned)
         .collect::<BTreeSet<_>>();
-    let extension = component_extension
-        .or_else(|| document_path.extension().and_then(|extension| extension.to_str()));
+    let extension = component_extension.or_else(|| {
+        document_path
+            .extension()
+            .and_then(|extension| extension.to_str())
+    });
     for (name, specifier) in framework_component_completions(extension, &prefix) {
         if unavailable.contains(name) {
             continue;
         }
-        items.entry(name.to_owned()).or_insert_with(|| LspCompletionItem {
-            detail: Some(format!("function - {specifier}")),
-            additional_edits: vec![RenameEdit {
-                uri: edit_uri.to_owned(),
-                range: LspRange {
-                    start_line: insertion as u64,
-                    start_character: 0,
-                    end_line: insertion as u64,
-                    end_character: 0,
-                },
-                new_text: format!("import {{ {name} }} from '{specifier}';\n"),
-            }],
-            ..typescript_completion_item(name, DeclarationKind::Function)
-        });
-    }
-    if !matches!(extension, Some("vue" | "svelte")) && prefix.len() >= 3 {
-        package_specifiers.extend(typescript_dependency_packages(document_path));
-    }
-    package_specifiers.retain(|specifier| {
-        !(extension == Some("vue") && specifier == "vue")
-            && !(extension == Some("svelte") && specifier == "svelte")
-    });
-    for specifier in package_specifiers {
-        for (name, kind) in typescript_package_exports(navigation_cache, document_path, &specifier, &prefix) {
-            if unavailable.contains(name.as_str()) {
-                continue;
-            }
-            items.entry(name.clone()).or_insert_with(|| LspCompletionItem {
-                detail: Some(format!("{} - {specifier}", typescript_declaration_kind(kind))),
+        items
+            .entry(name.to_owned())
+            .or_insert_with(|| LspCompletionItem {
+                detail: Some(format!("function - {specifier}")),
                 additional_edits: vec![RenameEdit {
                     uri: edit_uri.to_owned(),
                     range: LspRange {
@@ -237,8 +219,42 @@ pub(super) fn typescript_completions(
                     },
                     new_text: format!("import {{ {name} }} from '{specifier}';\n"),
                 }],
-                ..typescript_completion_item(&name, kind)
+                ..typescript_completion_item(name, DeclarationKind::Function)
             });
+    }
+    if !matches!(extension, Some("vue" | "svelte")) && prefix.len() >= 3 {
+        package_specifiers.extend(typescript_dependency_packages(document_path));
+    }
+    package_specifiers.retain(|specifier| {
+        !(extension == Some("vue") && specifier == "vue")
+            && !(extension == Some("svelte") && specifier == "svelte")
+    });
+    for specifier in package_specifiers {
+        for (name, kind) in
+            typescript_package_exports(navigation_cache, document_path, &specifier, &prefix)
+        {
+            if unavailable.contains(name.as_str()) {
+                continue;
+            }
+            items
+                .entry(name.clone())
+                .or_insert_with(|| LspCompletionItem {
+                    detail: Some(format!(
+                        "{} - {specifier}",
+                        typescript_declaration_kind(kind)
+                    )),
+                    additional_edits: vec![RenameEdit {
+                        uri: edit_uri.to_owned(),
+                        range: LspRange {
+                            start_line: insertion as u64,
+                            start_character: 0,
+                            end_line: insertion as u64,
+                            end_character: 0,
+                        },
+                        new_text: format!("import {{ {name} }} from '{specifier}';\n"),
+                    }],
+                    ..typescript_completion_item(&name, kind)
+                });
         }
     }
     items
@@ -247,21 +263,53 @@ pub(super) fn typescript_completions(
         .collect()
 }
 
-fn framework_component_completions<'a>(extension: Option<&str>, prefix: &str) -> Vec<(&'a str, &'a str)> {
+fn framework_component_completions<'a>(
+    extension: Option<&str>,
+    prefix: &str,
+) -> Vec<(&'a str, &'a str)> {
     let (package, names): (&str, &[&str]) = match extension {
         Some("vue") => (
             "vue",
             &[
-                "computed", "ref", "reactive", "readonly", "watch", "watchEffect", "watchPostEffect",
-                "watchSyncEffect", "toRef", "toRefs", "unref", "isRef", "nextTick", "onMounted",
-                "onUnmounted", "onUpdated", "onBeforeMount", "onBeforeUnmount", "onBeforeUpdate",
-                "defineProps", "defineEmits", "defineExpose", "defineModel", "defineOptions",
-                "provide", "inject", "useTemplateRef",
+                "computed",
+                "ref",
+                "reactive",
+                "readonly",
+                "watch",
+                "watchEffect",
+                "watchPostEffect",
+                "watchSyncEffect",
+                "toRef",
+                "toRefs",
+                "unref",
+                "isRef",
+                "nextTick",
+                "onMounted",
+                "onUnmounted",
+                "onUpdated",
+                "onBeforeMount",
+                "onBeforeUnmount",
+                "onBeforeUpdate",
+                "defineProps",
+                "defineEmits",
+                "defineExpose",
+                "defineModel",
+                "defineOptions",
+                "provide",
+                "inject",
+                "useTemplateRef",
             ],
         ),
         Some("svelte") => (
             "svelte",
-            &["onMount", "onDestroy", "beforeUpdate", "afterUpdate", "tick", "createEventDispatcher"],
+            &[
+                "onMount",
+                "onDestroy",
+                "beforeUpdate",
+                "afterUpdate",
+                "tick",
+                "createEventDispatcher",
+            ],
         ),
         _ => return Vec::new(),
     };

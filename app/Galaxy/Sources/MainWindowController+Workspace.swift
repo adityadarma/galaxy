@@ -40,6 +40,7 @@ extension MainWindowController {
     }
 
     func openWorkspace(at url: URL) throws {
+        if openExistingWorkspace?(url) == true { return }
         // A new folder is a new project session. Do not carry files from the
         // previous workspace into the new tab bar.
         guard confirmDiscardAllGroups() else { return }

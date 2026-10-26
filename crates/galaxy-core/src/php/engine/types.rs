@@ -233,6 +233,26 @@ impl PhpEngine {
     /// Key or value type when iterating `ty` with `foreach`.
     pub(super) fn element_type(&mut self, ty: &str, key: bool) -> Option<String> {
         let chain = self.lineage_env(ty);
+        // php-src declares IteratorAggregate without PHPDoc templates. Read
+        // the project's `@implements IteratorAggregate<TKey, TValue>` before
+        // following that native interface so collection generics still flow.
+        for (class, env) in &chain {
+            if let Some(parent) = class.generic_parents.iter().find(|parent| {
+                matches!(
+                    generics::base(parent).to_ascii_lowercase().as_str(),
+                    "traversable" | "iterator" | "iteratoraggregate"
+                )
+            }) {
+                let args = generics::split(parent).1;
+                let index = usize::from(!key);
+                if let Some(found) = args.get(index) {
+                    let found = generics::subst(found, env, "");
+                    if !found.is_empty() {
+                        return Some(found);
+                    }
+                }
+            }
+        }
         let (_, env) = chain.iter().find(|(class, _)| {
             matches!(
                 class.fqn.to_ascii_lowercase().as_str(),

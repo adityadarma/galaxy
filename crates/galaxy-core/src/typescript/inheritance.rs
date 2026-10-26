@@ -94,18 +94,10 @@ pub(super) fn collect_inherited_member_uses(
             && object.kind() == "this"
             && let Some(member_name) = direct_member_name(text, property)
             && let Some(class) = enclosing_class(node)
-            && imported_superclass_binding(
-                class,
-                text,
-                locations,
-                imports,
-                symbols,
-                import_symbols,
-            )
-            .is_none()
-            && let Some(declaration_range) = local_superclass_declaration(
-                class, text, locations, symbols,
-            )
+            && imported_superclass_binding(class, text, locations, imports, symbols, import_symbols)
+                .is_none()
+            && let Some(declaration_range) =
+                local_superclass_declaration(class, text, locations, symbols)
         {
             uses.push(TypeMemberUse {
                 target: TypeMemberTarget::SuperLocal(declaration_range),
@@ -132,7 +124,9 @@ pub(super) fn collect_inherited_member_uses(
                     member_name,
                     member_range: locations.range(property),
                 });
-            } else if let Some(declaration) = local_superclass_declaration(class, text, locations, symbols) {
+            } else if let Some(declaration) =
+                local_superclass_declaration(class, text, locations, symbols)
+            {
                 uses.push(TypeMemberUse {
                     target: TypeMemberTarget::SuperLocalChain { declaration, chain },
                     member_name,
@@ -180,10 +174,7 @@ pub(super) fn collect_inherited_member_uses(
     uses
 }
 
-fn fluent_this_method_chain<'a>(
-    node: Node<'a>,
-    text: &str,
-) -> Option<(Vec<String>, Node<'a>)> {
+fn fluent_this_method_chain<'a>(node: Node<'a>, text: &str) -> Option<(Vec<String>, Node<'a>)> {
     let call = (node.kind() == "call_expression").then_some(node)?;
     let function = call.child_by_field_name("function")?;
     let property = function.child_by_field_name("property")?;

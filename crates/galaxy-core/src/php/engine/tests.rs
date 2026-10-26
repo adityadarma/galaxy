@@ -307,13 +307,32 @@ fn knows_phps_own_classes_and_functions() {
     let items = engine.complete(&file, text, 1, 10);
     assert!(labels(&items).contains(&"ArrayIterator"));
 
-    // Hover shows the stub; definition opens a copy of it on disk.
+    // Hover shows the official php-src declaration; definition materializes it.
     let text = "<?php\nstrlen('a');";
     let hover = engine.hover(&file, text, 1, 2).expect("hover on strlen");
     assert!(hover.markdown.contains("strlen"), "{}", hover.markdown);
     let found = engine.definition(&file, text, 1, 2);
     assert_eq!(found.len(), 1);
     assert!(found[0].path.is_file());
+    assert!(
+        found[0]
+            .path
+            .to_string_lossy()
+            .contains("galaxy-php-stubs/8.5/")
+    );
+}
+
+#[test]
+fn php_before_8_has_no_bundled_builtin_api() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("composer.json"),
+        r#"{"require":{"php":"^7.4"}}"#,
+    )
+    .unwrap();
+    let mut engine = PhpEngine::new(dir.path());
+    let items = engine.complete(&dir.path().join("main.php"), "<?php\nstrle", 1, 5);
+    assert!(!labels(&items).contains(&"strlen"));
 }
 
 #[test]

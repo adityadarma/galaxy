@@ -868,15 +868,19 @@ impl Core {
             let Some(source) = component_script_source(&path, &text, line as usize) else {
                 return false;
             };
-            let script_insertion_line = component_script_insertion_line(&path, &text, line as usize)
-                .unwrap_or(0);
+            let script_insertion_line =
+                component_script_insertion_line(&path, &text, line as usize).unwrap_or(0);
             let index_path = if is_component_path(Path::new(&path)) {
                 format!("{path}.ts")
             } else {
                 path.clone()
             };
             let component_extension = is_component_path(Path::new(&path))
-                .then(|| Path::new(&path).extension().and_then(|extension| extension.to_str()))
+                .then(|| {
+                    Path::new(&path)
+                        .extension()
+                        .and_then(|extension| extension.to_str())
+                })
                 .flatten();
             let exports = self
                 .typescript_workspace_exports
@@ -2403,7 +2407,10 @@ fn is_typescript_path(path: &Path) -> bool {
 }
 
 fn is_component_path(path: &Path) -> bool {
-    matches!(path.extension().and_then(|extension| extension.to_str()), Some("vue" | "svelte"))
+    matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("vue" | "svelte")
+    )
 }
 
 /// Returns JavaScript/TypeScript source in a virtual document that preserves
@@ -2420,11 +2427,22 @@ fn component_script_source(path: &str, text: &str, line: usize) -> Option<String
         let tag_end = text[start..].find('>')? + start;
         let body_start = tag_end + 1;
         let body_end = text[body_start..].find("</script>")? + body_start;
-        let start_line = text[..body_start].bytes().filter(|byte| *byte == b'\n').count();
-        let end_line = start_line + text[body_start..body_end].bytes().filter(|byte| *byte == b'\n').count();
+        let start_line = text[..body_start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+        let end_line = start_line
+            + text[body_start..body_end]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count();
         if (start_line..=end_line).contains(&line) {
             let mut virtual_source = String::with_capacity(body_end);
-            virtual_source.extend(text[..body_start].chars().map(|character| if character == '\n' { '\n' } else { ' ' }));
+            virtual_source.extend(
+                text[..body_start]
+                    .chars()
+                    .map(|character| if character == '\n' { '\n' } else { ' ' }),
+            );
             virtual_source.push_str(&text[body_start..body_end]);
             return Some(virtual_source);
         }
@@ -2444,8 +2462,15 @@ fn component_script_insertion_line(path: &str, text: &str, line: usize) -> Optio
         let tag_end = text[start..].find('>')? + start;
         let body_start = tag_end + 1;
         let body_end = text[body_start..].find("</script>")? + body_start;
-        let start_line = text[..body_start].bytes().filter(|byte| *byte == b'\n').count();
-        let end_line = start_line + text[body_start..body_end].bytes().filter(|byte| *byte == b'\n').count();
+        let start_line = text[..body_start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+        let end_line = start_line
+            + text[body_start..body_end]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count();
         if (start_line..=end_line).contains(&line) {
             // A newline directly after the opening tag begins the script body
             // on the next document line, not the tag's line.
@@ -5909,7 +5934,10 @@ mod tests {
     #[test]
     fn component_script_insertion_line_stays_inside_script_setup() {
         let source = "<script setup lang=\"ts\">\nconst value = 1\n</script>\n";
-        assert_eq!(component_script_insertion_line("Counter.vue", source, 1), Some(1));
+        assert_eq!(
+            component_script_insertion_line("Counter.vue", source, 1),
+            Some(1)
+        );
     }
 
     #[test]
@@ -7090,14 +7118,22 @@ mod tests {
             r#"{"dependencies":{"vue":"3"}}"#,
         )
         .unwrap();
-        std::fs::write(package.join("package.json"), r#"{"exports":"./index.d.ts"}"#)
-            .unwrap();
-        std::fs::write(package.join("index.d.ts"), "export declare function computed(): void;\n")
-            .unwrap();
+        std::fs::write(
+            package.join("package.json"),
+            r#"{"exports":"./index.d.ts"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("index.d.ts"),
+            "export declare function computed(): void;\n",
+        )
+        .unwrap();
         let path = dir.path().join("Counter.vue");
         std::fs::write(&path, "<script setup>\ncomp\n</script>\n").unwrap();
         let core = Core::new();
-        let document = core.open_document(path.to_string_lossy().into_owned()).unwrap();
+        let document = core
+            .open_document(path.to_string_lossy().into_owned())
+            .unwrap();
 
         assert!(core.request_completion(document.clone(), 1, 4));
         let item = core
@@ -7107,7 +7143,10 @@ mod tests {
             .unwrap();
         assert_eq!(item.insert_text, "computed");
         assert_eq!(item.additional_edits[0].line, 1);
-        assert_eq!(item.additional_edits[0].text, "import { computed } from 'vue';\n");
+        assert_eq!(
+            item.additional_edits[0].text,
+            "import { computed } from 'vue';\n"
+        );
     }
 
     #[test]
@@ -8326,7 +8365,9 @@ mod tests {
         let text = "class baseService { setMessage() {} }\nclass Service extends baseService { use() { this.setMessage(); } }\n";
         let (_dir, path, document) = file_doc(text);
         let core = Core::new();
-        let handle = core.open_document(path.to_string_lossy().into_owned()).unwrap();
+        let handle = core
+            .open_document(path.to_string_lossy().into_owned())
+            .unwrap();
 
         assert!(core.request_definition(handle.clone(), 1, 53));
         let definition = core.definition_locations(handle);
@@ -8340,7 +8381,9 @@ mod tests {
         let text = "declare class baseService { protected setCode(code: number): this; protected setMessage(message: string): this; }\nclass Service extends baseService { use() { return this.setCode(200).setMessage('ok'); } }\n";
         let (_dir, path, _document) = file_doc(text);
         let core = Core::new();
-        let handle = core.open_document(path.to_string_lossy().into_owned()).unwrap();
+        let handle = core
+            .open_document(path.to_string_lossy().into_owned())
+            .unwrap();
 
         assert!(core.request_definition(handle.clone(), 1, 70));
         let definition = core.definition_locations(handle);
