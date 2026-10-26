@@ -64,6 +64,11 @@ pub(super) struct TypeScriptNavigationCache {
 }
 
 impl TypeScriptNavigationCache {
+    pub(super) fn clear(&mut self) {
+        self.indexes.clear();
+        self.resolutions.clear();
+    }
+
     pub(super) fn index(&mut self, path: &Path) -> Option<Arc<DocumentIndex>> {
         let path = module_identity(path);
         let freshness = FileFreshness::read(&path)?;

@@ -276,8 +276,13 @@ fn load_tsconfig_chain(
     }
     if let Some(extends) = value.get("extends") {
         let extends = extends.as_str()?;
-        let parent = local_tsconfig_path(path.parent()?, extends)?;
-        load_tsconfig_chain(&parent, seen, configs)?;
+        // Package-based presets (for example `@adonisjs/tsconfig/...`) are
+        // useful to `tsc`, but this bounded resolver must not discard the
+        // local config and its `paths` merely because that package preset is
+        // outside its local extends subset.
+        if let Some(parent) = local_tsconfig_path(path.parent()?, extends) {
+            load_tsconfig_chain(&parent, seen, configs)?;
+        }
     }
     configs.push((path, value));
     Some(())
@@ -587,6 +592,12 @@ pub fn relative_import_candidates(specifier: &str, from: &Path) -> Vec<PathBuf> 
         (".jsx", &[".tsx"][..]),
         (".mjs", &[".mts"][..]),
         (".cjs", &[".cts"][..]),
+        // Declaration barrels often preserve a `.ts` source specifier even
+        // though published packages contain only the emitted `.d.ts` file.
+        (".ts", &[".d.ts"][..]),
+        (".tsx", &[".d.ts"][..]),
+        (".mts", &[".d.ts"][..]),
+        (".cts", &[".d.ts"][..]),
     ] {
         if let Some(stem) = base.to_string_lossy().strip_suffix(compiled) {
             candidates.extend(
@@ -1559,6 +1570,13 @@ mod tests {
     }
 
     #[test]
+    fn adds_declaration_fallback_for_explicit_typescript_specifiers() {
+        let candidates =
+            relative_import_candidates("./feature.ts", Path::new("/project/src/main.d.ts"));
+        assert!(candidates.contains(&PathBuf::from("/project/src/feature.d.ts")));
+    }
+
+    #[test]
     fn resolves_first_file_and_rejects_directories_and_packages() {
         let root = tempfile::tempdir().unwrap();
         let src = root.path().join("src");
@@ -1567,6 +1585,7 @@ mod tests {
         std::fs::write(src.join("feature.tsx"), "").unwrap();
         std::fs::write(src.join("indexed/index.d.ts"), "").unwrap();
         std::fs::write(src.join("compiled.ts"), "").unwrap();
+        std::fs::write(src.join("declaration.d.ts"), "").unwrap();
         let from = src.join("main.ts");
 
         assert_eq!(
@@ -1580,6 +1599,10 @@ mod tests {
         assert_eq!(
             resolve_relative_import("./compiled.js", &from),
             Some(src.join("compiled.ts"))
+        );
+        assert_eq!(
+            resolve_relative_import("./declaration.ts", &from),
+            Some(src.join("declaration.d.ts"))
         );
         assert_eq!(resolve_relative_import("./directory", &from), None);
         assert!(relative_import_candidates("react", &from).is_empty());
@@ -1615,6 +1638,28 @@ mod tests {
         assert_eq!(
             resolve_typescript_specifier(&detected, "exact", &from),
             Some(project.join("generated/exact.cts"))
+        );
+    }
+
+    #[test]
+    fn resolves_local_paths_when_tsconfig_extends_a_package_preset() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("app/libraries")).unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+        std::fs::write(
+            dir.path().join("tsconfig.json"),
+            r##"{"extends":"@adonisjs/tsconfig/tsconfig.app.json","compilerOptions":{"paths":{"#libraries/*":["./app/libraries/*.js"]}}}"##,
+        )
+        .unwrap();
+        let target = dir.path().join("app/libraries/auditing.ts");
+        std::fs::write(&target, "export const auditing = true;\n").unwrap();
+        let importer = dir.path().join("app/resolver.ts");
+        std::fs::write(&importer, "import '#libraries/auditing';\n").unwrap();
+
+        let project = TypeScriptProject::detect(&importer).unwrap();
+        assert_eq!(
+            resolve_typescript_specifier(&project, "#libraries/auditing", &importer),
+            Some(target)
         );
     }
 

@@ -393,7 +393,9 @@ pub(super) fn index_export(
                     .map(|identifier| locations.range(*identifier)),
                 specifier: specifier.clone(),
                 specifier_range,
-                range: locations.range(export_specifier),
+                // Navigation from `from` needs the entire re-export statement,
+                // while `name_range` retains the precise exported identifier.
+                range: locations.range(node),
                 default: false,
                 type_only: type_only || has_keyword(export_specifier, text, "type"),
                 syntax_valid: !node.has_error() && !node.is_error() && !node.is_missing(),

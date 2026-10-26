@@ -196,7 +196,7 @@ impl SyntaxLanguage {
     /// Upstream highlights.scm bundled with the matching grammar version.
     pub fn highlight_query(self) -> &'static str {
         match self {
-            Self::Rust => tree_sitter_rust::HIGHLIGHTS_QUERY,
+            Self::Rust => rust_highlights(),
             Self::TypeScript | Self::Tsx => TYPESCRIPT_HIGHLIGHTS,
             Self::JavaScript => JAVASCRIPT_HIGHLIGHTS,
             Self::Json => tree_sitter_json::HIGHLIGHTS_QUERY,
@@ -490,6 +490,18 @@ fn php_highlights() -> &'static str {
     })
 }
 
+/// The upstream Rust query styles attribute names but leaves `#[...]`
+/// delimiters unscoped, causing `#` to fall back to the plain foreground.
+fn rust_highlights() -> &'static str {
+    static QUERY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    QUERY.get_or_init(|| {
+        format!(
+            "{}\n[\"#\" \"[\" \"]\"] @punctuation\n",
+            tree_sitter_rust::HIGHLIGHTS_QUERY
+        )
+    })
+}
+
 // These two grammar crates do not export their upstream query. Keep a small,
 // self-contained equivalent here rather than depending on Cargo registry paths.
 const TYPESCRIPT_HIGHLIGHTS: &str = r#"
@@ -502,6 +514,7 @@ const TYPESCRIPT_HIGHLIGHTS: &str = r#"
 ] @string
 (number) @number
 (property_identifier) @property
+(private_property_identifier) @property
 (call_expression function: (identifier) @function)
 (call_expression function: (member_expression property: (property_identifier) @function))
 (function_declaration name: (identifier) @function)
@@ -535,6 +548,7 @@ const JAVASCRIPT_HIGHLIGHTS: &str = r#"
 [(true) (false) (null) (undefined)] @constant
 (identifier) @variable
 (property_identifier) @property
+(private_property_identifier) @property
 (function_declaration name: (identifier) @function)
 (call_expression function: (identifier) @function)
 [("const") ("let") ("var") ("function") ("class") ("return") ("if") ("else") ("for") ("while") ("import") ("export") ("async") ("await") ("new")] @keyword
@@ -2013,6 +2027,32 @@ mod tests {
     }
 
     #[test]
+    fn typescript_query_colours_private_class_fields_as_properties() {
+        let language = SyntaxLanguage::TypeScript;
+        let source = "class Backup {\n  #path = '';\n  read() { return this.#path; }\n}\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let query = language.compile_highlights().unwrap();
+        let names = query.capture_names();
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+        let mut private_fields = 0;
+        while let Some(m) = matches.next() {
+            for capture in m.captures {
+                if &source[capture.node.byte_range()] == "#path"
+                    && HighlightScope::from_capture(names[capture.index as usize])
+                        == Some(HighlightScope::Property)
+                {
+                    private_fields += 1;
+                }
+            }
+        }
+
+        assert_eq!(private_fields, 2);
+    }
+
+    #[test]
     fn detects_extensions_special_names_and_shebangs() {
         assert_eq!(
             SyntaxLanguage::detect("/w/main.rs", ""),
@@ -2067,7 +2107,10 @@ mod tests {
             SyntaxLanguage::detect(".docker/nginx.conf", ""),
             Some(SyntaxLanguage::Nginx)
         );
-        assert_eq!(SyntaxLanguage::detect("php-fpm/www.conf", ""), Some(SyntaxLanguage::Ini));
+        assert_eq!(
+            SyntaxLanguage::detect("php-fpm/www.conf", ""),
+            Some(SyntaxLanguage::Ini)
+        );
         for (path, expected) in [
             ("main.c", SyntaxLanguage::C),
             ("main.cpp", SyntaxLanguage::Cpp),

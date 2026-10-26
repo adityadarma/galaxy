@@ -41,6 +41,12 @@ pub struct Utf16Range {
     pub end: Utf16Position,
 }
 
+fn module_keyword_before(specifier: Utf16Range, position: Utf16Position) -> bool {
+    specifier.start.line == position.line
+        && position <= specifier.start
+        && specifier.start.col.saturating_sub(position.col) <= 6
+}
+
 /// A top-level declaration kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeclarationKind {
@@ -555,6 +561,31 @@ impl DocumentIndex {
                         .specifier_range
                         .filter(|range| contains(*range, position))
                         .and(export.specifier.as_deref())
+                })
+            })
+    }
+
+    /// Returns a module specifier when the cursor is on its full import/export
+    /// statement, including the `from` keyword before the string literal.
+    pub fn module_statement_at(&self, line: usize, col: usize) -> Option<&str> {
+        let position = Utf16Position::new(line, col);
+        self.imports
+            .iter()
+            .find(|import| {
+                contains(import.range, position)
+                    || module_keyword_before(import.specifier_range, position)
+            })
+            .map(|import| import.specifier.as_str())
+            .or_else(|| {
+                self.exports.iter().find_map(|export| {
+                    (export.syntax_valid
+                        && export.specifier.is_some()
+                        && (contains(export.range, position)
+                            || export
+                                .specifier_range
+                                .is_some_and(|range| module_keyword_before(range, position))))
+                    .then_some(export.specifier.as_deref())
+                    .flatten()
                 })
             })
     }

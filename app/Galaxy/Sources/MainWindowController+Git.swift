@@ -137,7 +137,7 @@ extension MainWindowController {
         blameHideItem?.cancel()
         let item = DispatchWorkItem { [weak self] in self?.hideBlamePopover() }
         blameHideItem = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: item)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: item)
     }
 
     func cancelBlameHide() {

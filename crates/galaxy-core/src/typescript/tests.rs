@@ -111,6 +111,10 @@ fn indexes_exact_static_module_specifier_ranges() {
     assert_eq!(index.static_module_at(2, 25), Some("./three"));
     assert_eq!(index.static_module_at(3, 16), Some("./four"));
     assert!(index.static_module_at(0, 20).is_none());
+    assert_eq!(index.module_statement_at(0, 18), Some("./one"));
+    assert_eq!(index.module_statement_at(2, 24), Some("./three"));
+    assert_eq!(index.module_statement_at(3, 14), Some("./four"));
+    assert_eq!(index.module_statement_at(3, 10), Some("./four"));
 }
 
 #[test]

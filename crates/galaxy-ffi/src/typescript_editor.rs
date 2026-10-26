@@ -31,6 +31,10 @@ pub(super) struct TypeScriptWorkspaceExports {
 }
 
 impl TypeScriptWorkspaceExports {
+    pub(super) fn clear(&mut self) {
+        self.roots.clear();
+    }
+
     pub(super) fn refresh(&mut self, root: &Path, paths: &[String]) {
         let mut by_name = BTreeMap::<String, Vec<WorkspaceExport>>::new();
         for path in paths

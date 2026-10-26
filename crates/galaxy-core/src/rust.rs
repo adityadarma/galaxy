@@ -997,6 +997,7 @@ fn collect_unresolved(
     }
     if node.kind() == "identifier"
         && identifier_is_reference(node)
+        && !is_attribute_argument(node)
         && let Ok(name) = node.utf8_text(text.as_bytes())
         && engine.resolve(path, name, node.start_byte()).is_empty()
     {
@@ -1015,6 +1016,20 @@ fn collect_unresolved(
     for child in node.named_children(&mut cursor) {
         collect_unresolved(engine, path, text, child, out);
     }
+}
+
+/// Attribute names and arguments may be procedural macros or compiler-builtins.
+/// The local resolver cannot expand them, so reporting them as unresolved floods
+/// the editor with false positives for common `#[derive(...)]` declarations.
+fn is_attribute_argument(node: Node<'_>) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "attribute_item" {
+            return true;
+        }
+        current = parent.parent();
+    }
+    false
 }
 
 fn identifier_is_reference(node: Node<'_>) -> bool {
@@ -1686,6 +1701,15 @@ mod tests {
         );
         let actions = engine.actions(path, source, 0, 0);
         assert_eq!(actions[0].title, "Remove unused import `Coffee`");
+    }
+
+    #[test]
+    fn does_not_report_builtin_derive_attributes_as_unresolved() {
+        let path = Path::new("/tmp/lib.rs");
+        let source = "#[derive(Debug, Clone, Copy, PartialEq, Eq)]\npub struct Range;\n";
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        engine.install(Built::default());
+        assert!(engine.diagnostics(path, source).is_empty());
     }
 
     #[test]

@@ -17,6 +17,8 @@ const PACKAGE: &str = "@adonisjs/lucid/orm";
 /// Public subpath export of the package (`"./types/*"`), stable across builds.
 const DECLARATION: &str = "@adonisjs/lucid/types/querybuilder";
 const BUILDER: &str = "ChainableContract";
+const MODEL_DECLARATION: &str = "@adonisjs/lucid/types/model";
+const MODEL: &str = "LucidModel";
 const RELATIONS: [&str; 5] = [
     "hasOne",
     "hasMany",
@@ -36,6 +38,7 @@ pub(super) fn collect(root: Node<'_>, context: &Context<'_>) -> Vec<TypeMemberUs
     let mut uses = Vec::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
+        collect_model_query_members(node, root, context, &mut uses);
         if is_callback(node.kind())
             && let Some(parameter) = sole_callback_parameter(node)
             && is_relation_option(node, context)
@@ -50,6 +53,109 @@ pub(super) fn collect(root: Node<'_>, context: &Context<'_>) -> Vec<TypeMemberUs
         stack.extend(node.named_children(&mut cursor));
     }
     uses
+}
+
+/// `BaseModel` exposes static `query`; its result is a fluent Lucid builder.
+/// Generic model inference is outside this syntactic index, but these two
+/// public contracts cover direct model queries without guessing unrelated APIs.
+fn collect_model_query_members(
+    node: Node<'_>,
+    root: Node<'_>,
+    context: &Context<'_>,
+    uses: &mut Vec<TypeMemberUse>,
+) {
+    let Some(property) = (node.kind() == "member_expression")
+        .then(|| node.child_by_field_name("property"))
+        .flatten()
+    else {
+        return;
+    };
+    let Some(member_name) = direct_member_name(context.text, property) else {
+        return;
+    };
+    let Some(object) = node.child_by_field_name("object") else {
+        return;
+    };
+    let target = if let Some(model_name) = node_text(context.text, object)
+        && model_extends_lucid_base_model(root, context, model_name)
+    {
+        Some(TypeMemberTarget::PackageDeclaration {
+            specifier: MODEL_DECLARATION,
+            type_name: MODEL,
+        })
+    } else if query_call_model(object, context.text)
+        .is_some_and(|model_name| model_extends_lucid_base_model(root, context, model_name))
+    {
+        Some(TypeMemberTarget::PackageDeclaration {
+            specifier: DECLARATION,
+            type_name: BUILDER,
+        })
+    } else {
+        None
+    };
+    if let Some(target) = target {
+        uses.push(TypeMemberUse {
+            target,
+            member_name,
+            member_range: context.locations.range(property),
+        });
+    }
+}
+
+/// Returns the model receiver for `Audit.query()` and every fluent call rooted in it.
+fn query_call_model<'a>(node: Node<'a>, text: &'a str) -> Option<&'a str> {
+    let call = (node.kind() == "call_expression").then_some(node)?;
+    let function = call.child_by_field_name("function")?;
+    let object = function.child_by_field_name("object")?;
+    let method = function.child_by_field_name("property")?;
+    if direct_member_name(text, method)? == "query" {
+        return node_text(text, object);
+    }
+    query_call_model(object, text)
+}
+
+fn model_extends_lucid_base_model(root: Node<'_>, context: &Context<'_>, model_name: &str) -> bool {
+    let base_model_names = context
+        .imports
+        .iter()
+        .filter(|import| import.specifier == PACKAGE)
+        .flat_map(|import| import.bindings.iter())
+        .filter(|binding| {
+            !binding.type_only && binding.imported_name.as_deref() == Some("BaseModel")
+        })
+        .map(|binding| binding.local_name.as_str())
+        .collect::<Vec<_>>();
+    if base_model_names.is_empty() {
+        return false;
+    }
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if matches!(node.kind(), "class_declaration" | "class")
+            && node
+                .child_by_field_name("name")
+                .and_then(|name| node_text(context.text, name))
+                == Some(model_name)
+        {
+            let mut cursor = node.walk();
+            return node
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() == "class_heritage")
+                .flat_map(|heritage| {
+                    let mut cursor = heritage.walk();
+                    heritage.named_children(&mut cursor).collect::<Vec<_>>()
+                })
+                .filter(|clause| clause.kind() == "extends_clause")
+                .flat_map(|clause| {
+                    let mut cursor = clause.walk();
+                    clause.named_children(&mut cursor).collect::<Vec<_>>()
+                })
+                .filter_map(|base| node_text(context.text, base))
+                .any(|base| base_model_names.contains(&base));
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    false
 }
 
 /// `true` when `callback` is the `onQuery` option of a Lucid relation call.

@@ -554,7 +554,19 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 self?.refreshCodeActions()
                 self?.refreshDocumentSymbols()
                 self?.reloadSettings()
-                let problems = self?.bridge.core.problems() ?? []
+                let allProblems = self?.bridge.core.problems() ?? []
+                // Analysis workers can finish after the user switches folders.
+                // Never let a late result from the previous workspace leak
+                // into the new workspace's Problems panel or editor gutter.
+                let problems: [ProblemInfo]
+                if let root = self?.workspace?.root() {
+                    let rootURI = "file://\(URL(fileURLWithPath: root).standardizedFileURL.path)/"
+                    problems = allProblems.filter {
+                        $0.uri.hasPrefix(rootURI) && !$0.uri.contains("/node_modules/")
+                    }
+                } else {
+                    problems = allProblems
+                }
                 self?.problemsPanel.update(problems)
                 self?.problemsPanel.isHidden = self?.bottomPanelTab != .problems
                 self?.bottomPanelHeader.setProblemCount(problems.count)
@@ -826,11 +838,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
 
     private func showProblem(_ problem: ProblemInfo) {
-        guard let path = URL(string: problem.uri)?.path else { return }
-        guard let found = allTabs.first(where: { $0.doc.path() == path }) else { return }
-        focusTab(found)
-        activeTab?.doc.goToLine(line: problem.line, col: problem.column)
-        editorView.window?.makeFirstResponder(editorView)
+        guard let url = URL(string: problem.uri), url.isFileURL else { return }
+        do {
+            try openFile(at: url)
+            activeTab?.doc.goToLine(line: problem.line, col: problem.column)
+            editorView.revealLine(Int(problem.line))
+            editorView.window?.makeFirstResponder(editorView)
+        } catch {
+            statusLabel.stringValue = "Cannot open problem location: \(url.path)"
+        }
     }
 
     private func openTerminalLink(path: String, line: UInt64, col: UInt64) {

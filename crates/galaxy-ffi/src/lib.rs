@@ -14,7 +14,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use galaxy_core::analysis::{
     BuiltinStore, CompletionItem as LspCompletionItem, DefinitionLocation as LspDefinitionLocation,
-    HoverInfo as LspHoverInfo, Range as LspRange, RenameEdit as LspRenameEdit,
+    Diagnostic as LspDiagnostic, DiagnosticSeverity, HoverInfo as LspHoverInfo, Range as LspRange,
+    RenameEdit as LspRenameEdit,
 };
 use galaxy_core::change::{Change, ChangeSet};
 use galaxy_core::clipboard;
@@ -435,7 +436,7 @@ impl NavigationHistory {
 pub struct Core {
     listener: RwLock<Option<Arc<dyn CoreListener>>>,
     /// What the built-in engines last answered, per document.
-    analysis: Mutex<BuiltinStore>,
+    analysis: Arc<Mutex<BuiltinStore>>,
     /// Built-in PHP engines, one per project root.
     php: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<PhpEngine>>>>>,
     /// Built-in Go engines, one per project root.
@@ -462,7 +463,7 @@ impl Default for Core {
     fn default() -> Self {
         Self {
             listener: RwLock::new(None),
-            analysis: Mutex::new(BuiltinStore::default()),
+            analysis: Arc::new(Mutex::new(BuiltinStore::default())),
             php: Arc::new(Mutex::new(HashMap::new())),
             go: Arc::new(Mutex::new(HashMap::new())),
             rust: Arc::new(Mutex::new(HashMap::new())),
@@ -649,8 +650,36 @@ impl Core {
     pub fn open_workspace(&self, path: String) -> Result<Arc<Workspace>, CoreError> {
         let ws = CoreWorkspace::open(PathBuf::from(&path))?;
         tracing::info!(path = %ws.root().display(), "opened workspace");
+        // Core lives for the whole app, while built-in results are scoped to
+        // one workspace. Drop old diagnostics before detached index workers
+        // start, so Problems never mixes projects after switching folders.
+        self.analysis
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.php_documents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.php_checked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.typescript_checked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.typescript_navigation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.typescript_workspace_exports
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         spawn_workspace_indexing(
             ws.clone(),
+            Arc::clone(&self.analysis),
             Arc::clone(&self.typescript_navigation),
             Arc::clone(&self.typescript_workspace_exports),
             Arc::clone(&self.go),
@@ -1034,6 +1063,9 @@ impl Core {
         let uri = file_uri(Path::new(&path));
         if is_typescript_path(Path::new(&path)) || is_component_path(Path::new(&path)) {
             return self.typescript_definition(&document, &uri, line, character);
+        }
+        if is_rust_path(Path::new(&path)) {
+            return self.rust_definition(&document, &uri, line, character);
         }
         self.php_definition(&document, &uri, line, character)
     }
@@ -2096,6 +2128,11 @@ impl Core {
                     .iter()
                     .filter(|import| {
                         !typescript_import_is_type_only(import)
+                            // Bare package names and tsconfig aliases need a
+                            // package/config resolver. Do not report them as
+                            // broken merely because local path resolution
+                            // cannot prove them.
+                            && (import.specifier.starts_with('.') || import.specifier.starts_with('/'))
                             && resolve_typescript_import_uncached(
                                 Path::new(&path),
                                 &import.specifier,
@@ -2589,6 +2626,39 @@ impl Core {
             .set_definitions(uri, locations);
         found
     }
+
+    fn rust_definition(
+        &self,
+        document: &Arc<DocumentHandle>,
+        uri: &str,
+        line: u64,
+        character: u64,
+    ) -> bool {
+        let path = document.path();
+        let Some(engine) = self.rust_engine(Path::new(&path)).map(Engine::Rust) else {
+            return false;
+        };
+        let text = document.lock().editor.doc.text();
+        let locations = engine
+            .definition(Path::new(&path), &text, line as u32, character as u32)
+            .into_iter()
+            .map(|target| LspDefinitionLocation {
+                uri: file_uri(&target.path),
+                range: LspRange {
+                    start_line: u64::from(target.line),
+                    start_character: u64::from(target.column),
+                    end_line: u64::from(target.line),
+                    end_character: u64::from(target.column),
+                },
+            })
+            .collect::<Vec<_>>();
+        let found = !locations.is_empty();
+        self.analysis
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_definitions(uri, locations);
+        found
+    }
 }
 
 fn is_php_path(path: &Path) -> bool {
@@ -2756,6 +2826,7 @@ fn typescript_range(range: galaxy_core::typescript::Utf16Range) -> LspRange {
 
 fn spawn_workspace_indexing(
     workspace: CoreWorkspace,
+    analysis: Arc<Mutex<BuiltinStore>>,
     cache: Arc<Mutex<TypeScriptNavigationCache>>,
     typescript_exports: Arc<Mutex<TypeScriptWorkspaceExports>>,
     go_engines: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<GoEngine>>>>>,
@@ -2767,6 +2838,7 @@ fn spawn_workspace_indexing(
         .name("workspace-indexing".into())
         .spawn(move || {
             let paths = workspace.build_file_index().paths().collect::<Vec<_>>();
+            publish_workspace_typescript_diagnostics(&analysis, &root, &paths);
             typescript_exports
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -2795,6 +2867,81 @@ fn spawn_workspace_indexing(
             }
             send_workspace_index_finished(&listener, &root, total, changed);
         });
+}
+
+/// Publishes bounded parser/type diagnostics for workspace TypeScript sources,
+/// not only files that happened to be opened in an editor tab. Dependencies
+/// are intentionally excluded: their declarations belong to package tooling.
+fn publish_workspace_typescript_diagnostics(
+    analysis: &Arc<Mutex<BuiltinStore>>,
+    root: &Path,
+    paths: &[String],
+) {
+    const MAX_FILES: usize = 10_000;
+    let root_uri = format!("{}/", file_uri(root));
+    analysis
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear_diagnostics_under(&root_uri);
+    for relative in paths
+        .iter()
+        .filter(|path| workspace_typescript_source(path))
+        .take(MAX_FILES)
+    {
+        let path = root.join(relative);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let index = DocumentIndex::parse(&path, &text);
+        let uri = file_uri(&path);
+        let mut diagnostics: Vec<LspDiagnostic> = index
+            .diagnostics
+            .iter()
+            .map(|diagnostic| LspDiagnostic {
+                uri: uri.clone(),
+                range: LspRange {
+                    start_line: diagnostic.range.start.line as u64,
+                    start_character: diagnostic.range.start.col as u64,
+                    end_line: diagnostic.range.end.line as u64,
+                    end_character: diagnostic.range.end.col as u64,
+                },
+                severity: DiagnosticSeverity::Error,
+                message: diagnostic.message.clone(),
+                source: Some("galaxy".into()),
+                code: None,
+                unnecessary: false,
+            })
+            .collect();
+        diagnostics.extend(
+            index
+                .type_diagnostics
+                .iter()
+                .map(|diagnostic| LspDiagnostic {
+                    uri: uri.clone(),
+                    range: typescript_range(diagnostic.range),
+                    severity: DiagnosticSeverity::Error,
+                    message: diagnostic.message.clone(),
+                    source: Some("galaxy".into()),
+                    code: Some(diagnostic.code.clone()),
+                    unnecessary: false,
+                }),
+        );
+        analysis
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_diagnostics(&uri, diagnostics);
+    }
+}
+
+fn workspace_typescript_source(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    !normalized.split('/').any(|part| {
+        matches!(
+            part,
+            "node_modules" | ".git" | "dist" | "build" | "coverage"
+        )
+    }) && is_typescript_path(Path::new(&normalized))
+        && !normalized.ends_with(".d.ts")
 }
 
 fn send_workspace_index_started(listener: &Option<Arc<dyn CoreListener>>, root: &Path, total: u64) {
@@ -4977,6 +5124,18 @@ impl DocumentHandle {
     /// Changes whenever diagnostics change, so the UI can skip redraws.
     pub fn diagnostics_revision(&self) -> u64 {
         self.lock().diagnostics_revision
+    }
+
+    /// Returns the diagnostic covering this UTF-16 position, if any.
+    pub fn diagnostic_at(&self, line: u64, character: u64) -> Option<DiagnosticInfo> {
+        self.lock()
+            .diagnostics
+            .iter()
+            .find(|diagnostic| {
+                (diagnostic.start_line, diagnostic.start_character) <= (line, character)
+                    && (line, character) <= (diagnostic.end_line, diagnostic.end_character)
+            })
+            .cloned()
     }
 
     /// Definitions from the current completed syntax tree. Parsing stays on
@@ -7812,6 +7971,42 @@ mod tests {
     }
 
     #[test]
+    fn typescript_definition_follows_named_adonis_alias_export() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("app/libraries")).unwrap();
+        std::fs::create_dir_all(dir.path().join("app/audit_resolvers")).unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+        std::fs::write(
+            dir.path().join("tsconfig.json"),
+            r##"{"extends":"@adonisjs/tsconfig/tsconfig.app.json","compilerOptions":{"paths":{"#libraries/*":["./app/libraries/*.js"]}}}"##,
+        )
+        .unwrap();
+        let definition = dir.path().join("app/libraries/auditing.ts");
+        std::fs::write(
+            &definition,
+            "export interface Resolver { resolve(): void }\n",
+        )
+        .unwrap();
+        let source = "import { Resolver } from '#libraries/auditing'\nexport default class Audit implements Resolver {}\n";
+        let importer = dir
+            .path()
+            .join("app/audit_resolvers/ip_address_resolver.ts");
+        std::fs::write(&importer, source).unwrap();
+        let core = Core::new();
+        let document = core
+            .open_document(importer.to_string_lossy().into_owned())
+            .unwrap();
+        assert!(core.request_definition(document.clone(), 0, 10));
+        let definitions = core.definition_locations(document);
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(
+            definitions[0].uri,
+            file_uri(&std::fs::canonicalize(definition).unwrap())
+        );
+        assert_eq!((definitions[0].line, definitions[0].column), (0, 7));
+    }
+
+    #[test]
     fn typescript_definition_follows_adonis_on_query_callback() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
@@ -7857,6 +8052,53 @@ mod tests {
             let definitions = core.definition_locations(document.clone());
             assert_eq!(definitions.len(), 1);
             assert!(definitions[0].uri.ends_with("types/querybuilder.d.ts"));
+            assert_eq!(definitions[0].line, 0);
+        }
+    }
+
+    #[test]
+    fn typescript_definition_follows_adonis_model_query_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+        let package = dir.path().join("node_modules/@adonisjs/lucid");
+        let orm = package.join("build/src/orm");
+        let types = package.join("build/src/types");
+        std::fs::create_dir_all(&orm).unwrap();
+        std::fs::create_dir_all(&types).unwrap();
+        std::fs::write(
+            package.join("package.json"),
+            r##"{"exports":{"./orm":"./build/src/orm/index.js","./types/*":"./build/src/types/*.js"}}"##,
+        )
+        .unwrap();
+        std::fs::write(orm.join("index.js"), "").unwrap();
+        std::fs::write(
+            orm.join("index.d.ts"),
+            "export declare const BaseModel: import('../../types/model.js').LucidModel;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            types.join("model.d.ts"),
+            "export interface LucidModel { query(): import('./querybuilder.js').ChainableContract }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            types.join("querybuilder.d.ts"),
+            "export interface ChainableContract { where(column: string, value: unknown): ChainableContract }\n",
+        )
+        .unwrap();
+        let path = dir.path().join("app/auditing.ts");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let source = "import { BaseModel } from '@adonisjs/lucid/orm'\nclass Audit extends BaseModel {}\nfunction audits() { return Audit.query().where('auditableType', 'audit') }\n";
+        std::fs::write(&path, source).unwrap();
+        let core = Core::new();
+        let document = core
+            .open_document(path.to_string_lossy().into_owned())
+            .unwrap();
+        for (column, suffix) in [(33, "types/model.d.ts"), (41, "types/querybuilder.d.ts")] {
+            assert!(core.request_definition(document.clone(), 2, column));
+            let definitions = core.definition_locations(document.clone());
+            assert_eq!(definitions.len(), 1);
+            assert!(definitions[0].uri.ends_with(suffix));
             assert_eq!(definitions[0].line, 0);
         }
     }
@@ -8189,6 +8431,11 @@ mod tests {
             );
             assert_eq!((locations[0].line, locations[0].column), (0, 0));
         }
+
+        assert!(core.request_definition(main.clone(), 3, 10));
+        let reexport_from = core.definition_locations(main.clone());
+        assert_eq!(reexport_from.len(), 1);
+        assert!(reexport_from[0].uri.ends_with("dep.ts"));
 
         assert!(core.request_definition(main.clone(), 4, 5));
         let value = core.definition_locations(main.clone());
@@ -9060,6 +9307,25 @@ mod tests {
             .collect();
         assert!(names.contains(&"User".to_owned()), "{names:?}");
         assert!(names.contains(&"Greet".to_owned()), "{names:?}");
+    }
+
+    #[test]
+    fn rust_definition_comes_from_the_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.rs");
+        std::fs::write(&path, "fn greet() {}\nfn main() { greet(); }\n").unwrap();
+        let core = Core::new();
+        let document = core
+            .open_document(path.to_string_lossy().into_owned())
+            .unwrap();
+
+        until("Rust definition", || {
+            core.request_definition(document.clone(), 1, 14)
+        });
+        let found = core.definition_locations(document);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].uri.ends_with("main.rs"));
+        assert_eq!((found[0].line, found[0].column), (0, 3));
     }
 
     #[test]

@@ -19,6 +19,10 @@ extension MainWindowController {
             dismissHover()
             return
         }
+        if let diagnostic = document.diagnosticAt(line: position.line, character: position.colUtf16) {
+            showDiagnosticHover(diagnostic, at: position)
+            return
+        }
         // Same spot: skip unless the last answer was empty (the server may
         // still be indexing), then retry at most once a second.
         if hoverDocument === document, hoverRequestPosition?.line == position.line,
@@ -40,6 +44,34 @@ extension MainWindowController {
         if !bridge.requestHover(document: document, line: position.line, character: position.colUtf16) {
             hoverRequestPosition = nil
         }
+    }
+
+    private func showDiagnosticHover(_ diagnostic: DiagnosticInfo, at position: TextPos) {
+        let severity = switch diagnostic.severity {
+        case 1: "Error"
+        case 2: "Warning"
+        case 3: "Information"
+        case 4: "Hint"
+        default: "Diagnostic"
+        }
+        let contents = "**\(severity)**\n\n\(diagnostic.message)"
+        if hoverShownContents != contents || hoverPopover.isHidden {
+            hoverPopover.show(contents)
+            hoverPopover.frame = hoverFrame(for: HoverInfo(
+                contents: contents,
+                startLine: diagnostic.startLine,
+                startCharacter: diagnostic.startCharacter,
+                endLine: diagnostic.endLine,
+                endCharacter: diagnostic.endCharacter
+            ), at: position)
+            hoverPopover.isHidden = false
+            hoverPopover.needsLayout = true
+        }
+        hoverDocument = nil
+        hoverRequestPosition = nil
+        hoverShownContents = contents
+        hoverShownPosition = position
+        hoverShownRange = (diagnostic.startLine, diagnostic.startCharacter, diagnostic.endCharacter)
     }
 
     func refreshHover() {

@@ -106,6 +106,20 @@ pub struct BuiltinStore {
 }
 
 impl BuiltinStore {
+    /// A workspace switch invalidates every document-scoped response. Keeping
+    /// them would show diagnostics and navigation results from the old root.
+    pub fn clear(&mut self) {
+        self.diagnostics.clear();
+        self.hover.clear();
+        self.completion.clear();
+        self.definitions.clear();
+        self.references.clear();
+        self.rename_edits.clear();
+        self.signatures.clear();
+        self.code_actions.clear();
+        self.document_symbols.clear();
+    }
+
     pub fn diagnostics(&self, uri: &str) -> &[Diagnostic] {
         self.diagnostics.get(uri).map(Vec::as_slice).unwrap_or(&[])
     }
@@ -135,6 +149,13 @@ impl BuiltinStore {
         }
         self.diagnostics.insert(uri.to_owned(), diagnostics);
         true
+    }
+
+    /// Drops diagnostics matching a workspace URI prefix. Workspace scanners
+    /// use this to replace provisional open-document results atomically.
+    pub fn clear_diagnostics_under(&mut self, uri_prefix: &str) {
+        self.diagnostics
+            .retain(|uri, _| !uri.starts_with(uri_prefix));
     }
 
     pub fn hover(&self, uri: &str) -> Option<&HoverInfo> {
@@ -255,6 +276,22 @@ mod tests {
         assert_eq!(store.problems().len(), 1);
         assert!(store.set_diagnostics("file:///a.php", Vec::new()));
         assert!(store.diagnostics("file:///a.php").is_empty());
+    }
+
+    #[test]
+    fn clear_drops_results_from_the_previous_workspace() {
+        let mut store = BuiltinStore::default();
+        store.set_diagnostics("file:///old/stub.php", vec![problem("old")]);
+        store.set_hover(
+            "file:///old/stub.php",
+            Some(HoverInfo {
+                contents: "old hover".into(),
+                range: None,
+            }),
+        );
+        store.clear();
+        assert!(store.problems().is_empty());
+        assert!(store.hover("file:///old/stub.php").is_none());
     }
 
     #[test]
