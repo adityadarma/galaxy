@@ -222,8 +222,8 @@ Format: `[ ] ID — Task` lalu kriteria selesai.
   - Status: package fuzz terpisah berisi target `edit_operations` untuk text/selection/edit Unicode dan `json_rpc` untuk input arbitrary ke validator JSON-RPC. Script `scripts/fuzz.sh` dan prosedur `docs/FUZZING.md` tersedia; target sengaja tidak masuk workspace normal karena `libfuzzer-sys` membutuhkan nightly. Long fuzz campaign masih dijalankan di CI/nightly, bukan diklaim selesai dari smoke compile lokal.
 - [x] M7-06 — Crash reporting lokal (panic hook Rust + crash log macOS), tanpa upload otomatis.
   - Status: panic hook Rust dan `NSSetUncaughtExceptionHandler` macOS menulis report lokal ke `~/Library/Logs/Galaxy/crash-report.log`. Tidak ada upload otomatis dan report tidak menyimpan isi dokumen. Signal crash tetap memakai crash report macOS karena operasi filesystem tidak aman di signal handler. Detail privasi ada di `docs/CRASH-REPORTING.md`.
-- [ ] M7-07 — Code signing, notarization, DMG, auto-update (Sparkle).
-  - Status: local build only untuk workflow saat ini. Script Developer ID/notarization/DMG tersedia sebagai opsi release, tetapi tidak diwajibkan. Sparkle belum dibundel karena feed URL, EdDSA key, dan signed framework belum tersedia; auto-update tetap disabled. Detail ada di `docs/RELEASE.md`.
+- [x] M7-07 — Code signing dan auto-update (Sparkle).
+  - Status: workflow GitHub Release membangun ZIP terpisah `arm64` dan `x86_64`, menandatangani bundle dengan `Galaxy Self-Signed`, serta menandatangani enclosure dan appcast Sparkle dengan EdDSA. Konfigurasi, backup key, dan detail rilis ada di `docs/RELEASE.md`. Notarisasi/DMG tidak termasuk jalur self-signed.
 - [x] M7-08 — Dokumentasi pengguna: shortcut, settings, konfigurasi LSP.
   - Status: panduan penggunaan ada di `docs/USER-GUIDE.md`; referensi settings, auto-save, language server, dan local data ada di `docs/CONFIGURATION.md`.
 - [ ] M7-09 — Rilis beta tertutup dan kumpulkan feedback.

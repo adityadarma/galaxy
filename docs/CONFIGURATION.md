@@ -76,7 +76,8 @@ diagnostics datang dari engine bawaan di dalam proses Galaxy.
 |---|---|
 | PHP/Blade/Laravel | engine bawaan |
 | Go | engine bawaan |
-| Rust, TypeScript/JavaScript, Python, Swift, Dart, Vue, Svelte | syntax highlighting saja; engine bawaan belum ada |
+| TypeScript/JavaScript | engine bawaan untuk navigation, completion, diagnostics, dan type declarations |
+| Rust, Python, Swift, Dart, Vue, Svelte | syntax highlighting saja; engine bawaan belum ada |
 
 Batas engine Go: tidak ada type checker penuh, jadi diagnostics hanya mencakup
 syntax error, import yang tidak dipakai, import std yang tidak ada, variabel

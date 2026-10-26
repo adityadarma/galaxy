@@ -2,8 +2,9 @@ import AppKit
 import os
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     private let bridge = CoreBridge()
+    private let updater = AppUpdater()
     private var windowControllers: [MainWindowController] = []
     private var preferencesController: PreferencesWindowController?
     /// A path handed to us before the window existed (`Galaxy <path>`).
@@ -141,6 +142,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         preferencesController = controller
         controller.showWindow(sender)
         NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc func checkForUpdates(_ sender: Any?) {
+        updater.checkForUpdates()
+    }
+
+    func canCheckForUpdates() -> Bool {
+        updater.isAvailable
+    }
+
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        if item.action == #selector(checkForUpdates(_:)) {
+            return canCheckForUpdates()
+        }
+        return true
     }
 
     private func applyAppearancePreference() {

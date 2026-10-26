@@ -13,6 +13,8 @@ settings:
     ENABLE_USER_SCRIPT_SANDBOXING: NO
     DEAD_CODE_STRIPPING: YES
     SWIFT_STRICT_CONCURRENCY: complete
+    SPARKLE_FEED_URL: https://github.com/adityadarma/galaxy/releases/latest/download/appcast-$(ARCHS).xml
+    SPARKLE_PUBLIC_ED_KEY: ""
   configs:
     Release:
       SWIFT_OPTIMIZATION_LEVEL: -O
@@ -35,6 +37,14 @@ targets:
   Galaxy:
     type: application
     platform: macOS
+    info:
+      path: Galaxy/Resources/Info.plist
+      properties:
+        SUFeedURL: $(SPARKLE_FEED_URL)
+        SUEnableAutomaticChecks: true
+        SURequireSignedFeed: true
+        SUVerifyUpdateBeforeExtraction: true
+        SUPublicEDKey: $(SPARKLE_PUBLIC_ED_KEY)
     sources:
       - path: Galaxy/Sources
       - path: Galaxy/Resources
@@ -48,12 +58,7 @@ targets:
         PRODUCT_NAME: Galaxy
         MARKETING_VERSION: "0.1.0"
         CURRENT_PROJECT_VERSION: "1"
-        GENERATE_INFOPLIST_FILE: YES
-        INFOPLIST_KEY_NSPrincipalClass: NSApplication
-        INFOPLIST_KEY_CFBundleDisplayName: Galaxy
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
-        INFOPLIST_KEY_NSHumanReadableCopyright: ""
         ENABLE_HARDENED_RUNTIME: YES
         CODE_SIGN_IDENTITY: "-"
         CODE_SIGN_STYLE: Manual
@@ -76,6 +81,9 @@ targets:
         basedOnDependencyAnalysis: false
     dependencies:
       - target: GalaxyCLI
+      - package: Sparkle
+        product: Sparkle
+        embed: true
     copyFiles:
       - destination: executables
         files:
@@ -134,3 +142,8 @@ schemes:
     test:
       targets:
         - GalaxyUITests
+
+packages:
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    exactVersion: 2.10.0

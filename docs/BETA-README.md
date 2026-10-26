@@ -2,8 +2,8 @@
 
 ## Status
 
-The repository is ready for a local beta build. A closed beta release is not
-complete until a signed/notarized build is distributed to external testers and
+The repository is ready for a GitHub Release beta build. A closed beta release
+is not complete until a signed build is distributed to external testers and
 feedback is collected.
 
 ## Maintainer Checklist
@@ -11,9 +11,8 @@ feedback is collected.
 - [ ] Run `scripts/test-all.sh` on the release commit.
 - [ ] Run `scripts/measure-app.sh 5` and attach the JSON result.
 - [ ] Run `scripts/profile-memory.sh 10000` and archive `dhat-heap.json`.
-- [ ] Run the release packaging flow with a real Developer ID identity.
-- [ ] Notarize and staple the app before distributing it.
-- [ ] Create and verify the DMG checksum.
+- [ ] Push a `vX.Y.Z` tag and verify both architecture ZIPs, checksums, and appcasts on the GitHub Release.
+- [ ] Verify Sparkle offers the release to an older installation of the same architecture.
 - [ ] Test a clean install on a second macOS account or machine.
 - [ ] Test launch, open folder, edit/save, PHP/Laravel intelligence, terminal,
   search, Git, and session restore.

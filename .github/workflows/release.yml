@@ -1,0 +1,152 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version, for example v0.1.0
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14
+          - arch: x86_64
+            runner: macos-13
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          RAW="${INPUT_VERSION:-$GITHUB_REF_NAME}"
+          VERSION="${RAW#v}"
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Invalid version: $RAW" >&2; exit 1; }
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ matrix.arch }}
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Test Rust core
+        run: cargo test --workspace --locked
+
+      - name: Import signing certificate
+        env:
+          P12_BASE64: ${{ secrets.GALAXY_SELF_SIGN_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.GALAXY_SELF_SIGN_P12_PASSWORD }}
+        run: |
+          [[ -n "$P12_BASE64" && -n "$P12_PASSWORD" ]] || { echo "Galaxy signing secrets are required." >&2; exit 1; }
+          KEYCHAIN="$RUNNER_TEMP/galaxy-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+          printf '%s' "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/galaxy-signing.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/galaxy-signing.p12" -k "$KEYCHAIN" -f pkcs12 -P "$P12_PASSWORD" -T /usr/bin/codesign
+          # A self-signed identity has no public CA chain. Trust its certificate
+          # in this disposable CI keychain so codesign recognizes the identity.
+          security find-certificate -c "Galaxy Self-Signed" -p "$KEYCHAIN" > "$RUNNER_TEMP/galaxy-signing.cer"
+          security add-trusted-cert -d -r trustRoot -k "$KEYCHAIN" "$RUNNER_TEMP/galaxy-signing.cer"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" | awk -F'"' '/Galaxy Self-Signed/ { print $1 }' | awk '{ print $2 }')"
+          [[ -n "$IDENTITY" ]] || { echo "Galaxy signing identity was not imported." >&2; exit 1; }
+          echo "identity=$IDENTITY" >> "$GITHUB_ENV"
+          rm -f "$RUNNER_TEMP/galaxy-signing.p12"
+
+      - name: Build signed app
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          BUILD: ${{ github.run_number }}
+          SPARKLE_PUBLIC_KEY: ${{ vars.SPARKLE_PUBLIC_KEY }}
+        run: |
+          [[ -n "$SPARKLE_PUBLIC_KEY" ]] || { echo "SPARKLE_PUBLIC_KEY is required." >&2; exit 1; }
+          xcodegen generate --spec app/project.yml --project app
+          xcodebuild -project app/Galaxy.xcodeproj -scheme Galaxy -configuration Release \
+            -destination "platform=macOS,arch=${{ matrix.arch }}" \
+            ARCHS="${{ matrix.arch }}" ONLY_ACTIVE_ARCH=YES \
+            MARKETING_VERSION="$VERSION" CURRENT_PROJECT_VERSION="$BUILD" \
+            SPARKLE_PUBLIC_ED_KEY="$SPARKLE_PUBLIC_KEY" \
+            CODE_SIGN_IDENTITY="$IDENTITY" CODE_SIGN_STYLE=Manual \
+            -derivedDataPath "app/build-release-${{ matrix.arch }}" build -quiet
+          APP="app/build-release-${{ matrix.arch }}/Build/Products/Release/Galaxy.app"
+          # Self-signed certificates do not use a provisioning profile. Sign
+          # the completed bundle explicitly, including its embedded framework.
+          codesign --deep --force --sign "$IDENTITY" "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign -dvv "$APP" 2>&1 | grep -q '^Authority=Galaxy Self-Signed$'
+          ZIP="Galaxy-$VERSION-${{ matrix.arch }}.zip"
+          ditto -c -k --keepParent "$APP" "$ZIP"
+          shasum -a 256 "$ZIP" > "$ZIP.sha256"
+
+      - name: Sign update and write appcast
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          BUILD: ${{ github.run_number }}
+          ARCH: ${{ matrix.arch }}
+          REPO: ${{ github.repository }}
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+        run: |
+          [[ -n "$SPARKLE_PRIVATE_KEY" ]] || { echo "SPARKLE_PRIVATE_KEY is required." >&2; exit 1; }
+          SIGN="app/build-release-$ARCH/SourcePackages/artifacts/sparkle/Sparkle/bin/sign_update"
+          [[ -x "$SIGN" ]] || SIGN="$(find app/build-release-$ARCH -path '*/Sparkle/bin/sign_update' -type f -print -quit)"
+          [[ -n "$SIGN" && -x "$SIGN" ]] || { echo "sign_update was not found." >&2; exit 1; }
+          ZIP="Galaxy-$VERSION-$ARCH.zip"
+          ATTRS="$(printf '%s' "$SPARKLE_PRIVATE_KEY" | "$SIGN" --ed-key-file - "$ZIP")"
+          cat > "appcast-$ARCH.xml" <<EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle"><channel>
+          <title>Galaxy</title><item><title>Galaxy $VERSION</title>
+          <sparkle:version>$BUILD</sparkle:version><sparkle:shortVersionString>$VERSION</sparkle:shortVersionString>
+          <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+          <enclosure url="https://github.com/$REPO/releases/download/v$VERSION/$ZIP" type="application/octet-stream" $ATTRS />
+          </item></channel></rss>
+          EOF
+          printf '%s' "$SPARKLE_PRIVATE_KEY" | "$SIGN" --ed-key-file - "appcast-$ARCH.xml"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.arch }}
+          path: |
+            Galaxy-*.zip
+            Galaxy-*.zip.sha256
+            appcast-${{ matrix.arch }}.xml
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          RAW="${INPUT_VERSION:-$GITHUB_REF_NAME}"
+          VERSION="${RAW#v}"
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Invalid version: $RAW" >&2; exit 1; }
+          gh release create "v$VERSION" release/* \
+            --title "Galaxy $VERSION" \
+            --generate-notes \
+            --target "$GITHUB_SHA"
