@@ -74,7 +74,7 @@ pub(crate) fn search_directories() -> Vec<PathBuf> {
             home.join(".composer/vendor/bin"),
             home.join(".config/composer/vendor/bin"),
             home.join(".local/bin"),
-            // `cargo install` (rust-analyzer) and `go install` (gopls).
+            // `cargo install` tools and `go install` (gopls).
             home.join(".cargo/bin"),
             home.join("go/bin"),
             // Laravel Herd ships its own php binary.

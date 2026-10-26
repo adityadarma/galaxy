@@ -37,6 +37,7 @@ use galaxy_core::multicursor;
 use galaxy_core::navigation::{self, Location, NavHistory};
 use galaxy_core::php::{self, PhpEngine};
 use galaxy_core::position::Utf16Position;
+use galaxy_core::rust::{self, RustEngine};
 use galaxy_core::selection::{Selection, SelectionSet};
 use galaxy_core::snippets;
 use galaxy_core::syntax::{self, SyntaxLanguage, SyntaxService, SyntaxSnapshot};
@@ -439,6 +440,8 @@ pub struct Core {
     php: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<PhpEngine>>>>>,
     /// Built-in Go engines, one per project root.
     go: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<GoEngine>>>>>,
+    /// Built-in Rust engines, one per Cargo project root.
+    rust: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<RustEngine>>>>>,
     /// Open files handled by built-in analysis, whether or not a language
     /// server serves them.
     php_documents: Mutex<HashMap<String, std::sync::Weak<DocumentHandle>>>,
@@ -462,6 +465,7 @@ impl Default for Core {
             analysis: Mutex::new(BuiltinStore::default()),
             php: Arc::new(Mutex::new(HashMap::new())),
             go: Arc::new(Mutex::new(HashMap::new())),
+            rust: Arc::new(Mutex::new(HashMap::new())),
             php_documents: Mutex::new(HashMap::new()),
             php_checked: Mutex::new(HashMap::new()),
             typescript_checked: Mutex::new(HashMap::new()),
@@ -692,6 +696,7 @@ impl Core {
         if !(is_php_path(path)
             || is_blade_path(path)
             || is_go_path(path)
+            || is_rust_path(path)
             || is_typescript_path(path))
         {
             return false;
@@ -718,6 +723,7 @@ impl Core {
                 open.remove(&uri);
                 analysis.forget(&uri);
                 self.release_go_buffer(&uri);
+                self.release_rust_buffer(&uri);
                 self.typescript_checked
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
@@ -728,6 +734,7 @@ impl Core {
                 .collect()
         };
         self.check_php(&mut analysis, &documents);
+        self.check_rust(&mut analysis, &documents);
         self.check_typescript(&mut analysis, &documents);
         for (uri, document) in &documents {
             let diagnostics = analysis
@@ -806,7 +813,9 @@ impl Core {
                 .set_hover(&uri, hover);
             return answered;
         }
-        let engine = if is_go_path(Path::new(&path)) {
+        let engine = if is_rust_path(Path::new(&path)) {
+            self.rust_engine(Path::new(&path)).map(Engine::Rust)
+        } else if is_go_path(Path::new(&path)) {
             self.go_engine(Path::new(&path)).map(Engine::Go)
         } else {
             self.php_engine_any(Path::new(&path)).map(Engine::Php)
@@ -904,7 +913,9 @@ impl Core {
                 .set_completion(&uri, items);
             return answered;
         }
-        let engine = if is_go_path(Path::new(&path)) {
+        let engine = if is_rust_path(Path::new(&path)) {
+            self.rust_engine(Path::new(&path)).map(Engine::Rust)
+        } else if is_go_path(Path::new(&path)) {
             self.go_engine(Path::new(&path)).map(Engine::Go)
         } else {
             self.php_engine_any(Path::new(&path)).map(Engine::Php)
@@ -966,7 +977,9 @@ impl Core {
             return false;
         }
         let uri = file_uri(Path::new(&path));
-        let engine = if is_go_path(Path::new(&path)) {
+        let engine = if is_rust_path(Path::new(&path)) {
+            self.rust_engine(Path::new(&path)).map(Engine::Rust)
+        } else if is_go_path(Path::new(&path)) {
             self.go_engine(Path::new(&path)).map(Engine::Go)
         } else {
             self.php_engine(Path::new(&path)).map(Engine::Php)
@@ -1158,11 +1171,13 @@ impl Core {
             return false;
         }
         let path = Path::new(&path);
-        if !(is_go_path(path) || is_php_path(path) || is_blade_path(path)) {
+        if !(is_rust_path(path) || is_go_path(path) || is_php_path(path) || is_blade_path(path)) {
             return false;
         }
         let uri = file_uri(path);
-        let engine = if is_go_path(path) {
+        let engine = if is_rust_path(path) {
+            self.rust_engine(path).map(Engine::Rust)
+        } else if is_go_path(path) {
             self.go_engine(path).map(Engine::Go)
         } else {
             self.php_engine_any(path).map(Engine::Php)
@@ -1250,7 +1265,9 @@ impl Core {
                 .set_document_symbols(&uri, symbols);
             return answered;
         }
-        let engine = if is_go_path(Path::new(&path)) {
+        let engine = if is_rust_path(Path::new(&path)) {
+            self.rust_engine(Path::new(&path)).map(Engine::Rust)
+        } else if is_go_path(Path::new(&path)) {
             self.go_engine(Path::new(&path)).map(Engine::Go)
         } else {
             self.php_engine(Path::new(&path)).map(Engine::Php)
@@ -1477,6 +1494,7 @@ fn rename_edit(edit: &galaxy_core::analysis::RenameEdit) -> RenameEdit {
 enum Engine {
     Php(Arc<Mutex<PhpEngine>>),
     Go(Arc<Mutex<GoEngine>>),
+    Rust(Arc<Mutex<RustEngine>>),
 }
 
 impl Engine {
@@ -1484,6 +1502,7 @@ impl Engine {
         match self {
             Engine::Php(engine) => engine.lock().unwrap_or_else(|e| e.into_inner()).is_ready(),
             Engine::Go(engine) => engine.lock().unwrap_or_else(|e| e.into_inner()).is_ready(),
+            Engine::Rust(engine) => engine.lock().unwrap_or_else(|e| e.into_inner()).is_ready(),
         }
     }
 
@@ -1497,6 +1516,13 @@ impl Engine {
                     .flatten()
             }
             Engine::Go(engine) => {
+                let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                engine
+                    .is_ready()
+                    .then(|| engine.hover(path, text, line, column))
+                    .flatten()
+            }
+            Engine::Rust(engine) => {
                 let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
                 engine
                     .is_ready()
@@ -1524,6 +1550,13 @@ impl Engine {
                     Vec::new()
                 }
             }
+            Engine::Rust(engine) => {
+                let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                engine
+                    .is_ready()
+                    .then(|| engine.complete(path, text, line, column))
+                    .unwrap_or_default()
+            }
         }
     }
 
@@ -1537,6 +1570,13 @@ impl Engine {
                     .flatten()
             }
             Engine::Go(engine) => {
+                let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                engine
+                    .is_ready()
+                    .then(|| engine.signature(path, text, line, column))
+                    .flatten()
+            }
+            Engine::Rust(engine) => {
                 let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
                 engine
                     .is_ready()
@@ -1564,6 +1604,13 @@ impl Engine {
                     Vec::new()
                 }
             }
+            Engine::Rust(engine) => {
+                let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                engine
+                    .is_ready()
+                    .then(|| engine.definition(path, text, line, column))
+                    .unwrap_or_default()
+            }
         }
     }
 
@@ -1585,6 +1632,13 @@ impl Engine {
                     Vec::new()
                 }
             }
+            Engine::Rust(engine) => {
+                let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                engine
+                    .is_ready()
+                    .then(|| engine.actions(path, text, line, column))
+                    .unwrap_or_default()
+            }
         }
     }
 
@@ -1598,6 +1652,10 @@ impl Engine {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .diagnostics(path, text),
+            Engine::Rust(engine) => engine
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .diagnostics(path, text),
         }
     }
 
@@ -1605,6 +1663,10 @@ impl Engine {
         match self {
             Engine::Php(_) => php::outline(path, text),
             Engine::Go(_) => go::outline(path, text),
+            Engine::Rust(engine) => engine
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .outline(path, text),
         }
     }
 }
@@ -1636,6 +1698,82 @@ impl Core {
             spawn_go_index(&engine, &root);
         }
         Some(engine)
+    }
+
+    fn rust_engine(&self, path: &Path) -> Option<Arc<Mutex<RustEngine>>> {
+        if !is_rust_path(path) {
+            return None;
+        }
+        let root = rust::project_root(path);
+        let (engine, fresh) = {
+            let mut engines = self.rust.lock().unwrap_or_else(|e| e.into_inner());
+            match engines.get(&root) {
+                Some(engine) => (engine.clone(), false),
+                None => {
+                    let engine = Arc::new(Mutex::new(RustEngine::pending(&root)));
+                    engines.insert(root.clone(), engine.clone());
+                    (engine, true)
+                }
+            }
+        };
+        if fresh {
+            spawn_rust_index(&engine, &root);
+        }
+        Some(engine)
+    }
+
+    fn release_rust_buffer(&self, uri: &str) {
+        let Some(path) = uri.strip_prefix("file://") else {
+            return;
+        };
+        let path = Path::new(path);
+        if !is_rust_path(path) {
+            return;
+        }
+        for engine in self.rust.lock().unwrap_or_else(|e| e.into_inner()).values() {
+            engine
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .close_document(path);
+        }
+    }
+
+    fn check_rust(
+        &self,
+        analysis: &mut BuiltinStore,
+        documents: &HashMap<String, Arc<DocumentHandle>>,
+    ) {
+        for (uri, document) in documents {
+            let path = document.path();
+            if !is_rust_path(Path::new(&path)) {
+                continue;
+            }
+            let Some(engine) = self.rust_engine(Path::new(&path)) else {
+                continue;
+            };
+            let text = document.lock().editor.doc.text();
+            let diagnostics = engine
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .diagnostics(Path::new(&path), &text)
+                .into_iter()
+                .map(|problem| galaxy_core::analysis::Diagnostic {
+                    uri: uri.clone(),
+                    range: LspRange {
+                        start_line: u64::from(problem.start_line),
+                        start_character: u64::from(problem.start_column),
+                        end_line: u64::from(problem.end_line),
+                        end_character: u64::from(problem.end_column),
+                    },
+                    severity: galaxy_core::analysis::DiagnosticSeverity::Error,
+                    message: problem.message,
+                    source: Some("galaxy".into()),
+                    code: None,
+                    unnecessary: false,
+                })
+                .collect();
+            analysis.set_diagnostics(uri, diagnostics);
+        }
     }
 
     /// A closed Go document no longer overrides the file on disk.
@@ -1676,6 +1814,69 @@ impl Core {
         engine
             .is_ready()
             .then(|| engine.references(Path::new(&path), &text, line as u32, character as u32))
+    }
+
+    fn rust_usages(
+        &self,
+        document: &Arc<DocumentHandle>,
+        line: u64,
+        character: u64,
+    ) -> Option<Vec<galaxy_core::lang::Occurrence>> {
+        let path = document.path();
+        let engine = self.rust_engine(Path::new(&path))?;
+        let text = document.lock().editor.doc.text();
+        let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+        engine
+            .is_ready()
+            .then(|| engine.references(Path::new(&path), &text, line as u32, character as u32))
+    }
+
+    fn rust_rename(
+        &self,
+        document: &Arc<DocumentHandle>,
+        uri: &str,
+        line: u64,
+        character: u64,
+        new_name: &str,
+    ) -> bool {
+        let path = document.path();
+        let edits = self
+            .rust_engine(Path::new(&path))
+            .and_then(|engine| {
+                let text = document.lock().editor.doc.text();
+                let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                engine.is_ready().then(|| {
+                    engine
+                        .rename(
+                            Path::new(&path),
+                            &text,
+                            line as u32,
+                            character as u32,
+                            new_name,
+                        )
+                        .ok()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|usage| LspRenameEdit {
+                            uri: file_uri(&usage.path),
+                            range: LspRange {
+                                start_line: u64::from(usage.line),
+                                start_character: u64::from(usage.start_column),
+                                end_line: u64::from(usage.line),
+                                end_character: u64::from(usage.end_column),
+                            },
+                            new_text: new_name.to_owned(),
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .unwrap_or_default();
+        let found = !edits.is_empty();
+        self.analysis
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_rename_edits(uri, edits);
+        found
     }
 
     /// Renames the Go symbol at the cursor; `false` when the name is not
@@ -1976,7 +2177,9 @@ impl Core {
         line: u64,
         character: u64,
     ) -> bool {
-        let usages = if is_go_path(Path::new(&document.path())) {
+        let usages = if is_rust_path(Path::new(&document.path())) {
+            self.rust_usages(document, line, character)
+        } else if is_go_path(Path::new(&document.path())) {
             self.go_usages(document, line, character)
         } else {
             self.php_usages(document, line, character)
@@ -2304,6 +2507,9 @@ impl Core {
         character: u64,
         new_name: &str,
     ) -> bool {
+        if is_rust_path(Path::new(&document.path())) {
+            return self.rust_rename(document, uri, line, character, new_name);
+        }
         if is_go_path(Path::new(&document.path())) {
             return self.go_rename(document, uri, line, character, new_name);
         }
@@ -2397,6 +2603,11 @@ fn is_php_path(path: &Path) -> bool {
 fn is_go_path(path: &Path) -> bool {
     path.extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("go"))
+}
+
+fn is_rust_path(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
 }
 
 fn is_typescript_path(path: &Path) -> bool {
@@ -2813,6 +3024,24 @@ fn spawn_go_index(
         .name("go-index".into())
         .spawn(move || {
             let built = GoEngine::build(&root);
+            engine
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .install(built);
+        })
+        .ok()
+}
+
+fn spawn_rust_index(
+    engine: &Arc<Mutex<RustEngine>>,
+    root: &Path,
+) -> Option<std::thread::JoinHandle<()>> {
+    let engine = Arc::clone(engine);
+    let root = root.to_path_buf();
+    std::thread::Builder::new()
+        .name("rust-index".into())
+        .spawn(move || {
+            let built = RustEngine::build(&root);
             engine
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())

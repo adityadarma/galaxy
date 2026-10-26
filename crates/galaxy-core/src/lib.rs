@@ -33,6 +33,7 @@ pub mod php;
 pub mod position;
 pub mod rope_diff;
 pub mod rpc;
+pub mod rust;
 pub mod selection;
 pub mod snippets;
 pub mod syntax;

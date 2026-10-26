@@ -1,0 +1,1704 @@
+//! Bounded native Rust navigation and analysis.
+//!
+//! This module is the Rust semantic engine. It does not start or depend on an
+//! external language server. Type inference, macro expansion, and Cargo
+//! feature selection are implemented here as the native engine grows.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use ignore::WalkBuilder;
+use tree_sitter::{Node, Parser, Tree};
+
+use crate::lang::{
+    Action, Completion, Edit, HoverResult, ItemKind, Occurrence, OutlineSymbol, Problem, Severity,
+    Signature, Target,
+};
+
+const MAX_FILES: usize = 4_000;
+const MAX_FILE_BYTES: u64 = 2 << 20;
+const MAX_ITEMS: usize = 200;
+const MAX_PROBLEMS: usize = 200;
+const MAX_OCCURRENCES: usize = 2_000;
+const KEYWORDS: &[&str] = &[
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
+    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
+    "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
+    "unsafe", "use", "where", "while",
+];
+
+#[derive(Debug, Clone)]
+struct Declaration {
+    name: String,
+    module: Vec<String>,
+    kind: ItemKind,
+    path: PathBuf,
+    line: u32,
+    column: u32,
+    scope_depth: usize,
+    signature: String,
+}
+
+#[derive(Debug, Clone)]
+struct UseBinding {
+    local: String,
+    target: Vec<String>,
+    glob: bool,
+}
+
+/// Project declarations built on a worker thread.
+#[derive(Debug, Default)]
+pub struct Built {
+    declarations: Vec<Declaration>,
+    files: Vec<PathBuf>,
+    uses: HashMap<PathBuf, Vec<UseBinding>>,
+    source_roots: Vec<PathBuf>,
+}
+
+/// Static index for one Cargo project or repository.
+#[derive(Debug)]
+pub struct RustEngine {
+    declarations: Vec<Declaration>,
+    files: Vec<PathBuf>,
+    uses: HashMap<PathBuf, Vec<UseBinding>>,
+    source_roots: Vec<PathBuf>,
+    open: HashMap<PathBuf, (Vec<Declaration>, Vec<UseBinding>, String)>,
+    ready: bool,
+}
+
+impl RustEngine {
+    pub fn pending(_root: &Path) -> Self {
+        Self {
+            declarations: Vec::new(),
+            files: Vec::new(),
+            uses: HashMap::new(),
+            source_roots: Vec::new(),
+            open: HashMap::new(),
+            ready: false,
+        }
+    }
+
+    pub fn build(root: &Path) -> Built {
+        let mut declarations = Vec::new();
+        let mut files = Vec::new();
+        let mut uses = HashMap::new();
+        let roots = cargo_source_roots(root);
+        for source_root in &roots {
+            let mut walker = WalkBuilder::new(source_root);
+            walker
+                .hidden(false)
+                .git_ignore(true)
+                .git_global(true)
+                .parents(true);
+            for entry in walker
+                .build()
+                .flatten()
+                .take(MAX_FILES.saturating_sub(files.len()))
+            {
+                let path = entry.path();
+                if path.extension().and_then(|ext| ext.to_str()) != Some("rs")
+                    || entry
+                        .metadata()
+                        .is_ok_and(|metadata| metadata.len() > MAX_FILE_BYTES)
+                {
+                    continue;
+                }
+                if let Ok(text) = std::fs::read_to_string(path) {
+                    files.push(path.to_path_buf());
+                    declarations.extend(parse_declarations(path, &text, source_root));
+                    uses.insert(path.to_path_buf(), parse_use_bindings(&text));
+                }
+            }
+        }
+        declarations.sort_by(|left, right| {
+            (&left.name, &left.path, left.line).cmp(&(&right.name, &right.path, right.line))
+        });
+        Built {
+            declarations,
+            files,
+            uses,
+            source_roots: roots,
+        }
+    }
+
+    pub fn install(&mut self, built: Built) {
+        self.declarations = built.declarations;
+        self.files = built.files;
+        self.uses = built.uses;
+        self.source_roots = built.source_roots;
+        self.ready = true;
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.ready
+    }
+
+    pub fn sync_document(&mut self, path: &Path, text: &str) {
+        self.open.insert(
+            path.to_path_buf(),
+            (
+                parse_declarations(path, text, &self.source_root_for(path)),
+                parse_use_bindings(text),
+                text.to_owned(),
+            ),
+        );
+    }
+
+    pub fn close_document(&mut self, path: &Path) {
+        self.open.remove(path);
+    }
+
+    pub fn complete(&mut self, path: &Path, text: &str, line: u32, column: u32) -> Vec<Completion> {
+        self.sync_document(path, text);
+        let prefix = word_before(text, line, column);
+        if member_access_before(text, line, column) {
+            return self
+                .member_completions(text, line, column)
+                .into_iter()
+                .filter(|item| item.label.starts_with(prefix))
+                .take(MAX_ITEMS)
+                .collect();
+        }
+        let mut candidates = self.visible_declarations(path);
+        candidates.extend(local_declarations(
+            path,
+            text,
+            cursor_byte(text, line, column),
+        ));
+        candidates.retain(|item| item.name.starts_with(prefix));
+        candidates
+            .sort_by(|left, right| left.name.cmp(&right.name).then(left.path.cmp(&right.path)));
+        candidates.dedup_by(|left, right| left.name == right.name && left.kind == right.kind);
+        candidates
+            .into_iter()
+            .take(MAX_ITEMS)
+            .map(|item| Completion {
+                label: item.name.clone(),
+                detail: Some(item.signature.clone()),
+                insert_text: item.name.clone(),
+                is_snippet: false,
+                kind: item.kind,
+                sort: item.name.clone(),
+                extra: Vec::new(),
+                replace_from: None,
+            })
+            .collect()
+    }
+
+    pub fn signature(
+        &mut self,
+        path: &Path,
+        text: &str,
+        line: u32,
+        column: u32,
+    ) -> Option<Signature> {
+        self.sync_document(path, text);
+        let byte = cursor_byte(text, line, column);
+        let (name, active) = call_at(text, byte)?;
+        let declaration = self
+            .resolve(path, &name, byte)
+            .into_iter()
+            .find(|item| item.kind == ItemKind::Function)?;
+        let parameters = signature_parameters(&declaration.signature);
+        Some(Signature {
+            label: declaration.signature,
+            documentation: None,
+            parameters,
+            active,
+        })
+    }
+
+    pub fn definition(&mut self, path: &Path, text: &str, line: u32, column: u32) -> Vec<Target> {
+        self.sync_document(path, text);
+        let Some(name) = identifier_at(text, line, column) else {
+            return Vec::new();
+        };
+        self.resolve(path, &name, cursor_byte(text, line, column))
+            .into_iter()
+            .map(|item| Target {
+                path: item.path,
+                line: item.line,
+                column: item.column,
+            })
+            .take(MAX_ITEMS)
+            .collect()
+    }
+
+    pub fn hover(
+        &mut self,
+        path: &Path,
+        text: &str,
+        line: u32,
+        column: u32,
+    ) -> Option<HoverResult> {
+        self.sync_document(path, text);
+        let (name, start, end) = identifier_range(text, line, column)?;
+        let declaration = self
+            .resolve(path, &name, cursor_byte(text, line, column))
+            .into_iter()
+            .next()?;
+        Some(HoverResult {
+            markdown: format!("```rust\n{}\n```", declaration.signature),
+            line,
+            start_column: start,
+            end_column: end,
+        })
+    }
+
+    pub fn diagnostics(&mut self, path: &Path, text: &str) -> Vec<Problem> {
+        self.sync_document(path, text);
+        let Some(tree) = parse_tree(text) else {
+            return Vec::new();
+        };
+        let mut errors = Vec::new();
+        collect_errors(tree.root_node(), text, &mut errors);
+        collect_unresolved(self, path, text, tree.root_node(), &mut errors);
+        errors.sort_by_key(|problem| (problem.start_line, problem.start_column));
+        errors.truncate(MAX_PROBLEMS);
+        errors
+    }
+
+    pub fn actions(&mut self, path: &Path, text: &str, line: u32, _column: u32) -> Vec<Action> {
+        self.sync_document(path, text);
+        let Some(source) = text.lines().nth(line as usize) else {
+            return Vec::new();
+        };
+        let Some(binding) = parse_use_bindings(source)
+            .into_iter()
+            .find(|binding| !binding.glob)
+        else {
+            return Vec::new();
+        };
+        if identifier_count(text, &binding.local) != 1 {
+            return Vec::new();
+        }
+        vec![Action {
+            title: format!("Remove unused import `{}`", binding.local),
+            edits: vec![Edit {
+                start_line: line,
+                start_column: 0,
+                end_line: line + 1,
+                end_column: 0,
+                text: String::new(),
+            }],
+            files: Vec::new(),
+        }]
+    }
+
+    /// Conservative native formatting for valid Rust syntax. It changes only
+    /// indentation and trailing whitespace, preserving token spacing.
+    pub fn format(&self, text: &str) -> Option<String> {
+        let tree = parse_tree(text)?;
+        if tree.root_node().has_error() {
+            return None;
+        }
+        let mut depth = 0usize;
+        let mut out = String::new();
+        for line in text.lines() {
+            let content = line.trim();
+            if content.starts_with('}') {
+                depth = depth.saturating_sub(1);
+            }
+            if !content.is_empty() {
+                out.push_str(&"    ".repeat(depth));
+                out.push_str(content);
+            }
+            out.push('\n');
+            let (opens, closes) = structural_braces(content);
+            depth += opens;
+            depth = depth.saturating_sub(closes);
+        }
+        Some(out)
+    }
+
+    /// Finds identifier occurrences when the name has exactly one top-level
+    /// declaration in this project. Ambiguous names require richer resolution.
+    pub fn references(
+        &mut self,
+        path: &Path,
+        text: &str,
+        line: u32,
+        column: u32,
+    ) -> Vec<Occurrence> {
+        self.sync_document(path, text);
+        let Some(name) = identifier_at(text, line, column) else {
+            return Vec::new();
+        };
+        let declarations = self.resolve(path, &name, cursor_byte(text, line, column));
+        if declarations.len() != 1 {
+            return Vec::new();
+        }
+        if declarations[0].kind == ItemKind::Variable {
+            return local_occurrences(path, text, &name, &declarations[0]);
+        }
+        let target = &declarations[0];
+        self.sources()
+            .into_iter()
+            .flat_map(|(candidate_path, source)| {
+                item_occurrences(self, &candidate_path, &source, &name, target)
+            })
+            .take(MAX_OCCURRENCES)
+            .collect()
+    }
+
+    /// Validates that a local rename is safe enough for the current static
+    /// resolver, then returns all edits as UTF-16 occurrences.
+    pub fn rename(
+        &mut self,
+        path: &Path,
+        text: &str,
+        line: u32,
+        column: u32,
+        new_name: &str,
+    ) -> Result<Vec<Occurrence>, String> {
+        if !valid_name(new_name) {
+            return Err("invalid Rust identifier".to_owned());
+        }
+        let found = self.references(path, text, line, column);
+        if found.is_empty() {
+            return Err("symbol is ambiguous or unknown".to_owned());
+        }
+        Ok(found)
+    }
+
+    pub fn outline(&self, path: &Path, text: &str) -> Vec<OutlineSymbol> {
+        parse_declarations(path, text, &self.source_root_for(path))
+            .into_iter()
+            .map(|item| OutlineSymbol {
+                name: item.name,
+                kind: item_kind_name(item.kind),
+                line: item.line,
+                column: item.column,
+                children: Vec::new(),
+            })
+            .collect()
+    }
+
+    fn all_declarations(&self) -> Vec<Declaration> {
+        let mut all = self.declarations.clone();
+        all.retain(|item| !self.open.contains_key(&item.path));
+        all.extend(
+            self.open
+                .values()
+                .flat_map(|(declarations, _, _)| declarations)
+                .cloned(),
+        );
+        all
+    }
+
+    fn visible_declarations(&self, path: &Path) -> Vec<Declaration> {
+        let mut visible = self.all_declarations();
+        let aliases = self.use_bindings(path);
+        for binding in aliases {
+            let targets = if binding.glob {
+                self.declarations_in_module(path, &binding.target)
+            } else {
+                self.resolve_path(path, &binding.target)
+            };
+            for target in targets {
+                let mut alias = target.clone();
+                if !binding.glob {
+                    alias.name = binding.local.clone();
+                }
+                visible.push(alias);
+            }
+        }
+        visible
+    }
+
+    fn member_completions(&self, text: &str, line: u32, column: u32) -> Vec<Completion> {
+        let byte = cursor_byte(text, line, column);
+        let before = &text[..byte];
+        let Some(receiver) = before
+            .rsplit_once('.')
+            .map(|(left, _)| left.trim_end())
+            .and_then(|left| left.rsplit(|character: char| !is_ident(character)).next())
+        else {
+            return Vec::new();
+        };
+        let Some(ty) = receiver_type(before, receiver) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for (_, source) in self.sources() {
+            out.extend(struct_fields(&source, &ty));
+            out.extend(impl_methods(&source, &ty));
+        }
+        out.sort_by(|left, right| left.label.cmp(&right.label));
+        out.dedup_by(|left, right| left.label == right.label);
+        out
+    }
+
+    fn resolve(&self, path: &Path, name: &str, at: usize) -> Vec<Declaration> {
+        if let Some((_, text)) = self.document(path)
+            && let Some(local) = local_declaration(path, text, name, at)
+        {
+            return vec![local];
+        }
+        let all = self.all_declarations();
+        let local: Vec<_> = all
+            .iter()
+            .filter(|item| item.path == path && item.name == name)
+            .cloned()
+            .collect();
+        if !local.is_empty() {
+            return local;
+        }
+        if let Some(binding) = self
+            .use_bindings(path)
+            .iter()
+            .find(|binding| binding.local == name)
+            && !binding.glob
+            && let Some(target) = self.resolve_path(path, &binding.target).into_iter().next()
+        {
+            return vec![target];
+        }
+        let globbed: Vec<_> = self
+            .use_bindings(path)
+            .into_iter()
+            .filter(|binding| binding.glob)
+            .flat_map(|binding| self.declarations_in_module(path, &binding.target))
+            .filter(|item| item.name == name)
+            .collect();
+        if globbed.len() == 1 {
+            return globbed;
+        }
+        let matching: Vec<_> = all.into_iter().filter(|item| item.name == name).collect();
+        (matching.len() == 1)
+            .then_some(matching)
+            .unwrap_or_default()
+    }
+
+    fn resolve_path(&self, path: &Path, target: &[String]) -> Vec<Declaration> {
+        let Some(name) = target.last() else {
+            return Vec::new();
+        };
+        let current = self.module_for(path);
+        let module = match target.first().map(String::as_str) {
+            Some("crate") => target[1..target.len().saturating_sub(1)].to_vec(),
+            Some("self") => {
+                let mut module = current;
+                module.extend_from_slice(&target[1..target.len().saturating_sub(1)]);
+                module
+            }
+            Some("super") => {
+                let mut module = current;
+                let parents = target
+                    .iter()
+                    .take_while(|segment| segment.as_str() == "super")
+                    .count();
+                for _ in 0..parents {
+                    module.pop();
+                }
+                module.extend_from_slice(&target[parents..target.len().saturating_sub(1)]);
+                module
+            }
+            _ if target.len() > 1 => target[..target.len() - 1].to_vec(),
+            _ => Vec::new(),
+        };
+        let matches: Vec<_> = self
+            .all_declarations()
+            .into_iter()
+            .filter(|item| item.name == *name && item.module == module)
+            .collect();
+        (matches.len() == 1).then_some(matches).unwrap_or_default()
+    }
+
+    fn declarations_in_module(&self, path: &Path, target: &[String]) -> Vec<Declaration> {
+        let module = self.module_target(path, target);
+        self.all_declarations()
+            .into_iter()
+            .filter(|item| item.module == module)
+            .collect()
+    }
+
+    fn module_target(&self, path: &Path, target: &[String]) -> Vec<String> {
+        let current = self.module_for(path);
+        match target.first().map(String::as_str) {
+            Some("crate") => target[1..].to_vec(),
+            Some("self") => {
+                let mut module = current;
+                module.extend_from_slice(&target[1..]);
+                module
+            }
+            Some("super") => {
+                let parents = target
+                    .iter()
+                    .take_while(|segment| segment.as_str() == "super")
+                    .count();
+                let mut module = current;
+                for _ in 0..parents {
+                    module.pop();
+                }
+                module.extend_from_slice(&target[parents..]);
+                module
+            }
+            _ => target.to_vec(),
+        }
+    }
+
+    fn source_root_for(&self, path: &Path) -> PathBuf {
+        self.source_roots
+            .iter()
+            .find(|root| path.starts_with(root))
+            .cloned()
+            .or_else(|| path.parent().map(Path::to_path_buf))
+            .unwrap_or_default()
+    }
+
+    fn module_for(&self, path: &Path) -> Vec<String> {
+        module_path(path, &self.source_root_for(path))
+    }
+
+    fn use_bindings(&self, path: &Path) -> Vec<UseBinding> {
+        self.open
+            .get(path)
+            .map(|(_, uses, _)| uses.clone())
+            .or_else(|| self.uses.get(path).cloned())
+            .unwrap_or_default()
+    }
+
+    fn sources(&self) -> Vec<(PathBuf, String)> {
+        let mut paths = self.files.clone();
+        paths.extend(self.open.keys().cloned());
+        paths.sort();
+        paths.dedup();
+        paths
+            .into_iter()
+            .filter_map(|path| {
+                self.open
+                    .get(&path)
+                    .map(|(_, _, text)| (path.clone(), text.clone()))
+                    .or_else(|| std::fs::read_to_string(&path).ok().map(|text| (path, text)))
+            })
+            .collect()
+    }
+
+    fn document(&self, path: &Path) -> Option<(PathBuf, &str)> {
+        self.open
+            .get(path)
+            .map(|(_, _, text)| (path.to_path_buf(), text.as_str()))
+    }
+}
+
+fn structural_braces(line: &str) -> (usize, usize) {
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut opens = 0;
+    let mut closes = 0;
+    let mut characters = line.chars().peekable();
+    while let Some(character) = characters.next() {
+        if !quoted && character == '/' && characters.peek() == Some(&'/') {
+            break;
+        }
+        if character == '"' && !escaped {
+            quoted = !quoted;
+        }
+        if !quoted {
+            match character {
+                '{' => opens += 1,
+                '}' => closes += 1,
+                _ => {}
+            }
+        }
+        escaped = character == '\\' && !escaped;
+        if character != '\\' {
+            escaped = false;
+        }
+    }
+    (opens, closes)
+}
+
+/// The nearest Cargo workspace root, then `.git`, then the file directory.
+pub fn project_root(file: &Path) -> PathBuf {
+    let start = file.parent().unwrap_or(file);
+    start
+        .ancestors()
+        .find(|dir| dir.join("Cargo.toml").is_file())
+        .or_else(|| start.ancestors().find(|dir| dir.join(".git").exists()))
+        .unwrap_or(start)
+        .to_path_buf()
+}
+
+/// Source directories configured by the nearest Cargo manifest. A normal
+/// package uses `src`; custom `path` targets add their containing directory.
+/// This parser intentionally reads only local manifest paths and never runs
+/// Cargo or resolves dependencies.
+fn cargo_source_roots(root: &Path) -> Vec<PathBuf> {
+    let manifest = root.join("Cargo.toml");
+    let mut roots = vec![root.join("src")];
+    let Ok(contents) = std::fs::read_to_string(manifest) else {
+        return roots;
+    };
+    for line in contents.lines().map(str::trim) {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "path" {
+            continue;
+        }
+        let value = value.trim().trim_matches('"');
+        let path = root.join(value);
+        if path.extension().is_some_and(|extension| extension == "rs") {
+            if let Some(parent) = path.parent() {
+                roots.push(parent.to_path_buf());
+            }
+        }
+    }
+    roots.retain(|path| path.is_dir());
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+fn module_path(path: &Path, source_root: &Path) -> Vec<String> {
+    let Ok(relative) = path.strip_prefix(source_root) else {
+        return Vec::new();
+    };
+    let mut parts: Vec<_> = relative
+        .components()
+        .filter_map(|component| component.as_os_str().to_str())
+        .map(str::to_owned)
+        .collect();
+    let Some(file) = parts.pop() else {
+        return Vec::new();
+    };
+    let stem = Path::new(&file)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("");
+    if !matches!(stem, "lib" | "main" | "mod") && !stem.is_empty() {
+        parts.push(stem.to_owned());
+    }
+    parts
+}
+
+fn parse_tree(text: &str) -> Option<Tree> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&tree_sitter_rust::LANGUAGE.into())
+        .ok()?;
+    parser.parse(text, None)
+}
+
+fn parse_declarations(path: &Path, text: &str, source_root: &Path) -> Vec<Declaration> {
+    let Some(tree) = parse_tree(text) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    collect_declarations(
+        path,
+        text,
+        tree.root_node(),
+        &module_path(path, source_root),
+        &mut out,
+    );
+    out
+}
+
+fn collect_declarations(
+    path: &Path,
+    text: &str,
+    node: Node<'_>,
+    module: &[String],
+    out: &mut Vec<Declaration>,
+) {
+    collect_declaration(path, text, node, module, out);
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        let mut child_module = module.to_vec();
+        if node.kind() == "mod_item"
+            && child.kind() == "declaration_list"
+            && let Some(name) = node.child_by_field_name("name")
+            && let Ok(name) = name.utf8_text(text.as_bytes())
+        {
+            child_module.push(name.to_owned());
+        }
+        collect_declarations(path, text, child, &child_module, out);
+    }
+}
+
+fn parse_use_bindings(text: &str) -> Vec<UseBinding> {
+    let Some(tree) = parse_tree(text) else {
+        return Vec::new();
+    };
+    let mut bindings = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "use_declaration" {
+            let source = node.utf8_text(text.as_bytes()).unwrap_or("");
+            bindings.extend(use_bindings(source));
+            continue;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    bindings
+}
+
+fn use_bindings(source: &str) -> Vec<UseBinding> {
+    let source = source
+        .trim()
+        .trim_start_matches("pub ")
+        .trim_start_matches("use ")
+        .trim_end_matches(';')
+        .trim();
+    let mut out = Vec::new();
+    collect_use_bindings(source, "", &mut out);
+    out
+}
+
+fn collect_use_bindings(source: &str, prefix: &str, out: &mut Vec<UseBinding>) {
+    for item in split_use_items(source) {
+        let item = item.trim();
+        if let Some(open) = item.find('{') {
+            let before = item[..open].trim_end_matches("::").trim();
+            let close = item.rfind('}').unwrap_or(item.len());
+            let next_prefix = if before.is_empty() {
+                prefix.to_owned()
+            } else {
+                format!("{prefix}{before}::")
+            };
+            collect_use_bindings(&item[open + 1..close], &next_prefix, out);
+            continue;
+        }
+        let (path, alias) = item.rsplit_once(" as ").unwrap_or((item, ""));
+        if path.trim_end().ends_with("::*") {
+            let target: Vec<String> =
+                format!("{prefix}{}", path.trim_end().trim_end_matches("::*"))
+                    .split("::")
+                    .map(str::trim)
+                    .filter(|segment| !segment.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+            if !target.is_empty() && target.iter().all(|segment| is_ident_text(segment)) {
+                out.push(UseBinding {
+                    local: "*".to_owned(),
+                    target,
+                    glob: true,
+                });
+            }
+            continue;
+        }
+        let target: Vec<String> = format!("{prefix}{path}")
+            .split("::")
+            .map(str::trim)
+            .filter(|segment| !segment.is_empty())
+            .map(str::to_owned)
+            .collect();
+        let local = if alias.is_empty() {
+            target.last().map(String::as_str).unwrap_or("")
+        } else {
+            alias.trim()
+        };
+        if !target.is_empty()
+            && target.iter().all(|segment| is_ident_text(segment))
+            && is_ident_text(local)
+        {
+            out.push(UseBinding {
+                local: local.to_owned(),
+                target,
+                glob: false,
+            });
+        }
+    }
+}
+
+fn split_use_items(source: &str) -> Vec<&str> {
+    let mut depth = 0;
+    let mut start = 0;
+    let mut out = Vec::new();
+    for (index, character) in source.char_indices() {
+        match character {
+            '{' => depth += 1,
+            '}' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(&source[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&source[start..]);
+    out
+}
+
+fn collect_declaration(
+    path: &Path,
+    text: &str,
+    node: Node<'_>,
+    module: &[String],
+    out: &mut Vec<Declaration>,
+) {
+    let kind = match node.kind() {
+        "function_item" => ItemKind::Function,
+        "struct_item" => ItemKind::Class,
+        "enum_item" => ItemKind::Enum,
+        "trait_item" => ItemKind::Interface,
+        "type_item" => ItemKind::Class,
+        "const_item" | "static_item" => ItemKind::Constant,
+        "mod_item" => ItemKind::Class,
+        _ => return,
+    };
+    let Some(name) = node.child_by_field_name("name") else {
+        return;
+    };
+    let name_text = name.utf8_text(text.as_bytes()).unwrap_or("");
+    if name_text.is_empty() {
+        return;
+    }
+    let point = name.start_position();
+    let signature = text[node.start_byte()..node.end_byte()]
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_owned();
+    out.push(Declaration {
+        name: name_text.to_owned(),
+        module: module.to_vec(),
+        kind,
+        path: path.to_path_buf(),
+        line: point.row as u32,
+        column: utf16_column(text, name.start_byte()),
+        scope_depth: 0,
+        signature,
+    });
+}
+
+fn local_declaration(path: &Path, text: &str, name: &str, at: usize) -> Option<Declaration> {
+    local_declarations(path, text, at)
+        .into_iter()
+        .filter(|binding| binding.name == name)
+        .max_by_key(|binding| (binding.scope_depth, binding.line, binding.column))
+}
+
+fn local_declarations(path: &Path, text: &str, at: usize) -> Vec<Declaration> {
+    let Some(tree) = parse_tree(text) else {
+        return Vec::new();
+    };
+    let mut bindings = Vec::new();
+    collect_local_bindings(path, text, tree.root_node(), at, 0, &mut bindings);
+    bindings
+}
+
+fn collect_local_bindings(
+    path: &Path,
+    text: &str,
+    node: Node<'_>,
+    at: usize,
+    depth: usize,
+    out: &mut Vec<Declaration>,
+) {
+    if node.start_byte() > at || node.end_byte() < at {
+        return;
+    }
+    if node.kind() == "function_item"
+        && let Some(parameters) = node.child_by_field_name("parameters")
+    {
+        let mut cursor = parameters.walk();
+        for parameter in parameters.named_children(&mut cursor) {
+            collect_pattern_bindings(path, text, parameter, depth, out);
+        }
+    }
+    if node.kind() == "parameters" {
+        let mut cursor = node.walk();
+        for parameter in node.named_children(&mut cursor) {
+            collect_pattern_bindings(path, text, parameter, depth, out);
+        }
+    }
+    if node.kind() == "let_declaration" && node.start_byte() < at {
+        if let Some(pattern) = node
+            .child_by_field_name("pattern")
+            .or_else(|| node.named_child(0))
+        {
+            collect_pattern_bindings(path, text, pattern, depth, out);
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if node.kind() == "block" && child.kind() == "let_declaration" && child.start_byte() < at {
+            if let Some(pattern) = child
+                .child_by_field_name("pattern")
+                .or_else(|| child.named_child(0))
+            {
+                collect_pattern_bindings(path, text, pattern, depth + 1, out);
+            }
+        }
+        if child.start_byte() <= at && child.end_byte() >= at {
+            collect_local_bindings(path, text, child, at, depth + 1, out);
+        }
+    }
+}
+
+fn collect_pattern_bindings(
+    path: &Path,
+    text: &str,
+    node: Node<'_>,
+    depth: usize,
+    out: &mut Vec<Declaration>,
+) {
+    if node.kind() == "identifier" {
+        let name = node.utf8_text(text.as_bytes()).unwrap_or("");
+        if !name.is_empty() {
+            let point = node.start_position();
+            out.push(Declaration {
+                name: name.to_owned(),
+                module: Vec::new(),
+                kind: ItemKind::Variable,
+                path: path.to_path_buf(),
+                line: point.row as u32,
+                column: utf16_column(text, node.start_byte()),
+                scope_depth: depth,
+                signature: format!("let {name}"),
+            });
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_pattern_bindings(path, text, child, depth, out);
+    }
+}
+
+fn collect_errors(node: Node<'_>, text: &str, out: &mut Vec<Problem>) {
+    if out.len() >= MAX_PROBLEMS || !node.has_error() {
+        return;
+    }
+    if node.is_error() || node.is_missing() {
+        let start = node.start_position();
+        let end = node.end_position();
+        out.push(Problem {
+            start_line: start.row as u32,
+            start_column: utf16_column(text, node.start_byte()),
+            end_line: end.row as u32,
+            end_column: utf16_column(text, node.end_byte()),
+            severity: Severity::Error,
+            message: "Syntax error".to_owned(),
+            unnecessary: false,
+        });
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_errors(child, text, out);
+    }
+}
+
+fn collect_unresolved(
+    engine: &RustEngine,
+    path: &Path,
+    text: &str,
+    node: Node<'_>,
+    out: &mut Vec<Problem>,
+) {
+    if out.len() >= MAX_PROBLEMS || node.has_error() {
+        return;
+    }
+    if node.kind() == "identifier"
+        && identifier_is_reference(node)
+        && let Ok(name) = node.utf8_text(text.as_bytes())
+        && engine.resolve(path, name, node.start_byte()).is_empty()
+    {
+        let point = node.start_position();
+        out.push(Problem {
+            start_line: point.row as u32,
+            start_column: utf16_column(text, node.start_byte()),
+            end_line: point.row as u32,
+            end_column: utf16_column(text, node.end_byte()),
+            severity: Severity::Error,
+            message: format!("cannot resolve `{name}`"),
+            unnecessary: false,
+        });
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_unresolved(engine, path, text, child, out);
+    }
+}
+
+fn identifier_is_reference(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    !matches!(
+        parent.kind(),
+        "function_item"
+            | "struct_item"
+            | "enum_item"
+            | "trait_item"
+            | "type_item"
+            | "mod_item"
+            | "field_declaration"
+            | "parameter"
+            | "let_declaration"
+            | "use_as_clause"
+            | "scoped_identifier"
+    ) && parent.child_by_field_name("name").map(|name| name.id()) != Some(node.id())
+}
+
+fn identifier_count(text: &str, name: &str) -> usize {
+    let Some(tree) = parse_tree(text) else {
+        return 0;
+    };
+    let mut count = 0;
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier" && node.utf8_text(text.as_bytes()).ok() == Some(name) {
+            count += 1;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    count
+}
+
+fn identifier_at(text: &str, line: u32, column: u32) -> Option<String> {
+    identifier_range(text, line, column).map(|range| range.0)
+}
+
+fn identifier_range(text: &str, line: u32, column: u32) -> Option<(String, u32, u32)> {
+    let start = line_start(text, line)?;
+    let end = text[start..]
+        .find('\n')
+        .map_or(text.len(), |offset| start + offset);
+    let byte = byte_at_column(&text[start..end], column) + start;
+    let left = text[..byte]
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !is_ident(*c))
+        .map_or(0, |(at, c)| at + c.len_utf8());
+    let right = text[byte..]
+        .char_indices()
+        .find(|(_, c)| !is_ident(*c))
+        .map_or(text.len(), |(at, _)| byte + at);
+    (left < right).then(|| {
+        (
+            text[left..right].to_owned(),
+            utf16_column(text, left),
+            utf16_column(text, right),
+        )
+    })
+}
+
+fn word_before(text: &str, line: u32, column: u32) -> &str {
+    let Some(start) = line_start(text, line) else {
+        return "";
+    };
+    let end = text[start..]
+        .find('\n')
+        .map_or(text.len(), |offset| start + offset);
+    let byte = start + byte_at_column(&text[start..end], column);
+    let word_start = text[..byte]
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !is_ident(*c))
+        .map_or(0, |(at, c)| at + c.len_utf8());
+    &text[word_start..byte]
+}
+
+fn member_access_before(text: &str, line: u32, column: u32) -> bool {
+    let byte = cursor_byte(text, line, column);
+    text[..byte].trim_end().ends_with('.')
+        || text[..byte]
+            .rsplit_once('.')
+            .is_some_and(|(_, right)| right.chars().all(is_ident))
+}
+
+fn receiver_type(before: &str, receiver: &str) -> Option<String> {
+    let binding = format!("let {receiver}:");
+    if let Some((_, after)) = before.rsplit_once(&binding) {
+        return after
+            .split(|character: char| !is_ident(character))
+            .next()
+            .filter(|ty| !ty.is_empty())
+            .map(str::to_owned);
+    }
+    let construction = format!("let {receiver} = ");
+    before
+        .rsplit_once(&construction)
+        .and_then(|(_, after)| {
+            after
+                .split(|character: char| !is_ident(character))
+                .next()
+                .filter(|ty| !ty.is_empty())
+                .map(str::to_owned)
+        })
+        .or_else(|| parameter_type(before, receiver))
+}
+
+fn parameter_type(before: &str, receiver: &str) -> Option<String> {
+    let function = before.rsplit_once("fn ")?.1;
+    let parameters = function.split_once('(')?.1.split_once(')')?.0;
+    parameters.split(',').find_map(|parameter| {
+        let (name, ty) = parameter.trim().split_once(':')?;
+        (name.trim().trim_start_matches("mut ") == receiver)
+            .then(|| {
+                ty.trim()
+                    .trim_start_matches('&')
+                    .trim_start_matches("mut ")
+                    .split(|character: char| !is_ident(character))
+                    .next()
+                    .unwrap_or("")
+                    .to_owned()
+            })
+            .filter(|ty| !ty.is_empty())
+    })
+}
+
+fn struct_fields(text: &str, ty: &str) -> Vec<Completion> {
+    let Some((_, rest)) = text.split_once(&format!("struct {ty}")) else {
+        return Vec::new();
+    };
+    let Some(body) = rest
+        .split_once('{')
+        .and_then(|(_, after)| after.split_once('}').map(|(body, _)| body))
+    else {
+        return Vec::new();
+    };
+    body.lines()
+        .filter_map(|line| {
+            line.trim()
+                .split_once(':')
+                .map(|(name, value)| completion(name.trim(), value.trim(), ItemKind::Variable))
+        })
+        .collect()
+}
+
+fn impl_methods(text: &str, ty: &str) -> Vec<Completion> {
+    let Some((_, rest)) = text.split_once(&format!("impl {ty}")) else {
+        return Vec::new();
+    };
+    let Some(body) = rest
+        .split_once('{')
+        .and_then(|(_, after)| after.split_once('}').map(|(body, _)| body))
+    else {
+        return Vec::new();
+    };
+    body.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let name = line
+                .strip_prefix("pub fn ")
+                .or_else(|| line.strip_prefix("fn "))?
+                .split('(')
+                .next()?;
+            Some(completion(name, line, ItemKind::Function))
+        })
+        .collect()
+}
+
+fn completion(name: &str, detail: &str, kind: ItemKind) -> Completion {
+    Completion {
+        label: name.to_owned(),
+        detail: Some(detail.to_owned()),
+        insert_text: name.to_owned(),
+        is_snippet: false,
+        kind,
+        sort: name.to_owned(),
+        extra: Vec::new(),
+        replace_from: None,
+    }
+}
+
+fn call_at(text: &str, byte: usize) -> Option<(String, u32)> {
+    let tree = parse_tree(text)?;
+    let call = deepest_call(tree.root_node(), byte)?;
+    let function = call.child_by_field_name("function")?;
+    let name = function
+        .utf8_text(text.as_bytes())
+        .ok()?
+        .rsplit("::")
+        .next()?
+        .trim();
+    if name.is_empty() {
+        return None;
+    }
+    let arguments = call.child_by_field_name("arguments")?;
+    let mut active = 0;
+    let mut cursor = arguments.walk();
+    for argument in arguments.named_children(&mut cursor) {
+        if argument.end_byte() < byte {
+            active += 1;
+        }
+    }
+    Some((name.to_owned(), active))
+}
+
+fn deepest_call(node: Node<'_>, byte: usize) -> Option<Node<'_>> {
+    if node.start_byte() > byte || node.end_byte() < byte {
+        return None;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if let Some(call) = deepest_call(child, byte) {
+            return Some(call);
+        }
+    }
+    (node.kind() == "call_expression").then_some(node)
+}
+
+fn signature_parameters(signature: &str) -> Vec<String> {
+    signature
+        .split_once('(')
+        .and_then(|(_, after)| after.split_once(')').map(|(parameters, _)| parameters))
+        .map(|parameters| {
+            parameters
+                .split(',')
+                .map(str::trim)
+                .filter(|parameter| !parameter.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn line_start(text: &str, line: u32) -> Option<usize> {
+    let mut start = 0;
+    for _ in 0..line {
+        start += text[start..].find('\n')? + 1;
+    }
+    Some(start)
+}
+
+fn byte_at_column(line: &str, column: u32) -> usize {
+    let mut units = 0;
+    for (offset, character) in line.char_indices() {
+        if units >= column {
+            return offset;
+        }
+        units += character.len_utf16() as u32;
+    }
+    line.len()
+}
+
+fn cursor_byte(text: &str, line: u32, column: u32) -> usize {
+    line_start(text, line).map_or(text.len(), |start| {
+        let end = text[start..]
+            .find('\n')
+            .map_or(text.len(), |offset| start + offset);
+        start + byte_at_column(&text[start..end], column)
+    })
+}
+
+fn utf16_column(text: &str, byte: usize) -> u32 {
+    let line_start = text[..byte].rfind('\n').map_or(0, |offset| offset + 1);
+    text[line_start..byte].encode_utf16().count() as u32
+}
+
+fn is_ident(character: char) -> bool {
+    character == '_' || character.is_alphanumeric()
+}
+
+fn is_ident_text(text: &str) -> bool {
+    let mut characters = text.chars();
+    matches!(characters.next(), Some(character) if is_ident(character)) && characters.all(is_ident)
+}
+
+fn item_kind_name(kind: ItemKind) -> &'static str {
+    match kind {
+        ItemKind::Class => "Class",
+        ItemKind::Interface => "Interface",
+        ItemKind::Enum => "Enum",
+        ItemKind::Function => "Function",
+        ItemKind::Constant => "Constant",
+        _ => "Variable",
+    }
+}
+
+fn valid_name(name: &str) -> bool {
+    let mut characters = name.chars();
+    matches!(characters.next(), Some(character) if character == '_' || character.is_alphabetic())
+        && characters.all(|character| character == '_' || character.is_alphanumeric())
+        && !KEYWORDS.contains(&name)
+}
+
+fn item_occurrences(
+    engine: &RustEngine,
+    path: &Path,
+    text: &str,
+    name: &str,
+    target: &Declaration,
+) -> Vec<Occurrence> {
+    let Some(tree) = parse_tree(text) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier"
+            && node.utf8_text(text.as_bytes()).ok() == Some(name)
+            && engine
+                .resolve(path, name, node.start_byte())
+                .first()
+                .is_some_and(|found| {
+                    found.path == target.path
+                        && found.line == target.line
+                        && found.column == target.column
+                })
+        {
+            let point = node.start_position();
+            out.push(Occurrence {
+                path: path.to_path_buf(),
+                line: point.row as u32,
+                start_column: utf16_column(text, node.start_byte()),
+                end_column: utf16_column(text, node.end_byte()),
+                dollar: false,
+            });
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    out.sort();
+    out
+}
+
+fn local_occurrences(
+    path: &Path,
+    text: &str,
+    name: &str,
+    declaration: &Declaration,
+) -> Vec<Occurrence> {
+    let Some(tree) = parse_tree(text) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "identifier"
+            && node.utf8_text(text.as_bytes()).ok() == Some(name)
+            && (utf16_column(text, node.start_byte()) == declaration.column
+                && node.start_position().row as u32 == declaration.line
+                || local_declaration(path, text, name, node.start_byte()).is_some_and(|found| {
+                    found.line == declaration.line && found.column == declaration.column
+                }))
+        {
+            let point = node.start_position();
+            out.push(Occurrence {
+                path: path.to_path_buf(),
+                line: point.row as u32,
+                start_column: utf16_column(text, node.start_byte()),
+                end_column: utf16_column(text, node.end_byte()),
+                dollar: false,
+            });
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    out.sort();
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_buffer_provides_completion_definition_hover_and_outline() {
+        let path = Path::new("/tmp/lib.rs");
+        let text = "pub struct Coffee;\npub fn brew() {}\nfn main() { brew }";
+        let column = text.lines().nth(2).unwrap().find("brew").unwrap() as u32 + 2;
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        engine.install(Built::default());
+        assert_eq!(engine.complete(path, text, 2, column + 2)[0].label, "brew");
+        assert_eq!(engine.definition(path, text, 2, column)[0].line, 1);
+        assert!(
+            engine
+                .hover(path, text, 2, column)
+                .unwrap()
+                .markdown
+                .contains("fn brew")
+        );
+        assert_eq!(engine.outline(path, text).len(), 3);
+    }
+
+    #[test]
+    fn reports_rust_syntax_errors() {
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        assert!(
+            !engine
+                .diagnostics(Path::new("/tmp/lib.rs"), "fn broken(")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn references_and_rename_require_a_unique_top_level_declaration() {
+        let path = Path::new("/tmp/lib.rs");
+        let text = "pub fn brew() {}\nfn main() { brew(); }";
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        engine.install(Built::default());
+        let uses = engine.references(path, text, 1, 13);
+        assert_eq!(uses.len(), 2);
+        assert_eq!(
+            engine
+                .rename(path, text, 1, 13, "make_coffee")
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(engine.rename(path, text, 1, 13, "fn").is_err());
+    }
+
+    #[test]
+    fn imported_alias_resolves_to_its_unique_declaration() {
+        let definition = PathBuf::from("/tmp/models.rs");
+        let importer = Path::new("/tmp/lib.rs");
+        let source = "use crate::models::Coffee as Drink;\nfn main() { Drink; }";
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        engine.install(Built {
+            declarations: vec![Declaration {
+                name: "Coffee".to_owned(),
+                module: vec!["models".to_owned()],
+                kind: ItemKind::Class,
+                path: definition.clone(),
+                line: 0,
+                column: 11,
+                scope_depth: 0,
+                signature: "pub struct Coffee;".to_owned(),
+            }],
+            files: Vec::new(),
+            uses: HashMap::new(),
+            source_roots: Vec::new(),
+        });
+        assert_eq!(
+            engine.definition(importer, source, 1, 14)[0].path,
+            definition
+        );
+        assert!(
+            engine
+                .hover(importer, source, 1, 14)
+                .unwrap()
+                .markdown
+                .contains("Coffee")
+        );
+    }
+
+    #[test]
+    fn module_paths_distinguish_same_named_items() {
+        let root = Path::new("/project/src");
+        let mut engine = RustEngine::pending(Path::new("/project"));
+        engine.install(Built {
+            declarations: vec![
+                Declaration {
+                    name: "Config".to_owned(),
+                    module: vec!["client".to_owned()],
+                    kind: ItemKind::Class,
+                    path: PathBuf::from("/project/src/client.rs"),
+                    line: 0,
+                    column: 11,
+                    scope_depth: 0,
+                    signature: "pub struct Config;".to_owned(),
+                },
+                Declaration {
+                    name: "Config".to_owned(),
+                    module: vec!["server".to_owned()],
+                    kind: ItemKind::Class,
+                    path: PathBuf::from("/project/src/server.rs"),
+                    line: 0,
+                    column: 11,
+                    scope_depth: 0,
+                    signature: "pub struct Config;".to_owned(),
+                },
+            ],
+            files: Vec::new(),
+            uses: HashMap::new(),
+            source_roots: vec![root.to_path_buf()],
+        });
+        let source = "use crate::server::Config;\nfn main() { Config; }";
+        assert_eq!(
+            engine.definition(Path::new("/project/src/lib.rs"), source, 1, 14)[0].path,
+            PathBuf::from("/project/src/server.rs")
+        );
+    }
+
+    #[test]
+    fn lexical_scope_prefers_the_nearest_binding() {
+        let path = Path::new("/tmp/lib.rs");
+        let source =
+            "fn brew(coffee: u8) {\n let coffee = 2;\n { let coffee = 3; coffee; }\n coffee;\n}";
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        engine.install(Built::default());
+        assert_eq!(engine.definition(path, source, 2, 22)[0].line, 2);
+        assert_eq!(engine.definition(path, source, 3, 2)[0].line, 1);
+    }
+
+    #[test]
+    fn grouped_imports_and_repeated_super_resolve_the_full_path() {
+        let root = Path::new("/project/src");
+        let mut engine = RustEngine::pending(Path::new("/project"));
+        engine.install(Built {
+            declarations: vec![Declaration {
+                name: "Coffee".to_owned(),
+                module: vec!["models".to_owned(), "drink".to_owned()],
+                kind: ItemKind::Class,
+                path: PathBuf::from("/project/src/models/drink.rs"),
+                line: 0,
+                column: 11,
+                scope_depth: 0,
+                signature: "pub struct Coffee;".to_owned(),
+            }],
+            files: Vec::new(),
+            uses: HashMap::new(),
+            source_roots: vec![root.to_path_buf()],
+        });
+        let source = "use crate::models::{drink::{Coffee as Bean}};\nfn main() { Bean; }";
+        assert_eq!(
+            engine.definition(Path::new("/project/src/lib.rs"), source, 1, 14)[0].path,
+            PathBuf::from("/project/src/models/drink.rs")
+        );
+        let nested = Path::new("/project/src/models/drink/nested.rs");
+        let source = "use super::super::drink::Coffee;\nfn main() { Coffee; }";
+        assert_eq!(
+            engine.definition(nested, source, 1, 14)[0].path,
+            PathBuf::from("/project/src/models/drink.rs")
+        );
+    }
+
+    #[test]
+    fn rename_local_binding_excludes_shadowed_bindings() {
+        let path = Path::new("/tmp/lib.rs");
+        let source = "fn main() {\n let coffee = 1;\n { let coffee = 2; coffee; }\n coffee;\n}";
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        engine.install(Built::default());
+        let references = engine.references(path, source, 2, 21);
+        assert_eq!(references.len(), 2);
+        assert_eq!(references[0].line, 2);
+        assert_eq!(references[1].line, 2);
+        assert_eq!(
+            engine
+                .rename(path, source, 2, 21, "espresso")
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn glob_import_and_item_references_follow_the_resolved_declaration() {
+        let root = Path::new("/project/src");
+        let target = PathBuf::from("/project/src/models.rs");
+        let source_path = Path::new("/project/src/lib.rs");
+        let mut engine = RustEngine::pending(Path::new("/project"));
+        engine.install(Built {
+            declarations: vec![Declaration {
+                name: "Coffee".to_owned(),
+                module: vec!["models".to_owned()],
+                kind: ItemKind::Class,
+                path: target.clone(),
+                line: 0,
+                column: 11,
+                scope_depth: 0,
+                signature: "pub struct Coffee;".to_owned(),
+            }],
+            files: vec![target],
+            uses: HashMap::new(),
+            source_roots: vec![root.to_path_buf()],
+        });
+        let source = "use crate::models::*;\nfn main() { Coffee; }";
+        assert_eq!(
+            engine.definition(source_path, source, 1, 14)[0].path,
+            PathBuf::from("/project/src/models.rs")
+        );
+    }
+
+    #[test]
+    fn member_completion_and_signature_use_local_type_annotations() {
+        let path = Path::new("/tmp/lib.rs");
+        let source = "struct Coffee { beans: u8 }\nimpl Coffee { fn brew(&self, minutes: u8) {} }\nfn main() { let coffee: Coffee = Coffee { beans: 1 }; coffee.br; brew(1, 2); }";
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        engine.install(Built::default());
+        assert!(
+            engine
+                .complete(path, source, 2, 65)
+                .iter()
+                .any(|item| item.label == "brew")
+        );
+        let argument = source.lines().nth(2).unwrap().rfind('2').unwrap() as u32;
+        let signature = engine.signature(path, source, 2, argument).unwrap();
+        assert!(signature.label.contains("fn brew"));
+        assert_eq!(signature.active, 1);
+    }
+
+    #[test]
+    fn member_completion_uses_workspace_definitions() {
+        let definition = PathBuf::from("/tmp/models.rs");
+        let path = Path::new("/tmp/lib.rs");
+        let source = "fn main() { let coffee: Coffee = todo!(); coffee.br }";
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        engine.install(Built {
+            declarations: Vec::new(),
+            files: vec![definition.clone()],
+            uses: HashMap::new(),
+            source_roots: vec![PathBuf::from("/tmp")],
+        });
+        engine.sync_document(
+            &definition,
+            "pub struct Coffee { pub beans: u8 }\nimpl Coffee { pub fn brew(&self) {} }",
+        );
+        assert!(
+            engine
+                .complete(path, source, 0, 55)
+                .iter()
+                .any(|item| item.label == "brew")
+        );
+    }
+
+    #[test]
+    fn member_completion_infers_receiver_type_from_function_parameter() {
+        let path = Path::new("/tmp/lib.rs");
+        let source = "struct Coffee { beans: u8 }\nimpl Coffee { fn brew(&self) {} }\nfn serve(coffee: &Coffee) { coffee.br }";
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        engine.install(Built::default());
+        assert!(
+            engine
+                .complete(path, source, 2, 40)
+                .iter()
+                .any(|item| item.label == "brew")
+        );
+    }
+
+    #[test]
+    fn signature_help_tracks_the_innermost_nested_call() {
+        let path = Path::new("/tmp/lib.rs");
+        let source = "fn brew(minutes: u8, temperature: u8) {}\nfn grind(beans: u8, setting: u8) {}\nfn main() { brew(grind(1, 2), 3); }";
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        engine.install(Built::default());
+        let inner = engine.signature(path, source, 2, 26).unwrap();
+        assert!(inner.label.contains("fn grind"));
+        assert_eq!(inner.active, 1);
+        let outer = engine.signature(path, source, 2, 31).unwrap();
+        assert!(outer.label.contains("fn brew"));
+        assert_eq!(outer.active, 1);
+    }
+
+    #[test]
+    fn reports_unresolved_references_and_offers_unused_import_removal() {
+        let path = Path::new("/tmp/lib.rs");
+        let source = "use crate::models::Coffee;\nfn main() { missing(); }\n";
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        engine.install(Built::default());
+        assert!(
+            engine
+                .diagnostics(path, source)
+                .iter()
+                .any(|problem| problem.message.contains("missing"))
+        );
+        let actions = engine.actions(path, source, 0, 0);
+        assert_eq!(actions[0].title, "Remove unused import `Coffee`");
+    }
+
+    #[test]
+    fn formatter_only_normalizes_indentation_for_valid_syntax() {
+        let engine = RustEngine::pending(Path::new("/tmp"));
+        assert_eq!(
+            engine.format("fn main() {\nlet coffee = 1;  \n}\n"),
+            Some("fn main() {\n    let coffee = 1;\n}\n".to_owned())
+        );
+        assert_eq!(
+            structural_braces("let label = \"{not a block}\"; // }"),
+            (0, 0)
+        );
+        assert_eq!(engine.format("fn main("), None);
+    }
+}
