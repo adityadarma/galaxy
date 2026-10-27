@@ -476,8 +476,8 @@ pub fn outdent(doc: &Document, sel: &SelectionSet, cfg: &IndentConfig) -> Transa
     finish_with_map(doc, sel, changes, |_| false)
 }
 
-/// Toggles a language's line comment marker after each affected line's
-/// indentation. A selection across lines is one transaction and one undo step.
+/// Toggles a language's line comment marker at the selection's shared indentation.
+/// A selection across lines is one transaction and one undo step.
 pub fn toggle_comment(doc: &Document, sel: &SelectionSet, marker: &str) -> Transaction {
     let mut lines = BTreeSet::new();
     for selection in sel.iter() {
@@ -488,27 +488,43 @@ pub fn toggle_comment(doc: &Document, sel: &SelectionSet, marker: &str) -> Trans
         }
         lines.extend(first..=last);
     }
-    let all_commented = lines.iter().all(|&line| {
-        let text = doc
-            .rope()
-            .slice(doc.line_to_char(line)..doc.line_end_char(line))
-            .to_string();
-        text.trim_start_matches([' ', '\t']).starts_with(marker)
+    let texts: Vec<_> = lines
+        .iter()
+        .map(|&line| {
+            doc.rope()
+                .slice(doc.line_to_char(line)..doc.line_end_char(line))
+                .to_string()
+        })
+        .collect();
+    let indent = texts
+        .iter()
+        .filter(|text| !text.trim().is_empty())
+        .map(|text| text.chars().take_while(|c| matches!(c, ' ' | '\t')).count())
+        .min()
+        .unwrap_or(0);
+    let all_commented = texts.iter().all(|text| {
+        text.trim().is_empty()
+            || text
+                .trim_start_matches([' ', '\t'])
+                .starts_with(marker)
     });
     let changes = lines
         .into_iter()
-        .map(|line| {
+        .zip(texts)
+        .filter_map(|(line, text)| {
+            if text.trim().is_empty() {
+                return None;
+            }
             let start = doc.line_to_char(line);
-            let text = doc.rope().slice(start..doc.line_end_char(line)).to_string();
-            let indent = text.chars().take_while(|c| matches!(c, ' ' | '\t')).count();
-            let at = start + indent;
+            let marker_indent = text.chars().take_while(|c| matches!(c, ' ' | '\t')).count();
+            let at = start + marker_indent;
             if all_commented {
-                let rest = &text[indent..];
-                let remove =
-                    marker.chars().count() + usize::from(rest.starts_with(&format!("{marker} ")));
-                Change::delete(at, at + remove)
+                let rest = &text[marker_indent..];
+                let remove = marker.chars().count()
+                    + usize::from(rest.starts_with(&format!("{marker} ")));
+                Some(Change::delete(at, at + remove))
             } else {
-                Change::insert(at, format!("{marker} "))
+                Some(Change::insert(start + indent, format!("{marker} ")))
             }
         })
         .collect();
@@ -1210,11 +1226,11 @@ mod tests {
     }
 
     #[test]
-    fn toggle_comment_preserves_indent_and_round_trips() {
+    fn toggle_comment_aligns_markers_to_selection_indent_and_round_trips() {
         let (mut doc, mut sel) = setup("[  one\n    two\n  three]");
         let tx = toggle_comment(&doc, &sel, "//");
         tx.apply(&mut doc, &mut sel);
-        assert_eq!(doc.text(), "  // one\n    // two\n  // three");
+        assert_eq!(doc.text(), "  // one\n  //   two\n  // three");
         toggle_comment(&doc, &sel, "//").apply(&mut doc, &mut sel);
         assert_eq!(doc.text(), "  one\n    two\n  three");
     }

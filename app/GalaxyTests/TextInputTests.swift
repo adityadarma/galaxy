@@ -110,6 +110,26 @@ final class TextInputTests: XCTestCase {
         XCTAssertEqual(doc.lines(first: 0, count: 1), ["  let value = 1"])
     }
 
+    func testCommandSlashTogglesLineComment() throws {
+        let (view, doc, url) = try makeView(text: "let value = 1", extension: "rs")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let event = try XCTUnwrap(NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: .command,
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: "/",
+            charactersIgnoringModifiers: "/",
+            isARepeat: false,
+            keyCode: 44
+        ))
+
+        view.keyDown(with: event)
+        XCTAssertEqual(doc.lines(first: 0, count: 1), ["// let value = 1"])
+    }
+
     func testLineOperationsFromTheMenuActions() throws {
         let (view, doc, url) = try makeView(text: "b\na\nc  ")
         defer { try? FileManager.default.removeItem(at: url) }

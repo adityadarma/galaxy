@@ -496,7 +496,7 @@ fn rust_highlights() -> &'static str {
     static QUERY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     QUERY.get_or_init(|| {
         format!(
-            "{}\n[\"#\" \"[\" \"]\"] @punctuation\n",
+            "(identifier) @variable\n{}\n[\"#\" \"[\" \"]\"] @punctuation\n(scoped_identifier path: (identifier) @type name: (identifier) @constant)\n",
             tree_sitter_rust::HIGHLIGHTS_QUERY
         )
     })
@@ -756,6 +756,10 @@ pub fn style_runs_for_viewport(
         spans = crate::php::framework::laravel::blade::subtract(spans, &overlay.claimed);
         spans.extend(overlay.spans);
     }
+    // Tree-sitter does not guarantee that a broad fallback capture precedes a
+    // semantic capture of the same token. Apply the generic variable color
+    // first so the renderer lets the more specific scope win.
+    spans.sort_by_key(|(start, end, scope)| (*start, *end, highlight_priority(*scope)));
     let mut runs = Vec::new();
     for (start, end, scope) in spans {
         let start_char = rope.byte_to_char(start);
@@ -782,6 +786,13 @@ pub fn style_runs_for_viewport(
     }
     runs.sort_by_key(|run| (run.line, run.start, run.end));
     runs
+}
+
+fn highlight_priority(scope: HighlightScope) -> u8 {
+    match scope {
+        HighlightScope::Variable => 0,
+        _ => 1,
+    }
 }
 
 /// Cached parses of injected code (script/style bodies and template
@@ -1970,7 +1981,7 @@ mod tests {
     #[test]
     fn rust_query_emits_keyword_string_and_comment_scopes() {
         let language = SyntaxLanguage::Rust;
-        let source = "// note\nfn main() { let name = \"Galaxy\"; }";
+        let source = "// note\nenum ClassKind { Interface }\nfn main() { let name = \"Galaxy\"; let _ = ClassKind::Interface; let value = name; }";
         let mut parser = Parser::new();
         parser.set_language(&language.grammar()).unwrap();
         let tree = parser.parse(source, None).unwrap();
@@ -1989,6 +2000,14 @@ mod tests {
         assert!(scopes.contains(&HighlightScope::Comment));
         assert!(scopes.contains(&HighlightScope::Keyword));
         assert!(scopes.contains(&HighlightScope::String));
+        assert!(scopes.contains(&HighlightScope::Type));
+        assert!(scopes.contains(&HighlightScope::Constant));
+        assert!(scopes.contains(&HighlightScope::Variable));
+
+        let doc = Document::from_text(source);
+        let runs = style_runs_for_viewport(&doc, &tree, language, 0, 3);
+        assert!(runs.iter().any(|run| run.scope == HighlightScope::Type));
+        assert!(runs.iter().any(|run| run.scope == HighlightScope::Constant));
     }
 
     #[test]

@@ -139,7 +139,23 @@ extension MainWindowController {
     }
 
     func refreshSignatureHelp() {
-        guard let document = activeTab?.doc else { signaturePopup.isHidden = true; return }
+        guard let document = activeTab?.doc else {
+            lastSignatureRequest = nil
+            signaturePopup.isHidden = true
+            return
+        }
+        let request = (
+            path: document.path(),
+            revision: document.revision(),
+            line: completionPosition.line,
+            column: completionPosition.colUtf16
+        )
+        guard lastSignatureRequest?.path != request.path
+            || lastSignatureRequest?.revision != request.revision
+            || lastSignatureRequest?.line != request.line
+            || lastSignatureRequest?.column != request.column
+        else { return }
+        lastSignatureRequest = request
         bridge.requestSignatureHelp(document: document, line: completionPosition.line, character: completionPosition.colUtf16)
         guard let signature = bridge.signatureHelp(document: document) else { signaturePopup.isHidden = true; return }
         signaturePopup.show(signature)

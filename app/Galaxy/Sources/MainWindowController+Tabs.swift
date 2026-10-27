@@ -32,6 +32,10 @@ extension MainWindowController {
         activeIndex = index
         let tab = tabs[index]
         shownTab = tab
+        // Diagnostic revisions belong to a document. Two tabs can have the
+        // same revision number, so force the viewport to discard decorations
+        // drawn for the previously shown document.
+        lastDiagnosticsRevision = nil
         refreshGitDiff()
         refreshBlame()
         tab.lastActiveAt = .now

@@ -203,13 +203,43 @@ final class GitBlameTests: XCTestCase {
         let rect = try XCTUnwrap(c.editorView.blameAnnotationRect())
         XCTAssertTrue(c.blamePopover.isHidden)
 
-        c.editorView.onHover?(TextPos(line: 0, colUtf16: 0), NSPoint(x: rect.midX, y: rect.midY))
+        c.editorView.lastMousePoint = NSPoint(x: rect.midX, y: rect.midY)
+        c.editorView.onHover?(TextPos(line: 0, colUtf16: 0), c.editorView.lastMousePoint!)
+        waitFor { !c.blamePopover.isHidden }
         XCTAssertFalse(c.blamePopover.isHidden)
         XCTAssertEqual(c.blamePopover.sha.count, 40)
 
         // Away from the annotation, the card closes after its grace period.
         c.editorView.onHover?(TextPos(line: 0, colUtf16: 0), NSPoint(x: c.editorView.textOriginX + 2, y: rect.midY))
         waitFor { c.blamePopover.isHidden }
+        XCTAssertTrue(c.blamePopover.isHidden)
+    }
+
+    func testBriefAnnotationHoverDoesNotOpenTheCard() throws {
+        let c = try makeController()
+        try open(c, "f.txt")
+        waitFor { c.editorView.blameAnnotation != nil }
+        let rect = try XCTUnwrap(c.editorView.blameAnnotationRect())
+
+        c.editorView.lastMousePoint = NSPoint(x: rect.midX, y: rect.midY)
+        c.editorView.onHover?(TextPos(line: 0, colUtf16: 0), c.editorView.lastMousePoint!)
+        c.editorView.lastMousePoint = NSPoint(x: c.editorView.textOriginX + 2, y: rect.midY)
+        c.editorView.onHover?(TextPos(line: 0, colUtf16: 0), c.editorView.lastMousePoint!)
+        RunLoop.current.run(until: Date().addingTimeInterval(1.25))
+
+        XCTAssertTrue(c.blamePopover.isHidden)
+    }
+
+    func testLeavingAnnotationDismissesTheCardPromptly() throws {
+        let c = try makeController()
+        try open(c, "f.txt")
+        waitFor { c.editorView.blameAnnotation != nil }
+        let rect = try XCTUnwrap(c.editorView.blameAnnotationRect())
+
+        c.editorView.onHover?(TextPos(line: 0, colUtf16: 0), NSPoint(x: rect.midX, y: rect.midY))
+        c.editorView.onHover?(TextPos(line: 0, colUtf16: 0), NSPoint(x: c.editorView.textOriginX + 2, y: rect.midY))
+        RunLoop.current.run(until: Date().addingTimeInterval(0.5))
+
         XCTAssertTrue(c.blamePopover.isHidden)
     }
 }

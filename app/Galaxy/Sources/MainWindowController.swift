@@ -22,7 +22,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// map runs the full height of the editor instead of under the rows.
     var stickyTrailing: NSLayoutConstraint!
     var documentSymbols: [OutlineSymbol] = []
-    private var lastDiagnosticsRevision: UInt64?
+    var lastDiagnosticsRevision: UInt64?
+    var lastSignatureRequest: (path: String, revision: UInt64, line: UInt64, column: UInt64)?
     let titleBar = TitleBar()
     let activityBar = ActivityBar()
     let sourceControl = SourceControlController()
@@ -111,6 +112,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// Commit behind the annotated line; what the blame card shows.
     var blameCommit: BlameCommitInfo?
     var blameRefreshItem: DispatchWorkItem?
+    var blameShowItem: DispatchWorkItem?
     var blameHideItem: DispatchWorkItem?
     /// Scroll notifications can arrive much faster than display refresh.
     /// Minimap and sticky scope updates are decorative, so coalesce them.
@@ -196,6 +198,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     var loadedGitPicker: GitBranchPicker?
     var syntaxEvictionTimer: Timer?
     var lspTimer: Timer?
+    private var lastProblemsRefresh = Date.distantPast
     private var memoryPressureSource: DispatchSourceMemoryPressure?
     var globalSettingsURL = GalaxySettings.globalURL
     var settingsModified: Date?
@@ -554,12 +557,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 self?.refreshCodeActions()
                 self?.refreshDocumentSymbols()
                 self?.reloadSettings()
-                let allProblems = self?.bridge.core.problems() ?? []
+                guard let self, Date().timeIntervalSince(self.lastProblemsRefresh) >= 1 else { return }
+                self.lastProblemsRefresh = .now
+                let allProblems = self.bridge.core.problems()
                 // Analysis workers can finish after the user switches folders.
                 // Never let a late result from the previous workspace leak
                 // into the new workspace's Problems panel or editor gutter.
                 let problems: [ProblemInfo]
-                if let root = self?.workspace?.root() {
+                if let root = self.workspace?.root() {
                     let rootURI = "file://\(URL(fileURLWithPath: root).standardizedFileURL.path)/"
                     problems = allProblems.filter {
                         $0.uri.hasPrefix(rootURI) && !$0.uri.contains("/node_modules/")
@@ -567,18 +572,18 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 } else {
                     problems = allProblems
                 }
-                self?.problemsPanel.update(problems)
-                self?.problemsPanel.isHidden = self?.bottomPanelTab != .problems
-                self?.bottomPanelHeader.setProblemCount(problems.count)
-                if let document = self?.activeTab?.doc {
+                self.problemsPanel.update(problems)
+                self.problemsPanel.isHidden = self.bottomPanelTab != .problems
+                self.bottomPanelHeader.setProblemCount(problems.count)
+                if let document = self.activeTab?.doc {
                     let markers = problems.filter { $0.uri == "file://\(document.path())" }
                         .map { ($0.line, $0.severity) }
-                    self?.scrollView.diagnosticScroller.update(markers: markers, lineCount: document.lineCount())
+                    self.scrollView.diagnosticScroller.update(markers: markers, lineCount: document.lineCount())
                     // Redraw only when diagnostics change, not every 100 ms.
                     let revision = document.diagnosticsRevision()
-                    if revision != self?.lastDiagnosticsRevision {
-                        self?.lastDiagnosticsRevision = revision
-                        self?.editorView.needsDisplay = true
+                    if revision != self.lastDiagnosticsRevision {
+                        self.lastDiagnosticsRevision = revision
+                        self.editorView.needsDisplay = true
                     }
                 }
             }
@@ -789,7 +794,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         blamePopover.translatesAutoresizingMaskIntoConstraints = true
         blamePopover.onPointerEntered = { [weak self] in self?.cancelBlameHide() }
         blamePopover.onPointerExited = { [weak self] in self?.scheduleBlameHide() }
-        editorView.onMouseExit = { [weak self] in self?.scheduleBlameHide() }
+        editorView.onMouseExit = { [weak self] in
+            self?.cancelBlameShow()
+            self?.scheduleBlameHide()
+        }
         completionPopup.isHidden = true
         signaturePopup.isHidden = true
         completionPopup.onClose = { [weak self] in self?.closeCompletion() }
@@ -907,7 +915,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         explorer.scrollView.isHidden = true
         explorer.scrollView.translatesAutoresizingMaskIntoConstraints = false
         explorer.onOpenFile = { [weak self] workspace, entry in
-            self?.openWorkspaceFile(workspace, entry, preview: true)
+            self?.openWorkspaceFile(workspace, entry, preview: false)
         }
         explorer.onPinFile = { [weak self] workspace, entry in
             self?.openWorkspaceFile(workspace, entry, preview: false)

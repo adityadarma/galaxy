@@ -14,6 +14,11 @@ extension EditorView: @preconcurrency NSTextInputClient {
     override func keyDown(with event: NSEvent) {
         guard document != nil else { return super.keyDown(with: event) }
         if onCompletionKey?(event) == true { return }
+        if event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
+           event.charactersIgnoringModifiers == "/" {
+            toggleComment(nil)
+            return
+        }
         LatencyProbe.shared.keyDown(event)
         beginKeyEvent()
         // Routes through the input context, so IMEs see each event once and
@@ -70,6 +75,7 @@ extension EditorView: @preconcurrency NSTextInputClient {
     @objc func toggleComment(_ sender: Any?) {
         guard !isReadOnly, let document else { return }
         document.edit(command: .toggleComment)
+        onSnippetInvalidated?()
         didChangeDocument()
     }
 

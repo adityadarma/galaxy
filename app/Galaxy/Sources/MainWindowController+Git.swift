@@ -114,20 +114,41 @@ extension MainWindowController {
     /// Returns `true` when it is, so the LSP hover stays out of the way.
     func handleBlameHover(point: NSPoint) -> Bool {
         guard let commit = blameCommit, let rect = editorView.blameAnnotationRect(), rect.contains(point) else {
+            cancelBlameShow()
             if !blamePopover.isHidden { scheduleBlameHide() }
             return false
         }
         cancelBlameHide()
         hoverPopover.isHidden = true
-        if blamePopover.isHidden || blamePopover.sha != commit.sha {
-            blamePopover.show(commit)
-            let anchor = detailView.convert(rect, from: editorView)
-            let visible = detailView.convert(editorView.visibleRect, from: editorView).insetBy(dx: 8, dy: 4)
-            blamePopover.frame = HoverPopover.placement(size: blamePopover.fittingSize(), anchor: anchor, in: visible, gap: 2)
-            blamePopover.isHidden = false
-            blamePopover.needsLayout = true
-        }
+        if blamePopover.isHidden { scheduleBlameShow(commit) }
         return true
+    }
+
+    /// Avoid opening the card while the pointer merely crosses an annotation.
+    func scheduleBlameShow(_ commit: BlameCommitInfo) {
+        guard blameShowItem == nil else { return }
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.blameShowItem = nil
+            guard
+                  self.blameCommit?.sha == commit.sha,
+                  let point = self.editorView.lastMousePoint,
+                  let currentRect = self.editorView.blameAnnotationRect(),
+                  currentRect.contains(point) else { return }
+            self.blamePopover.show(commit)
+            let anchor = self.detailView.convert(currentRect, from: self.editorView)
+            let visible = self.detailView.convert(self.editorView.visibleRect, from: self.editorView).insetBy(dx: 8, dy: 4)
+            self.blamePopover.frame = HoverPopover.placement(size: self.blamePopover.fittingSize(), anchor: anchor, in: visible, gap: 2)
+            self.blamePopover.isHidden = false
+            self.blamePopover.needsLayout = true
+        }
+        blameShowItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: item)
+    }
+
+    func cancelBlameShow() {
+        blameShowItem?.cancel()
+        blameShowItem = nil
     }
 
     /// Closes the card after a short grace period, so the pointer can cross
@@ -137,7 +158,7 @@ extension MainWindowController {
         blameHideItem?.cancel()
         let item = DispatchWorkItem { [weak self] in self?.hideBlamePopover() }
         blameHideItem = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2, execute: item)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: item)
     }
 
     func cancelBlameHide() {
@@ -146,6 +167,7 @@ extension MainWindowController {
     }
 
     func hideBlamePopover() {
+        cancelBlameShow()
         cancelBlameHide()
         blamePopover.isHidden = true
     }

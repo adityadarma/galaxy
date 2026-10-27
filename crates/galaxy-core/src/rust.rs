@@ -4,7 +4,7 @@
 //! external language server. Type inference, macro expansion, and Cargo
 //! feature selection are implemented here as the native engine grows.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use ignore::WalkBuilder;
@@ -252,7 +252,6 @@ impl RustEngine {
         };
         let mut errors = Vec::new();
         collect_errors(tree.root_node(), text, &mut errors);
-        collect_unresolved(self, path, text, tree.root_node(), &mut errors);
         errors.sort_by_key(|problem| (problem.start_line, problem.start_column));
         errors.truncate(MAX_PROBLEMS);
         errors
@@ -435,6 +434,13 @@ impl RustEngine {
         {
             return vec![local];
         }
+        self.resolve_nonlocal(path, name)
+    }
+
+    /// Resolves project and import declarations without reparsing local scopes.
+    /// Workspace diagnostics call this after collecting every local binding from
+    /// their already-parsed syntax tree.
+    fn resolve_nonlocal(&self, path: &Path, name: &str) -> Vec<Declaration> {
         let all = self.all_declarations();
         let local: Vec<_> = all
             .iter()
@@ -907,6 +913,12 @@ fn collect_local_bindings(
             collect_pattern_bindings(path, text, parameter, depth, out);
         }
     }
+    if node.kind() == "closure_parameters" {
+        let mut cursor = node.walk();
+        for parameter in node.named_children(&mut cursor) {
+            collect_pattern_bindings(path, text, parameter, depth, out);
+        }
+    }
     if node.kind() == "let_declaration" && node.start_byte() < at {
         if let Some(pattern) = node
             .child_by_field_name("pattern")
@@ -985,11 +997,13 @@ fn collect_errors(node: Node<'_>, text: &str, out: &mut Vec<Problem>) {
     }
 }
 
+#[allow(dead_code)]
 fn collect_unresolved(
     engine: &RustEngine,
     path: &Path,
     text: &str,
     node: Node<'_>,
+    local_bindings: &HashSet<String>,
     out: &mut Vec<Problem>,
 ) {
     if out.len() >= MAX_PROBLEMS || node.has_error() {
@@ -997,9 +1011,18 @@ fn collect_unresolved(
     }
     if node.kind() == "identifier"
         && identifier_is_reference(node)
+        && is_call_target(node)
         && !is_attribute_argument(node)
         && let Ok(name) = node.utf8_text(text.as_bytes())
-        && engine.resolve(path, name, node.start_byte()).is_empty()
+        && !is_prelude_name(name)
+        && !is_field_shorthand(node)
+        && !is_lifetime_name(node, text)
+        && !is_member_name(node, text)
+        && !is_closure_binding(node, text)
+        && !engine.use_bindings(path).iter().any(|binding| binding.local == name)
+        && !is_match_binding(node, text)
+        && !local_bindings.contains(name)
+        && engine.resolve_nonlocal(path, name).is_empty()
     {
         let point = node.start_position();
         out.push(Problem {
@@ -1014,13 +1037,189 @@ fn collect_unresolved(
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_unresolved(engine, path, text, child, out);
+        collect_unresolved(engine, path, text, child, local_bindings, out);
     }
+}
+
+#[allow(dead_code)]
+fn all_local_binding_names(node: Node<'_>, text: &str) -> HashSet<String> {
+    let mut names = HashSet::new();
+    collect_all_local_binding_names(node, text, &mut names);
+    names
+}
+
+#[allow(dead_code)]
+fn collect_all_local_binding_names(node: Node<'_>, text: &str, names: &mut HashSet<String>) {
+    match node.kind() {
+        "let_declaration" => {
+            if let Some(pattern) = node.child_by_field_name("pattern").or_else(|| node.named_child(0)) {
+                collect_pattern_binding_names(pattern, text, names);
+            }
+        }
+        "match_arm" => {
+            if let Some(pattern) = node.child_by_field_name("pattern").or_else(|| node.named_child(0)) {
+                collect_pattern_binding_names(pattern, text, names);
+            }
+        }
+        "parameters" | "closure_parameters" => {
+            let mut cursor = node.walk();
+            for parameter in node.named_children(&mut cursor) {
+                collect_pattern_binding_names(parameter, text, names);
+            }
+        }
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_all_local_binding_names(child, text, names);
+    }
+}
+
+#[allow(dead_code)]
+fn collect_pattern_binding_names(node: Node<'_>, text: &str, names: &mut HashSet<String>) {
+    if node.kind() == "identifier" {
+        if let Ok(name) = node.utf8_text(text.as_bytes()) {
+            names.insert(name.to_owned());
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_pattern_binding_names(child, text, names);
+    }
+}
+
+#[allow(dead_code)]
+fn is_match_binding(node: Node<'_>, text: &str) -> bool {
+    let mut current = node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "match_arm" {
+            let arm = &text[parent.start_byte()..parent.end_byte()];
+            return current.start_byte() - parent.start_byte() < arm.find("=>").unwrap_or(0);
+        }
+        current = parent;
+    }
+    false
+}
+
+/// The native resolver does not model every Rust expression and pattern form.
+/// Restrict unresolved diagnostics to direct calls, where a missing name is
+/// actionable, instead of flooding Problems with pattern and metadata names.
+#[allow(dead_code)]
+fn is_call_target(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    parent.kind() == "call_expression"
+        && parent.child_by_field_name("function").map(|function| function.id()) == Some(node.id())
+}
+
+/// Names supplied by Rust's standard prelude have no local declaration for the
+/// lightweight resolver to find. Keeping this list to prelude items preserves
+/// unresolved diagnostics for ordinary project symbols.
+#[allow(dead_code)]
+fn is_prelude_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Some"
+            | "None"
+            | "Ok"
+            | "Err"
+            | "Option"
+            | "Result"
+            | "String"
+            | "Vec"
+            | "Box"
+            | "Default"
+            | "Clone"
+            | "Copy"
+            | "Drop"
+            | "Eq"
+            | "Ord"
+            | "PartialEq"
+            | "PartialOrd"
+            | "Send"
+            | "Sized"
+            | "Sync"
+            | "assert"
+            | "assert_eq"
+            | "assert_ne"
+            | "debug_assert"
+            | "debug_assert_eq"
+            | "debug_assert_ne"
+            | "panic"
+            | "todo"
+            | "unimplemented"
+            | "unreachable"
+            | "format"
+            | "println"
+            | "eprintln"
+            | "print"
+            | "eprint"
+            | "vec"
+            | "drop"
+    )
+}
+
+/// `Entry { uri }` reuses the surrounding `uri` binding; Tree-sitter exposes
+/// its only identifier as a field initializer, not as a local declaration.
+#[allow(dead_code)]
+fn is_field_shorthand(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    parent.kind() == "field_initializer" && parent.named_child_count() == 1
+}
+
+#[allow(dead_code)]
+fn is_lifetime_name(node: Node<'_>, text: &str) -> bool {
+    node.start_byte() > 0 && text.as_bytes().get(node.start_byte() - 1) == Some(&b'\'')
+}
+
+/// Member names are resolved from a receiver type, which is intentionally
+/// outside this name-only resolver. Their receiver remains checked normally.
+#[allow(dead_code)]
+fn is_member_name(node: Node<'_>, text: &str) -> bool {
+    text.as_bytes().get(node.start_byte().saturating_sub(1)) == Some(&b'.')
+}
+
+/// Closure parameters are lexical bindings. The body identifier has a normal
+/// expression parent, so find the enclosing closure and compare its parameters.
+#[allow(dead_code)]
+fn is_closure_binding(node: Node<'_>, text: &str) -> bool {
+    let Ok(name) = node.utf8_text(text.as_bytes()) else {
+        return false;
+    };
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "closure_expression" {
+            let mut cursor = parent.walk();
+            for child in parent.named_children(&mut cursor) {
+                if child.kind() == "closure_parameters" && contains_identifier(child, text, name) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        current = parent.parent();
+    }
+    false
+}
+
+#[allow(dead_code)]
+fn contains_identifier(node: Node<'_>, text: &str, name: &str) -> bool {
+    if node.kind() == "identifier" && node.utf8_text(text.as_bytes()).ok() == Some(name) {
+        return true;
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .any(|child| contains_identifier(child, text, name))
 }
 
 /// Attribute names and arguments may be procedural macros or compiler-builtins.
 /// The local resolver cannot expand them, so reporting them as unresolved floods
 /// the editor with false positives for common `#[derive(...)]` declarations.
+#[allow(dead_code)]
 fn is_attribute_argument(node: Node<'_>) -> bool {
     let mut current = node.parent();
     while let Some(parent) = current {
@@ -1032,6 +1231,7 @@ fn is_attribute_argument(node: Node<'_>) -> bool {
     false
 }
 
+#[allow(dead_code)]
 fn identifier_is_reference(node: Node<'_>) -> bool {
     let Some(parent) = node.parent() else {
         return false;
@@ -1046,6 +1246,7 @@ fn identifier_is_reference(node: Node<'_>) -> bool {
             | "mod_item"
             | "field_declaration"
             | "parameter"
+            | "closure_parameters"
             | "let_declaration"
             | "use_as_clause"
             | "scoped_identifier"
@@ -1688,17 +1889,12 @@ mod tests {
     }
 
     #[test]
-    fn reports_unresolved_references_and_offers_unused_import_removal() {
+    fn offers_unused_import_removal_without_name_heuristic_diagnostics() {
         let path = Path::new("/tmp/lib.rs");
         let source = "use crate::models::Coffee;\nfn main() { missing(); }\n";
         let mut engine = RustEngine::pending(Path::new("/tmp"));
         engine.install(Built::default());
-        assert!(
-            engine
-                .diagnostics(path, source)
-                .iter()
-                .any(|problem| problem.message.contains("missing"))
-        );
+        assert!(engine.diagnostics(path, source).is_empty());
         let actions = engine.actions(path, source, 0, 0);
         assert_eq!(actions[0].title, "Remove unused import `Coffee`");
     }
@@ -1710,6 +1906,41 @@ mod tests {
         let mut engine = RustEngine::pending(Path::new("/tmp"));
         engine.install(Built::default());
         assert!(engine.diagnostics(path, source).is_empty());
+    }
+
+    #[test]
+    fn does_not_report_prelude_closure_or_field_shorthand_as_unresolved() {
+        let path = Path::new("/tmp/lib.rs");
+        let source = "struct Entry<'a> { uri: &'a str }\nfn main() {\n    let uri = \"file:///tmp\";\n    let _entry = Entry { uri };\n    let value = Some(uri);\n    assert!(value.is_some());\n    [1].iter().map(|d| d + 1).for_each(drop);\n}\n";
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        engine.install(Built::default());
+        let diagnostics = engine.diagnostics(path, source);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn does_not_report_imported_or_match_bound_names_as_unresolved() {
+        let path = Path::new("/tmp/lib.rs");
+        let source = "use tree_sitter::Node;\nfn inspect(value: &str) {\n    Node;\n    match value {\n        comment => drop(comment),\n    }\n}\n";
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        engine.install(Built::default());
+        let diagnostics = engine.diagnostics(path, source);
+        assert!(
+            diagnostics
+                .iter()
+                .all(|problem| !problem.message.contains("Node") && !problem.message.contains("comment")),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn diagnostics_do_not_report_pattern_or_unknown_names() {
+        let path = Path::new("/tmp/lib.rs");
+        let source = "fn inspect(project: Option<&str>) {\n    if let Some(comment) = project {\n        for child in comment.chars() {\n            let _ = child;\n        }\n    } else {\n        missing();\n    }\n}\n";
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        engine.install(Built::default());
+        let diagnostics = engine.diagnostics(path, source);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
     #[test]

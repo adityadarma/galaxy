@@ -453,6 +453,10 @@ pub struct Core {
     /// polled frequently for other engines, but reparsing unchanged buffers
     /// would traverse the whole Tree-sitter tree on every poll.
     typescript_checked: Mutex<HashMap<String, u64>>,
+    /// Per open Rust file: buffer revision last checked. Rust diagnostics walk
+    /// the parsed source, so repeating that work from the UI's 100 ms poll
+    /// makes a newly navigated-to file stall scrolling.
+    rust_checked: Mutex<HashMap<String, u64>>,
     /// Parsed disk documents and successful module resolutions used by TypeScript navigation.
     typescript_navigation: Arc<Mutex<TypeScriptNavigationCache>>,
     /// Parsed direct exports from visible workspace TypeScript sources.
@@ -470,6 +474,7 @@ impl Default for Core {
             php_documents: Mutex::new(HashMap::new()),
             php_checked: Mutex::new(HashMap::new()),
             typescript_checked: Mutex::new(HashMap::new()),
+            rust_checked: Mutex::new(HashMap::new()),
             typescript_navigation: Arc::new(Mutex::new(TypeScriptNavigationCache::default())),
             typescript_workspace_exports: Arc::new(Mutex::new(
                 TypeScriptWorkspaceExports::default(),
@@ -669,6 +674,10 @@ impl Core {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.rust_checked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.typescript_navigation
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -684,6 +693,7 @@ impl Core {
             Arc::clone(&self.typescript_workspace_exports),
             Arc::clone(&self.go),
             Arc::clone(&self.php),
+            Arc::clone(&self.rust),
             self.listener
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
@@ -754,6 +764,10 @@ impl Core {
                 self.release_go_buffer(&uri);
                 self.release_rust_buffer(&uri);
                 self.typescript_checked
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&uri);
+                self.rust_checked
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&uri);
@@ -1780,6 +1794,16 @@ impl Core {
             if !is_rust_path(Path::new(&path)) {
                 continue;
             }
+            let revision = document.revision();
+            let unchanged = self
+                .rust_checked
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(uri)
+                .is_some_and(|checked| *checked == revision);
+            if unchanged {
+                continue;
+            }
             let Some(engine) = self.rust_engine(Path::new(&path)) else {
                 continue;
             };
@@ -1805,6 +1829,10 @@ impl Core {
                 })
                 .collect();
             analysis.set_diagnostics(uri, diagnostics);
+            self.rust_checked
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(uri.clone(), revision);
         }
     }
 
@@ -2831,6 +2859,7 @@ fn spawn_workspace_indexing(
     typescript_exports: Arc<Mutex<TypeScriptWorkspaceExports>>,
     go_engines: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<GoEngine>>>>>,
     php_engines: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<PhpEngine>>>>>,
+    rust_engines: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<RustEngine>>>>>,
     listener: Option<Arc<dyn CoreListener>>,
 ) {
     let root = workspace.root().to_path_buf();
@@ -2839,6 +2868,7 @@ fn spawn_workspace_indexing(
         .spawn(move || {
             let paths = workspace.build_file_index().paths().collect::<Vec<_>>();
             publish_workspace_typescript_diagnostics(&analysis, &root, &paths);
+            publish_workspace_rust_diagnostics(&analysis, &root, &paths, &rust_engines);
             typescript_exports
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -2869,6 +2899,78 @@ fn spawn_workspace_indexing(
         });
 }
 
+/// Publishes diagnostics for all Rust sources in each Cargo project below the
+/// workspace. This runs in the workspace worker, never in the 100 ms UI poll.
+fn publish_workspace_rust_diagnostics(
+    analysis: &Arc<Mutex<BuiltinStore>>,
+    root: &Path,
+    paths: &[String],
+    engines: &Arc<Mutex<HashMap<PathBuf, Arc<Mutex<RustEngine>>>>>,
+) {
+    const MAX_FILES: usize = 10_000;
+    let mut projects: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+    for relative in paths
+        .iter()
+        .filter(|path| is_rust_path(Path::new(path)))
+        .take(MAX_FILES)
+    {
+        let path = root.join(relative);
+        projects
+            .entry(rust::project_root(&path))
+            .or_default()
+            .push(path);
+    }
+    for (project_root, files) in projects {
+        let engine = {
+            let mut engines = engines.lock().unwrap_or_else(|e| e.into_inner());
+            engines
+                .entry(project_root.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(RustEngine::pending(&project_root))))
+                .clone()
+        };
+        let built = RustEngine::build(&project_root);
+        engine
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .install(built);
+        let mut results = Vec::new();
+        for path in files {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let uri = file_uri(&path);
+            // Open-document analysis runs on the UI poll. Do not retain this
+            // mutex while walking every workspace file, or opening a Rust file
+            // can block the UI until the complete scan finishes.
+            let diagnostics = engine
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .diagnostics(&path, &text)
+                .into_iter()
+                .map(|problem| LspDiagnostic {
+                    uri: uri.clone(),
+                    range: LspRange {
+                        start_line: u64::from(problem.start_line),
+                        start_character: u64::from(problem.start_column),
+                        end_line: u64::from(problem.end_line),
+                        end_character: u64::from(problem.end_column),
+                    },
+                    severity: DiagnosticSeverity::Error,
+                    message: problem.message,
+                    source: Some("galaxy".into()),
+                    code: None,
+                    unnecessary: false,
+                })
+                .collect();
+            results.push((uri, diagnostics));
+        }
+        let mut analysis = analysis.lock().unwrap_or_else(|e| e.into_inner());
+        for (uri, diagnostics) in results {
+            analysis.set_diagnostics(&uri, diagnostics);
+        }
+    }
+}
+
 /// Publishes bounded parser/type diagnostics for workspace TypeScript sources,
 /// not only files that happened to be opened in an editor tab. Dependencies
 /// are intentionally excluded: their declarations belong to package tooling.
@@ -2878,11 +2980,6 @@ fn publish_workspace_typescript_diagnostics(
     paths: &[String],
 ) {
     const MAX_FILES: usize = 10_000;
-    let root_uri = format!("{}/", file_uri(root));
-    analysis
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clear_diagnostics_under(&root_uri);
     for relative in paths
         .iter()
         .filter(|path| workspace_typescript_source(path))
@@ -9326,6 +9423,91 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert!(found[0].uri.ends_with("main.rs"));
         assert_eq!((found[0].line, found[0].column), (0, 3));
+    }
+
+    #[test]
+    fn rust_diagnostics_are_rechecked_only_after_a_document_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.rs");
+        std::fs::write(&path, "fn main() { missing(); }\n").unwrap();
+        let core = Core::new();
+        let document = core
+            .open_document(path.to_string_lossy().into_owned())
+            .unwrap();
+        assert!(core.register_document(document.clone(), "rust".into(), String::new()));
+
+        core.poll_analysis();
+        assert!(!document.lock().diagnostics.is_empty());
+        let uri = file_uri(&path);
+        let revision = document.revision();
+        assert_eq!(core.rust_checked.lock().unwrap().get(&uri), Some(&revision));
+
+        document.apply_rename_edits(vec![RenameEdit {
+            uri: String::new(),
+            start_line: 0,
+            start_character: 12,
+            end_line: 0,
+            end_character: 19,
+            new_text: "println!".into(),
+        }]);
+        core.poll_analysis();
+        assert!(document.lock().diagnostics.is_empty());
+        assert_eq!(
+            core.rust_checked.lock().unwrap().get(&uri),
+            Some(&document.revision())
+        );
+    }
+
+    #[test]
+    fn workspace_rust_diagnostics_include_unopened_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        let path = dir.path().join("src/unopened.rs");
+        std::fs::write(&path, "fn run() { missing(); }\n").unwrap();
+        let analysis = Arc::new(Mutex::new(BuiltinStore::default()));
+        let engines = Arc::new(Mutex::new(HashMap::new()));
+
+        publish_workspace_rust_diagnostics(
+            &analysis,
+            dir.path(),
+            &["src/unopened.rs".into()],
+            &engines,
+        );
+
+        let analysis = analysis.lock().unwrap();
+        let problems = analysis.problems();
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.uri == file_uri(&path))
+        );
+    }
+
+    #[test]
+    fn workspace_typescript_refresh_keeps_rust_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let rust_path = dir.path().join("src/lib.rs");
+        std::fs::create_dir_all(rust_path.parent().unwrap()).unwrap();
+        std::fs::write(&rust_path, "fn run() { missing(); }\n").unwrap();
+        let analysis = Arc::new(Mutex::new(BuiltinStore::default()));
+        let engines = Arc::new(Mutex::new(HashMap::new()));
+        publish_workspace_rust_diagnostics(&analysis, dir.path(), &["src/lib.rs".into()], &engines);
+
+        publish_workspace_typescript_diagnostics(&analysis, dir.path(), &[]);
+
+        assert!(
+            analysis
+                .lock()
+                .unwrap()
+                .problems()
+                .iter()
+                .any(|problem| problem.uri == file_uri(&rust_path))
+        );
     }
 
     #[test]

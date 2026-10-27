@@ -197,7 +197,8 @@ enum MainMenu {
         editMenu.addItem(withTitle: "Copy", action: #selector(EditorView.copy(_:)), keyEquivalent: "c")
         editMenu.addItem(withTitle: "Paste", action: #selector(EditorView.paste(_:)), keyEquivalent: "v")
         editMenu.addItem(withTitle: "Select All", action: #selector(EditorView.selectAll(_:)), keyEquivalent: "a")
-        editMenu.addItem(withTitle: "Toggle Line Comment", action: #selector(EditorView.toggleComment(_:)), keyEquivalent: "/")
+        let toggleComment = editMenu.addItem(withTitle: "Toggle Line Comment", action: #selector(EditorView.toggleComment(_:)), keyEquivalent: "/")
+        toggleComment.keyEquivalentModifierMask = .command
         editMenu.addItem(.separator())
         editMenu.addItem(withTitle: "Delete Line", action: #selector(EditorView.deleteLines(_:)), keyEquivalent: "")
         editMenu.addItem(withTitle: "Join Lines", action: #selector(EditorView.joinLines(_:)), keyEquivalent: "")
