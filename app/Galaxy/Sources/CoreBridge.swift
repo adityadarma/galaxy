@@ -8,6 +8,11 @@ import os
 @MainActor
 final class CoreBridge {
     let core: Core
+    /// Native completion can inspect a workspace-sized index. Keep it off the
+    /// AppKit main thread and serialize requests so stale typing work cannot
+    /// contend with newer requests.
+    private let completionQueue = DispatchQueue(label: "dev.adityadarma.galaxy.completion")
+    private var pendingCompletionRequest: DispatchWorkItem?
     private(set) var lastEvent: CoreEvent?
     var onEvent: ((CoreEvent) -> Void)?
 
@@ -62,6 +67,14 @@ final class CoreBridge {
         _ = core.pollAnalysis()
     }
 
+    func refreshWorkspaceIndexes(root: String) {
+        core.refreshWorkspaceIndexes(root: root)
+    }
+
+    func applyWorkspaceChanges(root: String, paths: [String], rescan: Bool) {
+        core.applyWorkspaceChanges(root: root, paths: paths, rescan: rescan)
+    }
+
     /// False when no request went out (server missing or still initializing).
     @discardableResult
     func requestHover(document: DocumentHandle, line: UInt64, character: UInt64) -> Bool {
@@ -73,15 +86,47 @@ final class CoreBridge {
     }
 
     func requestCompletion(document: DocumentHandle, line: UInt64, character: UInt64) {
-        _ = core.requestCompletion(document: document, line: line, character: character)
+        pendingCompletionRequest?.cancel()
+        let core = core
+        let enqueued = DispatchTime.now().uptimeNanoseconds
+        let item = Self.completionWorkItem(
+            core: core, document: document, line: line, character: character, enqueued: enqueued
+        )
+        pendingCompletionRequest = item
+        completionQueue.async(execute: item)
+    }
+
+    /// Constructs the work item outside the main actor. Creating this closure
+    /// in `requestCompletion` would capture its main-actor isolation and trap
+    /// when the serial completion queue executes it.
+    nonisolated private static func completionWorkItem(core: Core, document: DocumentHandle,
+                                                       line: UInt64, character: UInt64,
+                                                       enqueued: UInt64) -> DispatchWorkItem {
+        DispatchWorkItem {
+            runCompletion(core: core, document: document, line: line, character: character, enqueued: enqueued)
+        }
+    }
+
+    nonisolated private static func runCompletion(core: Core, document: DocumentHandle,
+                                                  line: UInt64, character: UInt64, enqueued: UInt64) {
+        let started = DispatchTime.now().uptimeNanoseconds
+        let answered = core.requestCompletion(document: document, line: line, character: character)
+        let elapsed = Double(DispatchTime.now().uptimeNanoseconds - started) / 1_000_000
+        let queue = Double(started - enqueued) / 1_000_000
+        let count = core.completions(document: document).count
+        Log.core.debug("completion answered=\(answered, privacy: .public) items=\(count, privacy: .public) queue_ms=\(queue, privacy: .public) engine_ms=\(elapsed, privacy: .public)")
     }
 
     func completions(document: DocumentHandle) -> [CompletionInfo] {
-        core.completions(document: document)
+        completionQueue.sync {
+            core.completions(document: document)
+        }
     }
 
     func snippetCompletions(document: DocumentHandle) -> [CompletionInfo] {
-        document.snippetCompletions()
+        completionQueue.sync {
+            document.snippetCompletions()
+        }
     }
 
     func expandedSnippet(body: String, baseIndent: String, indentUnit: String,

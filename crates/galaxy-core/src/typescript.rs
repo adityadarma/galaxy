@@ -200,6 +200,10 @@ pub enum TypeMemberTarget {
     /// A static member (an enum member) reached through a value import. The
     /// host resolves the export and accepts it only when it is an enum.
     ImportedValue(Utf16Range),
+    /// A static member reached through a named or default import of a class.
+    ImportedClass(Utf16Range),
+    /// A method on an instance exported by a module factory such as `Env.create`.
+    ImportedFactory(Utf16Range),
     /// A direct member of `this` in a class extending this value import.
     SuperImported(Utf16Range),
     /// A direct member of `this` in a class extending a local superclass.
@@ -303,6 +307,7 @@ pub struct DocumentIndex {
     qualified_type_imports: Vec<QualifiedTypeImport>,
     type_member_uses: Vec<TypeMemberUse>,
     type_declarations: Vec<TypeDeclaration>,
+    default_export_factory_import: Option<Utf16Range>,
     decorator_option_uses: Vec<DecoratorOptionUse>,
     decorator_option_types: Vec<(String, DecoratorOptionType)>,
     callable_type_annotations: Vec<CallableTypeAnnotation>,
@@ -365,6 +370,8 @@ impl DocumentIndex {
             &symbols,
             &import_symbols,
         );
+        let default_export_factory_import =
+            collect_default_export_factory_import(root, text, &imports);
         let inherited_member_uses = collect_inherited_member_uses(
             root,
             text,
@@ -423,6 +430,7 @@ impl DocumentIndex {
             qualified_type_imports,
             type_member_uses,
             type_declarations,
+            default_export_factory_import,
             decorator_option_uses,
             decorator_option_types,
             callable_type_annotations,
@@ -610,9 +618,6 @@ impl DocumentIndex {
 
     /// Resolves a direct local export, including `export { local as public }`.
     pub fn exported_declaration(&self, exported_name: &str) -> Option<&Declaration> {
-        if !self.diagnostics.is_empty() {
-            return None;
-        }
         let exports = self
             .exports
             .iter()
@@ -633,6 +638,23 @@ impl DocumentIndex {
                 item.name == name
                     && !matches!(
                         item.kind,
+                        DeclarationKind::Interface | DeclarationKind::Type
+                    )
+            })
+            .collect::<Vec<_>>();
+        (declarations.len() == 1).then(|| declarations[0])
+    }
+
+    /// Returns one unambiguous runtime declaration by name. Used as a
+    /// navigation fallback while a target module has incomplete export syntax.
+    pub fn unique_runtime_declaration(&self, name: &str) -> Option<&Declaration> {
+        let declarations = self
+            .declarations
+            .iter()
+            .filter(|declaration| {
+                declaration.name == name
+                    && !matches!(
+                        declaration.kind,
                         DeclarationKind::Interface | DeclarationKind::Type
                     )
             })
@@ -729,6 +751,18 @@ impl DocumentIndex {
             .find(|item| contains(item.member_range, position))
     }
 
+    pub fn default_export_factory_import(&self) -> Option<(&Import, &ImportBinding)> {
+        self.import_binding_by_range(self.default_export_factory_import?)
+    }
+
+    /// Returns the module supplying a re-exported default value.
+    pub fn default_export_reexport_specifier(&self) -> Option<&str> {
+        self.exports
+            .iter()
+            .find(|export| export.default && export.specifier.is_some())
+            .and_then(|export| export.specifier.as_deref())
+    }
+
     /// Returns an object option key used with a directly imported decorator.
     pub fn decorator_option_at(&self, line: usize, col: usize) -> Option<&DecoratorOptionUse> {
         let position = Utf16Position::new(line, col);
@@ -805,6 +839,14 @@ impl DocumentIndex {
             .iter()
             .find(|item| item.range == range)
             .map(|item| item.members.as_slice())
+    }
+
+    /// Direct members declared by local classes, interfaces, and object types.
+    /// Completion filters these by the receiver and prefix at the call site.
+    pub fn local_type_members(&self) -> impl Iterator<Item = &TypeMember> {
+        self.type_declarations
+            .iter()
+            .flat_map(|declaration| declaration.members.iter())
     }
 
     pub fn import_binding_by_range(&self, range: Utf16Range) -> Option<(&Import, &ImportBinding)> {
@@ -905,6 +947,8 @@ impl DocumentIndex {
             }
             TypeMemberTarget::Imported(_)
             | TypeMemberTarget::ImportedValue(_)
+            | TypeMemberTarget::ImportedClass(_)
+            | TypeMemberTarget::ImportedFactory(_)
             | TypeMemberTarget::SuperImported(_)
             | TypeMemberTarget::SuperLocal(_)
             | TypeMemberTarget::SuperImportedChain { .. }

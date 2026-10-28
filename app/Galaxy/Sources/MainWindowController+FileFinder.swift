@@ -59,6 +59,9 @@ extension MainWindowController {
     /// A watcher batch (M2-02): update the explorer and the file index.
     fileprivate func workspaceChanged(_ batch: WatchBatch, generation: Int) {
         guard generation == watchGeneration, workspace != nil else { return }
+        if let workspace {
+            bridge.applyWorkspaceChanges(root: workspace.root(), paths: batch.paths, rescan: batch.rescan)
+        }
         if batch.rescan {
             explorer.refresh()
             checkOpenFiles()

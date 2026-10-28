@@ -382,6 +382,7 @@ pub(super) fn index_export(
                 .and_then(|identifier| node_text(text, *identifier))
                 .map(str::to_owned)
                 .or_else(|| name.clone());
+            let default_export = exported_name.as_deref() == Some("default");
             exports.push(Export {
                 name,
                 name_range: identifier_nodes
@@ -396,7 +397,7 @@ pub(super) fn index_export(
                 // Navigation from `from` needs the entire re-export statement,
                 // while `name_range` retains the precise exported identifier.
                 range: locations.range(node),
-                default: false,
+                default: default_export,
                 type_only: type_only || has_keyword(export_specifier, text, "type"),
                 syntax_valid: !node.has_error() && !node.is_error() && !node.is_missing(),
             });

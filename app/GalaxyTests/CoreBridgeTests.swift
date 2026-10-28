@@ -96,6 +96,37 @@ final class CoreBridgeTests: XCTestCase {
     }
 
     @MainActor
+    func testDefinitionFindsECMAScriptMemberDeclarations() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("galaxy-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let source = directory.appendingPathComponent("cdn_helper.ts")
+        try """
+        export class CdnHelper {
+          static generateUrl(filePath: string): string {
+            const cleanPath = filePath.startsWith('/') ? filePath.slice(1) : filePath
+            return cleanPath
+          }
+          static generateUrls(filePaths: string[]): string[] {
+            return filePaths.map(path => this.generateUrl(path))
+          }
+        }
+        """.write(to: source, atomically: true, encoding: .utf8)
+
+        let bridge = CoreBridge()
+        let document = try bridge.openDocument(path: source.path)
+        for (line, character, expectedLine) in [(2, 34, 55), (2, 59, 53), (6, 21, 89)] {
+            bridge.requestDefinition(document: document, line: UInt64(line), character: UInt64(character))
+            let locations = bridge.definitionLocations(document: document)
+            XCTAssertEqual(locations.count, 1)
+            XCTAssertTrue(locations[0].uri.hasSuffix("ecmascript.d.ts"))
+            XCTAssertEqual(locations[0].line, UInt64(expectedLine))
+        }
+    }
+
+    @MainActor
     func testSavePreservesCrlfLineEndings() throws {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("galaxy-\(UUID().uuidString).txt")

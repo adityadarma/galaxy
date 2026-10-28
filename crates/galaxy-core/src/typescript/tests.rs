@@ -1,6 +1,21 @@
 use super::*;
 
 #[test]
+fn indexes_ambient_exported_class_members() {
+    let index = DocumentIndex::parse(
+        "node_modules/@adonisjs/core/build/src/env.d.ts",
+        "export declare class Env {\n  static create(value: URL): Promise<Env>;\n  get(name: string): string;\n}\n",
+    );
+
+    assert!(
+        index
+            .exported_declaration("Env")
+            .is_some_and(|declaration| declaration.kind == DeclarationKind::Class)
+    );
+    assert!(index.type_member("Env", "create").is_some());
+}
+
+#[test]
 fn indexes_typescript_declarations_imports_and_exports() {
     let index = DocumentIndex::parse(
         "src/example.ts",
@@ -461,6 +476,21 @@ fn indexes_type_imports_and_direct_annotated_members() {
     assert_eq!(
         index.type_member("Record", "title").unwrap().range.start,
         Utf16Position::new(3, 16)
+    );
+}
+
+#[test]
+fn indexes_direct_this_members_of_local_classes() {
+    let index = DocumentIndex::parse(
+        "main.ts",
+        "class CdnHelper {\n  private static readonly CDN_URL = 'https://example.test';\n  static generateUrl() { return this.CDN_URL; }\n}\n",
+    );
+
+    let usage = index.type_member_at(2, 37).expect("this field use");
+    assert_eq!(usage.member_name, "CDN_URL");
+    assert_eq!(
+        index.type_member_target(usage).unwrap().range.start,
+        Utf16Position::new(1, 26)
     );
 }
 

@@ -129,6 +129,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     var snippetSession: SnippetSession?
     var snippetDocumentKey: String?
     var completionDismissed = false
+    /// Coalesces typing bursts before asking synchronous native completion.
+    var completionRequestItem: DispatchWorkItem?
     /// After Ctrl+Space the request is repeated until the server answers with
     /// something (it may still be starting or indexing), then this is cleared.
     var suggestRetryUntil: Date?

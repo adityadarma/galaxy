@@ -439,6 +439,23 @@ pub(super) fn collect_type_member_uses(
             )
             && let Some(member_name) = direct_member_name(text, property)
         {
+            // `this.field` belongs to the nearest enclosing local class. It is
+            // not an explicitly typed receiver, so resolve it before type bindings.
+            if object.kind() == "this"
+                && let Some(class) = enclosing_class(node)
+                && let Some(name) = class.child_by_field_name("name")
+                && let Some(name) = node_text(text, name)
+                && let Some(declaration) = type_declarations.iter().find(|declaration| {
+                    declaration.kind == DeclarationKind::Class && declaration.name == name
+                })
+            {
+                uses.push(TypeMemberUse {
+                    target: TypeMemberTarget::Named(declaration.range),
+                    member_name,
+                    member_range: locations.range(property),
+                });
+                continue;
+            }
             let is_this_field = object.kind() == "member_expression"
                 && object
                     .child_by_field_name("object")
@@ -455,6 +472,18 @@ pub(super) fn collect_type_member_uses(
             };
             if let Some(receiver) = receiver {
                 let object_range = locations.range(object);
+                // A PascalCase receiver can name a local class directly,
+                // without requiring a variable type annotation.
+                if let Some(declaration) = type_declarations.iter().find(|declaration| {
+                    declaration.name == receiver && declaration.kind == DeclarationKind::Class
+                }) {
+                    uses.push(TypeMemberUse {
+                        target: TypeMemberTarget::Named(declaration.range),
+                        member_name,
+                        member_range: locations.range(property),
+                    });
+                    continue;
+                }
                 let declaration = symbols
                     .iter()
                     .chain(import_symbols)
@@ -462,6 +491,38 @@ pub(super) fn collect_type_member_uses(
                         symbol.name == receiver && symbol.occurrences.contains(&object_range)
                     })
                     .map(|symbol| symbol.declaration);
+                let imported_binding = imports.iter().flat_map(|import| {
+                    import.bindings.iter().filter(move |binding| {
+                        binding.local_name == receiver
+                            && !binding.type_only
+                            && matches!(binding.kind, ImportKind::Named | ImportKind::Default)
+                    })
+                });
+                // Named and default value imports can be classes. Record a
+                // static member use so the host can resolve its declaration.
+                if member_access_is_called(node)
+                    && receiver.chars().next().is_some_and(char::is_uppercase)
+                    && let Some(binding) = imported_binding.clone().next()
+                {
+                    uses.push(TypeMemberUse {
+                        target: TypeMemberTarget::ImportedClass(binding.range),
+                        member_name,
+                        member_range: locations.range(property),
+                    });
+                    continue;
+                }
+                if member_access_is_called(node)
+                    && let Some(binding) = imported_binding
+                        .filter(|binding| binding.kind == ImportKind::Default)
+                        .next()
+                {
+                    uses.push(TypeMemberUse {
+                        target: TypeMemberTarget::ImportedFactory(binding.range),
+                        member_name,
+                        member_range: locations.range(property),
+                    });
+                    continue;
+                }
                 let lexical_targets = bindings
                     .iter()
                     .filter(|(name, _, scope, _)| {
@@ -523,6 +584,68 @@ pub(super) fn collect_type_member_uses(
         stack.extend(node.named_children(&mut cursor));
     }
     uses
+}
+
+fn enclosing_class(mut node: Node<'_>) -> Option<Node<'_>> {
+    while let Some(parent) = node.parent() {
+        if matches!(parent.kind(), "class_declaration" | "class") {
+            return Some(parent);
+        }
+        node = parent;
+    }
+    None
+}
+
+fn member_access_is_called(node: Node<'_>) -> bool {
+    node.parent()
+        .is_some_and(|parent| parent.kind() == "call_expression")
+        || node
+            .parent()
+            .and_then(|parent| parent.parent())
+            .is_some_and(|parent| parent.kind() == "call_expression")
+}
+
+pub(super) fn collect_default_export_factory_import(
+    root: Node<'_>,
+    text: &str,
+    imports: &[Import],
+) -> Option<Utf16Range> {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "export_statement"
+            && node_text(text, node)
+                .is_some_and(|source| source.trim_start().starts_with("export default"))
+        {
+            let mut descendants = vec![node];
+            while let Some(candidate) = descendants.pop() {
+                if candidate.kind() == "member_expression"
+                    && let (Some(object), Some(property)) = (
+                        candidate.child_by_field_name("object"),
+                        candidate.child_by_field_name("property"),
+                    )
+                    && object.kind() == "identifier"
+                    && property.kind() == "property_identifier"
+                    && node_text(text, property) == Some("create")
+                    && let Some(name) = node_text(text, object)
+                    && let Some(binding) = imports
+                        .iter()
+                        .flat_map(|import| import.bindings.iter())
+                        .find(|binding| {
+                            binding.local_name == name
+                                && !binding.type_only
+                                && matches!(binding.kind, ImportKind::Named | ImportKind::Default)
+                        })
+                {
+                    return Some(binding.range);
+                }
+                let mut cursor = candidate.walk();
+                descendants.extend(candidate.named_children(&mut cursor));
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    None
 }
 
 #[allow(clippy::too_many_arguments)]

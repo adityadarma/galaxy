@@ -196,6 +196,44 @@ final class NavigationTests: XCTestCase {
         XCTAssertEqual(v.definitionLink?.end, 18)
     }
 
+    func testCommandHoverUnderlinesTypeScriptMemberInTemplateInterpolation() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-template-link-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let file = dir.appendingPathComponent("cdn_helper.ts")
+        let line = "    return `${this.CDN_URL}/${cleanPath}`"
+        try [
+            "export class CdnHelper {",
+            "  private static readonly CDN_URL = env.get('CDN_URL')",
+            "",
+            "  static generateUrl(filePath: string): string {",
+            "    const cleanPath = filePath.startsWith('/') ? filePath.slice(1) : filePath",
+            line,
+            "  }",
+            "}",
+        ].joined(separator: "\n").write(to: file, atomically: true, encoding: .utf8)
+
+        let c = MainWindowController(bridge: CoreBridge())
+        c.showWindow(nil)
+        defer { c.window?.orderOut(nil) }
+        try c.openFile(at: file)
+        let v = c.editorView
+        v.onDefinitionClick = { _ in true }
+        let column = (line as NSString).range(of: "CDN_URL").location + 2
+        v.lastMousePoint = NSPoint(x: v.textOriginX + v.xOffset(in: line, column: UInt64(column)) + 0.5,
+                                   y: 5 * v.metrics.lineHeight + v.metrics.lineHeight / 2)
+
+        let deadline = Date().addingTimeInterval(5)
+        while v.document?.viewport(firstLine: 5, count: 1).styles.isEmpty ?? true, Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
+        v.updateDefinitionLink(commandHeld: true)
+
+        let range = (line as NSString).range(of: "CDN_URL")
+        XCTAssertEqual(v.definitionLink?.start, UInt64(range.location))
+        XCTAssertEqual(v.definitionLink?.end, UInt64(range.location + range.length))
+    }
+
     func testCommandHoverUnderlinesVueImportSpecifier() throws {
         let text = "import { usePage } from '@inertiajs/vue3'"
         let c = try makeController(text: text)
@@ -210,6 +248,43 @@ final class NavigationTests: XCTestCase {
 
         XCTAssertEqual(v.definitionLink?.start, UInt64(specifier.location))
         XCTAssertEqual(v.definitionLink?.end, UInt64(specifier.location + specifier.length))
+    }
+
+    func testCommandHoverUnderlinesDartPackageImport() throws {
+        let text = "import 'package:equatable/equatable.dart';"
+        let c = try makeController(text: text)
+        let v = c.editorView
+        v.document?.setPath(path: "/tmp/main.dart")
+        v.onDefinitionClick = { _ in true }
+        let specifier = (text as NSString).range(of: "package:equatable/equatable.dart")
+        v.lastMousePoint = NSPoint(x: v.textOriginX + v.xOffset(in: text, column: UInt64(specifier.location + 2)) + 0.5,
+                                   y: v.metrics.lineHeight / 2)
+
+        v.updateDefinitionLink(commandHeld: true)
+
+        XCTAssertEqual(v.definitionLink?.start, UInt64(specifier.location))
+        XCTAssertEqual(v.definitionLink?.end, UInt64(specifier.location + specifier.length))
+    }
+
+    func testCommandHoverUnderlinesDartExportAndPart() throws {
+        let directory = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        for text in ["export 'about.dart';", "part 'transaction_state.dart';"] {
+            let target = text.contains("about") ? "about.dart" : "transaction_state.dart"
+            try "class Target {}".write(to: directory.appendingPathComponent(target), atomically: true, encoding: .utf8)
+            let c = try makeController(text: text)
+            let v = c.editorView
+            v.document?.setPath(path: directory.appendingPathComponent("main.dart").path)
+            v.onDefinitionClick = { _ in true }
+            let specifier = (text as NSString).range(of: target)
+            v.lastMousePoint = NSPoint(x: v.textOriginX + v.xOffset(in: text, column: UInt64(specifier.location + 2)) + 0.5,
+                                       y: v.metrics.lineHeight / 2)
+            v.updateDefinitionLink(commandHeld: true)
+            XCTAssertNotNil(v.definitionLink, text)
+        }
     }
 
     func testCommandHoverSkipsConfigurationLanguages() throws {
@@ -330,6 +405,40 @@ final class NavigationTests: XCTestCase {
         }
         XCTAssertEqual(view.document?.primaryCursor().line, 2)
         XCTAssertEqual(view.document?.primaryCursor().colUtf16, 45)
+    }
+
+    func testCommandClickOpensECMAScriptMemberDeclaration() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-ecmascript-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let file = dir.appendingPathComponent("cdn_helper.ts")
+        let source = """
+        export class CdnHelper {
+          static generateUrl(filePath: string): string {
+            return filePath.startsWith('/') ? filePath.slice(1) : filePath
+          }
+        }
+        """
+        try source.write(to: file, atomically: true, encoding: .utf8)
+
+        let controller = MainWindowController(bridge: CoreBridge())
+        controller.showWindow(nil)
+        defer { controller.window?.orderOut(nil) }
+        try controller.openFile(at: file)
+        let view = controller.editorView
+        let line = "    return filePath.startsWith('/') ? filePath.slice(1) : filePath"
+        let startsWith = (line as NSString).range(of: "startsWith")
+        click(view, line: 2, utf16Col: startsWith.location + 1, flags: .command)
+
+        let deadline = Date().addingTimeInterval(2)
+        while !(view.document?.path().hasSuffix("ecmascript.d.ts") ?? false)
+                || view.document?.primaryCursor().line != 55,
+              Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
+        XCTAssertTrue(view.document?.path().hasSuffix("ecmascript.d.ts") ?? false)
+        XCTAssertGreaterThan(view.document?.lineCount() ?? 0, 55)
+        XCTAssertEqual(view.document?.primaryCursor().line, 55)
     }
 
     func testCommandHoverSkipsPrimitiveTypesOutsidePHPToo() throws {

@@ -79,7 +79,8 @@ extension MainWindowController {
     func show(_ loc: NavLocation) -> Bool {
         isNavigating = true
         defer { isNavigating = false }
-        if let found = allTabs.first(where: { $0.navKey == loc.key }) {
+        let key = Self.fileKey(loc.key) ?? loc.key
+        if let found = allTabs.first(where: { $0.navKey == key }) {
             focusTab(found)
         } else {
             guard !loc.key.hasPrefix("untitled:"), FileManager.default.fileExists(atPath: loc.key) else { return false }
@@ -90,7 +91,7 @@ extension MainWindowController {
                 try? openFile(at: URL(fileURLWithPath: loc.key))
             }
         }
-        guard let tab = activeTab, tab.navKey == loc.key else { return false }
+        guard let tab = activeTab, tab.navKey == key else { return false }
         move(tab, toLine: loc.line, col: loc.col)
         return true
     }

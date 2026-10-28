@@ -303,25 +303,37 @@ extension EditorView {
         ].contains(document.syntaxLanguage() ?? "")
     }
 
-    /// Module path inside the quotes of `import x from 'p'`, `export * from 'p'`,
-    /// `import 'p'`, `require('p')` and `import('p')`; `nil` for any other string.
+    /// Module path inside the quotes of a JavaScript/TypeScript import or a
+    /// Dart import/export/part directive;
+    /// `nil` for any other string.
     static func importSpecifierRange(in text: String, stringStart: Int, stringEnd: Int) -> Range<Int>? {
         let units = Array(text.utf16)
         guard stringStart >= 0, stringEnd <= units.count, stringEnd - stringStart >= 3 else { return nil }
         let quotes: Set<UInt16> = [UInt16(UInt8(ascii: "'")), UInt16(UInt8(ascii: "\""))]
         guard quotes.contains(units[stringStart]), units[stringStart] == units[stringEnd - 1] else { return nil }
         let before = (text as NSString).substring(to: stringStart)
-        guard before.range(of: #"(?:\bfrom|\bimport|\brequire\s*\(|\bimport\s*\()\s*$"#,
+        guard before.range(of: #"(?:\bfrom|\bimport|\bexport|\bpart|\brequire\s*\(|\bimport\s*\()\s*$"#,
                            options: .regularExpression) != nil else { return nil }
         return (stringStart + 1)..<(stringEnd - 1)
     }
 
     /// The module path under `pos` when it sits in an import/require string
-    /// of a TypeScript or JavaScript file, quotes excluded.
+    /// of a TypeScript, JavaScript, or Dart file, quotes excluded.
     func importSpecifier(at pos: TextPos, text: String? = nil) -> (range: Range<Int>, path: String)? {
-        guard let document, Self.isJavaScriptFamily(document) else { return nil }
+        guard let document, Self.isJavaScriptFamily(document) || document.syntaxLanguage() == "Dart" else { return nil }
         let text = text ?? document.displayLine(line: pos.line)
         let column = Int(pos.colUtf16)
+        if document.syntaxLanguage() == "Dart" {
+            let units = Array(text.utf16)
+            let quotes: Set<UInt16> = [UInt16(UInt8(ascii: "'")), UInt16(UInt8(ascii: "\""))]
+            guard column < units.count else { return nil }
+            guard let stringStart = (0...column).reversed().first(where: { quotes.contains(units[$0]) }),
+                  let stringEnd = ((column + 1)..<units.count).first(where: { units[$0] == units[stringStart] }) else {
+                return nil
+            }
+            let range = Self.importSpecifierRange(in: text, stringStart: stringStart, stringEnd: stringEnd + 1)
+            return range.map { ($0, (text as NSString).substring(with: NSRange(location: $0.lowerBound, length: $0.count))) }
+        }
         // The widest string run is the whole literal, quotes included.
         let run = document.viewport(firstLine: pos.line, count: 1).styles
             .filter { $0.line == pos.line && $0.scope == "string" && Int($0.start) <= column && column < Int($0.end) }
@@ -387,9 +399,39 @@ extension EditorView {
             if builtins.names.contains(builtins.caseInsensitive ? word.lowercased() : word) { return nil }
         }
         if run.scope == "string" {
+            // Tree-sitter styles a template literal as one string run, including
+            // its `${...}` expression. That expression is code, not string text.
+            if Self.isTemplateInterpolation(in: text, at: range.lowerBound) { return qualified(range, in: text, document: document) }
             return Self.frameworkStringRange(in: text, stringStart: Int(run.start), stringEnd: Int(run.end))
         }
         return qualified(range, in: text, document: document)
+    }
+
+    /// Whether `column` sits inside a `${...}` expression in a template literal.
+    static func isTemplateInterpolation(in text: String, at column: Int) -> Bool {
+        let units = Array(text.utf16)
+        guard column >= 0, column < units.count else { return false }
+        let backtick = UInt16(UInt8(ascii: "`"))
+        let dollar = UInt16(UInt8(ascii: "$"))
+        let openBrace = UInt16(UInt8(ascii: "{"))
+        let closeBrace = UInt16(UInt8(ascii: "}"))
+        var inTemplate = false
+        var interpolationDepth = 0
+        var i = 0
+        while i < column {
+            if units[i] == backtick, interpolationDepth == 0 {
+                inTemplate.toggle()
+            } else if inTemplate, units[i] == dollar, i + 1 < units.count, units[i + 1] == openBrace {
+                interpolationDepth = 1
+                i += 1
+            } else if interpolationDepth > 0, units[i] == openBrace {
+                interpolationDepth += 1
+            } else if interpolationDepth > 0, units[i] == closeBrace {
+                interpolationDepth -= 1
+            }
+            i += 1
+        }
+        return inTemplate && interpolationDepth > 0
     }
 
     /// In PHP, `App\Models\Product` is one name: the link covers all of it.

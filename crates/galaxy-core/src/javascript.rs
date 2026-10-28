@@ -426,7 +426,8 @@ fn resolve_package_root(root: &Path, subpath: &str) -> Option<PathBuf> {
     if let Some(manifest) = &manifest {
         if let Some(exports) = manifest.get("exports") {
             if let Some(target) = package_export_target(exports, subpath) {
-                return resolve_package_target(root, &target);
+                let runtime = resolve_package_target(root, &target)?;
+                return declaration_sibling(&runtime).or(Some(runtime));
             }
             return None;
         }
@@ -452,6 +453,17 @@ fn resolve_package_root(root: &Path, subpath: &str) -> Option<PathBuf> {
         }
     }
     resolve_module_path(root, subpath)
+}
+
+/// Published packages often point `exports` at emitted JavaScript while
+/// colocating the navigable TypeScript declaration beside it.
+fn declaration_sibling(runtime: &Path) -> Option<PathBuf> {
+    runtime
+        .extension()
+        .is_some_and(|extension| matches!(extension.to_str(), Some("js" | "jsx" | "mjs" | "cjs")))
+        .then(|| runtime.with_extension("d.ts"))?
+        .is_file()
+        .then(|| runtime.with_extension("d.ts"))
 }
 
 fn package_metadata_target(root: &Path, target: &str) -> Option<PathBuf> {

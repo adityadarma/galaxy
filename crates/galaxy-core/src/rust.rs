@@ -133,6 +133,43 @@ impl RustEngine {
         self.ready
     }
 
+    /// Applies source-file watcher changes without rediscovering Cargo roots.
+    /// Cargo metadata changes can alter every module and require `build`.
+    pub fn apply_disk_changes(&mut self, paths: &[PathBuf]) -> bool {
+        if !self.ready
+            || paths.iter().any(|path| {
+                matches!(
+                    path.file_name().and_then(|name| name.to_str()),
+                    Some("Cargo.toml" | "Cargo.lock")
+                )
+            })
+        {
+            return false;
+        }
+        for path in paths {
+            if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
+                continue;
+            }
+            self.open.remove(path);
+            self.declarations.retain(|item| item.path != *path);
+            self.uses.remove(path);
+            self.files.retain(|file| file != path);
+            if let Ok(text) = std::fs::read_to_string(path)
+                && text.len() as u64 <= MAX_FILE_BYTES
+            {
+                let source_root = self.source_root_for(path);
+                self.declarations
+                    .extend(parse_declarations(path, &text, &source_root));
+                self.uses.insert(path.clone(), parse_use_bindings(&text));
+                self.files.push(path.clone());
+            }
+        }
+        self.declarations.sort_by(|left, right| {
+            (&left.name, &left.path, left.line).cmp(&(&right.name, &right.path, right.line))
+        });
+        true
+    }
+
     pub fn sync_document(&mut self, path: &Path, text: &str) {
         self.open.insert(
             path.to_path_buf(),
@@ -430,11 +467,57 @@ impl RustEngine {
 
     fn resolve(&self, path: &Path, name: &str, at: usize) -> Vec<Declaration> {
         if let Some((_, text)) = self.document(path)
+            && let Some(members) = self.resolve_member(text, name, at)
+        {
+            return members;
+        }
+        if let Some((_, text)) = self.document(path)
             && let Some(local) = local_declaration(path, text, name, at)
         {
             return vec![local];
         }
         self.resolve_nonlocal(path, name)
+    }
+
+    /// Resolve `value.member` after the lightweight local type inference used
+    /// by member completion. Do not fall back to a name-only match: a method
+    /// name is frequently shared by unrelated types.
+    fn resolve_member(&self, text: &str, name: &str, at: usize) -> Option<Vec<Declaration>> {
+        let tree = parse_tree(text)?;
+        let ast_receiver = member_access_at(tree.root_node(), at).and_then(|member| {
+            member.child_by_field_name("value").and_then(|receiver| {
+                receiver
+                    .utf8_text(text.as_bytes())
+                    .ok()
+                    .map(|name| (name, member.start_byte()))
+            })
+        });
+        let (receiver, before) = if let Some((receiver, start)) = ast_receiver {
+            (receiver, &text[..start])
+        } else {
+            let before = &text[..at];
+            let (left, _) = before.rsplit_once('.')?;
+            let receiver = left
+                .trim_end()
+                .rsplit(|character: char| !is_ident(character))
+                .next()?;
+            (receiver, left)
+        };
+        if !is_ident_text(receiver) {
+            return None;
+        }
+        let ty = receiver_type(before, receiver)?;
+        let mut matches = Vec::new();
+        for (path, source) in self.sources() {
+            matches.extend(member_declarations(&path, &source, &ty, name));
+        }
+        matches.sort_by(|left, right| {
+            (&left.path, left.line, left.column).cmp(&(&right.path, right.line, right.column))
+        });
+        matches.dedup_by(|left, right| {
+            left.path == right.path && left.line == right.line && left.column == right.column
+        });
+        (matches.len() == 1).then_some(matches)
     }
 
     /// Resolves project and import declarations without reparsing local scopes.
@@ -585,6 +668,22 @@ impl RustEngine {
             .get(path)
             .map(|(_, _, text)| (path.to_path_buf(), text.as_str()))
     }
+}
+
+fn member_access_at(node: Node<'_>, at: usize) -> Option<Node<'_>> {
+    if node.start_byte() > at || node.end_byte() < at {
+        return None;
+    }
+    if node.kind() == "field_expression"
+        && node
+            .child_by_field_name("field")
+            .is_some_and(|field| field.start_byte() <= at && at <= field.end_byte())
+    {
+        return Some(node);
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find_map(|child| member_access_at(child, at))
 }
 
 fn structural_braces(line: &str) -> (usize, usize) {
@@ -1019,7 +1118,10 @@ fn collect_unresolved(
         && !is_lifetime_name(node, text)
         && !is_member_name(node, text)
         && !is_closure_binding(node, text)
-        && !engine.use_bindings(path).iter().any(|binding| binding.local == name)
+        && !engine
+            .use_bindings(path)
+            .iter()
+            .any(|binding| binding.local == name)
         && !is_match_binding(node, text)
         && !local_bindings.contains(name)
         && engine.resolve_nonlocal(path, name).is_empty()
@@ -1052,12 +1154,18 @@ fn all_local_binding_names(node: Node<'_>, text: &str) -> HashSet<String> {
 fn collect_all_local_binding_names(node: Node<'_>, text: &str, names: &mut HashSet<String>) {
     match node.kind() {
         "let_declaration" => {
-            if let Some(pattern) = node.child_by_field_name("pattern").or_else(|| node.named_child(0)) {
+            if let Some(pattern) = node
+                .child_by_field_name("pattern")
+                .or_else(|| node.named_child(0))
+            {
                 collect_pattern_binding_names(pattern, text, names);
             }
         }
         "match_arm" => {
-            if let Some(pattern) = node.child_by_field_name("pattern").or_else(|| node.named_child(0)) {
+            if let Some(pattern) = node
+                .child_by_field_name("pattern")
+                .or_else(|| node.named_child(0))
+            {
                 collect_pattern_binding_names(pattern, text, names);
             }
         }
@@ -1111,7 +1219,10 @@ fn is_call_target(node: Node<'_>) -> bool {
         return false;
     };
     parent.kind() == "call_expression"
-        && parent.child_by_field_name("function").map(|function| function.id()) == Some(node.id())
+        && parent
+            .child_by_field_name("function")
+            .map(|function| function.id())
+            == Some(node.id())
 }
 
 /// Names supplied by Rust's standard prelude have no local declaration for the
@@ -1325,6 +1436,7 @@ fn receiver_type(before: &str, receiver: &str) -> Option<String> {
     let binding = format!("let {receiver}:");
     if let Some((_, after)) = before.rsplit_once(&binding) {
         return after
+            .trim_start()
             .split(|character: char| !is_ident(character))
             .next()
             .filter(|ty| !ty.is_empty())
@@ -1402,6 +1514,129 @@ fn impl_methods(text: &str, ty: &str) -> Vec<Completion> {
             Some(completion(name, line, ItemKind::Function))
         })
         .collect()
+}
+
+fn member_declarations(path: &Path, text: &str, ty: &str, name: &str) -> Vec<Declaration> {
+    let Some(tree) = parse_tree(text) else {
+        return Vec::new();
+    };
+    let mut members = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            "field_declaration" => {
+                if struct_for_member(node, text).as_deref() != Some(ty) {
+                    continue;
+                }
+                push_member_declaration(path, text, node, name, ItemKind::Variable, &mut members);
+            }
+            "function_item" if impl_for_member(node, text).as_deref() == Some(ty) => {
+                push_member_declaration(path, text, node, name, ItemKind::Function, &mut members);
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    members.extend(struct_field_declarations(path, text, ty, name));
+    members
+}
+
+fn struct_field_declarations(path: &Path, text: &str, ty: &str, name: &str) -> Vec<Declaration> {
+    let Some((_, rest)) = text.split_once(&format!("struct {ty}")) else {
+        return Vec::new();
+    };
+    let Some((_, body)) = rest.split_once('{') else {
+        return Vec::new();
+    };
+    let Some((body, _)) = body.split_once('}') else {
+        return Vec::new();
+    };
+    let Some(offset) = body
+        .find(name)
+        .filter(|offset| body[*offset + name.len()..].trim_start().starts_with(':'))
+    else {
+        return Vec::new();
+    };
+    let start = text.find(body).unwrap_or(0) + offset;
+    let point = text[..start].lines().count().saturating_sub(1) as u32;
+    vec![Declaration {
+        name: name.to_owned(),
+        module: Vec::new(),
+        kind: ItemKind::Variable,
+        path: path.to_path_buf(),
+        line: point,
+        column: utf16_column(text, start),
+        scope_depth: 0,
+        signature: body.trim().to_owned(),
+    }]
+}
+
+fn push_member_declaration(
+    path: &Path,
+    text: &str,
+    node: Node<'_>,
+    name: &str,
+    kind: ItemKind,
+    out: &mut Vec<Declaration>,
+) {
+    let Some(member_name) = node.child_by_field_name("name").or_else(|| {
+        let mut cursor = node.walk();
+        node.named_children(&mut cursor)
+            .find(|child| matches!(child.kind(), "identifier" | "field_identifier"))
+    }) else {
+        return;
+    };
+    if member_name.utf8_text(text.as_bytes()).ok() != Some(name) {
+        return;
+    }
+    let point = member_name.start_position();
+    out.push(Declaration {
+        name: name.to_owned(),
+        module: Vec::new(),
+        kind,
+        path: path.to_path_buf(),
+        line: point.row as u32,
+        column: utf16_column(text, member_name.start_byte()),
+        scope_depth: 0,
+        signature: text[node.start_byte()..node.end_byte()]
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_owned(),
+    });
+}
+
+fn struct_for_member(node: Node<'_>, text: &str) -> Option<String> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "struct_item" {
+            return parent
+                .child_by_field_name("name")?
+                .utf8_text(text.as_bytes())
+                .ok()
+                .map(str::to_owned);
+        }
+        current = parent.parent();
+    }
+    None
+}
+
+fn impl_for_member(node: Node<'_>, text: &str) -> Option<String> {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if parent.kind() == "impl_item" {
+            let ty = parent.child_by_field_name("type")?;
+            return ty.utf8_text(text.as_bytes()).ok().map(str::trim).map(|ty| {
+                ty.trim_start_matches('&')
+                    .trim_start_matches("mut ")
+                    .to_owned()
+            });
+        }
+        current = parent.parent();
+    }
+    None
 }
 
 fn completion(name: &str, detail: &str, kind: ItemKind) -> Completion {
@@ -1639,6 +1874,34 @@ mod tests {
     }
 
     #[test]
+    fn disk_delta_replaces_and_removes_file_declarations() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("src");
+        std::fs::create_dir_all(&source).unwrap();
+        let path = source.join("lib.rs");
+        std::fs::write(&path, "pub fn old_name() {}\n").unwrap();
+        let mut engine = RustEngine::pending(root.path());
+        engine.install(RustEngine::build(root.path()));
+        std::fs::write(&path, "pub fn new_name() {}\n").unwrap();
+        assert!(engine.apply_disk_changes(std::slice::from_ref(&path)));
+        assert!(
+            engine
+                .declarations
+                .iter()
+                .any(|item| item.name == "new_name")
+        );
+        assert!(
+            !engine
+                .declarations
+                .iter()
+                .any(|item| item.name == "old_name")
+        );
+        std::fs::remove_file(&path).unwrap();
+        assert!(engine.apply_disk_changes(std::slice::from_ref(&path)));
+        assert!(!engine.declarations.iter().any(|item| item.path == path));
+    }
+
+    #[test]
     fn references_and_rename_require_a_unique_top_level_declaration() {
         let path = Path::new("/tmp/lib.rs");
         let text = "pub fn brew() {}\nfn main() { brew(); }";
@@ -1861,6 +2124,36 @@ mod tests {
     }
 
     #[test]
+    fn member_definition_resolves_methods_and_fields_in_another_buffer() {
+        let definition = PathBuf::from("/tmp/models.rs");
+        let path = Path::new("/tmp/lib.rs");
+        let source = "fn main() { let coffee: Coffee = todo!(); coffee.brew(); coffee.beans; }";
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        engine.install(Built {
+            declarations: Vec::new(),
+            files: vec![definition.clone()],
+            uses: HashMap::new(),
+            source_roots: vec![PathBuf::from("/tmp")],
+        });
+        engine.sync_document(
+            &definition,
+            "pub struct Coffee { pub beans: u8 }\nimpl Coffee {\n    pub fn brew(&self) {}\n}",
+        );
+
+        let method_column = source.find("brew").unwrap() as u32 + 1;
+        let method = engine.definition(path, source, 0, method_column);
+        assert_eq!(method.len(), 1);
+        assert_eq!(method[0].path, definition);
+        assert_eq!((method[0].line, method[0].column), (2, 11));
+
+        let field_column = source.rfind("beans").unwrap() as u32 + 1;
+        let field = engine.definition(path, source, 0, field_column);
+        assert_eq!(field.len(), 1);
+        assert_eq!(field[0].path, definition);
+        assert_eq!((field[0].line, field[0].column), (0, 24));
+    }
+
+    #[test]
     fn member_completion_infers_receiver_type_from_function_parameter() {
         let path = Path::new("/tmp/lib.rs");
         let source = "struct Coffee { beans: u8 }\nimpl Coffee { fn brew(&self) {} }\nfn serve(coffee: &Coffee) { coffee.br }";
@@ -1928,7 +2221,8 @@ mod tests {
         assert!(
             diagnostics
                 .iter()
-                .all(|problem| !problem.message.contains("Node") && !problem.message.contains("comment")),
+                .all(|problem| !problem.message.contains("Node")
+                    && !problem.message.contains("comment")),
             "{diagnostics:?}"
         );
     }

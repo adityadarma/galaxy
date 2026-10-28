@@ -11,7 +11,9 @@ use crate::typescript_navigation::{
 };
 use std::sync::Mutex;
 
-const MAX_TYPESCRIPT_COMPLETIONS: usize = 100;
+/// Shared built-in completion cap. Engines may collect more candidates, but
+/// the FFI never hands more than this to the UI ranking path.
+const MAX_TYPESCRIPT_COMPLETIONS: usize = 200;
 const MAX_WORKSPACE_TYPESCRIPT_FILES: usize = 10_000;
 const MAX_WORKSPACE_TYPESCRIPT_FILE_BYTES: u64 = 1_048_576;
 const MAX_WORKSPACE_TYPESCRIPT_ROOTS: usize = 8;
@@ -27,7 +29,7 @@ struct WorkspaceExport {
 /// FFI owns disk-backed workspace state; core supplies the per-file parser.
 #[derive(Debug, Default)]
 pub(super) struct TypeScriptWorkspaceExports {
-    roots: BTreeMap<PathBuf, Vec<WorkspaceExport>>,
+    roots: BTreeMap<PathBuf, BTreeMap<String, Vec<WorkspaceExport>>>,
 }
 
 impl TypeScriptWorkspaceExports {
@@ -36,7 +38,7 @@ impl TypeScriptWorkspaceExports {
     }
 
     pub(super) fn refresh(&mut self, root: &Path, paths: &[String]) {
-        let mut by_name = BTreeMap::<String, Vec<WorkspaceExport>>::new();
+        let mut files = BTreeMap::new();
         for path in paths
             .iter()
             .filter(|path| is_source_path(path))
@@ -52,40 +54,100 @@ impl TypeScriptWorkspaceExports {
             let Ok(text) = std::fs::read_to_string(&full_path) else {
                 continue;
             };
-            let index = DocumentIndex::parse(&full_path, &text);
-            for declaration in index.declarations.iter().filter(|item| item.exported) {
-                by_name
-                    .entry(declaration.name.clone())
-                    .or_default()
-                    .push(WorkspaceExport {
-                        name: declaration.name.clone(),
-                        kind: declaration.kind,
-                        path: path.clone(),
-                        default: declaration.default,
-                    });
-            }
+            files.insert(path.clone(), workspace_exports(&full_path, &text, path));
         }
         // A name resolving to more than one module cannot be imported safely.
         if !self.roots.contains_key(root) && self.roots.len() >= MAX_WORKSPACE_TYPESCRIPT_ROOTS {
             self.roots.pop_first();
         }
-        self.roots.insert(
-            root.to_path_buf(),
-            by_name
-                .into_values()
-                .filter_map(|exports| {
-                    (exports.len() == 1).then(|| exports.into_iter().next().unwrap())
-                })
-                .collect(),
-        );
+        self.roots.insert(root.to_path_buf(), files);
     }
 
-    fn exports_for(&self, path: &Path) -> Option<(&Path, &[WorkspaceExport])> {
+    /// Updates only watcher-reported source files. The flattened completion
+    /// view remains derived at query time so duplicate exports stay rejected.
+    pub(super) fn apply_changes(&mut self, root: &Path, paths: &[String]) {
+        let Some(files) = self.roots.get_mut(root) else {
+            return;
+        };
+        for path in paths.iter().filter(|path| is_source_path(path)) {
+            let full_path = root.join(path);
+            match std::fs::read_to_string(&full_path) {
+                Ok(text) if text.len() as u64 <= MAX_WORKSPACE_TYPESCRIPT_FILE_BYTES => {
+                    files.insert(path.clone(), workspace_exports(&full_path, &text, path));
+                }
+                _ => {
+                    files.remove(path);
+                }
+            }
+        }
+    }
+
+    fn exports_for(&self, path: &Path) -> Option<(&Path, Vec<WorkspaceExport>)> {
         self.roots
             .iter()
             .filter(|(root, _)| path.strip_prefix(root).is_ok())
             .max_by_key(|(root, _)| root.components().count())
-            .map(|(root, exports)| (root.as_path(), exports.as_slice()))
+            .map(|(root, exports)| {
+                let mut by_name = BTreeMap::<String, Vec<WorkspaceExport>>::new();
+                for file_exports in exports.values() {
+                    for export in file_exports {
+                        by_name
+                            .entry(export.name.clone())
+                            .or_default()
+                            .push(export.clone());
+                    }
+                }
+                let unique = by_name
+                    .into_values()
+                    .filter_map(|exports| {
+                        (exports.len() == 1).then(|| exports.into_iter().next().unwrap())
+                    })
+                    .collect::<Vec<_>>();
+                (root.as_path(), unique)
+            })
+    }
+}
+
+fn workspace_exports(path: &Path, text: &str, relative: &str) -> Vec<WorkspaceExport> {
+    DocumentIndex::parse(path, text)
+        .declarations
+        .iter()
+        .filter(|item| item.exported)
+        .map(|declaration| WorkspaceExport {
+            name: declaration.name.clone(),
+            kind: declaration.kind,
+            path: relative.to_owned(),
+            default: declaration.default,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disk_delta_replaces_and_removes_workspace_exports() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("model.ts");
+        std::fs::write(&file, "export class OldModel {}\n").unwrap();
+        let mut exports = TypeScriptWorkspaceExports::default();
+        exports.refresh(root.path(), &["model.ts".into()]);
+        assert_eq!(
+            exports.exports_for(root.path()).unwrap().1[0].name,
+            "OldModel"
+        );
+
+        std::fs::write(&file, "export class NewModel {}\n").unwrap();
+        exports.apply_changes(root.path(), &["model.ts".into()]);
+        assert_eq!(
+            exports.exports_for(root.path()).unwrap().1[0].name,
+            "NewModel"
+        );
+
+        std::fs::remove_file(&file).unwrap();
+        exports.apply_changes(root.path(), &["model.ts".into()]);
+        assert!(exports.exports_for(root.path()).unwrap().1.is_empty());
     }
 }
 
@@ -106,6 +168,39 @@ pub(super) fn typescript_completions(
     let index = DocumentIndex::parse(path, text);
     let insertion = import_insertion_point(&index, script_insertion_line);
     let mut items = BTreeMap::new();
+    if is_this_member_access(text, line, character, &prefix) {
+        for member in index
+            .local_type_members()
+            .filter(|member| member.name.starts_with(&prefix))
+        {
+            items
+                .entry(member.name.clone())
+                .or_insert_with(|| LspCompletionItem {
+                    label: member.name.clone(),
+                    detail: Some("method".into()),
+                    insert_text: member.name.clone(),
+                    is_snippet: false,
+                    sort_text: Some(member.name.clone()),
+                    additional_edits: Vec::new(),
+                    replace_from: None,
+                    kind: Some(2),
+                });
+        }
+    }
+    for name in string_member_completions(text, line, character, &prefix) {
+        items
+            .entry(name.to_owned())
+            .or_insert_with(|| LspCompletionItem {
+                label: name.to_owned(),
+                detail: Some("method - String".into()),
+                insert_text: name.to_owned(),
+                is_snippet: false,
+                sort_text: Some(name.to_owned()),
+                additional_edits: Vec::new(),
+                replace_from: None,
+                kind: Some(2),
+            });
+    }
     if character > 0
         && let Some(symbol) = index.symbol_at(line, character - 1)
         && symbol.name.starts_with(&prefix)
@@ -323,6 +418,82 @@ fn framework_component_completions<'a>(
         .filter(|name| name.starts_with(prefix))
         .map(|name| (name, package))
         .collect()
+}
+
+fn string_member_completions<'a>(
+    text: &str,
+    line: usize,
+    character: usize,
+    prefix: &str,
+) -> Vec<&'a str> {
+    let Some(line_text) = text.lines().nth(line) else {
+        return Vec::new();
+    };
+    let before = line_text.get(..character).unwrap_or(line_text);
+    let Some(receiver) = before
+        .strip_suffix(prefix)
+        .and_then(|before_prefix| before_prefix.strip_suffix('.'))
+        .and_then(|before_dot| {
+            before_dot
+                .rsplit(|ch: char| !is_typescript_identifier_char(ch))
+                .next()
+        })
+        .filter(|receiver| !receiver.is_empty())
+    else {
+        return Vec::new();
+    };
+    let typed_receiver = [format!("{receiver}: string"), format!("{receiver}: String")];
+    if !typed_receiver
+        .iter()
+        .any(|annotation| text.contains(annotation))
+    {
+        return Vec::new();
+    }
+    [
+        "at",
+        "charAt",
+        "charCodeAt",
+        "codePointAt",
+        "concat",
+        "endsWith",
+        "includes",
+        "indexOf",
+        "lastIndexOf",
+        "localeCompare",
+        "match",
+        "matchAll",
+        "normalize",
+        "padEnd",
+        "padStart",
+        "repeat",
+        "replace",
+        "replaceAll",
+        "search",
+        "slice",
+        "split",
+        "startsWith",
+        "substring",
+        "toLocaleLowerCase",
+        "toLocaleUpperCase",
+        "toLowerCase",
+        "toString",
+        "toUpperCase",
+        "trim",
+        "trimEnd",
+        "trimStart",
+        "valueOf",
+    ]
+    .into_iter()
+    .filter(|name| name.starts_with(prefix))
+    .collect()
+}
+
+fn is_this_member_access(text: &str, line: usize, character: usize, prefix: &str) -> bool {
+    text.lines()
+        .nth(line)
+        .and_then(|line_text| line_text.get(..character))
+        .and_then(|before| before.strip_suffix(prefix))
+        .is_some_and(|before| before.ends_with("this."))
 }
 
 fn is_source_path(path: &str) -> bool {

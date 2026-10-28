@@ -10,6 +10,7 @@ pub mod clipboard;
 pub mod commands;
 pub mod composition;
 pub mod dap;
+pub mod dart;
 pub mod disk;
 pub mod document;
 pub mod edit;

@@ -225,7 +225,7 @@ impl SyntaxLanguage {
             Self::Make => tree_sitter_make::HIGHLIGHTS_QUERY,
             Self::Ini => tree_sitter_ini::HIGHLIGHTS_QUERY,
             Self::PowerShell => tree_sitter_powershell::HIGHLIGHTS_QUERY,
-            Self::Dart => tree_sitter_dart::HIGHLIGHTS_QUERY,
+            Self::Dart => dart_highlights(),
             Self::R => tree_sitter_r::HIGHLIGHTS_QUERY,
         }
     }
@@ -502,12 +502,30 @@ fn rust_highlights() -> &'static str {
     })
 }
 
+/// The bundled Dart query leaves declaration modifiers unscoped. Add them
+/// explicitly so `final` and related modifiers use the keyword color.
+fn dart_highlights() -> &'static str {
+    static QUERY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    QUERY.get_or_init(|| {
+        format!(
+            "{}\n[\"final\" \"const\" \"late\" \"var\"] @keyword\n",
+            tree_sitter_dart::HIGHLIGHTS_QUERY
+        )
+    })
+}
+
 // These two grammar crates do not export their upstream query. Keep a small,
 // self-contained equivalent here rather than depending on Cargo registry paths.
 const TYPESCRIPT_HIGHLIGHTS: &str = r#"
 (comment) @comment
 (type_identifier) @type
 (predefined_type) @type
+(class_declaration name: (type_identifier) @type)
+(interface_declaration name: (type_identifier) @type)
+(type_alias_declaration name: (type_identifier) @type)
+(enum_declaration name: (identifier) @type)
+((identifier) @type (#any-of? @type "Array" "Boolean" "Date" "Error" "JSON" "Map" "Math" "Number" "Object" "Promise" "Record" "RegExp" "Set" "String" "Symbol" "WeakMap" "WeakSet"))
+((member_expression object: (identifier) @type) (#match? @type "^[A-Z]"))
 [
   (string)
   (template_string)
@@ -519,10 +537,11 @@ const TYPESCRIPT_HIGHLIGHTS: &str = r#"
 (call_expression function: (member_expression property: (property_identifier) @function))
 (function_declaration name: (identifier) @function)
 (method_definition name: (property_identifier) @function)
+(method_signature name: (property_identifier) @function)
 (function_expression name: (identifier) @function)
 (arrow_function) @function
 [(this) (this_type)] @variable.builtin
-(undefined) @constant
+[(true) (false) (null) (undefined)] @constant
 (identifier) @variable
 [
   "async" "await" "break" "case" "catch" "class" "const" "continue"
@@ -791,6 +810,8 @@ pub fn style_runs_for_viewport(
 fn highlight_priority(scope: HighlightScope) -> u8 {
     match scope {
         HighlightScope::Variable => 0,
+        HighlightScope::Property => 1,
+        HighlightScope::Function | HighlightScope::FunctionBuiltin | HighlightScope::Type => 2,
         _ => 1,
     }
 }
@@ -1954,6 +1975,21 @@ mod tests {
     }
 
     #[test]
+    fn every_bundled_highlight_query_has_a_theme_scope() {
+        for language in SyntaxLanguage::ALL {
+            let query = language.compile_highlights().unwrap();
+            assert!(
+                query
+                    .capture_names()
+                    .iter()
+                    .any(|capture| HighlightScope::from_capture(capture).is_some()),
+                "{} has no captures mapped to the shared theme palette",
+                language.name()
+            );
+        }
+    }
+
+    #[test]
     fn capture_names_map_to_stable_theme_scopes() {
         assert_eq!(
             HighlightScope::from_capture("keyword.control"),
@@ -2069,6 +2105,82 @@ mod tests {
         }
 
         assert_eq!(private_fields, 2);
+    }
+
+    #[test]
+    fn typescript_final_runs_keep_types_functions_and_properties_colored() {
+        let language = SyntaxLanguage::TypeScript;
+        let source = "class Session {\n  save(value: string) { return JSON.stringify({ value, active: true }); }\n}\nconst session = new Session();\nsession.save(Object.create(null));\nCdnHelper.generatedUrlsIndexed(session);\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let doc = Document::from_text(source);
+        let runs = style_runs_for_viewport(&doc, &tree, language, 0, 5);
+        let scope_at = |offset: usize| {
+            let prefix = &source[..offset];
+            let line = prefix.bytes().filter(|byte| *byte == b'\n').count();
+            let column = prefix
+                .rsplit_once('\n')
+                .map_or(prefix.len(), |(_, tail)| tail.len());
+            runs.iter()
+                .filter(|run| run.line == line && run.start <= column && column < run.end)
+                // Renderer applies runs in order; the final overlapping run
+                // supplies the visible semantic color.
+                .last()
+                .map(|run| run.scope)
+        };
+        assert!(runs.iter().any(|run| run.scope == HighlightScope::Type));
+        assert!(runs.iter().any(|run| run.scope == HighlightScope::Function));
+        assert!(runs.iter().any(|run| run.scope == HighlightScope::Property));
+        assert_eq!(
+            scope_at(source.find("JSON").unwrap()),
+            Some(HighlightScope::Type)
+        );
+        assert_eq!(
+            scope_at(source.find("Object").unwrap()),
+            Some(HighlightScope::Type)
+        );
+        assert_eq!(
+            scope_at(source.find("CdnHelper").unwrap()),
+            Some(HighlightScope::Type)
+        );
+    }
+
+    #[test]
+    fn typescript_methods_and_boolean_literals_use_semantic_scopes() {
+        let language = SyntaxLanguage::TypeScript;
+        let source = "Object.defineProperty(target, key, {\n  get() { return true; },\n  set(value) { return false; },\n  serialize() { return true; },\n  hydrate(value) { return false; },\n  enumerable: true,\n  configurable: false,\n});\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let doc = Document::from_text(source);
+        let runs = style_runs_for_viewport(&doc, &tree, language, 0, 6);
+        let scope_at = |needle: &str, occurrence: usize| {
+            let offset = source.match_indices(needle).nth(occurrence).unwrap().0;
+            let prefix = &source[..offset];
+            let line = prefix.bytes().filter(|byte| *byte == b'\n').count();
+            let column = prefix
+                .rsplit_once('\n')
+                .map_or(prefix.len(), |(_, tail)| tail.len());
+            runs.iter()
+                .filter(|run| run.line == line && run.start <= column && column < run.end)
+                .last()
+                .map(|run| run.scope)
+        };
+
+        for (needle, occurrence, expected) in [
+            ("serialize", 0, HighlightScope::Function),
+            ("hydrate", 0, HighlightScope::Function),
+            ("true", 0, HighlightScope::Constant),
+            ("false", 0, HighlightScope::Constant),
+            ("enumerable", 0, HighlightScope::Property),
+        ] {
+            assert_eq!(
+                scope_at(needle, occurrence),
+                Some(expected),
+                "{needle}: {runs:?}"
+            );
+        }
     }
 
     #[test]

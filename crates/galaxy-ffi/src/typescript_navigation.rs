@@ -222,6 +222,17 @@ pub(super) fn typescript_import_target(
             uri: file_uri(&path),
             range: typescript_range(declaration.range),
         })
+        .or_else(|| {
+            cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .index(&target_path)
+                .and_then(|index| index.unique_runtime_declaration(imported_name).cloned())
+                .map(|declaration| LspDefinitionLocation {
+                    uri: file_uri(&target_path),
+                    range: typescript_range(declaration.range),
+                })
+        })
         .unwrap_or_else(|| module_root_location(&target_path));
     Some((location, occurrences.occurrences))
 }
@@ -442,6 +453,8 @@ pub(super) fn resolve_typescript_type_member_target(
         }
         member_target @ (TypeMemberTarget::Imported(range)
         | TypeMemberTarget::ImportedValue(range)
+        | TypeMemberTarget::ImportedClass(range)
+        | TypeMemberTarget::ImportedFactory(range)
         | TypeMemberTarget::SuperImported(range)) => {
             let (import, binding) = index.import_binding_by_range(*range)?;
             let imported_name = binding.imported_name.as_deref()?;
@@ -463,13 +476,54 @@ pub(super) fn resolve_typescript_type_member_target(
                 Path::new(importer_path),
                 &import.specifier,
             )?;
-            let (path, declaration) = if is_type {
-                resolve_typescript_type_export(cache, target, imported_name)?
-            } else {
-                resolve_typescript_export(cache, target, imported_name)?
-            };
+            let (path, declaration) =
+                if matches!(member_target, TypeMemberTarget::ImportedFactory(_)) {
+                    let mut module = resolve_typescript_definition_import(
+                        cache,
+                        Path::new(importer_path),
+                        &import.specifier,
+                    )?;
+                    let mut module_index = cache
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .index(&module)?;
+                    while module_index.default_export_factory_import().is_none() {
+                        let specifier = module_index.default_export_reexport_specifier()?;
+                        module = resolve_typescript_definition_import(cache, &module, specifier)?;
+                        module_index = cache
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .index(&module)?;
+                    }
+                    let (factory_import, factory_binding) =
+                        module_index.default_export_factory_import()?;
+                    let factory_target = resolve_typescript_definition_import(
+                        cache,
+                        &module,
+                        &factory_import.specifier,
+                    )?;
+                    resolve_typescript_export(
+                        cache,
+                        factory_target,
+                        factory_binding.imported_name.as_deref()?,
+                    )?
+                } else if is_type {
+                    resolve_typescript_type_export(cache, target, imported_name)?
+                } else {
+                    resolve_typescript_export(cache, target, imported_name)?
+                };
             if matches!(member_target, TypeMemberTarget::ImportedValue(_))
                 && declaration.kind != DeclarationKind::Enum
+            {
+                return None;
+            }
+            if matches!(member_target, TypeMemberTarget::ImportedClass(_))
+                && declaration.kind != DeclarationKind::Class
+            {
+                return None;
+            }
+            if matches!(member_target, TypeMemberTarget::ImportedFactory(_))
+                && declaration.kind != DeclarationKind::Class
             {
                 return None;
             }

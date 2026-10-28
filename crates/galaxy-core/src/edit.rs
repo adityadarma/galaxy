@@ -503,10 +503,7 @@ pub fn toggle_comment(doc: &Document, sel: &SelectionSet, marker: &str) -> Trans
         .min()
         .unwrap_or(0);
     let all_commented = texts.iter().all(|text| {
-        text.trim().is_empty()
-            || text
-                .trim_start_matches([' ', '\t'])
-                .starts_with(marker)
+        text.trim().is_empty() || text.trim_start_matches([' ', '\t']).starts_with(marker)
     });
     let changes = lines
         .into_iter()
@@ -520,8 +517,8 @@ pub fn toggle_comment(doc: &Document, sel: &SelectionSet, marker: &str) -> Trans
             let at = start + marker_indent;
             if all_commented {
                 let rest = &text[marker_indent..];
-                let remove = marker.chars().count()
-                    + usize::from(rest.starts_with(&format!("{marker} ")));
+                let remove =
+                    marker.chars().count() + usize::from(rest.starts_with(&format!("{marker} ")));
                 Some(Change::delete(at, at + remove))
             } else {
                 Some(Change::insert(start + indent, format!("{marker} ")))

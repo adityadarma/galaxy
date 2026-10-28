@@ -893,6 +893,7 @@ enum FileGlyph {
         case "php", "phtml": ("php", "doc", .labelColor)
         case "blade.php": ("laravel", "doc", .labelColor)
         case "rs": ("rust", "gearshape.fill", .labelColor)
+        case "dart": ("dart", "doc", .labelColor)
         case "swift": ("swift", "swift", .labelColor)
         case "md", "markdown": ("markdown", "info.circle.fill", .labelColor)
         case "json": ("json", "curlybraces", .labelColor)

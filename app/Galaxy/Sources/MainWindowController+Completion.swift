@@ -33,7 +33,16 @@ extension MainWindowController {
         (path as NSString).lastPathComponent.lowercased().hasSuffix(".go")
     }
 
-    func requestCompletionIfNeeded(force: Bool = false) {
+    func requestCompletionIfNeeded(force: Bool = false, debounced: Bool = false) {
+        completionRequestItem?.cancel()
+        if !force, !debounced {
+            let item = DispatchWorkItem { [weak self] in
+                self?.requestCompletionIfNeeded(debounced: true)
+            }
+            completionRequestItem = item
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: item)
+            return
+        }
         guard let document = activeTab?.doc else { return }
         // Completion owns the space below the caret. Cancel the old hover so
         // its asynchronous refresh cannot cover the suggestion list.
@@ -68,9 +77,15 @@ extension MainWindowController {
             return
         }
         localCompletionItems = nil
-        bridge.requestCompletion(document: document, line: position.line, character: position.colUtf16)
+        // Read snippet metadata before scheduling native completion. Both cross
+        // the same Rust document handle; running them concurrently corrupts the
+        // UniFFI return buffer while typing.
         snippetCompletionItems = prefix.isEmpty ? [] : bridge.snippetCompletions(document: document)
             .filter { $0.label.lowercased().hasPrefix(prefix.lowercased()) }
+        let requestStarted = DispatchTime.now().uptimeNanoseconds
+        bridge.requestCompletion(document: document, line: position.line, character: position.colUtf16)
+        let requestElapsed = Double(DispatchTime.now().uptimeNanoseconds - requestStarted) / 1_000_000
+        Log.ui.debug("completion_dispatch_ms=\(requestElapsed, privacy: .public)")
         refreshCompletion()
     }
 
@@ -104,7 +119,10 @@ extension MainWindowController {
             return
         }
         suggestRetryUntil = nil
+        let rankingStarted = DispatchTime.now().uptimeNanoseconds
         completionPopup.update(items, query: completionQuery)
+        let rankingElapsed = Double(DispatchTime.now().uptimeNanoseconds - rankingStarted) / 1_000_000
+        Log.ui.debug("completion_popup_ms=\(rankingElapsed, privacy: .public) items=\(items.count, privacy: .public)")
         if completionPopup.isHidden { return }
         let prefixColumn = completionPosition.colUtf16 >= UInt64(completionQuery.utf16.count)
             ? completionPosition.colUtf16 - UInt64(completionQuery.utf16.count) : 0
@@ -124,6 +142,8 @@ extension MainWindowController {
     }
 
     func closeCompletion() {
+        completionRequestItem?.cancel()
+        completionRequestItem = nil
         completionPopup.isHidden = true
         completionDismissed = true
         suggestRetryUntil = nil

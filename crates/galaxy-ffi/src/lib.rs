@@ -20,6 +20,7 @@ use galaxy_core::analysis::{
 use galaxy_core::change::{Change, ChangeSet};
 use galaxy_core::clipboard;
 use galaxy_core::commands::{self, CommandRegistry};
+use galaxy_core::dart::{self, DartEngine};
 use galaxy_core::disk::{DiskCheck, DiskStamp};
 use galaxy_core::document::{Document, Encoding, LineEnding};
 use galaxy_core::edit::{self, IndentConfig};
@@ -443,6 +444,11 @@ pub struct Core {
     go: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<GoEngine>>>>>,
     /// Built-in Rust engines, one per Cargo project root.
     rust: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<RustEngine>>>>>,
+    /// Built-in Dart engines, one per Flutter/Dart package root.
+    dart: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<DartEngine>>>>>,
+    /// Roots with a snapshot rebuild in flight. Watcher batches are coalesced
+    /// here so completion only reads installed in-memory indexes.
+    indexing_roots: Arc<Mutex<HashMap<PathBuf, bool>>>,
     /// Open files handled by built-in analysis, whether or not a language
     /// server serves them.
     php_documents: Mutex<HashMap<String, std::sync::Weak<DocumentHandle>>>,
@@ -457,6 +463,8 @@ pub struct Core {
     /// the parsed source, so repeating that work from the UI's 100 ms poll
     /// makes a newly navigated-to file stall scrolling.
     rust_checked: Mutex<HashMap<String, u64>>,
+    /// Per open Dart file: buffer revision last checked for diagnostics.
+    dart_checked: Mutex<HashMap<String, u64>>,
     /// Parsed disk documents and successful module resolutions used by TypeScript navigation.
     typescript_navigation: Arc<Mutex<TypeScriptNavigationCache>>,
     /// Parsed direct exports from visible workspace TypeScript sources.
@@ -471,10 +479,13 @@ impl Default for Core {
             php: Arc::new(Mutex::new(HashMap::new())),
             go: Arc::new(Mutex::new(HashMap::new())),
             rust: Arc::new(Mutex::new(HashMap::new())),
+            dart: Arc::new(Mutex::new(HashMap::new())),
+            indexing_roots: Arc::new(Mutex::new(HashMap::new())),
             php_documents: Mutex::new(HashMap::new()),
             php_checked: Mutex::new(HashMap::new()),
             typescript_checked: Mutex::new(HashMap::new()),
             rust_checked: Mutex::new(HashMap::new()),
+            dart_checked: Mutex::new(HashMap::new()),
             typescript_navigation: Arc::new(Mutex::new(TypeScriptNavigationCache::default())),
             typescript_workspace_exports: Arc::new(Mutex::new(
                 TypeScriptWorkspaceExports::default(),
@@ -686,6 +697,10 @@ impl Core {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.indexing_roots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(ws.root().to_path_buf(), false);
         spawn_workspace_indexing(
             ws.clone(),
             Arc::clone(&self.analysis),
@@ -694,12 +709,156 @@ impl Core {
             Arc::clone(&self.go),
             Arc::clone(&self.php),
             Arc::clone(&self.rust),
+            Arc::clone(&self.dart),
+            Arc::clone(&self.indexing_roots),
             self.listener
                 .read()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
         );
         Ok(Arc::new(Workspace { inner: ws }))
+    }
+
+    /// Rebuilds built-in indexes after a workspace watcher batch. The worker
+    /// atomically installs a new snapshot while requests use the old one.
+    pub fn refresh_workspace_indexes(&self, root: String) {
+        let root = PathBuf::from(root);
+        {
+            let mut indexing = self
+                .indexing_roots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(dirty) = indexing.get_mut(&root) {
+                *dirty = true;
+                return;
+            }
+            indexing.insert(root.clone(), false);
+        }
+        let workspace = match CoreWorkspace::open(root.clone()) {
+            Ok(workspace) => workspace,
+            Err(_) => {
+                self.indexing_roots
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&root);
+                return;
+            }
+        };
+        spawn_workspace_indexing(
+            workspace,
+            Arc::clone(&self.analysis),
+            Arc::clone(&self.typescript_navigation),
+            Arc::clone(&self.typescript_workspace_exports),
+            Arc::clone(&self.go),
+            Arc::clone(&self.php),
+            Arc::clone(&self.rust),
+            Arc::clone(&self.dart),
+            Arc::clone(&self.indexing_roots),
+            self.listener
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        );
+    }
+
+    /// Applies a source-only watcher batch directly to Dart/Rust/TypeScript indexes.
+    /// Mixed-language batches fall back to the full snapshot lifecycle because
+    /// they may change module, package, or framework resolution.
+    pub fn apply_workspace_changes(&self, root: String, paths: Vec<String>, rescan: bool) {
+        let root = PathBuf::from(root);
+        let source_only = !rescan
+            && !paths.is_empty()
+            && paths.iter().all(|path| {
+                let path = Path::new(path);
+                matches!(
+                    path.extension().and_then(|extension| extension.to_str()),
+                    Some("dart" | "rs")
+                ) || is_typescript_path(path)
+            });
+        if !source_only {
+            self.refresh_workspace_indexes(root.to_string_lossy().into_owned());
+            return;
+        }
+        {
+            let mut indexing = self
+                .indexing_roots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(dirty) = indexing.get_mut(&root) {
+                *dirty = true;
+                return;
+            }
+        }
+        let paths: Vec<PathBuf> = paths.into_iter().map(|path| root.join(path)).collect();
+        let dart_paths: Vec<PathBuf> = paths
+            .iter()
+            .filter(|path| {
+                path.extension().and_then(|extension| extension.to_str()) == Some("dart")
+            })
+            .cloned()
+            .collect();
+        let rust_paths: Vec<PathBuf> = paths
+            .iter()
+            .filter(|path| path.extension().and_then(|extension| extension.to_str()) == Some("rs"))
+            .cloned()
+            .collect();
+        let typescript_paths: Vec<String> = paths
+            .iter()
+            .filter_map(|path| path.strip_prefix(&root).ok())
+            .filter(|path| is_typescript_path(path))
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+            .collect();
+        let dart = Arc::clone(&self.dart);
+        let rust = Arc::clone(&self.rust);
+        let typescript_exports = Arc::clone(&self.typescript_workspace_exports);
+        let _ = std::thread::Builder::new()
+            .name("workspace-index-delta".into())
+            .spawn(move || {
+                let started = Instant::now();
+                if !dart_paths.is_empty()
+                    && let Some(engine) = dart
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&root)
+                        .cloned()
+                {
+                    let _ = engine
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .apply_disk_changes(&root, &dart_paths);
+                }
+                let mut rust_by_project: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
+                for path in rust_paths {
+                    rust_by_project
+                        .entry(rust::project_root(&path))
+                        .or_default()
+                        .push(path);
+                }
+                for (project, paths) in rust_by_project {
+                    if let Some(engine) = rust
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&project)
+                        .cloned()
+                    {
+                        let _ = engine
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .apply_disk_changes(&paths);
+                    }
+                }
+                if !typescript_paths.is_empty() {
+                    typescript_exports
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .apply_changes(&root, &typescript_paths);
+                }
+                tracing::debug!(
+                    root = %root.display(),
+                    ms = started.elapsed().as_millis() as u64,
+                    "applied built-in workspace index delta"
+                );
+            });
     }
 
     pub fn open_document(&self, path: String) -> Result<Arc<DocumentHandle>, CoreError> {
@@ -736,6 +895,7 @@ impl Core {
             || is_blade_path(path)
             || is_go_path(path)
             || is_rust_path(path)
+            || is_dart_path(path)
             || is_typescript_path(path))
         {
             return false;
@@ -771,6 +931,10 @@ impl Core {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&uri);
+                self.dart_checked
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&uri);
             }
             open.iter()
                 .filter_map(|(uri, weak)| Some((uri.clone(), weak.upgrade()?)))
@@ -778,6 +942,7 @@ impl Core {
         };
         self.check_php(&mut analysis, &documents);
         self.check_rust(&mut analysis, &documents);
+        self.check_dart(&mut analysis, &documents);
         self.check_typescript(&mut analysis, &documents);
         for (uri, document) in &documents {
             let diagnostics = analysis
@@ -856,6 +1021,30 @@ impl Core {
                 .set_hover(&uri, hover);
             return answered;
         }
+        if is_dart_path(Path::new(&path)) {
+            let text = document.lock().editor.doc.text();
+            let hover = self
+                .dart_engine(Path::new(&path))
+                .and_then(|engine| {
+                    let engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                    engine.hover(Path::new(&path), &text, line as u32, character as u32)
+                })
+                .map(|found| LspHoverInfo {
+                    contents: found.markdown,
+                    range: Some(LspRange {
+                        start_line: u64::from(found.line),
+                        start_character: u64::from(found.start_column),
+                        end_line: u64::from(found.line),
+                        end_character: u64::from(found.end_column),
+                    }),
+                });
+            let answered = hover.is_some();
+            self.analysis
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_hover(&uri, hover);
+            return answered;
+        }
         let engine = if is_rust_path(Path::new(&path)) {
             self.rust_engine(Path::new(&path)).map(Engine::Rust)
         } else if is_go_path(Path::new(&path)) {
@@ -910,50 +1099,89 @@ impl Core {
         line: u64,
         character: u64,
     ) -> bool {
+        // Completion runs away from the UI thread. Do not let an older request
+        // replace the cache after the document has changed underneath it.
+        let revision = document.revision();
         let path = document.path();
         if path.is_empty() {
             return false;
         }
         let uri = file_uri(Path::new(&path));
         if is_typescript_path(Path::new(&path)) || is_component_path(Path::new(&path)) {
-            let text = document.lock().editor.doc.text();
-            let Some(source) = component_script_source(&path, &text, line as usize) else {
+            // Completion sees source between keystrokes, including incomplete
+            // member expressions. Keep every TypeScript preparation step inside
+            // the FFI panic boundary so such input cannot crash Swift.
+            let completion = catch_unwind(AssertUnwindSafe(|| {
+                let text = document.lock().editor.doc.text();
+                let source = component_script_source(&path, &text, line as usize)?;
+                let script_insertion_line =
+                    component_script_insertion_line(&path, &text, line as usize).unwrap_or(0);
+                let index_path = if is_component_path(Path::new(&path)) {
+                    format!("{path}.ts")
+                } else {
+                    path.clone()
+                };
+                let component_extension = is_component_path(Path::new(&path))
+                    .then(|| {
+                        Path::new(&path)
+                            .extension()
+                            .and_then(|extension| extension.to_str())
+                    })
+                    .flatten();
+                let exports = self
+                    .typescript_workspace_exports
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                Some(typescript_completions(
+                    &index_path,
+                    &uri,
+                    &source,
+                    line as usize,
+                    character as usize,
+                    &exports,
+                    &self.typescript_navigation,
+                    script_insertion_line,
+                    component_extension,
+                ))
+            }))
+            .ok()
+            .flatten();
+            let Some(items) = completion else {
                 return false;
             };
-            let script_insertion_line =
-                component_script_insertion_line(&path, &text, line as usize).unwrap_or(0);
-            let index_path = if is_component_path(Path::new(&path)) {
-                format!("{path}.ts")
-            } else {
-                path.clone()
-            };
-            let component_extension = is_component_path(Path::new(&path))
-                .then(|| {
-                    Path::new(&path)
-                        .extension()
-                        .and_then(|extension| extension.to_str())
-                })
-                .flatten();
-            let exports = self
-                .typescript_workspace_exports
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let items = typescript_completions(
-                &index_path,
-                &uri,
-                &source,
-                line as usize,
-                character as usize,
-                &exports,
-                &self.typescript_navigation,
-                script_insertion_line,
-                component_extension,
-            );
             let answered = !items.is_empty();
-            self.analysis
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .set_completion(&uri, items);
+            if document.revision() == revision {
+                self.analysis
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .set_completion(&uri, items);
+            }
+            return answered;
+        }
+        if is_dart_path(Path::new(&path)) {
+            let text = document.lock().editor.doc.text();
+            let items: Vec<LspCompletionItem> = self
+                .dart_engine(Path::new(&path))
+                .map(|engine| {
+                    let engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                    engine
+                        .is_ready()
+                        .then(|| {
+                            engine.complete(Path::new(&path), &text, line as u32, character as u32)
+                        })
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default()
+                .into_iter()
+                .map(php_completion_item)
+                .collect();
+            let answered = !items.is_empty();
+            if document.revision() == revision {
+                self.analysis
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .set_completion(&uri, items);
+            }
             return answered;
         }
         let engine = if is_rust_path(Path::new(&path)) {
@@ -969,10 +1197,12 @@ impl Core {
             let items: Vec<LspCompletionItem> =
                 found.into_iter().map(php_completion_item).collect();
             let answered = !items.is_empty();
-            self.analysis
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .set_completion(&uri, items);
+            if document.revision() == revision {
+                self.analysis
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .set_completion(&uri, items);
+            }
             return answered;
         }
         false
@@ -1081,6 +1311,9 @@ impl Core {
         if is_rust_path(Path::new(&path)) {
             return self.rust_definition(&document, &uri, line, character);
         }
+        if is_dart_path(Path::new(&path)) {
+            return self.dart_definition(&document, &uri, line, character);
+        }
         self.php_definition(&document, &uri, line, character)
     }
 
@@ -1144,6 +1377,9 @@ impl Core {
         if is_typescript_path(Path::new(&path)) {
             return self.typescript_references(&document, &uri, line, character);
         }
+        if is_dart_path(Path::new(&path)) {
+            return self.dart_references(&document, &uri, line, character);
+        }
         self.php_references(&document, &uri, line, character)
     }
 
@@ -1180,6 +1416,9 @@ impl Core {
         let uri = file_uri(Path::new(&path));
         if is_typescript_path(Path::new(&path)) {
             return self.typescript_rename(&document, &uri, line, character, &new_name);
+        }
+        if is_dart_path(Path::new(&path)) {
+            return self.dart_rename(&document, &uri, line, character, &new_name);
         }
         self.php_rename(&document, &uri, line, character, &new_name)
     }
@@ -1304,6 +1543,28 @@ impl Core {
                 .iter()
                 .map(|declaration| typescript_outline_symbol(declaration, &uri))
                 .collect::<Vec<_>>();
+            let answered = !symbols.is_empty();
+            self.analysis
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_document_symbols(&uri, symbols);
+            return answered;
+        }
+        if is_dart_path(Path::new(&path)) {
+            let text = document.lock().editor.doc.text();
+            let symbols: Vec<galaxy_core::analysis::DocumentSymbolInfo> = self
+                .dart_engine(Path::new(&path))
+                .map(|engine| {
+                    let engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                    engine
+                        .is_ready()
+                        .then(|| engine.outline(Path::new(&path), &text))
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default()
+                .iter()
+                .map(|symbol| php_outline_symbol(symbol, &uri))
+                .collect();
             let answered = !symbols.is_empty();
             self.analysis
                 .lock()
@@ -1768,6 +2029,28 @@ impl Core {
         Some(engine)
     }
 
+    fn dart_engine(&self, path: &Path) -> Option<Arc<Mutex<DartEngine>>> {
+        if !is_dart_path(path) {
+            return None;
+        }
+        let root = dart::project_root(path);
+        let (engine, fresh) = {
+            let mut engines = self.dart.lock().unwrap_or_else(|e| e.into_inner());
+            match engines.get(&root) {
+                Some(engine) => (engine.clone(), false),
+                None => {
+                    let engine = Arc::new(Mutex::new(DartEngine::pending(&root)));
+                    engines.insert(root.clone(), engine.clone());
+                    (engine, true)
+                }
+            }
+        };
+        if fresh {
+            spawn_dart_index(&engine, &root);
+        }
+        Some(engine)
+    }
+
     fn release_rust_buffer(&self, uri: &str) {
         let Some(path) = uri.strip_prefix("file://") else {
             return;
@@ -1830,6 +2113,68 @@ impl Core {
                 .collect();
             analysis.set_diagnostics(uri, diagnostics);
             self.rust_checked
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(uri.clone(), revision);
+        }
+    }
+
+    fn check_dart(
+        &self,
+        analysis: &mut BuiltinStore,
+        documents: &HashMap<String, Arc<DocumentHandle>>,
+    ) {
+        for (uri, document) in documents {
+            let path = document.path();
+            if !is_dart_path(Path::new(&path)) {
+                continue;
+            }
+            let revision = document.revision();
+            if self
+                .dart_checked
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(uri)
+                .is_some_and(|checked| *checked == revision)
+            {
+                continue;
+            }
+            let Some(engine) = self.dart_engine(Path::new(&path)) else {
+                continue;
+            };
+            let text = document.lock().editor.doc.text();
+            let diagnostics = engine
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .diagnostics(Path::new(&path), &text)
+                .into_iter()
+                .map(|problem| galaxy_core::analysis::Diagnostic {
+                    uri: uri.clone(),
+                    range: LspRange {
+                        start_line: u64::from(problem.start_line),
+                        start_character: u64::from(problem.start_column),
+                        end_line: u64::from(problem.end_line),
+                        end_character: u64::from(problem.end_column),
+                    },
+                    severity: match problem.severity {
+                        galaxy_core::lang::Severity::Error => {
+                            galaxy_core::analysis::DiagnosticSeverity::Error
+                        }
+                        galaxy_core::lang::Severity::Warning => {
+                            galaxy_core::analysis::DiagnosticSeverity::Warning
+                        }
+                        galaxy_core::lang::Severity::Hint => {
+                            galaxy_core::analysis::DiagnosticSeverity::Hint
+                        }
+                    },
+                    message: problem.message,
+                    source: Some("galaxy".into()),
+                    code: None,
+                    unnecessary: problem.unnecessary,
+                })
+                .collect();
+            analysis.set_diagnostics(uri, diagnostics);
+            self.dart_checked
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .insert(uri.clone(), revision);
@@ -2311,6 +2656,12 @@ impl Core {
             .map(|(target, _)| vec![target])
             .unwrap_or_default();
         }
+        if locations.is_empty()
+            && let Some(location) =
+                ecmascript_primitive_type_definition(&text, line as usize, character as usize)
+        {
+            locations.push(location);
+        }
         if locations.is_empty() {
             locations = index
                 .symbol_at(line as usize, character as usize)
@@ -2473,6 +2824,12 @@ impl Core {
                 },
             });
         }
+        if locations.is_empty()
+            && let Some(location) =
+                ecmascript_builtin_definition(&text, line as usize, character as usize)
+        {
+            locations.push(location);
+        }
         let found = !locations.is_empty();
         self.analysis
             .lock()
@@ -2526,6 +2883,46 @@ impl Core {
         found
     }
 
+    fn dart_references(
+        &self,
+        document: &Arc<DocumentHandle>,
+        uri: &str,
+        line: u64,
+        character: u64,
+    ) -> bool {
+        let path = document.path();
+        let text = document.lock().editor.doc.text();
+        let locations: Vec<LspDefinitionLocation> = self
+            .dart_engine(Path::new(&path))
+            .map(|engine| {
+                let engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                engine
+                    .is_ready()
+                    .then(|| {
+                        engine.references(Path::new(&path), &text, line as u32, character as u32)
+                    })
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .map(|found| LspDefinitionLocation {
+                uri: file_uri(&found.path),
+                range: LspRange {
+                    start_line: u64::from(found.line),
+                    start_character: u64::from(found.start_column),
+                    end_line: u64::from(found.line),
+                    end_character: u64::from(found.end_column),
+                },
+            })
+            .collect();
+        let answered = !locations.is_empty();
+        self.analysis
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_references(uri, locations);
+        answered
+    }
+
     fn typescript_rename(
         &self,
         document: &Arc<DocumentHandle>,
@@ -2560,6 +2957,56 @@ impl Core {
             .unwrap_or_else(|e| e.into_inner())
             .set_rename_edits(uri, edits);
         found
+    }
+
+    fn dart_rename(
+        &self,
+        document: &Arc<DocumentHandle>,
+        uri: &str,
+        line: u64,
+        character: u64,
+        new_name: &str,
+    ) -> bool {
+        let path = document.path();
+        let text = document.lock().editor.doc.text();
+        let edits: Vec<LspRenameEdit> = self
+            .dart_engine(Path::new(&path))
+            .map(|engine| {
+                let engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                engine
+                    .is_ready()
+                    .then(|| {
+                        engine
+                            .rename(
+                                Path::new(&path),
+                                &text,
+                                line as u32,
+                                character as u32,
+                                new_name,
+                            )
+                            .unwrap_or_default()
+                    })
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .map(|found| LspRenameEdit {
+                uri: file_uri(&found.path),
+                range: LspRange {
+                    start_line: u64::from(found.line),
+                    start_character: u64::from(found.start_column),
+                    end_line: u64::from(found.line),
+                    end_character: u64::from(found.end_column),
+                },
+                new_text: new_name.to_owned(),
+            })
+            .collect();
+        let answered = !edits.is_empty();
+        self.analysis
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_rename_edits(uri, edits);
+        answered
     }
 
     /// Renames the PHP symbol at the cursor. `false` when the name is not
@@ -2687,6 +3134,40 @@ impl Core {
             .set_definitions(uri, locations);
         found
     }
+
+    fn dart_definition(
+        &self,
+        document: &Arc<DocumentHandle>,
+        uri: &str,
+        line: u64,
+        character: u64,
+    ) -> bool {
+        let path = document.path();
+        let Some(engine) = self.dart_engine(Path::new(&path)) else {
+            return false;
+        };
+        let text = document.lock().editor.doc.text();
+        let engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+        let locations = engine
+            .definition(Path::new(&path), &text, line as u32, character as u32)
+            .into_iter()
+            .map(|target| LspDefinitionLocation {
+                uri: file_uri(&target.path),
+                range: LspRange {
+                    start_line: u64::from(target.line),
+                    start_character: u64::from(target.column),
+                    end_line: u64::from(target.line),
+                    end_character: u64::from(target.column),
+                },
+            })
+            .collect::<Vec<_>>();
+        let found = !locations.is_empty();
+        self.analysis
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_definitions(uri, locations);
+        found
+    }
 }
 
 fn is_php_path(path: &Path) -> bool {
@@ -2698,9 +3179,222 @@ fn is_php_path(path: &Path) -> bool {
     name.ends_with(".php") && !name.ends_with(".blade.php")
 }
 
+const ECMASCRIPT_BUILTINS: &str = include_str!("../../galaxy-core/stubs/ecmascript.d.ts");
+
+fn ecmascript_builtin_definition(
+    text: &str,
+    line: usize,
+    character: usize,
+) -> Option<LspDefinitionLocation> {
+    let line_text = text.lines().nth(line)?;
+    let byte = line_text
+        .char_indices()
+        .map(|(byte, ch)| (byte, ch.len_utf16()))
+        .scan(0usize, |utf16, (byte, width)| {
+            let start = *utf16;
+            *utf16 += width;
+            Some((byte, start, *utf16))
+        })
+        .find(|(_, start, end)| *start <= character && character < *end)
+        .map(|(byte, _, _)| byte)
+        .unwrap_or(line_text.len());
+    let prefix_length = line_text[..byte]
+        .chars()
+        .rev()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>()
+        .len();
+    let start = byte.saturating_sub(prefix_length);
+    let end = line_text[byte..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .map(char::len_utf8)
+        .sum::<usize>()
+        + byte;
+    let token = &line_text[start..end];
+    let owner = line_text[..start].strip_suffix('.').and_then(|prefix| {
+        prefix
+            .chars()
+            .rev()
+            .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>()
+            .into()
+    });
+    let needle = match owner.as_deref() {
+        Some(owner)
+            if ecmascript_builtin_name(owner)
+                || ecmascript_builtin_receiver(text, line_text, owner) =>
+        {
+            [format!("  {token}("), format!("  {token}<")]
+                .into_iter()
+                .find(|needle| ECMASCRIPT_BUILTINS.contains(needle))?
+        }
+        None if ecmascript_primitive_type(token) => {
+            format!("interface {}", ecmascript_primitive_interface(token))
+        }
+        None if ecmascript_builtin_name(token) => ecmascript_declaration(token),
+        _ => return None,
+    };
+    let offset = ECMASCRIPT_BUILTINS.find(&needle)?;
+    let prefix = &ECMASCRIPT_BUILTINS[..offset];
+    let declaration_line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u64;
+    let declaration_column = prefix
+        .rsplit_once('\n')
+        .map_or(prefix.len(), |(_, tail)| tail.len())
+        + needle.find(token).unwrap_or(0);
+    Some(LspDefinitionLocation {
+        uri: file_uri(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../galaxy-core/stubs/ecmascript.d.ts"
+        ))),
+        range: LspRange {
+            start_line: declaration_line,
+            start_character: declaration_column as u64,
+            end_line: declaration_line,
+            end_character: declaration_column as u64 + token.len() as u64,
+        },
+    })
+}
+
+fn ecmascript_primitive_type_definition(
+    text: &str,
+    line: usize,
+    character: usize,
+) -> Option<LspDefinitionLocation> {
+    let location = ecmascript_builtin_definition(text, line, character)?;
+    let line_text = text.lines().nth(line)?;
+    let token = token_at_utf16_position(line_text, character)?;
+    ecmascript_primitive_type(token).then_some(location)
+}
+
+fn token_at_utf16_position(line_text: &str, character: usize) -> Option<&str> {
+    let byte = line_text
+        .char_indices()
+        .map(|(byte, ch)| (byte, ch.len_utf16()))
+        .scan(0usize, |utf16, (byte, width)| {
+            let start = *utf16;
+            *utf16 += width;
+            Some((byte, start, *utf16))
+        })
+        .find(|(_, start, end)| *start <= character && character < *end)
+        .map(|(byte, _, _)| byte)?;
+    let start = line_text[..byte]
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| !ch.is_ascii_alphanumeric() && *ch != '_')
+        .map_or(0, |(index, ch)| index + ch.len_utf8());
+    let end = line_text[byte..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .map(char::len_utf8)
+        .sum::<usize>()
+        + byte;
+    line_text.get(start..end).map(str::trim)
+}
+
+fn ecmascript_builtin_receiver(text: &str, _line_text: &str, receiver: &str) -> bool {
+    ["string", "number", "boolean"].iter().any(|type_name| {
+        text.lines().any(|line| {
+            line.contains(&format!("{receiver}: {type_name}"))
+                || line.contains(&format!("{receiver}?: {type_name}"))
+                || line.contains(&format!("{receiver}: readonly {type_name}"))
+        })
+    }) || text.lines().any(|line| {
+        line.contains(&format!("{receiver}: ")) && (line.contains("[]") || line.contains("Array<"))
+    })
+}
+
+fn ecmascript_primitive_type(name: &str) -> bool {
+    matches!(name, "string" | "number" | "boolean")
+}
+
+fn ecmascript_primitive_interface(name: &str) -> &str {
+    match name {
+        "string" => "String",
+        "number" => "Number",
+        "boolean" => "Boolean",
+        _ => unreachable!("primitive type was checked before conversion"),
+    }
+}
+
+fn ecmascript_builtin_name(name: &str) -> bool {
+    matches!(
+        name,
+        "Array"
+            | "Boolean"
+            | "Date"
+            | "Error"
+            | "JSON"
+            | "Map"
+            | "Math"
+            | "Number"
+            | "Object"
+            | "Promise"
+            | "RegExp"
+            | "Set"
+            | "String"
+            | "WeakMap"
+            | "WeakSet"
+            | "Awaited"
+            | "Exclude"
+            | "Extract"
+            | "InstanceType"
+            | "NonNullable"
+            | "Omit"
+            | "Parameters"
+            | "Partial"
+            | "Pick"
+            | "PropertyKey"
+            | "Readonly"
+            | "Record"
+            | "Required"
+            | "ReturnType"
+    )
+}
+
+fn ecmascript_declaration(name: &str) -> String {
+    if matches!(
+        name,
+        "Awaited"
+            | "Exclude"
+            | "Extract"
+            | "InstanceType"
+            | "NonNullable"
+            | "Omit"
+            | "Parameters"
+            | "Partial"
+            | "Pick"
+            | "PropertyKey"
+            | "Readonly"
+            | "Record"
+            | "Required"
+            | "ReturnType"
+    ) {
+        format!("declare type {name}")
+    } else if matches!(
+        name,
+        "Map" | "Set" | "WeakMap" | "WeakSet" | "Error" | "RegExp"
+    ) {
+        format!("declare class {name}")
+    } else {
+        format!("declare const {name}")
+    }
+}
+
 fn is_go_path(path: &Path) -> bool {
     path.extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("go"))
+}
+
+fn is_dart_path(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("dart"))
 }
 
 fn is_rust_path(path: &Path) -> bool {
@@ -2860,12 +3554,16 @@ fn spawn_workspace_indexing(
     go_engines: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<GoEngine>>>>>,
     php_engines: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<PhpEngine>>>>>,
     rust_engines: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<RustEngine>>>>>,
+    dart_engines: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<DartEngine>>>>>,
+    indexing_roots: Arc<Mutex<HashMap<PathBuf, bool>>>,
     listener: Option<Arc<dyn CoreListener>>,
 ) {
     let root = workspace.root().to_path_buf();
     let _ = std::thread::Builder::new()
         .name("workspace-indexing".into())
         .spawn(move || {
+            let started = Instant::now();
+            let retry_workspace = workspace.clone();
             let paths = workspace.build_file_index().paths().collect::<Vec<_>>();
             publish_workspace_typescript_diagnostics(&analysis, &root, &paths);
             publish_workspace_rust_diagnostics(&analysis, &root, &paths, &rust_engines);
@@ -2877,25 +3575,51 @@ fn spawn_workspace_indexing(
             let (total, changed) = refresh_workspace_index(&workspace, &paths, &listener);
             let mut workers = Vec::new();
             if workspace_detected(&root) {
-                workers.push(spawn_warmup(&root, cache));
+                workers.push(spawn_warmup(&root, Arc::clone(&cache)));
             }
             if let Some(project) = go::GoProject::detect(&root) {
                 let project_root = project.root().to_path_buf();
-                let (engine, fresh) = pending_go_engine(&go_engines, &project_root);
-                if fresh {
-                    workers.push(spawn_go_index(&engine, &project_root));
-                }
+                let (engine, _) = pending_go_engine(&go_engines, &project_root);
+                workers.push(spawn_go_index(&engine, &project_root));
             }
             if php_workspace_detected(&root) {
-                let (engine, fresh) = pending_php_engine(&php_engines, &root);
-                if fresh {
-                    workers.push(spawn_php_index(&engine, &root));
-                }
+                let (engine, _) = pending_php_engine(&php_engines, &root);
+                workers.push(spawn_php_index(&engine, &root));
+            }
+            if root.join("pubspec.yaml").is_file() {
+                let (engine, _) = pending_dart_engine(&dart_engines, &root);
+                workers.push(spawn_dart_index(&engine, &root));
             }
             for worker in workers.into_iter().flatten() {
                 let _ = worker.join();
             }
             send_workspace_index_finished(&listener, &root, total, changed);
+            tracing::debug!(
+                root = %root.display(),
+                files = total,
+                changed,
+                ms = started.elapsed().as_millis() as u64,
+                "rebuilt built-in workspace indexes"
+            );
+            let rerun = indexing_roots
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&root)
+                .unwrap_or(false);
+            if rerun {
+                spawn_workspace_indexing(
+                    retry_workspace,
+                    analysis,
+                    cache,
+                    typescript_exports,
+                    go_engines,
+                    php_engines,
+                    rust_engines,
+                    dart_engines,
+                    indexing_roots,
+                    listener,
+                );
+            }
         });
 }
 
@@ -3258,6 +3982,21 @@ fn pending_php_engine(
     }
 }
 
+fn pending_dart_engine(
+    engines: &Mutex<HashMap<PathBuf, Arc<Mutex<DartEngine>>>>,
+    root: &Path,
+) -> (Arc<Mutex<DartEngine>>, bool) {
+    let mut engines = engines.lock().unwrap_or_else(|e| e.into_inner());
+    match engines.get(root) {
+        Some(engine) => (engine.clone(), false),
+        None => {
+            let engine = Arc::new(Mutex::new(DartEngine::pending(root)));
+            engines.insert(root.to_path_buf(), engine.clone());
+            (engine, true)
+        }
+    }
+}
+
 fn spawn_go_index(
     engine: &Arc<Mutex<GoEngine>>,
     root: &Path,
@@ -3286,6 +4025,24 @@ fn spawn_rust_index(
         .name("rust-index".into())
         .spawn(move || {
             let built = RustEngine::build(&root);
+            engine
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .install(built);
+        })
+        .ok()
+}
+
+fn spawn_dart_index(
+    engine: &Arc<Mutex<DartEngine>>,
+    root: &Path,
+) -> Option<std::thread::JoinHandle<()>> {
+    let engine = Arc::clone(engine);
+    let root = root.to_path_buf();
+    std::thread::Builder::new()
+        .name("dart-index".into())
+        .spawn(move || {
+            let built = DartEngine::build(&root);
             engine
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -7558,6 +8315,50 @@ mod tests {
     }
 
     #[test]
+    fn typescript_completion_includes_string_members_for_typed_parameters() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.ts");
+        std::fs::write(
+            &path,
+            "function clean(filePath: string) { return filePath.starts; }\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let document = core
+            .open_document(path.to_string_lossy().into_owned())
+            .unwrap();
+
+        assert!(core.request_completion(document.clone(), 0, 57));
+        assert!(
+            core.completions(document)
+                .iter()
+                .any(|item| item.label == "startsWith")
+        );
+    }
+
+    #[test]
+    fn typescript_completion_includes_local_static_members_after_this() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.ts");
+        std::fs::write(
+            &path,
+            "class Cdn {\n  static generateUrl(path: string) { return path; }\n  static generateUrls(paths: string[]) { return paths.map(path => this.gene); }\n}\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let document = core
+            .open_document(path.to_string_lossy().into_owned())
+            .unwrap();
+
+        assert!(core.request_completion(document.clone(), 2, 75));
+        assert!(
+            core.completions(document)
+                .iter()
+                .any(|item| item.label == "generateUrl")
+        );
+    }
+
+    #[test]
     fn typescript_workspace_completion_imports_unique_exports() {
         let dir = tempfile::tempdir().unwrap();
         let models = dir.path().join("app/models");
@@ -7590,6 +8391,161 @@ mod tests {
         assert_eq!(
             item.additional_edits[0].text,
             "import { User } from '../models/user.js';\n"
+        );
+    }
+
+    #[test]
+    fn source_only_watcher_delta_updates_dart_and_rust_completion() {
+        let dart_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dart_root.path().join("lib")).unwrap();
+        std::fs::write(dart_root.path().join("pubspec.yaml"), "name: delta_app\n").unwrap();
+        let dart_model = dart_root.path().join("lib/model.dart");
+        let dart_consumer = dart_root.path().join("lib/main.dart");
+        std::fs::write(&dart_model, "class OldModel {}\n").unwrap();
+        std::fs::write(&dart_consumer, "Ol\n").unwrap();
+        let core = Core::new();
+        core.open_workspace(dart_root.path().to_string_lossy().into_owned())
+            .unwrap();
+        let document = core
+            .open_document(dart_consumer.to_string_lossy().into_owned())
+            .unwrap();
+        until("Dart workspace completion", || {
+            core.request_completion(document.clone(), 0, 2)
+        });
+        assert!(
+            core.completions(document.clone())
+                .iter()
+                .any(|item| item.label == "OldModel")
+        );
+        std::fs::write(&dart_model, "class NewModel {}\n").unwrap();
+        core.apply_workspace_changes(
+            dart_root.path().to_string_lossy().into_owned(),
+            vec!["lib/model.dart".into()],
+            false,
+        );
+        document.apply_rename_edits(vec![RenameEdit {
+            uri: String::new(),
+            start_line: 0,
+            start_character: 0,
+            end_line: 0,
+            end_character: 2,
+            new_text: "Ne".into(),
+        }]);
+        until("Dart delta completion", || {
+            core.request_completion(document.clone(), 0, 2)
+                && core
+                    .completions(document.clone())
+                    .iter()
+                    .any(|item| item.label == "NewModel")
+        });
+        assert!(
+            core.completions(document.clone())
+                .iter()
+                .any(|item| item.label == "NewModel")
+        );
+
+        let rust_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(rust_root.path().join("src")).unwrap();
+        std::fs::write(
+            rust_root.path().join("Cargo.toml"),
+            "[package]\nname='delta'\nversion='0.1.0'\n",
+        )
+        .unwrap();
+        let rust_model = rust_root.path().join("src/model.rs");
+        let rust_consumer = rust_root.path().join("src/main.rs");
+        std::fs::write(&rust_model, "pub fn old_name() {}\n").unwrap();
+        std::fs::write(&rust_consumer, "ol\n").unwrap();
+        let core = Core::new();
+        core.open_workspace(rust_root.path().to_string_lossy().into_owned())
+            .unwrap();
+        let document = core
+            .open_document(rust_consumer.to_string_lossy().into_owned())
+            .unwrap();
+        until("Rust workspace completion", || {
+            core.request_completion(document.clone(), 0, 2)
+        });
+        assert!(
+            core.completions(document.clone())
+                .iter()
+                .any(|item| item.label == "old_name")
+        );
+        std::fs::write(&rust_model, "pub fn new_name() {}\n").unwrap();
+        core.apply_workspace_changes(
+            rust_root.path().to_string_lossy().into_owned(),
+            vec!["src/model.rs".into()],
+            false,
+        );
+        document.apply_rename_edits(vec![RenameEdit {
+            uri: String::new(),
+            start_line: 0,
+            start_character: 0,
+            end_line: 0,
+            end_character: 2,
+            new_text: "ne".into(),
+        }]);
+        until("Rust delta completion", || {
+            core.request_completion(document.clone(), 0, 2)
+                && core
+                    .completions(document.clone())
+                    .iter()
+                    .any(|item| item.label == "new_name")
+        });
+        assert!(
+            core.completions(document)
+                .iter()
+                .any(|item| item.label == "new_name")
+        );
+    }
+
+    #[test]
+    fn source_only_watcher_delta_updates_typescript_auto_imports() {
+        let root = tempfile::tempdir().unwrap();
+        let models = root.path().join("models");
+        let consumers = root.path().join("consumers");
+        std::fs::create_dir_all(&models).unwrap();
+        std::fs::create_dir_all(&consumers).unwrap();
+        let model = models.join("user.ts");
+        let consumer = consumers.join("auth.ts");
+        std::fs::write(&model, "export class OldUser {}\n").unwrap();
+        std::fs::write(&consumer, "Ol\n").unwrap();
+        let core = Core::new();
+        core.open_workspace(root.path().to_string_lossy().into_owned())
+            .unwrap();
+        let document = core
+            .open_document(consumer.to_string_lossy().into_owned())
+            .unwrap();
+        until("TypeScript workspace completion", || {
+            core.request_completion(document.clone(), 0, 2)
+                && core
+                    .completions(document.clone())
+                    .iter()
+                    .any(|item| item.label == "OldUser")
+        });
+        std::fs::write(&model, "export class NewUser {}\n").unwrap();
+        core.apply_workspace_changes(
+            root.path().to_string_lossy().into_owned(),
+            vec!["models/user.ts".into()],
+            false,
+        );
+        document.apply_rename_edits(vec![RenameEdit {
+            uri: String::new(),
+            start_line: 0,
+            start_character: 0,
+            end_line: 0,
+            end_character: 2,
+            new_text: "Ne".into(),
+        }]);
+        until("TypeScript delta completion", || {
+            core.request_completion(document.clone(), 0, 2)
+                && core
+                    .completions(document.clone())
+                    .iter()
+                    .any(|item| item.label == "NewUser")
+        });
+        assert!(
+            core.completions(document)
+                .iter()
+                .all(|item| item.label != "OldUser")
         );
     }
 
@@ -8546,6 +9502,462 @@ mod tests {
 
         assert!(!core.request_definition(main.clone(), 6, 5));
         assert!(!core.request_definition(main, 7, 20));
+    }
+
+    #[test]
+    fn typescript_definition_resolves_static_class_methods() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        std::fs::write(
+            dir.path().join("cdn-helper.ts"),
+            "export class CdnHelper {\n  static generatedUrlsIndexed(value: unknown) { return value; }\n}\n",
+        )
+        .unwrap();
+        let main_path = dir.path().join("main.ts");
+        std::fs::write(
+            &main_path,
+            "import { CdnHelper } from './cdn-helper.js';\nCdnHelper.generatedUrlsIndexed([]);\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let main = core
+            .open_document(main_path.to_string_lossy().into_owned())
+            .unwrap();
+
+        assert!(core.request_definition(main.clone(), 1, 15));
+        let locations = core.definition_locations(main);
+        assert_eq!(locations.len(), 1);
+        assert!(locations[0].uri.ends_with("cdn-helper.ts"));
+        assert_eq!((locations[0].line, locations[0].column), (1, 9));
+    }
+
+    #[test]
+    fn typescript_definition_resolves_static_class_methods_from_package_declarations() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+        let package = dir.path().join("node_modules/@adonisjs/core/build/src");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            dir.path().join("node_modules/@adonisjs/core/package.json"),
+            r##"{"exports":{"./env":"./build/src/env.js"}}"##,
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("env.d.ts"),
+            "export declare class Env {\n  static create(value: URL): Promise<Env>;\n  get(name: string): string;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(package.join("env.js"), "export {};\n").unwrap();
+        let main_path = dir.path().join("main.ts");
+        std::fs::write(
+            &main_path,
+            "import { Env } from '@adonisjs/core/env';\nexport default await Env.create(new URL('file:///'));\n",
+        )
+        .unwrap();
+        let project = javascript::TypeScriptProject::detect(&main_path).unwrap();
+        assert_eq!(
+            javascript::resolve_typescript_specifier(&project, "@adonisjs/core/env", &main_path),
+            Some(package.join("env.d.ts"))
+        );
+        let source = std::fs::read_to_string(&main_path).unwrap();
+        assert!(
+            DocumentIndex::parse(&main_path, &source)
+                .type_member_at(1, 28)
+                .is_some()
+        );
+        let core = Core::new();
+        let main = core
+            .open_document(main_path.to_string_lossy().into_owned())
+            .unwrap();
+
+        assert!(core.request_definition(main.clone(), 1, 28));
+        let locations = core.definition_locations(main);
+        assert_eq!(locations.len(), 1);
+        assert!(
+            locations[0]
+                .uri
+                .ends_with("@adonisjs/core/build/src/env.d.ts")
+        );
+        assert_eq!((locations[0].line, locations[0].column), (1, 9));
+    }
+
+    #[test]
+    fn typescript_definition_resolves_local_static_class_methods() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.ts");
+        std::fs::write(
+            &path,
+            "class CdnHelper {\n  static generatedUrlsIndexed(value: unknown) { return value; }\n}\nCdnHelper.generatedUrlsIndexed([]);\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let document = core
+            .open_document(path.to_string_lossy().into_owned())
+            .unwrap();
+
+        assert!(core.request_definition(document.clone(), 3, 15));
+        let locations = core.definition_locations(document);
+        assert_eq!(locations.len(), 1);
+        assert_eq!((locations[0].line, locations[0].column), (1, 9));
+    }
+
+    #[test]
+    fn typescript_definition_resolves_cross_file_export_despite_target_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("cdn.ts");
+        std::fs::write(
+            &target,
+            "export class CdnHelper {}\nexport function generateUrl(path: string) { return path; }\nconst unfinished = (\n",
+        )
+        .unwrap();
+        let main_path = dir.path().join("main.ts");
+        std::fs::write(
+            &main_path,
+            "import { CdnHelper, generateUrl } from './cdn.js';\nCdnHelper;\ngenerateUrl('file');\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let main = core
+            .open_document(main_path.to_string_lossy().into_owned())
+            .unwrap();
+
+        for (line, column, target_line, target_column) in [(1, 1, 0, 7), (2, 1, 1, 7)] {
+            assert!(core.request_definition(main.clone(), line, column));
+            let locations = core.definition_locations(main.clone());
+            assert_eq!(locations.len(), 1);
+            assert!(locations[0].uri.ends_with("cdn.ts"));
+            assert_eq!(
+                (locations[0].line, locations[0].column),
+                (target_line, target_column)
+            );
+        }
+    }
+
+    #[test]
+    fn typescript_definition_resolves_default_factory_instance_methods() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("start")).unwrap();
+        let package = dir.path().join("node_modules/@adonisjs/core/build/src");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            dir.path().join("tsconfig.json"),
+            r##"{"compilerOptions":{"paths":{"#start/*":["./start/*.ts"]}}}"##,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("node_modules/@adonisjs/core/package.json"),
+            r##"{"exports":{"./env":"./build/src/env.js"}}"##,
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("env.d.ts"),
+            "export declare class Env {\n  static create(value?: URL): Promise<Env>;\n  get(name: string): string;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(package.join("env.js"), "export {};\n").unwrap();
+        std::fs::write(
+            dir.path().join("start/env.ts"),
+            "import { Env } from '@adonisjs/core/env';\nexport default await Env.create();\n",
+        )
+        .unwrap();
+        let main_path = dir.path().join("main.ts");
+        std::fs::write(
+            &main_path,
+            "import env from '#start/env';\nenv.get('CDN_URL');\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let main = core
+            .open_document(main_path.to_string_lossy().into_owned())
+            .unwrap();
+
+        assert!(core.request_definition(main.clone(), 1, 5));
+        let locations = core.definition_locations(main);
+        assert_eq!(locations.len(), 1);
+        assert!(
+            locations[0]
+                .uri
+                .ends_with("@adonisjs/core/build/src/env.d.ts")
+        );
+        assert_eq!((locations[0].line, locations[0].column), (2, 2));
+    }
+
+    #[test]
+    fn typescript_definition_resolves_default_factory_instance_methods_through_reexport() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("start")).unwrap();
+        std::fs::write(
+            dir.path().join("tsconfig.json"),
+            r##"{"compilerOptions":{"paths":{"#start/*":["./start/*.ts"]}}}"##,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("env-contract.ts"),
+            "export class Env {\n  static async create() { return new Env(); }\n  get(name: string) { return name; }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("start/env-instance.ts"),
+            "import { Env } from '../env-contract.js';\nexport default await Env.create();\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("start/env.ts"),
+            "export { default } from './env-instance.js';\n",
+        )
+        .unwrap();
+        let main_path = dir.path().join("main.ts");
+        std::fs::write(
+            &main_path,
+            "import env from '#start/env';\nenv.get('CDN_URL');\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let main = core
+            .open_document(main_path.to_string_lossy().into_owned())
+            .unwrap();
+
+        assert!(core.request_definition(main.clone(), 1, 5));
+        let locations = core.definition_locations(main);
+        assert_eq!(locations.len(), 1);
+        assert!(locations[0].uri.ends_with("env-contract.ts"));
+        assert_eq!((locations[0].line, locations[0].column), (2, 2));
+    }
+
+    #[test]
+    fn typescript_and_javascript_definitions_resolve_ecmascript_globals_and_methods() {
+        let dir = tempfile::tempdir().unwrap();
+        for extension in ["ts", "js"] {
+            let path = dir.path().join(format!("main.{extension}"));
+            std::fs::write(
+                &path,
+                "Object.keys({ value: 1 });\nJSON.stringify({ value: 1 });\n",
+            )
+            .unwrap();
+            let core = Core::new();
+            let document = core
+                .open_document(path.to_string_lossy().into_owned())
+                .unwrap();
+            for (line, column, declaration) in [
+                (0, 1, "Object"),
+                (0, 8, "keys"),
+                (1, 1, "JSON"),
+                (1, 6, "stringify"),
+            ] {
+                assert!(
+                    core.request_definition(document.clone(), line, column),
+                    "{extension} cursor {line}:{column}"
+                );
+                let locations = core.definition_locations(document.clone());
+                assert_eq!(locations.len(), 1);
+                assert!(locations[0].uri.ends_with("ecmascript.d.ts"));
+                assert_eq!(
+                    (locations[0].line, locations[0].column),
+                    ecmascript_declaration_position(declaration),
+                    "{extension} {declaration}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn typescript_definitions_resolve_each_ecmascript_global_declaration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.ts");
+        let names = [
+            "Object", "Array", "String", "Number", "Boolean", "Date", "Math", "Promise", "Map",
+            "Set", "WeakMap", "WeakSet", "Error", "RegExp", "JSON",
+        ];
+        std::fs::write(
+            &path,
+            names
+                .iter()
+                .map(|name| format!("{name};"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let core = Core::new();
+        let document = core
+            .open_document(path.to_string_lossy().into_owned())
+            .unwrap();
+
+        for (line, name) in names.iter().enumerate() {
+            assert!(
+                core.request_definition(document.clone(), line as u64, 1),
+                "{name}"
+            );
+            let locations = core.definition_locations(document.clone());
+            assert_eq!(locations.len(), 1, "{name}");
+            assert!(locations[0].uri.ends_with("ecmascript.d.ts"), "{name}");
+            assert_eq!(
+                (locations[0].line, locations[0].column),
+                ecmascript_declaration_position(name),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn typescript_definition_resolves_instance_methods_on_primitive_parameters() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.ts");
+        std::fs::write(
+            &path,
+            "class CdnHelper {\n  private static readonly CDN_URL = 'https://example.test';\n  static generateUrl(filePath: string): string {\n    const cleanPath = filePath.startsWith('/') ? filePath.slice(1) : filePath;\n    return `${this.CDN_URL}/${cleanPath}`;\n  }\n}\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let document = core
+            .open_document(path.to_string_lossy().into_owned())
+            .unwrap();
+
+        assert!(core.request_definition(document.clone(), 3, 31));
+        let locations = core.definition_locations(document.clone());
+        assert_eq!(locations.len(), 1);
+        assert!(locations[0].uri.ends_with("ecmascript.d.ts"));
+        assert_eq!(
+            (locations[0].line, locations[0].column),
+            ecmascript_declaration_position("startsWith")
+        );
+
+        assert!(core.request_definition(document.clone(), 3, 58));
+        let locations = core.definition_locations(document.clone());
+        assert_eq!(locations.len(), 1);
+        assert!(locations[0].uri.ends_with("ecmascript.d.ts"));
+        assert_eq!(
+            (locations[0].line, locations[0].column),
+            ecmascript_declaration_position("slice")
+        );
+
+        assert!(core.request_definition(document.clone(), 4, 20));
+        let locations = core.definition_locations(document);
+        assert_eq!(locations.len(), 1);
+        assert_eq!((locations[0].line, locations[0].column), (1, 26));
+    }
+
+    #[test]
+    fn typescript_definition_resolves_array_methods_on_array_parameters() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.ts");
+        std::fs::write(
+            &path,
+            "function urls(filePaths: string[]) { return filePaths.map(path => path); }\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let document = core
+            .open_document(path.to_string_lossy().into_owned())
+            .unwrap();
+
+        assert!(core.request_definition(document.clone(), 0, 55));
+        let locations = core.definition_locations(document);
+        assert_eq!(locations.len(), 1);
+        assert!(locations[0].uri.ends_with("ecmascript.d.ts"));
+        assert_eq!(
+            (locations[0].line, locations[0].column),
+            ecmascript_declaration_position("map")
+        );
+    }
+
+    #[test]
+    fn ecmascript_receiver_recognizes_array_parameter_shorthand() {
+        assert!(ecmascript_builtin_receiver(
+            "function urls(filePaths: string[]) { return filePaths.map(path => path); }",
+            "return filePaths.map(path => path);",
+            "filePaths"
+        ));
+    }
+
+    #[test]
+    fn typescript_definition_resolves_static_field_in_template_interpolation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cdn_helper.ts");
+        std::fs::write(
+            &path,
+            "export class CdnHelper {\n  private static readonly CDN_URL = env.get('CDN_URL', 'https://cdn.test')\n\n  static generateUrl(filePath: string): string {\n    const cleanPath = filePath.startsWith('/') ? filePath.slice(1) : filePath\n    return `${this.CDN_URL}/${cleanPath}`\n  }\n}\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let document = core
+            .open_document(path.to_string_lossy().into_owned())
+            .unwrap();
+
+        assert!(core.request_definition(document.clone(), 5, 19));
+        let locations = core.definition_locations(document);
+        assert_eq!(locations.len(), 1);
+        assert_eq!((locations[0].line, locations[0].column), (1, 26));
+    }
+
+    fn ecmascript_declaration_position(name: &str) -> (u64, u64) {
+        let declaration_prefixes = [
+            format!("declare const {name}"),
+            format!("declare class {name}"),
+            format!("declare function {name}"),
+            format!("declare type {name}"),
+            format!("interface {name}"),
+            format!("{name}("),
+            format!("{name}<"),
+        ];
+        let (line, declaration) = declaration_prefixes
+            .iter()
+            .find_map(|prefix| {
+                ECMASCRIPT_BUILTINS
+                    .lines()
+                    .enumerate()
+                    .find(|(_, line)| line.trim_start().starts_with(prefix))
+            })
+            .unwrap_or_else(|| panic!("missing ECMAScript declaration for {name}"));
+        (line as u64, declaration.find(name).unwrap() as u64)
+    }
+
+    #[test]
+    fn typescript_definition_resolves_primitive_type_keywords() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.ts");
+        std::fs::write(
+            &path,
+            "const title: string = 'Galaxy';\nconst count: number = 1;\nconst ready: boolean = true;\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let document = core
+            .open_document(path.to_string_lossy().into_owned())
+            .unwrap();
+
+        for (line, column) in [(0, 14), (1, 14), (2, 14)] {
+            assert!(
+                core.request_definition(document.clone(), line, column),
+                "cursor {line}:{column}"
+            );
+            let locations = core.definition_locations(document.clone());
+            assert_eq!(locations.len(), 1);
+            assert!(locations[0].uri.ends_with("ecmascript.d.ts"));
+        }
+    }
+
+    #[test]
+    fn typescript_definitions_resolve_builtin_utility_types_and_classes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("main.ts");
+        std::fs::write(
+            &path,
+            "type User = Record<string, Pick<{ id: string; name: string }, 'id'>>;\nMap.get;\n",
+        )
+        .unwrap();
+        let core = Core::new();
+        let document = core
+            .open_document(path.to_string_lossy().into_owned())
+            .unwrap();
+        for (line, column) in [(0, 13), (0, 28), (1, 1), (1, 5)] {
+            assert!(
+                core.request_definition(document.clone(), line, column),
+                "cursor {line}:{column}"
+            );
+            let locations = core.definition_locations(document.clone());
+            assert_eq!(locations.len(), 1);
+            assert!(locations[0].uri.ends_with("ecmascript.d.ts"));
+        }
     }
 
     #[test]

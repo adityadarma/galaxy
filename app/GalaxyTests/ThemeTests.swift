@@ -17,14 +17,8 @@ final class ThemeTests: XCTestCase {
                       Int(round(c.greenComponent * 255)), Int(round(c.blueComponent * 255)))
     }
 
-    func testListOffersSystemTheBuiltInPairAndEveryOneDarkProVariant() {
-        let names = Theme.names
-        XCTAssertEqual(Array(names.prefix(3)), ["System", "Galaxy Light", "Galaxy Dark"])
-        for variant in ["One Dark Pro", "One Dark Pro Flat", "One Dark Pro Darker",
-                        "One Dark Pro Mix", "One Dark Pro Night Flat"] {
-            XCTAssertTrue(names.contains(variant), variant)
-        }
-        XCTAssertEqual(Set(names).count, names.count, "names are unique")
+    func testListOffersOnlySystemAndTheBuiltInPair() {
+        XCTAssertEqual(Theme.names, ["System", "Galaxy Light", "Galaxy Dark"])
     }
 
     func testSystemFollowsTheAppearanceBetweenTheTwoDefaults() {
@@ -32,28 +26,17 @@ final class ThemeTests: XCTestCase {
         XCTAssertEqual(Theme.definition(for: light).name, "Galaxy Light")
         XCTAssertEqual(Theme.definition(for: dark).name, "Galaxy Dark")
         XCTAssertEqual(hex(Theme.editorBackground, light), "#FFFFFF")
-        XCTAssertEqual(hex(Theme.editorBackground, dark), "#1E1E1E")
+        XCTAssertEqual(hex(Theme.editorBackground, dark), "#15171D")
     }
 
     func testAChosenThemeWinsOverTheAppearance() {
-        Theme.select("One Dark Pro Night Flat", persist: false)
+        Theme.select("Galaxy Dark", persist: false)
         for appearance in [light, dark] {
-            XCTAssertEqual(Theme.definition(for: appearance).name, "One Dark Pro Night Flat")
-            XCTAssertEqual(hex(Theme.editorBackground, appearance), "#16191D")
-            XCTAssertEqual(hex(Theme.chrome, appearance), "#16191D")
-            XCTAssertEqual(hex(Theme.sidebar, appearance), "#16191D")
+            XCTAssertEqual(Theme.definition(for: appearance).name, "Galaxy Dark")
+            XCTAssertEqual(hex(Theme.editorBackground, appearance), "#15171D")
+            XCTAssertEqual(hex(Theme.chrome, appearance), "#1A1D23")
+            XCTAssertEqual(hex(Theme.sidebar, appearance), "#1C1F26")
         }
-    }
-
-    func testVariantsDifferInSurfacesButShareSyntaxColors() {
-        func surfaces(_ name: String) -> [String] {
-            Theme.select(name, persist: false)
-            return [hex(Theme.editorBackground, dark), hex(Theme.chrome, dark), hex(Theme.sidebar, dark)]
-        }
-        XCTAssertEqual(surfaces("One Dark Pro"), ["#282C34", "#21252B", "#21252B"])
-        XCTAssertEqual(surfaces("One Dark Pro Flat"), ["#282C34", "#282C34", "#282C34"])
-        XCTAssertEqual(surfaces("One Dark Pro Darker"), ["#23272E", "#1E2227", "#1E2227"])
-        XCTAssertEqual(hex(Theme.syntax("keyword", appearance: dark), dark), "#C678DD")
     }
 
     func testEveryThemeColorsEveryScope() {
