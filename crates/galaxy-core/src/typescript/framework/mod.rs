@@ -16,6 +16,8 @@
 //! To add a framework: create `<name>.rs` with a `collect` function and call
 //! it from [`collect_uses`].
 
+use std::path::Path;
+
 use tree_sitter::Node;
 
 use super::{Import, Locations, SymbolOccurrences, TypeMemberUse};
@@ -35,4 +37,9 @@ pub(super) fn collect_uses(root: Node<'_>, context: &Context<'_>) -> Vec<TypeMem
     let mut uses = Vec::new();
     uses.extend(adonisjs::collect(root, context));
     uses
+}
+
+/// Local classes that inherit AdonisJS's `@poppinss/macroable` hook.
+pub(super) fn macroable_classes(path: &Path, root: Node<'_>, context: &Context<'_>) -> Vec<String> {
+    adonisjs::macroable_classes(path, root, context)
 }

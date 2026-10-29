@@ -10,7 +10,11 @@ pub(super) fn collect_type_navigation_declarations(
 ) {
     if matches!(
         node.kind(),
-        "interface_declaration" | "type_alias_declaration" | "class_declaration" | "class"
+        "interface_declaration"
+            | "type_alias_declaration"
+            | "class_declaration"
+            | "abstract_class_declaration"
+            | "class"
     ) && let Some(name_node) = node.child_by_field_name("name")
         && let Some(name) = node_text(text, name_node)
         && let Some(members) = direct_type_members(node, text, locations)
@@ -50,7 +54,7 @@ pub(super) fn type_declaration_extends(node: Node<'_>, text: &str) -> Vec<String
             let mut descendants = vec![clause];
             let mut names = Vec::new();
             while let Some(descendant) = descendants.pop() {
-                if descendant.kind() == "type_identifier"
+                if matches!(descendant.kind(), "type_identifier" | "identifier")
                     && let Some(name) = node_text(text, descendant)
                 {
                     names.push(name.to_owned());

@@ -574,7 +574,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 } else {
                     problems = allProblems
                 }
-                self.problemsPanel.update(problems)
+                self.problemsPanel.update(problems, workspaceRoot: self.workspace?.root())
                 self.problemsPanel.isHidden = self.bottomPanelTab != .problems
                 self.bottomPanelHeader.setProblemCount(problems.count)
                 if let document = self.activeTab?.doc {

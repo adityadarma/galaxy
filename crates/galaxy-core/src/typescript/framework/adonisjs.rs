@@ -6,14 +6,19 @@
 //! `ChainableContract`, so a member used on the parameter, or on a nested
 //! builder callback parameter, resolves there.
 
+use std::path::Path;
+
 use tree_sitter::Node;
 
 use super::Context;
 use crate::typescript::{
-    TypeMemberTarget, TypeMemberUse, direct_member_name, node_text, sole_callback_parameter,
+    ImportKind, TypeMemberTarget, TypeMemberUse, direct_member_name, node_text,
+    sole_callback_parameter, type_declaration_extends,
 };
 
 const PACKAGE: &str = "@adonisjs/lucid/orm";
+const DATABASE_PACKAGE: &str = "@adonisjs/lucid/database";
+const MACROABLE_BUILDERS: [&str; 2] = ["DatabaseQueryBuilder", "ModelQueryBuilder"];
 /// Public subpath export of the package (`"./types/*"`), stable across builds.
 const DECLARATION: &str = "@adonisjs/lucid/types/querybuilder";
 const BUILDER: &str = "ChainableContract";
@@ -53,6 +58,95 @@ pub(super) fn collect(root: Node<'_>, context: &Context<'_>) -> Vec<TypeMemberUs
         stack.extend(node.named_children(&mut cursor));
     }
     uses
+}
+
+/// Finds local classes that descend from the AdonisJS Macroable import. This
+/// stays in the framework adapter so the core checker has no package policy.
+pub(super) fn macroable_classes(path: &Path, root: Node<'_>, context: &Context<'_>) -> Vec<String> {
+    let mut macroable = context
+        .imports
+        .iter()
+        .filter(|import| import.specifier == "@poppinss/macroable")
+        .flat_map(|import| import.bindings.iter())
+        .filter(|binding| {
+            !binding.type_only && matches!(binding.kind, ImportKind::Default | ImportKind::Named)
+        })
+        .map(|binding| binding.local_name.clone())
+        .collect::<std::collections::HashSet<_>>();
+    macroable.extend(
+        context
+            .imports
+            .iter()
+            // `ModelQueryBuilder` ships from `/orm`; `DatabaseQueryBuilder`
+            // is re-exported from `/database` (and `/orm` in older releases).
+            .filter(|import| matches!(import.specifier.as_str(), PACKAGE | DATABASE_PACKAGE))
+            .flat_map(|import| import.bindings.iter())
+            .filter(|binding| {
+                !binding.type_only
+                    && matches!(binding.kind, ImportKind::Named)
+                    && binding
+                        .imported_name
+                        .as_deref()
+                        .is_some_and(|name| MACROABLE_BUILDERS.contains(&name))
+            })
+            .map(|binding| binding.local_name.clone()),
+    );
+    if path.ends_with("node_modules/@adonisjs/lucid/build/src/orm/query_builder/index.d.ts") {
+        macroable.extend(MACROABLE_BUILDERS.map(str::to_owned));
+    }
+    // Imported Lucid builders are values in this file even though they are
+    // not declared here; they must be returned alongside local subclasses.
+    let imported_builders = macroable
+        .iter()
+        .filter(|name| {
+            context.imports.iter().any(|import| {
+                matches!(import.specifier.as_str(), PACKAGE | DATABASE_PACKAGE)
+                    && import
+                        .bindings
+                        .iter()
+                        .any(|binding| &binding.local_name == *name)
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut classes = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if matches!(
+            node.kind(),
+            "class_declaration" | "abstract_class_declaration"
+        ) && let Some(name) = node
+            .child_by_field_name("name")
+            .and_then(|name| node_text(context.text, name))
+        {
+            classes.push((
+                name.to_owned(),
+                type_declaration_extends(node, context.text),
+            ));
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    while classes.iter().any(|(name, parents)| {
+        !macroable.contains(name) && parents.iter().any(|parent| macroable.contains(parent))
+    }) {
+        for (name, parents) in &classes {
+            if parents.iter().any(|parent| macroable.contains(parent)) {
+                macroable.insert(name.clone());
+            }
+        }
+    }
+    let mut result = classes
+        .into_iter()
+        .map(|(name, _)| name)
+        .filter(|name| macroable.contains(name))
+        .collect::<Vec<_>>();
+    for name in imported_builders {
+        if !result.contains(&name) {
+            result.push(name);
+        }
+    }
+    result
 }
 
 /// `BaseModel` exposes static `query`; its result is a fluent Lucid builder.

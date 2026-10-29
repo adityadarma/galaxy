@@ -243,6 +243,207 @@ fn reports_only_provable_type_errors() {
 }
 
 #[test]
+fn does_not_require_defaulted_function_parameters() {
+    let index = DocumentIndex::parse(
+        "validators.spec.ts",
+        "function makeFile(extname: string, size = 1024) {}\nmakeFile('jpg');\n",
+    );
+
+    assert!(
+        index
+            .type_diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "TS2554"),
+        "{:?}",
+        index.type_diagnostics
+    );
+}
+
+#[test]
+fn accepts_arguments_for_arrow_functions_with_defaulted_parameters() {
+    let index = DocumentIndex::parse(
+        "auth_service.spec.ts",
+        "const seed = (overrides: Record<string, any> = {}) => overrides;\nseed({ status: 1 });\n",
+    );
+
+    assert!(
+        index
+            .type_diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "TS2554"),
+        "{:?}",
+        index.type_diagnostics
+    );
+}
+
+#[test]
+fn permits_extending_date_prototype() {
+    let index = DocumentIndex::parse(
+        "extensions.ts",
+        "interface Date { toFormat(format?: string): string }\n\
+         Date.prototype.toFormat = function(format: string = 'yyyy-MM-dd') { return format; };\n",
+    );
+
+    assert!(
+        index
+            .type_diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "TS2339"),
+        "{:?}",
+        index.type_diagnostics
+    );
+}
+
+#[test]
+fn permits_date_now_and_class_constructor_arguments() {
+    let index = DocumentIndex::parse(
+        "values.ts",
+        "const id = String(Date.now());\n\
+         class VineMultipartFile { constructor(options?: object, values?: unknown[], name?: string) {} }\n\
+         new VineMultipartFile({}, [], 'file');\n",
+    );
+
+    assert!(
+        index
+            .type_diagnostics
+            .iter()
+            .all(|diagnostic| !matches!(diagnostic.code.as_str(), "TS2339" | "TS2554")),
+        "{:?}",
+        index.type_diagnostics
+    );
+}
+
+#[test]
+fn permits_macros_for_all_macroable_subclasses() {
+    let index = DocumentIndex::parse(
+        "query_builder.ts",
+        "import Macroable from '@poppinss/macroable';\n\
+         class DatabaseQueryBuilder extends Macroable {}\n\
+         class ModelQueryBuilder extends DatabaseQueryBuilder {}\n\
+         DatabaseQueryBuilder.macro('whereTenant', () => {});\n\
+         ModelQueryBuilder.macro('visibleTo', () => {});\n",
+    );
+
+    assert!(
+        index
+            .type_diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "TS2339"),
+        "{:?}",
+        index.type_diagnostics
+    );
+}
+
+#[test]
+fn permits_macros_for_imported_lucid_builders() {
+    let index = DocumentIndex::parse(
+        "model.ts",
+        "import { ModelQueryBuilder as Builder } from '@adonisjs/lucid/orm';\n\
+         Builder.macro('whereEncrypted', () => {});\n",
+    );
+
+    assert!(
+        index
+            .type_diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "TS2339"),
+        "{:?}",
+        index.type_diagnostics
+    );
+}
+
+#[test]
+fn permits_macros_for_database_query_builder_from_lucid_database() {
+    let index = DocumentIndex::parse(
+        "provider.ts",
+        "import { DatabaseQueryBuilder } from '@adonisjs/lucid/database';\n\
+         DatabaseQueryBuilder.macro('whereTenant', function () {});\n",
+    );
+
+    assert!(
+        index
+            .type_diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "TS2339"),
+        "{:?}",
+        index.type_diagnostics
+    );
+}
+
+#[test]
+fn permits_macros_for_lucid_builders_with_module_augmentation() {
+    // Mirrors src/query_builder/extensions.ts: augmenting the builder interface
+    // must not hide the static `macro` inherited from Macroable.
+    let index = DocumentIndex::parse(
+        "extensions.ts",
+        "import { ModelQueryBuilder } from '@adonisjs/lucid/orm'\n\
+         import { DatabaseQueryBuilder } from '@adonisjs/lucid/database'\n\
+         DatabaseQueryBuilder.macro('whereEncrypted', function (this: DatabaseQueryBuilder, columns: string) {\n\
+           return this.whereRaw('x', [columns])\n\
+         })\n\
+         ModelQueryBuilder.macro('whereEncrypted', function (this: ModelQueryBuilder, columns: string) {\n\
+           return this.whereRaw('x', [columns])\n\
+         })\n\
+         declare module '@adonisjs/lucid/database' {\n\
+           interface DatabaseQueryBuilder {\n\
+             whereEncrypted(columns: string, value: any): this\n\
+           }\n\
+         }\n\
+         declare module '@adonisjs/lucid/orm' {\n\
+           interface ModelQueryBuilder {\n\
+             whereEncrypted(columns: string, value: any): this\n\
+           }\n\
+         }\n",
+    );
+
+    assert!(
+        index
+            .type_diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "TS2339"),
+        "{:?}",
+        index.type_diagnostics
+    );
+}
+
+#[test]
+fn permits_macros_inside_lucid_model_query_builder_declaration() {
+    let index = DocumentIndex::parse(
+        "node_modules/@adonisjs/lucid/build/src/orm/query_builder/index.d.ts",
+        "import { Chainable } from '../../../database/query_builder/chainable.js';\n\
+         export declare class ModelQueryBuilder extends Chainable {}\n\
+         ModelQueryBuilder.macro('whereEncryptedLike', () => {});\n",
+    );
+
+    assert!(
+        index
+            .type_diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "TS2339"),
+        "{:?}",
+        index.type_diagnostics
+    );
+}
+
+#[test]
+fn indexes_imported_superclasses_as_type_references() {
+    let index = DocumentIndex::parse(
+        "model_query_builder.d.ts",
+        "import { Chainable } from '../../database/query_builder/chainable.js';\n\
+         export declare class ModelQueryBuilder extends Chainable {}\n",
+    );
+
+    let (import, binding) = index
+        .type_import_binding_at(1, 47)
+        .expect("imported superclass binding");
+    assert_eq!(
+        import.specifier,
+        "../../database/query_builder/chainable.js"
+    );
+    assert_eq!(binding.local_name, "Chainable");
+}
+
+#[test]
 fn resolves_shadowed_block_variables() {
     let index = DocumentIndex::parse(
         "scope.ts",
@@ -656,4 +857,44 @@ fn indexes_fluent_this_members_of_local_superclasses() {
             ..
         }) if chain.as_slice() == ["setCode"] && member_name == "setMessage"
     ));
+}
+
+#[test]
+fn interface_augmentation_does_not_shadow_imported_values() {
+    // Mirrors src/vinejs/extensions.ts: `interface Vine` inside
+    // `declare module` names a type only, so `Vine.macro` stays unchecked.
+    let index = DocumentIndex::parse(
+        "extensions.ts",
+        "import { Vine, VineString } from '@vinejs/vine'\n\
+         Vine.macro('fileSecure', function (this: Vine) {})\n\
+         VineString.macro('password', function (this: VineString) { return this })\n\
+         declare module '@vinejs/vine' {\n\
+           interface Vine { fileSecure(): void }\n\
+           interface VineString { password(): this }\n\
+         }\n",
+    );
+
+    assert!(
+        index.type_diagnostics.is_empty(),
+        "{:?}",
+        index.type_diagnostics
+    );
+}
+
+#[test]
+fn global_interface_augmentation_keeps_builtin_prototype() {
+    // Mirrors src/global.ts.
+    let index = DocumentIndex::parse(
+        "global.ts",
+        "declare global {\n\
+           interface String { censoredText: (length?: number) => string }\n\
+         }\n\
+         String.prototype.censoredText = function (length?: number): string { return '' }\n",
+    );
+
+    assert!(
+        index.type_diagnostics.is_empty(),
+        "{:?}",
+        index.type_diagnostics
+    );
 }

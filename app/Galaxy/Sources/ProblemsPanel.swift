@@ -70,7 +70,7 @@ final class ProblemsPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
-    func update(_ problems: [ProblemInfo]) {
+    func update(_ problems: [ProblemInfo], workspaceRoot: String? = nil) {
         let signature = problems.map {
             "\($0.uri)\u{1F}\($0.line)\u{1F}\($0.column)\u{1F}\($0.severity)\u{1F}\($0.message)"
         }.joined(separator: "\u{1E}")
@@ -78,12 +78,12 @@ final class ProblemsPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         problemsSignature = signature
         let grouped = Dictionary(grouping: problems, by: \.uri)
         groups = grouped.map { uri, problems in
-            let path = uri.replacingOccurrences(of: "file://", with: "")
+            let path = URL(string: uri)?.path ?? uri.replacingOccurrences(of: "file://", with: "")
             let url = URL(fileURLWithPath: path)
             return FileGroup(
                 uri: uri,
                 name: url.lastPathComponent,
-                directory: url.deletingLastPathComponent().path,
+                directory: Self.displayDirectory(for: path, workspaceRoot: workspaceRoot),
                 problems: problems.sorted { ($0.line, $0.column, $0.message) < ($1.line, $1.column, $1.message) }
             )
         }.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
@@ -91,6 +91,15 @@ final class ProblemsPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
         empty.isHidden = !problems.isEmpty
         scroll.isHidden = problems.isEmpty
         setAccessibilityValue(problems.isEmpty ? "No problems" : "\(problems.count) problems")
+    }
+
+    static func displayDirectory(for path: String, workspaceRoot: String?) -> String {
+        let directory = URL(fileURLWithPath: path).deletingLastPathComponent().standardizedFileURL.path
+        guard let workspaceRoot else { return directory }
+        let root = URL(fileURLWithPath: workspaceRoot).standardizedFileURL.path
+        guard directory == root || directory.hasPrefix(root + "/") else { return directory }
+        let relative = String(directory.dropFirst(root.count)).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        return relative.isEmpty ? "." : relative
     }
 
     func numberOfRows(in tableView: NSTableView) -> Int { rows.count }

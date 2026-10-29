@@ -97,6 +97,7 @@ pub(super) fn collect_scoped_declarations(
         "function_declaration"
             | "generator_function_declaration"
             | "class_declaration"
+            | "abstract_class_declaration"
             | "interface_declaration"
             | "type_alias_declaration"
             | "enum_declaration"
@@ -176,7 +177,7 @@ pub(super) fn collect_scoped_declarations(
 
 pub(super) fn declaration_kind(kind: &str) -> Option<DeclarationKind> {
     Some(match kind {
-        "class_declaration" | "class" => DeclarationKind::Class,
+        "class_declaration" | "abstract_class_declaration" | "class" => DeclarationKind::Class,
         "interface_declaration" => DeclarationKind::Interface,
         "type_alias_declaration" => DeclarationKind::Type,
         "enum_declaration" => DeclarationKind::Enum,
@@ -320,6 +321,7 @@ pub(super) fn is_local_reference(node: Node<'_>) -> bool {
                         "function_declaration"
                             | "generator_function_declaration"
                             | "class_declaration"
+                            | "abstract_class_declaration"
                             | "class"
                             | "interface_declaration"
                             | "type_alias_declaration"
@@ -380,7 +382,7 @@ pub(super) fn declarations_from_node(
         "function_declaration" | "function_signature" | "generator_function_declaration" => {
             DeclarationKind::Function
         }
-        "class_declaration" | "class" => DeclarationKind::Class,
+        "class_declaration" | "abstract_class_declaration" | "class" => DeclarationKind::Class,
         "interface_declaration" => DeclarationKind::Interface,
         "type_alias_declaration" => DeclarationKind::Type,
         "enum_declaration" => DeclarationKind::Enum,

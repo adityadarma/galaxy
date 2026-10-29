@@ -536,9 +536,17 @@ pub(super) fn resolve_typescript_type_member_target(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .index(&path)?;
-            let member = target_index.type_member(&declaration.name, member_name)?;
+            let (member_path, member) = resolve_inherited_member(
+                cache,
+                &path,
+                &target_index,
+                &declaration.name,
+                member_name,
+                0,
+                &mut HashSet::new(),
+            )?;
             Some(LspDefinitionLocation {
-                uri: file_uri(&path),
+                uri: file_uri(&member_path),
                 range: typescript_range(member.range),
             })
         }
@@ -695,6 +703,85 @@ pub(super) fn resolve_typescript_type_member_target(
                 .then_some(first)
         }
     }
+}
+
+/// Resolves a class member through local and imported superclasses. Declaration
+/// files frequently split inheritance across modules, such as Lucid's builders
+/// reaching `Macroable.macro` through `Chainable`.
+fn resolve_inherited_member(
+    cache: &Mutex<TypeScriptNavigationCache>,
+    path: &Path,
+    index: &DocumentIndex,
+    type_name: &str,
+    member_name: &str,
+    depth: usize,
+    visited: &mut HashSet<(PathBuf, String)>,
+) -> Option<(PathBuf, galaxy_core::typescript::TypeMember)> {
+    if depth == MAX_TYPESCRIPT_REEXPORT_DEPTH
+        || !visited.insert((module_identity(path), type_name.to_owned()))
+    {
+        return None;
+    }
+    let members = index.type_declaration(type_name)?;
+    let matches = members
+        .iter()
+        .filter(|member| member.name == member_name)
+        .collect::<Vec<_>>();
+    if let [member] = matches.as_slice() {
+        return Some((path.to_path_buf(), (*member).clone()));
+    }
+    for parent in index.type_parents(type_name)? {
+        if index.type_declaration(parent).is_some()
+            && let Some(member) = resolve_inherited_member(
+                cache,
+                path,
+                index,
+                parent,
+                member_name,
+                depth + 1,
+                visited,
+            )
+        {
+            return Some(member);
+        }
+        // `class_heritage` also lists `implements` types, which are usually
+        // type-only imports (Lucid's `DatabaseQueryBuilderContract`). Skip a
+        // parent that cannot be followed instead of abandoning the search.
+        let Some((import, binding)) = index.value_import(parent) else {
+            continue;
+        };
+        let Some(imported_name) = binding.imported_name.as_deref() else {
+            continue;
+        };
+        let Some(target) = resolve_typescript_definition_import(cache, path, &import.specifier)
+        else {
+            continue;
+        };
+        let Some((parent_path, declaration)) =
+            resolve_typescript_export(cache, target, imported_name)
+        else {
+            continue;
+        };
+        let Some(parent_index) = cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .index(&parent_path)
+        else {
+            continue;
+        };
+        if let Some(member) = resolve_inherited_member(
+            cache,
+            &parent_path,
+            &parent_index,
+            &declaration.name,
+            member_name,
+            depth + 1,
+            visited,
+        ) {
+            return Some(member);
+        }
+    }
+    None
 }
 
 fn resolve_fluent_member<'a>(
@@ -893,6 +980,13 @@ fn resolve_typescript_type_export_inner(
     if let Some(declaration) = index.export_assignment_namespace(name) {
         return Some((path, declaration.clone()));
     }
+    if let Some((specifier, imported_name)) = local_import_reexport(&index, name, true)
+        && let Some(target) = resolve_typescript_definition_import(cache, &path, &specifier)
+        && let Some(found) =
+            resolve_typescript_type_export_inner(cache, target, &imported_name, depth + 1, visited)
+    {
+        return Some(found);
+    }
     let candidates = index
         .exports
         .iter()
@@ -932,6 +1026,13 @@ fn resolve_typescript_export_inner(
     if let Some(declaration) = index.exported_declaration(name) {
         return Some((path, declaration.clone()));
     }
+    if let Some((specifier, imported_name)) = local_import_reexport(&index, name, false)
+        && let Some(target) = resolve_typescript_definition_import(cache, &path, &specifier)
+        && let Some(found) =
+            resolve_typescript_export_inner(cache, target, &imported_name, depth + 1, visited)
+    {
+        return Some(found);
+    }
     let mut candidates: Vec<(PathBuf, galaxy_core::typescript::Declaration)> = Vec::new();
     for export in index.exports.iter().filter(|export| !export.type_only) {
         let Some(specifier) = export.specifier.as_deref() else {
@@ -960,6 +1061,43 @@ fn resolve_typescript_export_inner(
         }
     }
     (candidates.len() == 1).then(|| candidates.remove(0))
+}
+
+/// Follows `import { X } from './x.js'; export { X };`, the pattern Lucid's
+/// `database/main.d.ts` uses for `DatabaseQueryBuilder`. Returns the import
+/// specifier and imported name for one unambiguous local export of `name`.
+fn local_import_reexport(
+    index: &DocumentIndex,
+    name: &str,
+    allow_type_only: bool,
+) -> Option<(String, String)> {
+    let locals = index
+        .exports
+        .iter()
+        .filter(|export| {
+            export.specifier.is_none()
+                && export.exported_name.as_deref() == Some(name)
+                && (allow_type_only || !export.type_only)
+        })
+        .filter_map(|export| export.name.as_deref())
+        .collect::<Vec<_>>();
+    let [local] = locals.as_slice() else {
+        return None;
+    };
+    let bindings = index
+        .imports
+        .iter()
+        .flat_map(|import| import.bindings.iter().map(move |binding| (import, binding)))
+        .filter(|(_, binding)| {
+            binding.local_name == *local
+                && matches!(binding.kind, ImportKind::Named | ImportKind::Default)
+                && (allow_type_only || !binding.type_only)
+        })
+        .collect::<Vec<_>>();
+    let [(import, binding)] = bindings.as_slice() else {
+        return None;
+    };
+    Some((import.specifier.clone(), binding.imported_name.clone()?))
 }
 
 pub(super) fn module_identity(path: &Path) -> PathBuf {

@@ -412,7 +412,7 @@ impl DocumentIndex {
         type_member_uses.extend(enum_uses);
         type_member_uses.extend(framework_uses);
 
-        let type_diagnostics = type_diagnostics(text, root, &locations);
+        let type_diagnostics = type_diagnostics(&path, text, root, &locations);
         Self {
             path,
             language,
@@ -834,6 +834,31 @@ impl DocumentIndex {
         }
     }
 
+    /// Direct parent type names declared by one unambiguous local class.
+    pub fn type_parents(&self, name: &str) -> Option<&[String]> {
+        let declarations = self
+            .type_declarations
+            .iter()
+            .filter(|item| item.name == name && item.kind == DeclarationKind::Class)
+            .collect::<Vec<_>>();
+        (declarations.len() == 1).then(|| declarations[0].extends.as_slice())
+    }
+
+    /// A unique named/default value import by its local binding name.
+    pub fn value_import(&self, name: &str) -> Option<(&Import, &ImportBinding)> {
+        let bindings = self
+            .imports
+            .iter()
+            .flat_map(|import| import.bindings.iter().map(move |binding| (import, binding)))
+            .filter(|(_, binding)| {
+                binding.local_name == name
+                    && !binding.type_only
+                    && matches!(binding.kind, ImportKind::Named | ImportKind::Default)
+            })
+            .collect::<Vec<_>>();
+        (bindings.len() == 1).then(|| bindings[0])
+    }
+
     pub fn type_declaration_at(&self, range: Utf16Range) -> Option<&[TypeMember]> {
         self.type_declarations
             .iter()
@@ -962,31 +987,41 @@ impl DocumentIndex {
 }
 
 struct Locations<'a> {
-    text: &'a str,
+    _text: &'a str,
     line_starts: Vec<usize>,
+    utf16_offsets: Vec<usize>,
 }
 
 impl<'a> Locations<'a> {
     fn new(text: &'a str) -> Self {
         let mut line_starts = vec![0];
         line_starts.extend(text.match_indices('\n').map(|(offset, _)| offset + 1));
-        Self { text, line_starts }
+        let mut utf16_offsets = vec![0; text.len() + 1];
+        let mut utf16 = 0;
+        for (byte, character) in text.char_indices() {
+            let end = byte + character.len_utf8();
+            utf16_offsets[byte..end].fill(utf16);
+            utf16 += character.len_utf16();
+        }
+        utf16_offsets[text.len()] = utf16;
+        Self {
+            _text: text,
+            line_starts,
+            utf16_offsets,
+        }
     }
 
-    fn position(&self, text: &str, byte: usize) -> Utf16Position {
-        let byte = byte.min(text.len());
+    fn position(&self, byte: usize) -> Utf16Position {
+        let byte = byte.min(self.utf16_offsets.len() - 1);
         let line = self.line_starts.partition_point(|start| *start <= byte) - 1;
         let start = self.line_starts[line];
-        Utf16Position::new(
-            line,
-            text.get(start..byte).unwrap_or("").encode_utf16().count(),
-        )
+        Utf16Position::new(line, self.utf16_offsets[byte] - self.utf16_offsets[start])
     }
 
     fn range(&self, node: Node<'_>) -> Utf16Range {
         Utf16Range {
-            start: self.position(self.text, node.start_byte()),
-            end: self.position(self.text, node.end_byte()),
+            start: self.position(node.start_byte()),
+            end: self.position(node.end_byte()),
         }
     }
 }

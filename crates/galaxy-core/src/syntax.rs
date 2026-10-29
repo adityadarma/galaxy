@@ -524,6 +524,7 @@ const TYPESCRIPT_HIGHLIGHTS: &str = r#"
 (interface_declaration name: (type_identifier) @type)
 (type_alias_declaration name: (type_identifier) @type)
 (enum_declaration name: (identifier) @type)
+(extends_clause (identifier) @type)
 ((identifier) @type (#any-of? @type "Array" "Boolean" "Date" "Error" "JSON" "Map" "Math" "Number" "Object" "Promise" "Record" "RegExp" "Set" "String" "Symbol" "WeakMap" "WeakSet"))
 ((member_expression object: (identifier) @type) (#match? @type "^[A-Z]"))
 [
@@ -549,8 +550,9 @@ const TYPESCRIPT_HIGHLIGHTS: &str = r#"
   "for" "from" "function" "if" "import" "in" "instanceof" "let" "new"
   "of" "return" "static" "switch" "throw" "try" "typeof" "var" "void"
   "while" "with" "yield" "as" "interface" "implements" "private"
-  "protected" "public" "readonly" "type" "namespace" "declare"
+   "protected" "public" "readonly" "type" "namespace" "declare"
 ] @keyword
+(abstract_class_declaration "abstract" @keyword)
 [
   ";" "." "," "(" ")" "[" "]" "{" "}" ":"
 ] @punctuation
@@ -2079,6 +2081,44 @@ mod tests {
                 "missing TypeScript scope {expected:?}"
             );
         }
+    }
+
+    #[test]
+    fn typescript_query_highlights_abstract_as_keyword() {
+        let language = SyntaxLanguage::TypeScript;
+        let source = "export declare abstract class Chainable {}\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let query = language.compile_highlights().unwrap();
+        let names = query.capture_names();
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+
+        assert!(matches.any(|m| m.captures.iter().any(|capture| {
+            &source[capture.node.byte_range()] == "abstract"
+                && HighlightScope::from_capture(names[capture.index as usize])
+                    == Some(HighlightScope::Keyword)
+        })));
+    }
+
+    #[test]
+    fn typescript_query_highlights_superclasses_as_types() {
+        let language = SyntaxLanguage::TypeScript;
+        let source = "class DatabaseQueryBuilder extends Chainable {}\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let query = language.compile_highlights().unwrap();
+        let names = query.capture_names();
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+
+        assert!(matches.any(|m| m.captures.iter().any(|capture| {
+            &source[capture.node.byte_range()] == "Chainable"
+                && HighlightScope::from_capture(names[capture.index as usize])
+                    == Some(HighlightScope::Type)
+        })));
     }
 
     #[test]

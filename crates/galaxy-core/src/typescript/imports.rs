@@ -16,7 +16,11 @@ pub(super) fn collect_type_import_references(
     let mut references = Vec::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        if node.kind() == "type_identifier"
+        if (node.kind() == "type_identifier"
+            || (node.kind() == "identifier"
+                && node
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "extends_clause")))
             && node
                 .parent()
                 .is_none_or(|parent| parent.kind() != "import_statement")

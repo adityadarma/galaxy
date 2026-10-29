@@ -32,7 +32,7 @@ pub(super) enum Type {
     Null,
     Undefined,
     Object(std::collections::BTreeMap<String, Type>),
-    Function(Vec<Type>, Box<Type>, Vec<String>),
+    Function(Vec<Type>, usize, Box<Type>, Vec<String>),
     Named(String, Vec<Type>),
     Union(Vec<Type>),
 }
@@ -41,10 +41,17 @@ pub(super) enum Type {
 pub(super) struct TypeState {
     values: std::collections::HashMap<String, Type>,
     aliases: std::collections::HashMap<String, (Vec<String>, Type)>,
+    /// Local classes: the only declarations collected here that also create a
+    /// runtime value. Interfaces and type aliases name types only, so an
+    /// augmentation such as `declare module '@vinejs/vine' { interface Vine {} }`
+    /// or `declare global { interface String {} }` must not replace the
+    /// imported or global value in expressions like `Vine.macro`.
+    classes: std::collections::HashSet<String>,
     diagnostics: Vec<TypeDiagnostic>,
 }
 
 pub(super) fn type_diagnostics(
+    path: &std::path::Path,
     text: &str,
     root: Node<'_>,
     locations: &Locations,
@@ -52,8 +59,35 @@ pub(super) fn type_diagnostics(
     let mut state = TypeState::default();
     // First collect named declarations so forward references and aliases are stable.
     collect_type_declarations(text, root, &mut state);
+    let mut cursor = root.walk();
+    let imports = root
+        .named_children(&mut cursor)
+        .filter(|node| node.kind() == "import_statement")
+        .map(|node| import_from_node(text, node, locations))
+        .collect::<Vec<_>>();
+    let context = framework::Context {
+        text,
+        locations,
+        imports: &imports,
+        import_symbols: &[],
+    };
+    for name in framework::macroable_classes(path, root, &context) {
+        state.values.insert(name, macroable_constructor());
+    }
     check_type_node(text, root, locations, &mut state);
     state.diagnostics
+}
+
+fn macroable_constructor() -> Type {
+    Type::Object(std::collections::BTreeMap::from([(
+        "macro".to_owned(),
+        Type::Function(
+            vec![Type::Primitive("string"), Type::Unknown],
+            2,
+            Box::new(Type::Unknown),
+            Vec::new(),
+        ),
+    )]))
 }
 
 pub(super) fn collect_type_declarations(text: &str, node: Node<'_>, state: &mut TypeState) {
@@ -71,7 +105,7 @@ pub(super) fn collect_type_declarations(text: &str, node: Node<'_>, state: &mut 
                 }
             }
         }
-        "interface_declaration" | "class_declaration" => {
+        "interface_declaration" | "class_declaration" | "abstract_class_declaration" => {
             if let Some(name) = node
                 .child_by_field_name("name")
                 .and_then(|n| node_text(text, n))
@@ -96,11 +130,22 @@ pub(super) fn collect_type_declarations(text: &str, node: Node<'_>, state: &mut 
                     stack.extend(item.named_children(&mut cursor));
                 }
                 let parameters = type_parameters(text, node);
-                let ty = if node.kind() == "class_declaration" {
+                let ty = if matches!(
+                    node.kind(),
+                    "class_declaration" | "abstract_class_declaration"
+                ) {
+                    let constructor = class_constructor(text, node).unwrap_or_else(|| {
+                        Type::Function(Vec::new(), 0, Box::new(Type::Unknown), parameters.clone())
+                    });
+                    let Type::Function(arguments, required, _, generic) = constructor else {
+                        unreachable!("class constructors are functions")
+                    };
+                    state.classes.insert(name.to_owned());
                     Type::Function(
-                        Vec::new(),
+                        arguments,
+                        required,
                         Box::new(Type::Object(properties)),
-                        parameters.clone(),
+                        generic,
                     )
                 } else {
                     Type::Object(properties)
@@ -162,26 +207,9 @@ pub(super) fn check_type_node(
             else {
                 return;
             };
-            let mut parameters = Vec::new();
-            if let Some(params) = node.child_by_field_name("parameters") {
-                let mut cursor = params.walk();
-                for parameter in params.named_children(&mut cursor) {
-                    parameters.push(
-                        parameter
-                            .child_by_field_name("type")
-                            .map(|n| parse_type(text, n))
-                            .unwrap_or(Type::Unknown),
-                    );
-                }
-            }
-            let result = node
-                .child_by_field_name("return_type")
-                .map(|n| parse_type(text, n))
-                .unwrap_or(Type::Unknown);
-            state.values.insert(
-                name.to_owned(),
-                Type::Function(parameters, Box::new(result), type_parameters(text, node)),
-            );
+            state
+                .values
+                .insert(name.to_owned(), function_type(text, node));
         }
         "assignment_expression" => {
             let right = node.child_by_field_name("right");
@@ -250,7 +278,9 @@ pub(super) fn infer_type(text: &str, node: Node<'_>, state: &mut TypeState) -> T
         "identifier" => node_text(text, node)
             .map(|name| {
                 state.values.get(name).cloned().unwrap_or_else(|| {
-                    if state.aliases.contains_key(name) {
+                    if let Some(global) = ecmascript_global(name) {
+                        global
+                    } else if state.classes.contains(name) && state.aliases.contains_key(name) {
                         Type::Named(name.to_owned(), Vec::new())
                     } else {
                         Type::Unknown
@@ -278,9 +308,7 @@ pub(super) fn infer_type(text: &str, node: Node<'_>, state: &mut TypeState) -> T
             }
             Type::Object(fields)
         }
-        "arrow_function" | "function_expression" => {
-            Type::Function(Vec::new(), Box::new(Type::Unknown), Vec::new())
-        }
+        "arrow_function" | "function_expression" => function_type(text, node),
         "member_expression" => {
             let object = node
                 .child_by_field_name("object")
@@ -306,7 +334,7 @@ pub(super) fn infer_type(text: &str, node: Node<'_>, state: &mut TypeState) -> T
             let Some(callee) = callee else {
                 return Type::Unknown;
             };
-            let Type::Function(_, result, parameters) =
+            let Type::Function(_, _, result, parameters) =
                 resolve(&infer_type(text, callee, state), state)
             else {
                 return Type::Unknown;
@@ -328,6 +356,71 @@ pub(super) fn infer_type(text: &str, node: Node<'_>, state: &mut TypeState) -> T
     }
 }
 
+fn ecmascript_global(name: &str) -> Option<Type> {
+    (name == "Date").then(|| {
+        Type::Object(std::collections::BTreeMap::from([
+            (
+                "now".to_owned(),
+                Type::Function(
+                    Vec::new(),
+                    0,
+                    Box::new(Type::Primitive("number")),
+                    Vec::new(),
+                ),
+            ),
+            ("prototype".to_owned(), Type::Unknown),
+        ]))
+    })
+}
+
+fn class_constructor(text: &str, class: Node<'_>) -> Option<Type> {
+    let body = class.child_by_field_name("body")?;
+    let mut cursor = body.walk();
+    body.named_children(&mut cursor)
+        .find(|member| {
+            member.kind() == "method_definition"
+                && member
+                    .child_by_field_name("name")
+                    .and_then(|name| node_text(text, name))
+                    == Some("constructor")
+        })
+        .map(|constructor| function_type(text, constructor))
+}
+
+fn function_type(text: &str, node: Node<'_>) -> Type {
+    let mut parameters = Vec::new();
+    let mut required_parameters = 0;
+    if let Some(params) = node.child_by_field_name("parameters") {
+        let mut cursor = params.walk();
+        for parameter in params.named_children(&mut cursor) {
+            let has_default = node_text(text, parameter).is_some_and(|source| source.contains('='));
+            if !matches!(
+                parameter.kind(),
+                "optional_parameter" | "assignment_pattern"
+            ) && !has_default
+            {
+                required_parameters += 1;
+            }
+            parameters.push(
+                parameter
+                    .child_by_field_name("type")
+                    .map(|n| parse_type(text, n))
+                    .unwrap_or(Type::Unknown),
+            );
+        }
+    }
+    let result = node
+        .child_by_field_name("return_type")
+        .map(|n| parse_type(text, n))
+        .unwrap_or(Type::Unknown);
+    Type::Function(
+        parameters,
+        required_parameters,
+        Box::new(result),
+        type_parameters(text, node),
+    )
+}
+
 pub(super) fn check_call(text: &str, node: Node<'_>, locations: &Locations, state: &mut TypeState) {
     let function = node
         .child_by_field_name("function")
@@ -337,7 +430,7 @@ pub(super) fn check_call(text: &str, node: Node<'_>, locations: &Locations, stat
     if matches!(node.kind(), "new_expression") {
         callee = resolve(&callee, state);
     }
-    let Type::Function(parameters, _, generic_parameters) = callee else {
+    let Type::Function(parameters, required_parameters, _, generic_parameters) = callee else {
         return;
     };
     let explicit_arguments = node
@@ -363,7 +456,7 @@ pub(super) fn check_call(text: &str, node: Node<'_>, locations: &Locations, stat
             list.named_children(&mut cursor).collect::<Vec<_>>()
         })
         .collect();
-    if args.len() != parameters.len() {
+    if args.len() < required_parameters || args.len() > parameters.len() {
         state.diagnostics.push(TypeDiagnostic {
             code: "TS2554".into(),
             message: format!(
@@ -445,11 +538,12 @@ pub(super) fn substitute(ty: &Type, parameters: &[String], args: &[Type]) -> Typ
                 .map(|(name, item)| (name.clone(), substitute(item, parameters, args)))
                 .collect(),
         ),
-        Type::Function(items, result, generic) => Type::Function(
+        Type::Function(items, required, result, generic) => Type::Function(
             items
                 .iter()
                 .map(|item| substitute(item, parameters, args))
                 .collect(),
+            *required,
             Box::new(substitute(result, parameters, args)),
             generic.clone(),
         ),
