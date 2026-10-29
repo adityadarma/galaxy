@@ -2146,7 +2146,7 @@ mod tests {
                 .map_or(prefix.len(), |(_, tail)| tail.len());
             runs.iter()
                 .filter(|run| run.line == line && run.start <= column && column < run.end)
-                .last()
+                .next_back()
                 .map(|run| run.scope)
         };
 
@@ -2200,7 +2200,7 @@ mod tests {
                 .filter(|run| run.line == line && run.start <= column && column < run.end)
                 // Renderer applies runs in order; the final overlapping run
                 // supplies the visible semantic color.
-                .last()
+                .next_back()
                 .map(|run| run.scope)
         };
         assert!(runs.iter().any(|run| run.scope == HighlightScope::Type));
@@ -2238,7 +2238,7 @@ mod tests {
                 .map_or(prefix.len(), |(_, tail)| tail.len());
             runs.iter()
                 .filter(|run| run.line == line && run.start <= column && column < run.end)
-                .last()
+                .next_back()
                 .map(|run| run.scope)
         };
 

@@ -4,6 +4,7 @@ use std::path::{Component, Path, PathBuf};
 use galaxy_core::analysis::{
     CompletionItem as LspCompletionItem, DocumentSymbolInfo, Range as LspRange, RenameEdit,
 };
+use galaxy_core::javascript::PackageImports;
 use galaxy_core::typescript::{Declaration, DeclarationKind, DocumentIndex};
 
 use crate::typescript_navigation::{
@@ -30,14 +31,17 @@ struct WorkspaceExport {
 #[derive(Debug, Default)]
 pub(super) struct TypeScriptWorkspaceExports {
     roots: BTreeMap<PathBuf, BTreeMap<String, Vec<WorkspaceExport>>>,
+    generation: u64,
 }
 
 impl TypeScriptWorkspaceExports {
     pub(super) fn clear(&mut self) {
         self.roots.clear();
+        self.generation += 1;
     }
 
     pub(super) fn refresh(&mut self, root: &Path, paths: &[String]) {
+        self.generation += 1;
         let mut files = BTreeMap::new();
         for path in paths
             .iter()
@@ -69,6 +73,7 @@ impl TypeScriptWorkspaceExports {
         let Some(files) = self.roots.get_mut(root) else {
             return;
         };
+        self.generation += 1;
         for path in paths.iter().filter(|path| is_source_path(path)) {
             let full_path = root.join(path);
             match std::fs::read_to_string(&full_path) {
@@ -80,6 +85,47 @@ impl TypeScriptWorkspaceExports {
                 }
             }
         }
+    }
+
+    /// Bumped whenever the index changes, so cached diagnostics that depend
+    /// on it can be recomputed.
+    pub(super) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// For each name in `names` that a single workspace module exports, the
+    /// import a quick fix would add: `(name, specifier)`. The specifier
+    /// follows the same rules as completion auto-imports.
+    pub(super) fn import_suggestions(
+        &self,
+        document: &Path,
+        names: &BTreeSet<&str>,
+    ) -> BTreeMap<String, String> {
+        let mut suggestions = BTreeMap::new();
+        if names.is_empty() {
+            return suggestions;
+        }
+        let Some((root, exports)) = self.exports_for(document) else {
+            return suggestions;
+        };
+        let Ok(document_relative) = document.strip_prefix(root) else {
+            return suggestions;
+        };
+        let package_imports = PackageImports::detect(document);
+        for export in exports {
+            if !names.contains(export.name.as_str()) || Path::new(&export.path) == document_relative
+            {
+                continue;
+            }
+            if let Some(specifier) = package_imports
+                .as_ref()
+                .and_then(|imports| imports.specifier_for(&root.join(&export.path)))
+                .or_else(|| workspace_module_specifier(document_relative, &export.path))
+            {
+                suggestions.insert(export.name, specifier);
+            }
+        }
+        suggestions
     }
 
     fn exports_for(&self, path: &Path) -> Option<(&Path, Vec<WorkspaceExport>)> {
@@ -122,35 +168,7 @@ fn workspace_exports(path: &Path, text: &str, relative: &str) -> Vec<WorkspaceEx
         .collect()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn disk_delta_replaces_and_removes_workspace_exports() {
-        let root = tempfile::tempdir().unwrap();
-        let file = root.path().join("model.ts");
-        std::fs::write(&file, "export class OldModel {}\n").unwrap();
-        let mut exports = TypeScriptWorkspaceExports::default();
-        exports.refresh(root.path(), &["model.ts".into()]);
-        assert_eq!(
-            exports.exports_for(root.path()).unwrap().1[0].name,
-            "OldModel"
-        );
-
-        std::fs::write(&file, "export class NewModel {}\n").unwrap();
-        exports.apply_changes(root.path(), &["model.ts".into()]);
-        assert_eq!(
-            exports.exports_for(root.path()).unwrap().1[0].name,
-            "NewModel"
-        );
-
-        std::fs::remove_file(&file).unwrap();
-        exports.apply_changes(root.path(), &["model.ts".into()]);
-        assert!(exports.exports_for(root.path()).unwrap().1.is_empty());
-    }
-}
-
+#[allow(clippy::too_many_arguments)]
 pub(super) fn typescript_completions(
     path: &str,
     edit_uri: &str,
@@ -246,6 +264,10 @@ pub(super) fn typescript_completions(
         let Some(document_relative) = document_path.strip_prefix(workspace_root).ok() else {
             return Vec::new();
         };
+        // package.json `imports` aliases win over relative paths, as the
+        // project asked for them (`#services/auth_service`).
+        let package_imports = PackageImports::detect(document_path);
+        let quote = preferred_quote(&index, text);
         for export in exports {
             if Path::new(&export.path) == document_relative
                 || !export.name.starts_with(&prefix)
@@ -253,14 +275,20 @@ pub(super) fn typescript_completions(
             {
                 continue;
             }
-            let Some(specifier) = workspace_module_specifier(document_relative, &export.path)
+            let Some(specifier) = package_imports
+                .as_ref()
+                .and_then(|imports| imports.specifier_for(&workspace_root.join(&export.path)))
+                .or_else(|| workspace_module_specifier(document_relative, &export.path))
             else {
                 continue;
             };
             let import = if export.default {
-                format!("import {} from '{specifier}';\n", export.name)
+                format!("import {} from {quote}{specifier}{quote};\n", export.name)
             } else {
-                format!("import {{ {} }} from '{specifier}';\n", export.name)
+                format!(
+                    "import {{ {} }} from {quote}{specifier}{quote};\n",
+                    export.name
+                )
             };
             items
                 .entry(export.name.clone())
@@ -324,9 +352,12 @@ pub(super) fn typescript_completions(
     if !matches!(extension, Some("vue" | "svelte")) && prefix.len() >= 3 {
         package_specifiers.extend(typescript_dependency_packages(document_path));
     }
+    // Vue and Svelte components get their own framework imports above.
     package_specifiers.retain(|specifier| {
-        !(extension == Some("vue") && specifier == "vue")
-            && !(extension == Some("svelte") && specifier == "svelte")
+        !matches!(
+            (extension, specifier.as_str()),
+            (Some("vue"), "vue") | (Some("svelte"), "svelte")
+        )
     });
     for specifier in package_specifiers {
         for (name, kind) in
@@ -512,6 +543,31 @@ fn import_insertion_point(index: &DocumentIndex, fallback: usize) -> usize {
         .unwrap_or(fallback)
 }
 
+/// The quote the file's existing imports use; single quotes otherwise.
+fn preferred_quote(index: &DocumentIndex, text: &str) -> char {
+    let lines = text.lines().collect::<Vec<_>>();
+    index
+        .imports
+        .iter()
+        .find_map(|import| {
+            let start = import.specifier_range.start;
+            let line = lines.get(start.line)?;
+            // Columns are UTF-16; the quote opens the literal.
+            String::from_utf16(
+                &line
+                    .encode_utf16()
+                    .skip(start.col)
+                    .take(1)
+                    .collect::<Vec<_>>(),
+            )
+            .ok()?
+            .chars()
+            .next()
+            .filter(|ch| matches!(ch, '"' | '\''))
+        })
+        .unwrap_or('\'')
+}
+
 fn workspace_module_specifier(document: &Path, exported_path: &str) -> Option<String> {
     let from = document.parent()?;
     let target = Path::new(exported_path).with_extension("js");
@@ -647,5 +703,34 @@ pub(super) fn typescript_outline_symbol(
             end_character: declaration.range.end.col as u64,
         },
         children: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disk_delta_replaces_and_removes_workspace_exports() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("model.ts");
+        std::fs::write(&file, "export class OldModel {}\n").unwrap();
+        let mut exports = TypeScriptWorkspaceExports::default();
+        exports.refresh(root.path(), &["model.ts".into()]);
+        assert_eq!(
+            exports.exports_for(root.path()).unwrap().1[0].name,
+            "OldModel"
+        );
+
+        std::fs::write(&file, "export class NewModel {}\n").unwrap();
+        exports.apply_changes(root.path(), &["model.ts".into()]);
+        assert_eq!(
+            exports.exports_for(root.path()).unwrap().1[0].name,
+            "NewModel"
+        );
+
+        std::fs::remove_file(&file).unwrap();
+        exports.apply_changes(root.path(), &["model.ts".into()]);
+        assert!(exports.exports_for(root.path()).unwrap().1.is_empty());
     }
 }

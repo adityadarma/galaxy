@@ -62,6 +62,118 @@ pub(super) fn resolve_symbols(
         .collect()
 }
 
+/// Identifier and type references whose name this file never declares or
+/// imports, in any scope. Deliberately loose about scope (a name declared
+/// anywhere counts) so callers can flag missing imports without false
+/// positives from scoping gaps; callers still decide which names matter.
+pub(super) fn unresolved_references(
+    text: &str,
+    root: Node<'_>,
+    locations: &Locations,
+) -> Vec<(String, Utf16Range)> {
+    let mut scopes = vec![Scope {
+        parent: None,
+        range: locations.range(root),
+    }];
+    let mut declarations = Vec::new();
+    collect_scoped_declarations(
+        root,
+        0,
+        text,
+        locations,
+        &mut scopes,
+        &mut declarations,
+        true,
+    );
+    let mut declared = declarations
+        .iter()
+        .map(|declaration| declaration.name.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let declared_ranges = declarations
+        .iter()
+        .map(|declaration| {
+            let range = declaration.range;
+            (
+                range.start.line,
+                range.start.col,
+                range.end.line,
+                range.end.col,
+            )
+        })
+        .collect::<std::collections::HashSet<_>>();
+    let mut references = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        match node.kind() {
+            // `<T>` and `infer T` introduce names the scope walk does not track.
+            "type_parameter" | "infer_type" => {
+                let mut cursor = node.walk();
+                if let Some(name) = node
+                    .child_by_field_name("name")
+                    .or_else(|| node.named_children(&mut cursor).next())
+                    .and_then(|name| node_text(text, name))
+                {
+                    declared.insert(name);
+                }
+            }
+            // `catch (error)`, class expressions and named function
+            // expressions bind names outside `collect_scoped_declarations`.
+            "catch_clause" | "class" | "function_expression" => {
+                if let Some(name) = node
+                    .child_by_field_name("parameter")
+                    .or_else(|| node.child_by_field_name("name"))
+                    .and_then(|name| node_text(text, name))
+                {
+                    declared.insert(name);
+                }
+            }
+            "mapped_type_clause" => {
+                if let Some(name) = node
+                    .child_by_field_name("name")
+                    .and_then(|name| node_text(text, name))
+                {
+                    declared.insert(name);
+                }
+            }
+            // Ambient blocks (`declare global`, `declare module 'x'`) talk
+            // about names owned elsewhere.
+            "ambient_declaration" => continue,
+            "identifier" | "type_identifier" => {
+                let range = locations.range(node);
+                // `Ns.Type`: only `Ns` is looked up in this file.
+                let qualified_member = node.parent().is_some_and(|parent| {
+                    parent.kind() == "nested_type_identifier"
+                        && parent
+                            .child_by_field_name("name")
+                            .is_some_and(|name| name.id() == node.id())
+                });
+                if !declared_ranges.contains(&(
+                    range.start.line,
+                    range.start.col,
+                    range.end.line,
+                    range.end.col,
+                )) && !qualified_member
+                    && is_local_reference(node)
+                    && let Some(name) = node_text(text, node)
+                {
+                    references.push((name, range));
+                }
+                continue;
+            }
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    let mut unresolved = references
+        .into_iter()
+        .filter(|(name, _)| !declared.contains(name))
+        .map(|(name, range)| (name.to_owned(), range))
+        .collect::<Vec<_>>();
+    unresolved.sort_by_key(|(_, range)| (range.start.line, range.start.col));
+    unresolved
+}
+
 pub(super) fn collect_scoped_declarations(
     node: Node<'_>,
     scope: usize,

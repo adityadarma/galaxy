@@ -459,6 +459,9 @@ pub struct Core {
     /// polled frequently for other engines, but reparsing unchanged buffers
     /// would traverse the whole Tree-sitter tree on every poll.
     typescript_checked: Mutex<HashMap<String, u64>>,
+    /// Workspace export generation `typescript_checked` was computed with;
+    /// missing-import warnings depend on it, so a change rechecks buffers.
+    typescript_checked_exports: Mutex<u64>,
     /// Per open Rust file: buffer revision last checked. Rust diagnostics walk
     /// the parsed source, so repeating that work from the UI's 100 ms poll
     /// makes a newly navigated-to file stall scrolling.
@@ -484,6 +487,7 @@ impl Default for Core {
             php_documents: Mutex::new(HashMap::new()),
             php_checked: Mutex::new(HashMap::new()),
             typescript_checked: Mutex::new(HashMap::new()),
+            typescript_checked_exports: Mutex::new(0),
             rust_checked: Mutex::new(HashMap::new()),
             dart_checked: Mutex::new(HashMap::new()),
             typescript_navigation: Arc::new(Mutex::new(TypeScriptNavigationCache::default())),
@@ -1164,12 +1168,11 @@ impl Core {
                 .dart_engine(Path::new(&path))
                 .map(|engine| {
                     let engine = engine.lock().unwrap_or_else(|e| e.into_inner());
-                    engine
-                        .is_ready()
-                        .then(|| {
-                            engine.complete(Path::new(&path), &text, line as u32, character as u32)
-                        })
-                        .unwrap_or_default()
+                    if engine.is_ready() {
+                        engine.complete(Path::new(&path), &text, line as u32, character as u32)
+                    } else {
+                        Default::default()
+                    }
                 })
                 .unwrap_or_default()
                 .into_iter()
@@ -1556,10 +1559,11 @@ impl Core {
                 .dart_engine(Path::new(&path))
                 .map(|engine| {
                     let engine = engine.lock().unwrap_or_else(|e| e.into_inner());
-                    engine
-                        .is_ready()
-                        .then(|| engine.outline(Path::new(&path), &text))
-                        .unwrap_or_default()
+                    if engine.is_ready() {
+                        engine.outline(Path::new(&path), &text)
+                    } else {
+                        Default::default()
+                    }
                 })
                 .unwrap_or_default()
                 .iter()
@@ -1859,10 +1863,11 @@ impl Engine {
             }
             Engine::Rust(engine) => {
                 let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
-                engine
-                    .is_ready()
-                    .then(|| engine.complete(path, text, line, column))
-                    .unwrap_or_default()
+                if engine.is_ready() {
+                    engine.complete(path, text, line, column)
+                } else {
+                    Default::default()
+                }
             }
         }
     }
@@ -1913,10 +1918,11 @@ impl Engine {
             }
             Engine::Rust(engine) => {
                 let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
-                engine
-                    .is_ready()
-                    .then(|| engine.definition(path, text, line, column))
-                    .unwrap_or_default()
+                if engine.is_ready() {
+                    engine.definition(path, text, line, column)
+                } else {
+                    Vec::new()
+                }
             }
         }
     }
@@ -1941,10 +1947,11 @@ impl Engine {
             }
             Engine::Rust(engine) => {
                 let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
-                engine
-                    .is_ready()
-                    .then(|| engine.actions(path, text, line, column))
-                    .unwrap_or_default()
+                if engine.is_ready() {
+                    engine.actions(path, text, line, column)
+                } else {
+                    Vec::new()
+                }
             }
         }
     }
@@ -2453,6 +2460,20 @@ impl Core {
             .typescript_checked
             .lock()
             .unwrap_or_else(|e| e.into_inner());
+        let exports = self
+            .typescript_workspace_exports
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        {
+            let mut generation = self
+                .typescript_checked_exports
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if *generation != exports.generation() {
+                *generation = exports.generation();
+                checked.clear();
+            }
+        }
         for (uri, document) in documents {
             let path = document.path();
             if !is_typescript_path(Path::new(&path)) {
@@ -2522,6 +2543,28 @@ impl Core {
                         unnecessary: false,
                     }),
             );
+            // Only names some workspace module exports are reported, so
+            // globals and lib types never warn.
+            let names = index
+                .unresolved_references
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<std::collections::BTreeSet<_>>();
+            let suggestions = exports.import_suggestions(Path::new(&path), &names);
+            diagnostics.extend(index.unresolved_references.iter().filter_map(|(name, range)| {
+                let specifier = suggestions.get(name)?;
+                Some(galaxy_core::analysis::Diagnostic {
+                    uri: uri.clone(),
+                    range: typescript_range(*range),
+                    severity: galaxy_core::analysis::DiagnosticSeverity::Warning,
+                    message: format!(
+                        "Cannot find name '{name}'. Did you forget to import it from '{specifier}'?"
+                    ),
+                    source: Some("galaxy".into()),
+                    code: Some("TS2304".into()),
+                    unnecessary: false,
+                })
+            }));
             analysis.set_diagnostics(uri, diagnostics);
             analysis.set_document_symbols(
                 uri,
@@ -2902,12 +2945,11 @@ impl Core {
             .dart_engine(Path::new(&path))
             .map(|engine| {
                 let engine = engine.lock().unwrap_or_else(|e| e.into_inner());
-                engine
-                    .is_ready()
-                    .then(|| {
-                        engine.references(Path::new(&path), &text, line as u32, character as u32)
-                    })
-                    .unwrap_or_default()
+                if engine.is_ready() {
+                    engine.references(Path::new(&path), &text, line as u32, character as u32)
+                } else {
+                    Default::default()
+                }
             })
             .unwrap_or_default()
             .into_iter()
@@ -2979,20 +3021,19 @@ impl Core {
             .dart_engine(Path::new(&path))
             .map(|engine| {
                 let engine = engine.lock().unwrap_or_else(|e| e.into_inner());
-                engine
-                    .is_ready()
-                    .then(|| {
-                        engine
-                            .rename(
-                                Path::new(&path),
-                                &text,
-                                line as u32,
-                                character as u32,
-                                new_name,
-                            )
-                            .unwrap_or_default()
-                    })
-                    .unwrap_or_default()
+                if engine.is_ready() {
+                    engine
+                        .rename(
+                            Path::new(&path),
+                            &text,
+                            line as u32,
+                            character as u32,
+                            new_name,
+                        )
+                        .unwrap_or_default()
+                } else {
+                    Default::default()
+                }
             })
             .unwrap_or_default()
             .into_iter()
@@ -3552,15 +3593,19 @@ fn typescript_range(range: galaxy_core::typescript::Utf16Range) -> LspRange {
     }
 }
 
+/// Built-in language engines keyed by project root, shared across threads.
+type EngineMap<E> = Arc<Mutex<HashMap<PathBuf, Arc<Mutex<E>>>>>;
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_workspace_indexing(
     workspace: CoreWorkspace,
     analysis: Arc<Mutex<BuiltinStore>>,
     cache: Arc<Mutex<TypeScriptNavigationCache>>,
     typescript_exports: Arc<Mutex<TypeScriptWorkspaceExports>>,
-    go_engines: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<GoEngine>>>>>,
-    php_engines: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<PhpEngine>>>>>,
-    rust_engines: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<RustEngine>>>>>,
-    dart_engines: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<DartEngine>>>>>,
+    go_engines: EngineMap<GoEngine>,
+    php_engines: EngineMap<PhpEngine>,
+    rust_engines: EngineMap<RustEngine>,
+    dart_engines: EngineMap<DartEngine>,
     indexing_roots: Arc<Mutex<HashMap<PathBuf, bool>>>,
     listener: Option<Arc<dyn CoreListener>>,
 ) {
@@ -3635,7 +3680,7 @@ fn publish_workspace_rust_diagnostics(
     analysis: &Arc<Mutex<BuiltinStore>>,
     root: &Path,
     paths: &[String],
-    engines: &Arc<Mutex<HashMap<PathBuf, Arc<Mutex<RustEngine>>>>>,
+    engines: &EngineMap<RustEngine>,
 ) {
     const MAX_FILES: usize = 10_000;
     let mut projects: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();

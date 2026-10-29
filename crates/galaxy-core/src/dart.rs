@@ -73,8 +73,10 @@ impl DartEngine {
 
     pub fn build(root: &Path) -> Built {
         let package = package_name(root);
-        let mut built = Built::default();
-        built.packages = package_roots(root, package.as_deref());
+        let mut built = Built {
+            packages: package_roots(root, package.as_deref()),
+            ..Built::default()
+        };
         let mut roots = vec![root.join("lib")];
         roots.extend(built.packages.values().cloned());
         for source_root in roots {
@@ -165,7 +167,14 @@ impl DartEngine {
         let prefix = word_before(text, line, column);
         let qualified = qualifier_before(text, line, column);
         let file = self.file_for(path, text);
-        let visible = self.visible(path, text);
+        // After `p.` for an import prefix only that import's names apply.
+        let import_prefix = qualified
+            .as_deref()
+            .filter(|name| self.is_import_prefix(&file, name));
+        let visible = match import_prefix {
+            Some(prefix) => self.prefixed_exports(&file, prefix),
+            None => self.visible(path, text, None),
+        };
         let mut candidates: Vec<(Declaration, Vec<Insertion>)> = visible
             .iter()
             .cloned()
@@ -176,8 +185,14 @@ impl DartEngine {
         // every initial keystroke.
         if qualified.is_none() && prefix.chars().count() >= 2 {
             for (candidate_path, candidate_file) in &self.files {
+                // Already imported (possibly with a prefix): never offer a
+                // second, unprefixed import of the same file.
                 if candidate_path == path
                     || self.library_files(path, &file).contains(candidate_path)
+                    || file
+                        .imports
+                        .iter()
+                        .any(|import| &import.path == candidate_path)
                 {
                     continue;
                 }
@@ -203,10 +218,10 @@ impl DartEngine {
                 }
             }
         }
-        if let Some(prefix_name) = qualified {
+        if let Some(prefix_name) = qualified.as_ref().filter(|_| import_prefix.is_none()) {
             candidates.retain(|(item, _)| {
                 item.owner.as_deref() == Some(prefix_name.as_str())
-                    || (item.kind == ItemKind::Class && item.name == prefix_name)
+                    || (item.kind == ItemKind::Class && &item.name == prefix_name)
             });
         }
         candidates.retain(|(item, _)| item.name.starts_with(&prefix));
@@ -379,7 +394,7 @@ impl DartEngine {
             .as_deref()
             .filter(|q| !self.is_import_prefix(&file, q));
         let mut matches: Vec<_> = self
-            .visible(path, text)
+            .visible(path, text, qualifier.as_deref())
             .into_iter()
             .filter(|item| item.name == name)
             .collect();
@@ -391,10 +406,17 @@ impl DartEngine {
         }
         matches.sort_by(|a, b| (&a.path, a.line, a.column).cmp(&(&b.path, b.line, b.column)));
         matches.dedup();
-        (matches.len() == 1).then_some(matches).unwrap_or_default()
+        if matches.len() == 1 {
+            matches
+        } else {
+            Vec::new()
+        }
     }
 
-    fn visible(&self, path: &Path, text: &str) -> Vec<Declaration> {
+    /// Declarations reachable from `path`. Names of a prefixed import
+    /// (`import 'x.dart' as p;`) are only reachable through `p.`, as in
+    /// Dart, so they are included only when `prefix` names that import.
+    fn visible(&self, path: &Path, text: &str, prefix: Option<&str>) -> Vec<Declaration> {
         let file = self.file_for(path, text);
         let mut out = file.declarations.clone();
         for sibling in self.library_files(path, &file) {
@@ -403,13 +425,21 @@ impl DartEngine {
             }
         }
         for import in &file.imports {
-            if import.prefix.is_none() {
-                out.extend(self.exported(&import.path, import));
-            } else {
+            if import.prefix.is_none() || import.prefix.as_deref() == prefix {
                 out.extend(self.exported(&import.path, import));
             }
         }
         out
+    }
+
+    /// Top-level names a prefixed import exposes after `prefix.`.
+    fn prefixed_exports(&self, file: &FileIndex, prefix: &str) -> Vec<Declaration> {
+        file.imports
+            .iter()
+            .filter(|import| import.prefix.as_deref() == Some(prefix))
+            .flat_map(|import| self.exported(&import.path, import))
+            .filter(|item| item.owner.is_none())
+            .collect()
     }
 
     fn exported(&self, path: &Path, import: &Import) -> Vec<Declaration> {
@@ -746,7 +776,7 @@ fn parse_import(
     let names = |word: &str| {
         code.split_once(word).map(|(_, rest)| {
             rest.trim()
-                .trim_start_matches(|c| c == '{' || c == ' ')
+                .trim_start_matches(['{', ' '])
                 .split(|c: char| !is_ident(c))
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned)
@@ -1050,6 +1080,44 @@ mod tests {
                 .filter(|item| item.label == "Hidden")
                 .count(),
             0
+        );
+    }
+
+    #[test]
+    fn prefixed_import_names_need_their_prefix() {
+        let (root, engine) = engine(&[
+            ("card.dart", "class Card {}\n"),
+            (
+                "main.dart",
+                "import 'card.dart' as ui;\nvoid f() { Card(); ui.Card(); Ca }\n",
+            ),
+        ]);
+        let path = root.path().join("lib/main.dart");
+        let source = std::fs::read_to_string(&path).unwrap();
+        let line = source.lines().nth(1).unwrap();
+        let bare = line.find("Card()").unwrap() as u32 + 1;
+        let qualified = line.find("ui.Card").unwrap() as u32 + 4;
+        let typed = line.find("Ca }").unwrap() as u32 + 2;
+
+        assert!(engine.definition(&path, &source, 1, bare).is_empty());
+        assert_eq!(
+            engine.definition(&path, &source, 1, qualified)[0].path,
+            root.path().join("lib/card.dart")
+        );
+        // Unqualified completion neither offers `Card` as reachable nor
+        // proposes importing `card.dart` a second time.
+        assert!(
+            engine
+                .complete(&path, &source, 1, typed)
+                .iter()
+                .all(|item| item.label != "Card")
+        );
+        let after_prefix = line.find("ui.Card").unwrap() as u32 + 3;
+        assert!(
+            engine
+                .complete(&path, &source, 1, after_prefix)
+                .iter()
+                .any(|item| item.label == "Card" && item.extra.is_empty())
         );
     }
 

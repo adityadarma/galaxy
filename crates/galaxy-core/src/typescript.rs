@@ -299,6 +299,10 @@ pub struct DocumentIndex {
     pub diagnostics: Vec<ParseDiagnostic>,
     /// Diagnostics produced by the deliberately small TypeScript type subset.
     pub type_diagnostics: Vec<TypeDiagnostic>,
+    /// Names referenced (as values or types) that nothing in this file
+    /// declares or imports. Globals are included; the host matches these
+    /// against workspace exports to report missing imports.
+    pub unresolved_references: Vec<(String, Utf16Range)>,
     export_assignment: bool,
     namespace_members: Vec<NamespaceMemberUse>,
     symbols: Vec<SymbolOccurrences>,
@@ -422,6 +426,7 @@ impl DocumentIndex {
             exports,
             diagnostics: diagnostics(root, &locations),
             type_diagnostics,
+            unresolved_references: unresolved_references(text, root, &locations),
             export_assignment,
             namespace_members,
             symbols,

@@ -553,9 +553,11 @@ impl RustEngine {
             return globbed;
         }
         let matching: Vec<_> = all.into_iter().filter(|item| item.name == name).collect();
-        (matching.len() == 1)
-            .then_some(matching)
-            .unwrap_or_default()
+        if matching.len() == 1 {
+            matching
+        } else {
+            Vec::new()
+        }
     }
 
     fn resolve_path(&self, path: &Path, target: &[String]) -> Vec<Declaration> {
@@ -590,7 +592,11 @@ impl RustEngine {
             .into_iter()
             .filter(|item| item.name == *name && item.module == module)
             .collect();
-        (matches.len() == 1).then_some(matches).unwrap_or_default()
+        if matches.len() == 1 {
+            matches
+        } else {
+            Vec::new()
+        }
     }
 
     fn declarations_in_module(&self, path: &Path, target: &[String]) -> Vec<Declaration> {
@@ -744,10 +750,10 @@ fn cargo_source_roots(root: &Path) -> Vec<PathBuf> {
         }
         let value = value.trim().trim_matches('"');
         let path = root.join(value);
-        if path.extension().is_some_and(|extension| extension == "rs") {
-            if let Some(parent) = path.parent() {
-                roots.push(parent.to_path_buf());
-            }
+        if path.extension().is_some_and(|extension| extension == "rs")
+            && let Some(parent) = path.parent()
+        {
+            roots.push(parent.to_path_buf());
         }
     }
     roots.retain(|path| path.is_dir());
@@ -1018,23 +1024,24 @@ fn collect_local_bindings(
             collect_pattern_bindings(path, text, parameter, depth, out);
         }
     }
-    if node.kind() == "let_declaration" && node.start_byte() < at {
-        if let Some(pattern) = node
+    if node.kind() == "let_declaration"
+        && node.start_byte() < at
+        && let Some(pattern) = node
             .child_by_field_name("pattern")
             .or_else(|| node.named_child(0))
-        {
-            collect_pattern_bindings(path, text, pattern, depth, out);
-        }
+    {
+        collect_pattern_bindings(path, text, pattern, depth, out);
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        if node.kind() == "block" && child.kind() == "let_declaration" && child.start_byte() < at {
-            if let Some(pattern) = child
+        if node.kind() == "block"
+            && child.kind() == "let_declaration"
+            && child.start_byte() < at
+            && let Some(pattern) = child
                 .child_by_field_name("pattern")
                 .or_else(|| child.named_child(0))
-            {
-                collect_pattern_bindings(path, text, pattern, depth + 1, out);
-            }
+        {
+            collect_pattern_bindings(path, text, pattern, depth + 1, out);
         }
         if child.start_byte() <= at && child.end_byte() >= at {
             collect_local_bindings(path, text, child, at, depth + 1, out);

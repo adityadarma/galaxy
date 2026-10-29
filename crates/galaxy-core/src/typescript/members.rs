@@ -503,7 +503,7 @@ pub(super) fn collect_type_member_uses(
                         symbol.name == receiver && symbol.occurrences.contains(&object_range)
                     })
                     .map(|symbol| symbol.declaration);
-                let imported_binding = imports.iter().flat_map(|import| {
+                let mut imported_binding = imports.iter().flat_map(|import| {
                     import.bindings.iter().filter(move |binding| {
                         binding.local_name == receiver
                             && !binding.type_only
@@ -524,9 +524,8 @@ pub(super) fn collect_type_member_uses(
                     continue;
                 }
                 if member_access_is_called(node)
-                    && let Some(binding) = imported_binding
-                        .filter(|binding| binding.kind == ImportKind::Default)
-                        .next()
+                    && let Some(binding) =
+                        imported_binding.find(|binding| binding.kind == ImportKind::Default)
                 {
                     uses.push(TypeMemberUse {
                         target: TypeMemberTarget::ImportedFactory(binding.range),

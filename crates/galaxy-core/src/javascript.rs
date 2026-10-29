@@ -240,6 +240,99 @@ fn resolve_package_import(root: &Path, specifier: &str) -> Option<PathBuf> {
     resolve_package_target(root, &target)
 }
 
+/// The string `imports` entries (`"#services/*": "./app/services/*.js"`) of
+/// the package enclosing a file. Used to write auto-imports with the
+/// package's own `#` aliases instead of relative paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageImports {
+    root: PathBuf,
+    entries: Vec<(String, String)>,
+}
+
+impl PackageImports {
+    /// Reads the nearest `package.json` above `file`. `None` when it has no
+    /// usable `imports` entries.
+    pub fn detect(file: &Path) -> Option<Self> {
+        let root = file
+            .parent()?
+            .ancestors()
+            .take(MAX_PROJECT_ANCESTORS)
+            .find(|directory| directory.join("package.json").is_file())?
+            .to_path_buf();
+        let source = std::fs::read_to_string(root.join("package.json")).ok()?;
+        let manifest = jsonc::parse(&source).ok()?;
+        let JsoncValue::Object(imports) = manifest.get("imports")? else {
+            return None;
+        };
+        let entries = imports
+            .iter()
+            .filter_map(|(key, target)| Some((key.clone(), target.as_str()?.to_owned())))
+            .filter(|(key, target)| {
+                key.starts_with('#')
+                    && valid_wildcard_pattern(key)
+                    && valid_wildcard_pattern(target)
+                    && key.contains('*') == target.contains('*')
+            })
+            .collect::<Vec<_>>();
+        (!entries.is_empty()).then_some(Self { root, entries })
+    }
+
+    /// The shortest `#` specifier that resolves back to `target`, if any.
+    /// Wildcards drop the source extension first, so `"./app/services/*.js"`
+    /// maps `app/services/auth_service.ts` to `#services/auth_service`.
+    pub fn specifier_for(&self, target: &Path) -> Option<String> {
+        let target = lexical_normalize(target);
+        let relative = target
+            .strip_prefix(&self.root)
+            .ok()?
+            .to_str()?
+            .replace('\\', "/");
+        let mut best: Option<String> = None;
+        for (key, value) in &self.entries {
+            let Some(value_path) = value.strip_prefix("./") else {
+                continue;
+            };
+            let candidates = match value_path.split_once('*') {
+                None => vec![(key.clone(), value.clone())],
+                Some((prefix, suffix)) => {
+                    let Some(rest) = relative.strip_prefix(prefix) else {
+                        continue;
+                    };
+                    let stem = Path::new(rest)
+                        .with_extension("")
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    [Some(stem), rest.strip_suffix(suffix).map(str::to_owned)]
+                        .into_iter()
+                        .flatten()
+                        .filter(|wildcard| {
+                            !wildcard.is_empty() && !wildcard.split('/').any(|part| part == "..")
+                        })
+                        .map(|wildcard| {
+                            (
+                                key.replacen('*', &wildcard, 1),
+                                value.replacen('*', &wildcard, 1),
+                            )
+                        })
+                        .collect()
+                }
+            };
+            for (specifier, resolved_target) in candidates {
+                let resolves_here = resolve_package_target(&self.root, &resolved_target)
+                    .is_some_and(|resolved| lexical_normalize(&resolved) == target);
+                if resolves_here
+                    && best
+                        .as_ref()
+                        .is_none_or(|best| specifier.len() < best.len())
+                {
+                    best = Some(specifier);
+                }
+            }
+        }
+        best
+    }
+}
+
 fn package_import_target(imports: &JsoncValue, specifier: &str) -> Option<String> {
     let JsoncValue::Object(entries) = imports else {
         return None;

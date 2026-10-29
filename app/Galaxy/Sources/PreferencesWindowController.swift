@@ -43,6 +43,7 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
     private let breadcrumbsBox = NSButton(checkboxWithTitle: "Breadcrumbs", target: nil, action: nil)
     private let stickyScrollBox = NSButton(checkboxWithTitle: "Sticky scroll", target: nil, action: nil)
     private let gitBlameBox = NSButton(checkboxWithTitle: "Inline Git blame on the caret line", target: nil, action: nil)
+    private let folderIconsBox = NSButton(checkboxWithTitle: "Show folder icons", target: nil, action: nil)
 
     private static let tabSizes = [2, 4, 8]
     private static let whitespaceModes: [(title: String, value: WhitespaceRendering)] = [
@@ -135,6 +136,9 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
 
     private func buildExplorerPane() -> NSView {
         let stack = NSStackView()
+        stack.addArrangedSubview(section("Appearance"))
+        folderIconsBox.target = self; folderIconsBox.action = #selector(saveFolderIcons(_:))
+        stack.addArrangedSubview(folderIconsBox)
         stack.addArrangedSubview(section("Hidden in the Explorer (files.exclude)"))
         for box in excludeBoxes {
             box.target = self; box.action = #selector(saveFilesExclude(_:))
@@ -180,6 +184,7 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
         for (box, entry) in zip([minimapBox, wordWrapBox, breadcrumbsBox, stickyScrollBox], Self.viewDefaults) {
             box.state = (defaults.object(forKey: entry.key) as? Bool ?? entry.fallback) ? .on : .off
         }
+        folderIconsBox.state = ExplorerIcon.showsFolderIcons ? .on : .off
         let settings: GalaxySettings
         do {
             settings = FileManager.default.fileExists(atPath: settingsURL.path)
@@ -264,6 +269,11 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
     @objc private func saveAutoSaveDelay(_ sender: Any?) {
         updateAutoSaveDelay()
         store(Int(autoSaveDelay.doubleValue), "autoSaveDelay", in: "files")
+    }
+
+    @objc private func saveFolderIcons(_ sender: Any?) {
+        UserDefaults.standard.set(folderIconsBox.state == .on, forKey: ExplorerIcon.showFolderIconsKey)
+        onChange()
     }
 
     @objc private func saveViewToggle(_ sender: Any?) {

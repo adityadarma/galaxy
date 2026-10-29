@@ -82,12 +82,44 @@ final class SidebarSectionHeader: NSView {
 
     /// The buttons only make sense with a folder open.
     var showsTools = true {
-        didSet {
-            if mode == .explorer {
-                tools.forEach { $0.isHidden = !showsTools }
+        didSet { updateTools() }
+    }
+
+    /// Tools other than "…" appear only while the pointer is over the
+    /// header, as in VSCode.
+    private var isHovered = false {
+        didSet { if isHovered != oldValue { updateTools() } }
+    }
+
+    /// Shows the active mode's tools: "…" always, the rest on hover.
+    /// Explorer tools also need a folder open (`showsTools`).
+    private func updateTools() {
+        let sets: [(Mode, [NSButton], NSButton)] = [
+            (.explorer, tools, moreButton),
+            (.sourceControl, scmTools, scmMoreButton),
+            (.search, searchTools, searchMoreButton),
+        ]
+        for (setMode, buttons, more) in sets {
+            let active = setMode == mode && (setMode != .explorer || showsTools)
+            for button in buttons {
+                button.isHidden = !active || (button !== more && !isHovered)
             }
         }
     }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
+                                       owner: self, userInfo: nil))
+        if let window {
+            let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+            isHovered = NSMouseInRect(point, bounds, isFlipped)
+        }
+    }
+
+    override func mouseEntered(with event: NSEvent) { isHovered = true }
+    override func mouseExited(with event: NSEvent) { isHovered = false }
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -144,28 +176,18 @@ final class SidebarSectionHeader: NSView {
             row.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8).withPriority(.defaultHigh),
             row.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
+        updateTools()
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
     private func updateMode() {
+        updateTools()
         switch mode {
-        case .explorer:
-            scmTools.forEach { $0.isHidden = true }
-            searchTools.forEach { $0.isHidden = true }
-            tools.forEach { $0.isHidden = !showsTools }
-            label.stringValue = title.isEmpty ? "EXPLORER" : title.uppercased()
-        case .sourceControl:
-            tools.forEach { $0.isHidden = true }
-            scmTools.forEach { $0.isHidden = false }
-            searchTools.forEach { $0.isHidden = true }
-            label.stringValue = "SOURCE CONTROL"
-        case .search:
-            tools.forEach { $0.isHidden = true }
-            scmTools.forEach { $0.isHidden = true }
-            searchTools.forEach { $0.isHidden = false }
-            label.stringValue = "SEARCH"
+        case .explorer: label.stringValue = title.isEmpty ? "EXPLORER" : title.uppercased()
+        case .sourceControl: label.stringValue = "SOURCE CONTROL"
+        case .search: label.stringValue = "SEARCH"
         }
     }
 

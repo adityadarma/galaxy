@@ -366,6 +366,100 @@ fn typescript_workspace_completion_imports_unique_exports() {
 }
 
 #[test]
+fn typescript_workspace_completion_prefers_package_import_alias_and_file_quotes() {
+    let dir = tempfile::tempdir().unwrap();
+    let services = dir.path().join("app/services");
+    let controllers = dir.path().join("app/controllers");
+    std::fs::create_dir_all(&services).unwrap();
+    std::fs::create_dir_all(&controllers).unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r##"{"imports":{"#services/*":"./app/services/*.js"}}"##,
+    )
+    .unwrap();
+    std::fs::write(
+        services.join("auth_service.ts"),
+        "export default class AuthService {}\n",
+    )
+    .unwrap();
+    let consumer = controllers.join("auth_controller.ts");
+    std::fs::write(&consumer, "import { inject } from \"x\"\nAuthSe\n").unwrap();
+    let core = Core::new();
+    core.open_workspace(dir.path().to_string_lossy().into_owned())
+        .unwrap();
+    let document = core
+        .open_document(consumer.to_string_lossy().into_owned())
+        .unwrap();
+
+    until("workspace TypeScript completion", || {
+        core.request_completion(document.clone(), 1, 6)
+            && core
+                .completions(document.clone())
+                .iter()
+                .any(|item| item.label == "AuthService")
+    });
+    let item = core
+        .completions(document)
+        .into_iter()
+        .find(|item| item.label == "AuthService")
+        .unwrap();
+    assert_eq!(
+        item.additional_edits[0].text,
+        "import AuthService from \"#services/auth_service\";\n"
+    );
+}
+
+#[test]
+fn typescript_missing_import_of_workspace_export_warns() {
+    let dir = tempfile::tempdir().unwrap();
+    let services = dir.path().join("app/services");
+    let controllers = dir.path().join("app/controllers");
+    std::fs::create_dir_all(&services).unwrap();
+    std::fs::create_dir_all(&controllers).unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r##"{"imports":{"#services/*":"./app/services/*.js"}}"##,
+    )
+    .unwrap();
+    std::fs::write(
+        services.join("auth_service.ts"),
+        "export default class AuthService {}\n",
+    )
+    .unwrap();
+    let consumer = controllers.join("auth_controller.ts");
+    std::fs::write(
+        &consumer,
+        "// import AuthService from \"#services/auth_service\"\n\
+         export default class AuthController {\n  \
+         constructor(private authService: AuthService, other: Promise<string>) {}\n}\n",
+    )
+    .unwrap();
+    let core = Core::new();
+    core.open_workspace(dir.path().to_string_lossy().into_owned())
+        .unwrap();
+    let document = core
+        .open_document(consumer.to_string_lossy().into_owned())
+        .unwrap();
+    assert!(core.register_document(document.clone(), "typescript".into(), String::new()));
+
+    until("missing import warning", || {
+        core.poll_analysis();
+        !document.lock().diagnostics.is_empty()
+    });
+    let diagnostics = document.lock().diagnostics.clone();
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(diagnostics[0].severity, 2);
+    assert_eq!(diagnostics[0].start_line, 2);
+    assert!(
+        diagnostics[0]
+            .message
+            .contains("'AuthService'. Did you forget to import it from '#services/auth_service'"),
+        "{}",
+        diagnostics[0].message
+    );
+}
+
+#[test]
 fn vue_completion_auto_imports_dependency_exports() {
     let dir = tempfile::tempdir().unwrap();
     let package = dir.path().join("node_modules/vue");

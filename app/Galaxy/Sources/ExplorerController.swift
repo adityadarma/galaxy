@@ -649,7 +649,7 @@ final class ExplorerCell: NSTableCellView {
         isExpanded = expanded
         if entry.isDir {
             let folder = ExplorerIcon.folder(named: entry.name)
-            icon.isHidden = folder.image == nil
+            icon.isHidden = folder.image == nil || !ExplorerIcon.showsFolderIcons
             icon.image = folder.image
             icon.contentTintColor = nil
             updateChevron()
@@ -761,6 +761,12 @@ enum ExplorerIcon {
     }
 
     private static var cache: [String: NSImage?] = [:]
+
+    /// UserDefaults key of the Settings > Explorer "Folder icons" switch.
+    static let showFolderIconsKey = "ExplorerShowFolderIcons"
+    static var showsFolderIcons: Bool {
+        UserDefaults.standard.object(forKey: showFolderIconsKey) as? Bool ?? true
+    }
 
     static func folder(named name: String) -> Icon {
         let asset = folderAsset(named: name) ?? "folder-base"

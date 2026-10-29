@@ -76,6 +76,13 @@ extension MainWindowController {
             stickyScopeView.isEnabled = sticky
             updateStickyScope()
         }
+        // Redraw rows in place so folder icons follow the setting without
+        // relisting or collapsing anything.
+        let outline = explorer.outlineView
+        if outline.numberOfRows > 0 {
+            outline.reloadData(forRowIndexes: IndexSet(integersIn: 0..<outline.numberOfRows),
+                               columnIndexes: IndexSet(integersIn: 0..<outline.numberOfColumns))
+        }
     }
 
     func reloadSettings(force: Bool = false) {
