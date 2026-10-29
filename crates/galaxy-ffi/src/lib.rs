@@ -2781,7 +2781,11 @@ impl Core {
             );
         }
         if locations.is_empty()
-            && let Some(specifier) = index.static_module_at(line as usize, character as usize)
+            // The string literal itself, or the `from` keyword before it
+            // (e.g. `export * from './dep.js'`), as VS Code does.
+            && let Some(specifier) = index
+                .static_module_at(line as usize, character as usize)
+                .or_else(|| index.module_keyword_at(line as usize, character as usize))
             && let Some(target) = resolve_typescript_definition_import(
                 &self.typescript_navigation,
                 Path::new(&path),

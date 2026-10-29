@@ -812,9 +812,16 @@ fn indexes_direct_this_members_of_imported_superclasses() {
             ..
         }) if member_name == "createTable"
     ));
-    for (line, column) in [(2, 104), (3, 52), (5, 47)] {
+    // Computed keys are not direct members.
+    assert!(index.type_member_at(2, 104).is_none());
+    // Neither the type-only `TypedBase` nor the local `Local` declares
+    // `schema`, so these must not resolve to any declaration.
+    for (line, column) in [(3, 52), (5, 47)] {
         assert!(
-            index.type_member_at(line, column).is_none(),
+            index
+                .type_member_at(line, column)
+                .and_then(|usage| index.type_member_target(usage))
+                .is_none(),
             "cursor {line}:{column}"
         );
     }

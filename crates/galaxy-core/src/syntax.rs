@@ -1914,6 +1914,10 @@ mod tests {
             (SyntaxLanguage::Css, "main { color: red; }"),
             (SyntaxLanguage::Bash, "#!/usr/bin/env bash\necho Galaxy"),
             (
+                SyntaxLanguage::Nginx,
+                "server {\n    listen 80;\n    location / {\n        root /var/www;\n    }\n}\n",
+            ),
+            (
                 SyntaxLanguage::Php,
                 "<?php function hello(string $name): string { return $name; }",
             ),

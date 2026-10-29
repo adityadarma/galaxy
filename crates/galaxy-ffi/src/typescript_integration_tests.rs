@@ -11,10 +11,11 @@ fn until(what: &str, mut ask: impl FnMut() -> bool) {
     }
 }
 
-/// Opens a real file for tests that require a path on disk.
+/// Opens a real TypeScript file for tests that require a path on disk. The
+/// `.ts` extension matters: navigation dispatches on the file's language.
 fn file_doc(text: &str) -> (tempfile::TempDir, PathBuf, Arc<DocumentHandle>) {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("a.txt");
+    let path = dir.path().join("a.ts");
     std::fs::write(&path, text).unwrap();
     let doc = Core::new()
         .open_document(path.to_string_lossy().into_owned())
@@ -638,8 +639,9 @@ fn typescript_definition_follows_migration_schema_builder_method() {
     );
     assert!(declaration.exported_declaration("BaseSchema").is_some());
     assert_eq!(
+        // `exports` points at emitted JavaScript; the colocated declaration wins.
         resolve_typescript_import_uncached(&path, "@adonisjs/lucid/schema"),
-        Some(lucid.join("build/src/schema/main.js"))
+        Some(lucid.join("build/src/schema/main.d.ts"))
     );
     assert_eq!(
         resolve_typescript_import_uncached(&lucid.join("build/src/schema/main.d.ts"), "knex"),
@@ -1101,7 +1103,8 @@ fn typescript_import_diagnostics_use_project_resolution() {
         start_character: 17,
         end_line: 1,
         end_character: 20,
-        new_text: "missing-pkg".into(),
+        // Bare package names are never reported; a relative path is.
+        new_text: "./missing-pkg".into(),
     }]));
     core.poll_analysis();
     assert_eq!(

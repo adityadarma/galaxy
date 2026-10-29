@@ -100,7 +100,8 @@ fn rust_definition_comes_from_the_engine() {
 fn rust_diagnostics_are_rechecked_only_after_a_document_edit() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("main.rs");
-    std::fs::write(&path, "fn main() { missing(); }\n").unwrap();
+    // The Rust engine reports syntax errors only; a missing initializer is one.
+    std::fs::write(&path, "fn main() { let x = ; }\n").unwrap();
     let core = Core::new();
     let document = core
         .open_document(path.to_string_lossy().into_owned())
@@ -114,10 +115,10 @@ fn rust_diagnostics_are_rechecked_only_after_a_document_edit() {
     document.apply_rename_edits(vec![RenameEdit {
         uri: String::new(),
         start_line: 0,
-        start_character: 12,
+        start_character: 20,
         end_line: 0,
-        end_character: 19,
-        new_text: "println!".into(),
+        end_character: 20,
+        new_text: "1".into(),
     }]);
     core.poll_analysis();
     assert!(document.lock().diagnostics.is_empty());

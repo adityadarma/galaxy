@@ -573,6 +573,27 @@ impl DocumentIndex {
             })
     }
 
+    /// Returns a module specifier when the cursor is on the `from` keyword just
+    /// before it. Narrower than `module_statement_at`: bindings and names in the
+    /// statement keep their own resolvers and fail closed.
+    pub fn module_keyword_at(&self, line: usize, col: usize) -> Option<&str> {
+        let position = Utf16Position::new(line, col);
+        self.imports
+            .iter()
+            .find(|import| module_keyword_before(import.specifier_range, position))
+            .map(|import| import.specifier.as_str())
+            .or_else(|| {
+                self.exports.iter().find_map(|export| {
+                    (export.syntax_valid
+                        && export
+                            .specifier_range
+                            .is_some_and(|range| module_keyword_before(range, position)))
+                    .then_some(export.specifier.as_deref())
+                    .flatten()
+                })
+            })
+    }
+
     /// Returns a module specifier when the cursor is on its full import/export
     /// statement, including the `from` keyword before the string literal.
     pub fn module_statement_at(&self, line: usize, col: usize) -> Option<&str> {

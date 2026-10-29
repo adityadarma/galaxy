@@ -288,7 +288,8 @@ fn workspace_rust_diagnostics_include_unopened_sources() {
     )
     .unwrap();
     let path = dir.path().join("src/unopened.rs");
-    std::fs::write(&path, "fn run() { missing(); }\n").unwrap();
+    // The Rust engine reports syntax errors only.
+    std::fs::write(&path, "fn run() { let x = ; }\n").unwrap();
     let analysis = Arc::new(Mutex::new(BuiltinStore::default()));
     let engines = Arc::new(Mutex::new(HashMap::new()));
 
@@ -313,7 +314,7 @@ fn workspace_typescript_refresh_keeps_rust_diagnostics() {
     let dir = tempfile::tempdir().unwrap();
     let rust_path = dir.path().join("src/lib.rs");
     std::fs::create_dir_all(rust_path.parent().unwrap()).unwrap();
-    std::fs::write(&rust_path, "fn run() { missing(); }\n").unwrap();
+    std::fs::write(&rust_path, "fn run() { let x = ; }\n").unwrap();
     let analysis = Arc::new(Mutex::new(BuiltinStore::default()));
     let engines = Arc::new(Mutex::new(HashMap::new()));
     publish_workspace_rust_diagnostics(&analysis, dir.path(), &["src/lib.rs".into()], &engines);

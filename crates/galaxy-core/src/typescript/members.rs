@@ -447,6 +447,9 @@ pub(super) fn collect_type_member_uses(
             // not an explicitly typed receiver, so resolve it before type bindings.
             if object.kind() == "this"
                 && let Some(class) = enclosing_class(node)
+                // In a derived class, an undeclared member is inherited; leave
+                // it to the superclass resolvers instead of claiming it here.
+                && (!has_superclass(class) || declares_member(class, text, &member_name))
                 && let Some(name) = class.child_by_field_name("name")
                 && let Some(name) = node_text(text, name)
                 && let Some(declaration) = type_declarations.iter().find(|declaration| {
@@ -480,7 +483,12 @@ pub(super) fn collect_type_member_uses(
                 // without requiring a variable type annotation.
                 if let Some(declaration) = type_declarations.iter().find(|declaration| {
                     declaration.name == receiver && declaration.kind == DeclarationKind::Class
-                }) {
+                })
+                    // `Audit.query()` with `class Audit extends BaseModel {}`:
+                    // an undeclared member is inherited, so leave it to the
+                    // superclass resolvers.
+                    && local_class_owns_member(text_root, text, receiver, &member_name)
+                {
                     uses.push(TypeMemberUse {
                         target: TypeMemberTarget::Named(declaration.range),
                         member_name,
@@ -598,6 +606,47 @@ fn enclosing_class(mut node: Node<'_>) -> Option<Node<'_>> {
         node = parent;
     }
     None
+}
+
+/// Whether a member on the local class `name` belongs to that class itself:
+/// true unless the class extends something and does not declare `member`.
+fn local_class_owns_member(root: Node<'_>, text: &str, name: &str, member: &str) -> bool {
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if matches!(
+            node.kind(),
+            "class_declaration" | "abstract_class_declaration"
+        ) && node
+            .child_by_field_name("name")
+            .and_then(|item| node_text(text, item))
+            == Some(name)
+        {
+            return !has_superclass(node) || declares_member(node, text, member);
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    true
+}
+
+fn has_superclass(class: Node<'_>) -> bool {
+    let mut cursor = class.walk();
+    class
+        .named_children(&mut cursor)
+        .any(|child| child.kind() == "class_heritage")
+}
+
+/// Whether the class body itself declares `member` (field, method or accessor).
+fn declares_member(class: Node<'_>, text: &str, member: &str) -> bool {
+    let Some(body) = class.child_by_field_name("body") else {
+        return false;
+    };
+    let mut cursor = body.walk();
+    body.named_children(&mut cursor).any(|item| {
+        item.child_by_field_name("name")
+            .and_then(|name| node_text(text, name))
+            .is_some_and(|name| name == member)
+    })
 }
 
 fn member_access_is_called(node: Node<'_>) -> bool {
