@@ -10,7 +10,7 @@ workspace contents, or personal data in the report.
 - Mac model / memory:
 - Galaxy build / commit:
 - Workspace size:
-- Language servers installed:
+- Main languages / frameworks in the workspace:
 
 ## Workflow Results
 
@@ -21,7 +21,7 @@ workspace contents, or personal data in the report.
 | Edit, undo, save | | |
 | Find and replace | | |
 | Go to File / Symbol | | |
-| LSP completion and diagnostics | | |
+| Completion, navigation, and diagnostics | | |
 | Terminal and terminal tabs | | |
 | Git status and diff gutter | | |
 | Split editor and breadcrumbs | | |

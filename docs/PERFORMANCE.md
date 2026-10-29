@@ -1,7 +1,9 @@
 # Performance Audit
 
 Baseline collected on 2026-10-11 from the local Apple Silicon macOS host. App
-measurements use Release builds. Physical footprint excludes language servers.
+measurements use Release builds. Physical footprint covers the Galaxy process,
+including its built-in language engines, and excludes child processes such as
+git, terminals, and debug adapters.
 
 | Metric | Target | Observed | Result |
 |---|---:|---:|---|
@@ -16,6 +18,7 @@ measurements use Release builds. Physical footprint excludes language servers.
 | Initial index, 100k files | < 1 s | 622-823 ms; estimated 12.3 MB | pass |
 | Workspace search, 1 GB repo | first result < 100 ms | no repeatable 1 GB app harness | gap |
 | Incremental syntax highlight | < 2 ms | core incremental parser coverage exists; end-to-end timing missing | gap |
+| Completion pipeline | queue/engine/popup stages visible | structured local telemetry | instrumented |
 
 ## Actions
 
@@ -27,3 +30,6 @@ measurements use Release builds. Physical footprint excludes language servers.
   `scripts/measure-scroll.sh` as the repeatable baseline commands.
 - Rust heap profiling procedure is documented in `docs/MEMORY-PROFILING.md`;
   `scripts/profile-memory.sh` uses the isolated `memory-profile` binary.
+- Completion logs report `completion_dispatch_ms`, `queue_ms`, `engine_ms`, and
+  `completion_popup_ms`. Use them to isolate typing latency before changing an
+  engine or UI ranking policy.

@@ -1,171 +1,167 @@
-# PRD: Galaxy — Code Editor Native macOS
+# PRD: Galaxy — Native macOS Code Editor
 
-Versi: 0.1 (draft)
-Tanggal: 2026-10-05
-Platform: macOS 14+ (Apple Silicon prioritas, Intel didukung)
+Version: 0.1 (draft)
+Date: 2026-10-05
+Platform: macOS 14+ (Apple Silicon prioritized, Intel supported)
 
-## 1. Ringkasan
+## 1. Summary
 
-Galaxy adalah code editor native macOS dengan fokus utama pada performa dan efisiensi RAM. UI dibangun dengan Swift + AppKit, sedangkan core (text buffer, parsing, indexing, LSP, search) ditulis dalam Rust. Fitur difokuskan pada navigasi kode cepat: LSP, Go to File, syntax highlighting, dan workflow keyboard-first.
+Galaxy is a native macOS code editor focused primarily on performance and RAM efficiency. The UI is built with Swift + AppKit, while the core (text buffer, parsing, indexing, built-in language engines, search) is written in Rust. Features focus on fast code navigation: built-in code intelligence, Go to File, syntax highlighting, and a keyboard-first workflow.
 
-## 2. Masalah
+## 2. Problem
 
-- VSCode dan editor berbasis Electron memakai RAM besar (sering 500 MB–2 GB untuk workspace menengah).
-- Startup dan pembukaan workspace besar terasa lambat.
-- Developer butuh editor harian yang ringan tetapi tetap punya kemampuan IDE (LSP).
+- VSCode and Electron-based editors use a lot of RAM (often 500 MB–2 GB for a medium-sized workspace).
+- Startup and opening large workspaces feel slow.
+- Developers need a lightweight daily editor that still has IDE capabilities (completion, navigation, diagnostics).
 
-## 3. Tujuan
+## 3. Goals
 
-1. Editor yang terasa instan: startup, buka file, ketik, scroll, dan navigasi tanpa jeda.
-2. Pemakaian RAM jauh di bawah VSCode untuk workflow yang sama.
-3. Integrasi LSP yang stabil dan lengkap untuk fitur navigasi dan editing inti.
-4. Workflow keyboard-first yang mempercepat kerja developer.
+1. An editor that feels instant: startup, opening files, typing, scrolling, and navigation without lag.
+2. RAM usage far below VSCode for the same workflow.
+3. Stable built-in code intelligence for core navigation and editing features, with no external language servers to install.
+4. A keyboard-first workflow that speeds up developer work.
 
-## 4. Non-goals (di luar scope v1)
+## 4. Non-goals (out of scope for v1)
 
-- Plugin/extension yang bisa diinstal dari luar.
+- Externally installable plugins/extensions.
 - Marketplace.
 - Remote development (SSH, container, WSL).
 - Collaboration/real-time multiplayer.
 - Debugger (DAP).
-- Dukungan Windows/Linux.
-- Kompatibilitas extension/tema VSCode.
-- Notebook, preview Markdown kaya, AI assistant.
+- Windows/Linux support.
+- VSCode extension/theme compatibility.
+- Notebooks, rich Markdown preview, AI assistant.
 
-## 5. Target pengguna
+## 5. Target users
 
-- Developer individu di macOS yang bekerja dengan Rust, TypeScript/JavaScript, Python, Go.
-- Pengguna MacBook dengan RAM 8–16 GB yang merasa VSCode terlalu berat.
-- Pengguna keyboard-heavy yang mengutamakan navigasi cepat.
+- Individual developers on macOS working with Rust, TypeScript/JavaScript, Python, Go.
+- MacBook users with 8–16 GB RAM who find VSCode too heavy.
+- Keyboard-heavy users who prioritize fast navigation.
 
-## 6. Anggaran performa dan RAM (wajib)
+## 6. Performance and RAM budget (required)
 
-Diukur pada MacBook Air M1 8 GB, build release. Angka RAM = physical footprint proses editor (tidak termasuk proses language server).
+Measured on a MacBook Air M1 8 GB, release build. RAM figures = physical footprint of the editor process (excluding child processes such as git, terminals, and debug adapters).
 
-| Metrik | Target | Batas maksimum |
+| Metric | Target | Maximum limit |
 |---|---|---|
-| Cold start hingga window siap | < 200 ms | 400 ms |
-| RAM idle tanpa workspace | < 40 MB | 60 MB |
-| RAM workspace 10k file, 5 tab terbuka | < 120 MB | 180 MB |
-| Buka file 1 MB | < 30 ms | 80 ms |
-| Buka file 100 MB (mode file besar) | < 500 ms | 1 s |
-| Latensi keypress hingga render | < 8 ms | 16 ms |
-| Scroll | 120 fps (ProMotion) | 60 fps stabil |
-| Go to File, hasil pertama (10k file) | < 10 ms per ketikan | 30 ms |
-| Indeks file awal (100k file) | < 1 s | 3 s |
-| Workspace search (repo 1 GB) | hasil pertama < 100 ms | 300 ms |
-| Syntax highlight setelah edit | < 2 ms (incremental) | 8 ms |
+| Cold start until window ready | < 200 ms | 400 ms |
+| Idle RAM without workspace | < 40 MB | 60 MB |
+| RAM with 10k-file workspace, 5 open tabs | < 120 MB | 180 MB |
+| Open 1 MB file | < 30 ms | 80 ms |
+| Open 100 MB file (large file mode) | < 500 ms | 1 s |
+| Keypress-to-render latency | < 8 ms | 16 ms |
+| Scroll | 120 fps (ProMotion) | stable 60 fps |
+| Go to File, first result (10k files) | < 10 ms per keystroke | 30 ms |
+| Initial file index (100k files) | < 1 s | 3 s |
+| Workspace search (1 GB repo) | first result < 100 ms | 300 ms |
+| Syntax highlight after edit | < 2 ms (incremental) | 8 ms |
 
-Prinsip:
-- Tidak ada operasi blocking di main thread selain layout dan render viewport.
-- Semua cache punya batas ukuran dan kebijakan eviction (LRU).
-- Benchmark dan pengukuran RAM berjalan di CI; regresi > 10% memblokir merge.
+Principles:
+- No blocking operations on the main thread other than layout and viewport rendering.
+- Every cache has a size limit and an eviction policy (LRU).
+- Benchmarks and RAM measurements run in CI; a regression > 10% blocks the merge.
 
-## 7. Fitur
+## 7. Features
 
-Prioritas: P0 = wajib v1, P1 = target v1, P2 = setelah v1.
+Priority: P0 = required for v1, P1 = v1 target, P2 = after v1.
 
-### 7.1 Workspace dan File Explorer (P0)
-- Buka folder via menu, drag-and-drop, dan CLI `galaxy <path>`.
-- Tree explorer lazy: hanya membaca direktori yang dibuka.
-- Menghormati `.gitignore`, `.ignore`, dan exclude bawaan (`.git`, `node_modules`, `target`, `dist`, `build`).
-- File watcher (FSEvents) memperbarui tree dan buffer.
-- Create, rename, delete (ke Trash), reveal in Finder.
-- Recent workspaces dan restore session (tab, posisi cursor).
+### 7.1 Workspace and File Explorer (P0)
+- Open a folder via menu, drag-and-drop, and CLI `galaxy <path>`.
+- Lazy tree Explorer: reads only expanded directories.
+- Respects `.gitignore`, `.ignore`, and built-in excludes (`.git`, `node_modules`, `target`, `dist`, `build`).
+- File watcher (FSEvents) updates the tree and buffers.
+- Create, rename, delete (to Trash), reveal in Finder.
+- Recent workspaces and session restore (tabs, cursor position).
 
-Acceptance: workspace 100k file terbuka tanpa freeze UI; perubahan file eksternal terlihat < 200 ms.
+Acceptance: a 100k-file workspace opens without freezing the UI; external file changes are visible in < 200 ms.
 
 ### 7.2 Text Editor (P0)
-- Custom editor view (bukan `NSTextView`) dengan rendering viewport-only.
-- Buffer berbasis rope (`ropey`).
-- Multi-tab, split view horizontal/vertikal (P1).
-- Undo/redo berbasis transaksi, dikelompokkan per sesi ketik.
-- Multi-cursor dan multiple selection (`Cmd+D`, `Opt+Click`, column selection).
-- Auto-indent, auto-close bracket/quote, comment toggle, move/duplicate line.
+- Custom editor view (not `NSTextView`) with viewport-only rendering.
+- Rope-based buffer (`ropey`).
+- Multi-tab, horizontal/vertical split view (P1).
+- Transaction-based undo/redo, grouped per typing session.
+- Multi-cursor and multiple selection (`Cmd+D`, `Opt+Click`, column selection).
+- Auto-indent, auto-close brackets/quotes, comment toggle, move/duplicate line.
 - Line numbers, current line highlight, indent guides, bracket matching.
-- Soft wrap opsional.
-- Find/replace dalam file, termasuk regex dan case/whole word.
-- Encoding UTF-8 (utama), deteksi UTF-16 dan line ending LF/CRLF.
-- Dukungan IME penuh via `NSTextInputClient`, emoji, dan grapheme cluster.
-- Mode file besar (> 20 MB): tree-sitter dan LSP dimatikan, soft wrap off.
+- Optional soft wrap.
+- In-file find/replace, including regex and case/whole word.
+- UTF-8 encoding (primary), UTF-16 detection, and LF/CRLF line ending detection.
+- Full IME support via `NSTextInputClient`, emoji, and grapheme clusters.
+- Large file mode (> 20 MB): tree-sitter and language engines disabled, soft wrap off.
 
-Acceptance: mengetik di file 50k baris tetap < 16 ms per keypress; IME Jepang/Cina berfungsi.
+Acceptance: typing in a 50k-line file stays < 16 ms per keypress; Japanese/Chinese IME works.
 
 ### 7.3 Syntax Highlighting (P0)
-- `tree-sitter` dengan parsing incremental di background thread.
-- Bahasa v1: Rust, TypeScript, TSX, JavaScript, JSON, TOML, YAML, Markdown, Python, Go, HTML, CSS, Bash.
-- Grammar dibundel statis, query highlight berbasis `highlights.scm`.
-- Hanya node dalam viewport (+ margin) yang dikonversi ke style run.
-- Language injection (contoh: code block Markdown) — P1.
-- Semantic tokens dari LSP sebagai layer tambahan — P1.
-- Tema bawaan: 1 terang, 1 gelap; format tema JSON sederhana.
+- `tree-sitter` with incremental parsing on a background thread.
+- v1 languages: Rust, TypeScript, TSX, JavaScript, JSON, TOML, YAML, Markdown, Python, Go, HTML, CSS, Bash.
+- Grammars statically bundled; highlight queries based on `highlights.scm`.
+- Only nodes within the viewport (+ margin) are converted to style runs.
+- Language injection (e.g. Markdown code blocks) — P1.
+- Semantic tokens from the built-in engines as an additional layer — P2.
+- Built-in themes: 1 light, 1 dark; simple JSON theme format.
 
-Acceptance: highlight tidak pernah memblok input; re-highlight setelah edit < 8 ms.
+Acceptance: highlighting never blocks input; re-highlight after edit < 8 ms.
 
-### 7.4 Go to File dan Navigasi Cepat (P0)
-- `Cmd+P`: fuzzy finder file (`nucleo`), ranking memperhitungkan recency dan kedekatan path.
-- `Cmd+Shift+O`: go to symbol dalam file (tree-sitter outline, LSP `documentSymbol` bila ada).
-- `Cmd+T`: go to symbol workspace (LSP `workspace/symbol`) — P1.
+### 7.4 Go to File and Quick Navigation (P0)
+- `Cmd+P`: fuzzy file finder (`nucleo`); ranking accounts for recency and path proximity.
+- `Cmd+Shift+O`: go to symbol in file (outline from the built-in engine, tree-sitter outline as fallback).
+- `Cmd+T`: go to workspace symbol — P2 (removed together with the language server client).
 - `Ctrl+G`: go to line.
-- `Ctrl+-` / `Ctrl+Shift+-`: navigasi back/forward riwayat posisi.
-- Quick switch tab terakhir (`Ctrl+Tab`).
+- `Ctrl+-` / `Ctrl+Shift+-`: back/forward navigation through position history.
+- Quick switch to the last tab (`Ctrl+Tab`).
 
-Acceptance: hasil Go to File muncul < 30 ms per ketikan pada 100k file.
+Acceptance: Go to File results appear in < 30 ms per keystroke on 100k files.
 
-### 7.5 Command Palette dan Keybinding (P0)
-- `Cmd+Shift+P`: semua command terdaftar dan dapat dicari fuzzy.
-- Keybinding default mirip VSCode agar migrasi mudah.
-- Override keybinding via file `keybindings.json`.
-- Settings via `settings.json` (global dan per workspace `.galaxy/settings.json`).
+### 7.5 Command Palette and Keybindings (P0)
+- `Cmd+Shift+P`: all registered commands, fuzzy-searchable.
+- Default keybindings similar to VSCode for easy migration.
+- Keybinding overrides via a `keybindings.json` file.
+- Settings via `settings.json` (global and per workspace `.galaxy/settings.json`).
 
-### 7.6 LSP (P0)
-- Satu proses server per (bahasa, root workspace), dijalankan saat file bahasa itu pertama dibuka.
-- Deteksi server di `PATH`; konfigurasi path kustom di settings. Server tidak dibundel.
-- Server v1: `rust-analyzer`, `typescript-language-server`, `pyright-langserver`, `gopls`.
-- Document sync incremental, debounce perubahan.
-- Cancellation (`$/cancelRequest`) untuk request usang.
-- Fitur P0:
-  - Diagnostics (underline + panel Problems)
+### 7.6 Code Intelligence (P0)
+- Built-in engines run inside the Galaxy process; no external language servers, Node, or plugins are installed or launched.
+- Languages: PHP/Blade/Laravel, Go, TypeScript/JavaScript, Rust, Dart/Flutter. Other languages get syntax highlighting only.
+- Engines index the workspace in the background and read dependencies statically (`composer.json`/`vendor/`, `go.mod`/module cache, `node_modules` type declarations, `.dart_tool/package_config.json`); project code is never executed.
+- P0 features:
+  - Diagnostics (underline + Problems panel)
   - Hover
-  - Completion (dengan `resolve`, snippet dasar)
-  - Go to definition, type definition, implementation
+  - Completion (with auto-import edits and basic snippets)
+  - Go to definition
   - Find references
   - Rename symbol
-  - Formatting dokumen dan format on save
   - Code actions / quick fix
   - Signature help
-- Fitur P1: inlay hints, semantic tokens, document highlight, call hierarchy.
-- Progress indicator (`$/progress`) dan status server di status bar.
-- Auto-restart server bila crash (maks 3 kali per 5 menit).
-- Timeout dan isolasi: server lambat tidak boleh memblok UI.
+  - Document outline
+- P2 features: type definition, implementation, workspace symbols, document formatting, inlay hints, semantic tokens, call hierarchy.
+- Isolation: indexing runs off the main thread, and a request that cannot finish within its budget returns no result instead of blocking the UI.
 
-Acceptance: semua fitur P0 berjalan dengan `rust-analyzer` pada repo Rust nyata (misal `ripgrep`); completion tampil < 50 ms setelah respons server diterima.
+Acceptance: supported features work on real repositories per language (e.g. `ripgrep` for Rust); completion appears < 50 ms after engine results are available.
 
 ### 7.7 Workspace Search (P0)
-- `Cmd+Shift+F`: search seluruh workspace memakai crate `grep-*` / `ignore` (engine ripgrep).
+- `Cmd+Shift+F`: search the entire workspace using the `grep-*` / `ignore` crates (ripgrep engine).
 - Regex, case sensitive, whole word, include/exclude glob.
-- Hasil streaming, dibatasi (default 10k match), bisa dibatalkan.
-- Replace all dengan preview — P1.
+- Streaming results, capped (default 10k matches), cancellable.
+- Replace all with preview — P1.
 
 ### 7.8 Git (P1)
-- Branch saat ini di status bar.
-- Status file di explorer (modified, added, untracked).
-- Gutter diff (added/modified/deleted line) terhadap HEAD.
-- Implementasi via `gix` (gitoxide); tanpa UI commit di v1.
+- Current branch in the status bar.
+- File status in the Explorer (modified, added, untracked).
+- Gutter diff (added/modified/deleted lines) against HEAD.
+- Implemented via `gix` (gitoxide); no commit UI in v1.
 
-### 7.9 Terminal Terintegrasi (P1)
-- Panel terminal dengan PTY (`portable-pty`) dan parser `vte` / `alacritty_terminal`.
-- Multiple terminal tab.
-- Scrollback dibatasi (default 10k baris).
+### 7.9 Integrated Terminal (P1)
+- Terminal panel with PTY (`portable-pty`) and `vte` / `alacritty_terminal` parser.
+- Multiple terminal tabs.
+- Capped scrollback (default 10k lines).
 
-### 7.10 Produktivitas Developer (P1)
-- Breadcrumb symbol di atas editor.
-- Sticky scroll (header scope tetap terlihat).
-- Auto-save opsional.
-- Quick open file dari error di terminal/diagnostics (path:line:col).
+### 7.10 Developer Productivity (P1)
+- Symbol breadcrumb above the editor.
+- Sticky scroll (scope headers stay visible).
+- Optional auto-save.
+- Quick open file from errors in terminal/diagnostics (path:line:col).
 - Peek definition — P2.
 
-## 8. Arsitektur
+## 8. Architecture
 
 ```text
 ┌───────────────────────── Swift / AppKit ─────────────────────────┐
@@ -175,45 +171,44 @@ Acceptance: semua fitur P0 berjalan dengan `rust-analyzer` pada repo Rust nyata 
 └───────────────▲──────────────────────────────┬───────────────────┘
                 │ snapshot viewport, events    │ commands, input
 ┌───────────────┴──────────── UniFFI ──────────▼───────────────────┐
-│                         Rust core (galaxy-core)                   │
+│                         Rust core (galaxy-core)                  │
 │ Document store (ropey) · Undo · Selections · Edit ops            │
 │ Syntax service (tree-sitter, worker thread)                      │
 │ Workspace: file index, FSEvents watcher (notify), ignore         │
 │ Fuzzy finder (nucleo) · Search (grep crates)                     │
-│ LSP manager (tokio, JSON-RPC over stdio)                         │
+│ Language engines (in-process): PHP, Go, TS/JS, Rust, Dart        │
 │ Git (gix) · Terminal (portable-pty + vte)                        │
 │ Settings/keymap · Session store                                  │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-Keputusan desain:
-- Rust adalah sumber kebenaran state dokumen. Swift hanya menerima snapshot viewport (baris, style run, selection, diagnostics) dan mengirim perintah.
-- Komunikasi Rust ke Swift melalui callback event yang dikoalesasi per frame (`CVDisplayLink`/`CADisplayLink`) untuk menghindari banjir update.
-- Rendering awal memakai Core Text dengan cache `CTLine` per baris terlihat. Migrasi ke Metal hanya bila profiling menunjukkan Core Text menjadi bottleneck.
-- Worker thread terpisah untuk syntax, index, search; runtime `tokio` untuk LSP dan I/O.
-- Tidak ada WebView di mana pun.
+Design decisions:
+- Rust is the source of truth for document state. Swift only receives viewport snapshots (lines, style runs, selections, diagnostics) and sends commands.
+- Rust-to-Swift communication uses event callbacks coalesced per frame (`CVDisplayLink`/`CADisplayLink`) to avoid flooding updates.
+- Initial rendering uses Core Text with a `CTLine` cache per visible line. Migrate to Metal only if profiling shows Core Text is the bottleneck.
+- Separate worker threads for syntax, index, and search; `tokio` runtime for child-process I/O (debug adapters).
+- No WebView anywhere.
 
-## 9. Strategi efisiensi RAM
+## 9. RAM efficiency strategy
 
-- Rope dengan chunk berbagi (structural sharing) untuk snapshot murah.
-- File yang tidak terbuka tidak pernah dimuat ke memori; index hanya menyimpan path (interned, arena).
-- Tab yang tidak aktif lama: syntax tree dibuang, diparse ulang saat dibuka kembali.
-- Undo history dibatasi (default 1000 langkah atau 32 MB per dokumen).
-- Cache `CTLine` dan glyph hanya untuk viewport + margin.
-- Allocator `mimalloc` dievaluasi terhadap system allocator.
-- Respons terhadap memory pressure (`DispatchSource.makeMemoryPressureSource`): kosongkan cache non-esensial.
-- Pengukuran memakai `footprint`, Instruments (Allocations, Leaks), dan `dhat` di Rust.
+- Rope with shared chunks (structural sharing) for cheap snapshots.
+- Files that are not open are never loaded into memory; the index stores only paths (interned, arena).
+- Tabs inactive for a long time: syntax tree is discarded and reparsed when reopened.
+- Capped undo history (default 1000 steps or 32 MB per document).
+- `CTLine` and glyph caches only for the viewport + margin.
+- `mimalloc` allocator evaluated against the system allocator.
+- Response to memory pressure (`DispatchSource.makeMemoryPressureSource`): clear non-essential caches.
+- Measurement uses `footprint`, Instruments (Allocations, Leaks), and `dhat` in Rust.
 
-## 10. Stack teknologi
+## 10. Technology stack
 
-| Area | Pilihan |
+| Area | Choice |
 |---|---|
 | UI | Swift 6, AppKit |
 | Bridge | UniFFI |
 | Text buffer | `ropey` |
-| Syntax | `tree-sitter` + grammar bundel |
+| Syntax | `tree-sitter` + bundled grammars |
 | Async | `tokio` |
-| LSP types | `lsp-types` |
 | File watch | `notify` (FSEvents) |
 | Ignore/walk | `ignore` |
 | Fuzzy | `nucleo` |
@@ -224,35 +219,35 @@ Keputusan desain:
 | Logging | `tracing` |
 | Build | Cargo workspace + Xcode project (xcodegen/Tuist) |
 
-## 11. Risiko
+## 11. Risks
 
-| Risiko | Dampak | Mitigasi |
+| Risk | Impact | Mitigation |
 |---|---|---|
-| Custom editor view rumit (IME, a11y, bidi) | Tinggi | Spike awal di M1; ikuti `NSTextInputClient` ketat; uji IME sejak awal |
-| Overhead FFI per frame | Sedang | Snapshot batch per frame, hindari panggilan per karakter |
-| Variasi perilaku LSP server | Tinggi | Uji dengan 4 server nyata; capability negotiation ketat |
-| RAM language server besar (rust-analyzer > 1 GB) | Sedang | Di luar kendali editor; tampilkan RAM server di status bar, opsi stop server |
-| Scope creep | Tinggi | Non-goals dikunci; fitur baru hanya setelah v1 |
-| Rendering Core Text tidak cukup cepat | Sedang | Benchmark M1; jalur cadangan Metal |
+| Custom editor view is complex (IME, a11y, bidi) | High | Early spike in M1; follow `NSTextInputClient` strictly; test IME from the start |
+| Per-frame FFI overhead | Medium | Batch snapshots per frame; avoid per-character calls |
+| Built-in engines miss language semantics a full compiler would catch | High | Engines stay conservative: return no result rather than a wrong one; diagnostics limited to checks they can prove; test against real repositories |
+| High RAM for Rust analysis | Medium | Built-in engine caps indexing and work per request; show Galaxy process usage in the status bar |
+| Scope creep | High | Non-goals locked; new features only after v1 |
+| Core Text rendering not fast enough | Medium | Benchmark in M1; Metal fallback path |
 
-## 12. Metrik keberhasilan
+## 12. Success metrics
 
-- Seluruh anggaran di bagian 6 terpenuhi pada build v1.
-- Dapat dipakai harian (dogfooding) untuk mengembangkan Galaxy sendiri sejak M4.
-- Crash-free session > 99.5%.
-- Tidak ada kebocoran memori setelah sesi 8 jam (RAM stabil ±10%).
+- All budgets in section 6 are met in the v1 build.
+- Usable daily (dogfooding) to develop Galaxy itself starting from M4.
+- Crash-free sessions > 99.5%.
+- No memory leaks after an 8-hour session (RAM stable within ±10%).
 
-## 13. Milestone
+## 13. Milestones
 
-| Milestone | Isi | Estimasi |
+| Milestone | Scope | Estimate |
 |---|---|---|
-| M0 | Setup proyek, bridge, CI, harness benchmark | 2 minggu |
-| M1 | Editor view inti, rope, input, IME, render | 5 minggu |
-| M2 | Workspace, explorer, tab, Go to File, palette | 3 minggu |
-| M3 | Syntax highlighting tree-sitter, tema | 3 minggu |
-| M4 | LSP (rust-analyzer), diagnostics, navigasi | 5 minggu |
-| M5 | Workspace search, multi-LSP, settings | 3 minggu |
-| M6 | Git, terminal, produktivitas | 4 minggu |
-| M7 | Hardening, performa, RAM, rilis beta | 3 minggu |
+| M0 | Project setup, bridge, CI, benchmark harness | 2 weeks |
+| M1 | Core editor view, rope, input, IME, rendering | 5 weeks |
+| M2 | Workspace, Explorer, tabs, Go to File, palette | 3 weeks |
+| M3 | Tree-sitter syntax highlighting, themes | 3 weeks |
+| M4 | Built-in language engines, diagnostics, navigation | 5 weeks |
+| M5 | Workspace search, more language engines, settings | 3 weeks |
+| M6 | Git, terminal, productivity | 4 weeks |
+| M7 | Hardening, performance, RAM, beta release | 3 weeks |
 
-Total estimasi: ±28 minggu untuk 1–2 developer berpengalaman.
+Total estimate: ~28 weeks for 1–2 experienced developers.
