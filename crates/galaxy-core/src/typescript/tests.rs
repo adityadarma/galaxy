@@ -898,3 +898,37 @@ fn global_interface_augmentation_keeps_builtin_prototype() {
         index.type_diagnostics
     );
 }
+
+#[test]
+fn derived_class_without_constructor_inherits_superclass_arity() {
+    // Mirrors app/utilities/storage.ts: `Storage` inherits flydrive's
+    // `Disk` constructor, so `new Storage(config)` is valid.
+    let index = DocumentIndex::parse(
+        "storage.ts",
+        "import { Disk } from 'flydrive'\n\
+         export class Storage extends Disk {\n\
+           use(driver: string): Storage { return new Storage(driver) }\n\
+         }\n\
+         new Storage({})\n",
+    );
+
+    assert!(
+        index.type_diagnostics.is_empty(),
+        "{:?}",
+        index.type_diagnostics
+    );
+}
+
+#[test]
+fn class_without_superclass_still_checks_constructor_arity() {
+    let index = DocumentIndex::parse("main.ts", "class Point {}\nnew Point(1)\n");
+
+    assert!(
+        index
+            .type_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "TS2554"),
+        "{:?}",
+        index.type_diagnostics
+    );
+}

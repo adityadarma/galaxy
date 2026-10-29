@@ -525,6 +525,7 @@ const TYPESCRIPT_HIGHLIGHTS: &str = r#"
 (type_alias_declaration name: (type_identifier) @type)
 (enum_declaration name: (identifier) @type)
 (extends_clause (identifier) @type)
+(new_expression constructor: (identifier) @type)
 ((identifier) @type (#any-of? @type "Array" "Boolean" "Date" "Error" "JSON" "Map" "Math" "Number" "Object" "Promise" "Record" "RegExp" "Set" "String" "Symbol" "WeakMap" "WeakSet"))
 ((member_expression object: (identifier) @type) (#match? @type "^[A-Z]"))
 [
@@ -550,7 +551,7 @@ const TYPESCRIPT_HIGHLIGHTS: &str = r#"
   "for" "from" "function" "if" "import" "in" "instanceof" "let" "new"
   "of" "return" "static" "switch" "throw" "try" "typeof" "var" "void"
   "while" "with" "yield" "as" "interface" "implements" "private"
-   "protected" "public" "readonly" "type" "namespace" "declare"
+   "protected" "public" "readonly" "type" "namespace" "declare" "keyof"
 ] @keyword
 (abstract_class_declaration "abstract" @keyword)
 [
@@ -2119,6 +2120,35 @@ mod tests {
                 && HighlightScope::from_capture(names[capture.index as usize])
                     == Some(HighlightScope::Type)
         })));
+    }
+
+    /// Mirrors app/utilities/storage.ts: `new X(...)` colours `X` as a class
+    /// and `keyof` as a keyword, matching VS Code.
+    #[test]
+    fn typescript_query_highlights_constructed_classes_and_keyof() {
+        let language = SyntaxLanguage::TypeScript;
+        let source = "throw new CustomException('x')\nreturn new Storage(1)\ntype D = { default: keyof K }\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let doc = Document::from_text(source);
+        let runs = style_runs_for_viewport(&doc, &tree, language, 0, 3);
+        let scope = |needle: &str| {
+            let offset = source.find(needle).unwrap();
+            let prefix = &source[..offset];
+            let line = prefix.bytes().filter(|byte| *byte == b'\n').count();
+            let column = prefix
+                .rsplit_once('\n')
+                .map_or(prefix.len(), |(_, tail)| tail.len());
+            runs.iter()
+                .filter(|run| run.line == line && run.start <= column && column < run.end)
+                .last()
+                .map(|run| run.scope)
+        };
+
+        assert_eq!(scope("CustomException"), Some(HighlightScope::Type));
+        assert_eq!(scope("Storage"), Some(HighlightScope::Type));
+        assert_eq!(scope("keyof"), Some(HighlightScope::Keyword));
     }
 
     #[test]

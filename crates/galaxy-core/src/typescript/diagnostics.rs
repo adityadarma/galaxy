@@ -130,10 +130,23 @@ pub(super) fn collect_type_declarations(text: &str, node: Node<'_>, state: &mut 
                     stack.extend(item.named_children(&mut cursor));
                 }
                 let parameters = type_parameters(text, node);
-                let ty = if matches!(
+                let is_class = matches!(
                     node.kind(),
                     "class_declaration" | "abstract_class_declaration"
-                ) {
+                );
+                let mut heritage_cursor = node.walk();
+                let derived = is_class
+                    && node
+                        .named_children(&mut heritage_cursor)
+                        .any(|child| child.kind() == "class_heritage");
+                let ty = if derived && class_constructor(text, node).is_none() {
+                    // A derived class without its own constructor inherits the
+                    // superclass constructor and members (e.g. `Storage extends
+                    // Disk` from flydrive). Neither is known here, so fail
+                    // closed instead of assuming a zero-argument constructor.
+                    state.classes.insert(name.to_owned());
+                    Type::Unknown
+                } else if is_class {
                     let constructor = class_constructor(text, node).unwrap_or_else(|| {
                         Type::Function(Vec::new(), 0, Box::new(Type::Unknown), parameters.clone())
                     });
