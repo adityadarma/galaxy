@@ -9,7 +9,7 @@
 //! - `Utf8Position` (line, col in bytes): tree-sitter `Point`.
 //!
 //! All `*_to_char` conversions clamp out-of-range input instead of
-//! panicking: a stale position from the UI or a language server must never
+//! panicking: a stale position from the UI or a language engine must never
 //! crash the editor. Columns past the end of a line clamp to the line end
 //! (before its `\n`), and a column in the middle of a multi-unit character
 //! rounds down to the start of that character.

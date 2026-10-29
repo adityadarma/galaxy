@@ -1,6 +1,6 @@
 import AppKit
 
-/// LSP hover card. Renders the server's Markdown (code fences as monospaced
+/// Hover card. Renders the engine's Markdown (code fences as monospaced
 /// blocks, inline bold/italic/code), sizes itself to the content and scrolls
 /// when the content is taller than the space it is given.
 @MainActor
@@ -96,7 +96,7 @@ final class HoverPopover: NSView {
 
     // MARK: Markdown
 
-    /// Converts LSP hover Markdown into an attributed string. Fenced blocks
+    /// Converts hover Markdown into an attributed string. Fenced blocks
     /// become monospaced paragraphs without their language tag; prose goes
     /// through Foundation's inline Markdown parser.
     static func render(_ markdown: String) -> NSAttributedString {

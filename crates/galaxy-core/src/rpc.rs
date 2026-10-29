@@ -21,8 +21,8 @@ pub fn parse_json_rpc_payload(bytes: &[u8]) -> Result<Value, String> {
     Ok(value)
 }
 
-/// A received JSON-RPC payload. Invalid JSON and broken streams are surfaced
-/// as errors rather than silently discarded, so a manager can restart a server.
+/// A received framed payload. Invalid JSON and broken streams are surfaced
+/// as errors rather than silently discarded, so the session can report them.
 #[derive(Debug)]
 pub enum Incoming {
     Message(Value),
@@ -30,13 +30,12 @@ pub enum Incoming {
     Closed,
 }
 
-/// Worker threads for the runtime every language server shares. Work per
-/// server is one reader task plus pipe writes, so two threads are plenty.
-/// Before this, each server built a default multi-thread runtime with one
-/// worker per CPU core.
+/// Worker threads for the shared child-process runtime. Work per child is
+/// one reader task plus pipe writes, so two threads are plenty, instead of a
+/// default multi-thread runtime with one worker per CPU core.
 pub const RUNTIME_THREADS: usize = 2;
 
-/// One small Tokio runtime shared by every language-server transport. It
+/// One small Tokio runtime shared by every child-process transport. It
 /// lives for the process; it is never dropped, so dropping a transport from
 /// any context is safe.
 pub(crate) fn shared_runtime() -> io::Result<&'static Runtime> {
@@ -55,8 +54,8 @@ pub(crate) fn shared_runtime() -> io::Result<&'static Runtime> {
 }
 
 /// `PATH` plus common install locations. GUI apps on macOS start with a
-/// minimal `PATH`, so script servers (`#!/usr/bin/env php`, `node`) also need
-/// these directories in the child environment, see [`server_path_env`].
+/// minimal `PATH`, so a child launched through a script (`#!/usr/bin/env ...`)
+/// also needs these directories in its environment, see [`server_path_env`].
 pub(crate) fn search_directories() -> Vec<PathBuf> {
     let mut directories = env::var_os("PATH")
         .into_iter()
@@ -74,7 +73,7 @@ pub(crate) fn search_directories() -> Vec<PathBuf> {
             home.join(".composer/vendor/bin"),
             home.join(".config/composer/vendor/bin"),
             home.join(".local/bin"),
-            // `cargo install` tools and `go install` (gopls).
+            // `cargo install` and `go install` tools.
             home.join(".cargo/bin"),
             home.join("go/bin"),
             // Laravel Herd ships its own php binary.
@@ -98,8 +97,8 @@ pub(crate) fn search_directories() -> Vec<PathBuf> {
     directories
 }
 
-/// `PATH` for a server child: the server's own directory first, then the
-/// search directories, so `#!/usr/bin/env php` resolves when Galaxy is
+/// `PATH` for a child process: the program's own directory first, then the
+/// search directories, so `#!/usr/bin/env` shebangs resolve when Galaxy is
 /// launched from Finder with launchd's minimal `PATH`.
 pub(crate) fn server_path_env(program: &str) -> std::ffi::OsString {
     let mut directories = Vec::new();
@@ -132,14 +131,14 @@ pub(crate) async fn read_frame<R: AsyncRead + Unpin>(
             } else {
                 Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
-                    "truncated LSP headers",
+                    "truncated message headers",
                 ))
             };
         }
         if headers.len() - before > 8 * 1024 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "LSP header line exceeds 8 KiB",
+                "message header line exceeds 8 KiB",
             ));
         }
         if headers.ends_with(b"\r\n\r\n") {
@@ -148,7 +147,7 @@ pub(crate) async fn read_frame<R: AsyncRead + Unpin>(
         if headers.len() > 16 * 1024 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "LSP headers exceed 16 KiB",
+                "message headers exceed 16 KiB",
             ));
         }
     }

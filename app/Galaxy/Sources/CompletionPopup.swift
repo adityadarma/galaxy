@@ -330,7 +330,8 @@ private final class KindBadge: NSView {
         needsDisplay = true
     }
 
-    /// Letter and theme scope for an LSP `CompletionItemKind`.
+    /// Letter and theme scope for a completion kind. The engines use the LSP
+    /// `CompletionItemKind` numbering.
     private static func style(for kind: UInt64?) -> (String, String?) {
         switch kind {
         case 2, 4: ("m", "function")

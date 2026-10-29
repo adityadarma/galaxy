@@ -1,7 +1,7 @@
 //! Small built-in snippet catalog and VS Code-style placeholder expansion.
 //!
-//! The catalog intentionally stays compact. It supplies useful fallbacks when
-//! an LSP is unavailable; language servers can still provide richer items.
+//! The catalog intentionally stays compact. It supplies useful fallbacks next
+//! to the built-in language engines, which provide richer items.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;

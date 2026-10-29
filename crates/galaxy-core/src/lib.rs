@@ -1,8 +1,8 @@
 //! Galaxy editor core.
 //!
 //! This crate is UI-agnostic. The Swift/AppKit frontend talks to it through
-//! `galaxy-ffi`. All heavy work (parsing, indexing, LSP) will live here so the
-//! main thread only renders viewport snapshots.
+//! `galaxy-ffi`. All heavy work (parsing, indexing, language engines) lives
+//! here so the main thread only renders viewport snapshots.
 
 pub mod analysis;
 pub mod change;

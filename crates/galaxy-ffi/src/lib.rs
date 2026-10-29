@@ -510,7 +510,7 @@ impl Core {
     }
 
     /// Reads the nearest `package.json` project for a file or directory.
-    /// This is metadata only; TypeScript semantic requests remain LSP-owned.
+    /// This is metadata only; semantic requests go to the TypeScript engine.
     pub fn javascript_project(&self, path: String) -> Option<JavaScriptProjectInfo> {
         javascript::Project::detect(Path::new(&path)).map(|project| JavaScriptProjectInfo {
             root: project.root.to_string_lossy().into_owned(),
@@ -2579,8 +2579,8 @@ impl Core {
     }
 
     /// Uses of the PHP symbol at the cursor across the project, read from
-    /// open buffers where a file is open. `None` leaves the request to the
-    /// language servers.
+    /// open buffers where a file is open. `None` means the PHP engine has no
+    /// answer for this position.
     fn php_usages(
         &self,
         document: &Arc<DocumentHandle>,
@@ -3109,8 +3109,8 @@ impl Core {
         found
     }
 
-    /// Answers go-to-definition from the PHP engine; `false` leaves the
-    /// request to the language servers.
+    /// Answers go-to-definition from the PHP engine; `false` means no
+    /// definition was found.
     fn php_definition(
         &self,
         document: &Arc<DocumentHandle>,
@@ -4126,8 +4126,7 @@ fn spawn_php_index(
         .ok()
 }
 
-/// An outline entry in the shape the language servers use; `kind` is the
-/// LSP `SymbolKind` number.
+/// An outline entry; `kind` uses the LSP `SymbolKind` numbering.
 fn php_outline_symbol(
     symbol: &php::OutlineSymbol,
     uri: &str,
@@ -5494,7 +5493,8 @@ pub struct LineSpan {
     pub includes_eol: bool,
 }
 
-/// A UTF-16 LSP diagnostic range, supplied by the LSP manager to a document.
+/// A diagnostic with a UTF-16 range, supplied by the built-in engines to a
+/// document.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct DiagnosticInfo {
     pub start_line: u64,
@@ -5967,7 +5967,7 @@ impl DocumentHandle {
     }
 
     /// Built-in snippets for this document's file type. The UI filters these
-    /// by the word immediately before the caret and merges them with LSP
+    /// by the word immediately before the caret and merges them with engine
     /// completions.
     pub fn snippet_completions(&self) -> Vec<CompletionInfo> {
         let path = self.path();
@@ -6016,7 +6016,7 @@ impl DocumentHandle {
         self.lock().syntax.is_some()
     }
 
-    /// Called for every document on each LSP poll; bumps
+    /// Called for every document on each analysis poll; bumps
     /// [`Self::diagnostics_revision`] only when the list actually changed.
     pub fn set_diagnostics(&self, diagnostics: Vec<DiagnosticInfo>) {
         let mut st = self.lock();

@@ -729,7 +729,7 @@ pub fn relative_import_candidates(specifier: &str, from: &Path) -> Vec<PathBuf> 
 /// Resolves a relative JavaScript or TypeScript import to the first regular file.
 ///
 /// The candidate order matches [`relative_import_candidates`]. Package specifiers
-/// return `None` for language-server resolution.
+/// return `None`; the TypeScript engine resolves them.
 pub fn resolve_relative_import(specifier: &str, from: &Path) -> Option<PathBuf> {
     relative_import_candidates(specifier, from)
         .into_iter()

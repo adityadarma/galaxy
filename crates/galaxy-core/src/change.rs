@@ -6,7 +6,7 @@
 //!
 //! This is the single mutation primitive of the core. Applying a set
 //! returns its inverse, which is what undo (M1-04) stores, and the same
-//! ranges feed LSP `didChange` (M4-04) and tree-sitter `InputEdit` (M3-02).
+//! ranges feed tree-sitter `InputEdit` (M3-02).
 
 use crate::document::{Document, normalize_line_breaks};
 

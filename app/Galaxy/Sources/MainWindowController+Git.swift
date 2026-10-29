@@ -111,7 +111,7 @@ extension MainWindowController {
     }
 
     /// Opens the card when `point` (editor coordinates) is on the blame text.
-    /// Returns `true` when it is, so the LSP hover stays out of the way.
+    /// Returns `true` when it is, so the code hover stays out of the way.
     func handleBlameHover(point: NSPoint) -> Bool {
         guard let commit = blameCommit, let rect = editorView.blameAnnotationRect(), rect.contains(point) else {
             cancelBlameShow()

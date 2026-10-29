@@ -49,7 +49,7 @@ extension MainWindowController {
     }
 
     /// Right click in the editor text, VSCode's editor context menu. Items
-    /// the language server or the buffer cannot serve right now are disabled.
+    /// the language engine or the buffer cannot serve right now are disabled.
     func editorContextMenu() -> NSMenu? {
         guard activeTab?.isDocument == true, editorView.document != nil else { return nil }
         let readOnly = editorView.isReadOnly

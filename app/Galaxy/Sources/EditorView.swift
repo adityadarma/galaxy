@@ -946,7 +946,7 @@ final class EditorView: NSView {
                 context.setFillColor(Theme.editorForeground.resolved(for: effectiveAppearance).cgColor)
                 // Semantic runs come last so they win over Tree-sitter's.
                 let styles = (stylesByLine[line.line] ?? [])
-                // Unused code (LSP `Unnecessary`) is faded, not underlined.
+                // Unused code (the `Unnecessary` diagnostic tag) is faded, not underlined.
                 let faded = line.diagnostics.filter(\.unnecessary).map { Int($0.start)..<Int($0.end) }
                 let ctLine = styles.isEmpty && faded.isEmpty
                     ? layout(for: line.text)
@@ -991,7 +991,7 @@ final class EditorView: NSView {
                 CTLineDraw(note, context)
             }
 
-            // LSP diagnostics sit above text decorations but beneath carets.
+            // Diagnostics sit above text decorations but beneath carets.
             // Cmd hover: underline the identifier Cmd+click would open.
             if let link = definitionLink, link.line == line.line {
                 context.setFillColor(NSColor.linkColor.cgColor)

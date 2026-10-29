@@ -1,7 +1,7 @@
 //! Byte-level diff of two ropes by common prefix and suffix.
 //!
-//! Used where an edit path only knows "before" and "after" text: LSP
-//! incremental sync and incremental Tree-sitter reparses. Whole chunk
+//! Used where an edit path only knows "before" and "after" text: fold
+//! range updates and incremental Tree-sitter reparses. Whole chunk
 //! slices are compared with memcmp, so unchanged text costs no allocation,
 //! and rope clones share nodes, so holding "before" is cheap.
 

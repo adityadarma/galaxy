@@ -60,8 +60,8 @@ pub struct Document {
     line_ending: LineEnding,
     encoding: Encoding,
     has_bom: bool,
-    /// Bumped on every text mutation. Snapshots, syntax trees, and LSP
-    /// versions use it to detect stale results.
+    /// Bumped on every text mutation. Snapshots, syntax trees, and language
+    /// engine requests use it to detect stale results.
     revision: u64,
 }
 

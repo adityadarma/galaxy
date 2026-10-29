@@ -346,7 +346,7 @@ extension EditorView {
 
     /// File a relative import points at, trying the extensions and `index`
     /// files the module resolvers try. `nil` for packages (`react`,
-    /// `node:fs`), which the language server resolves.
+    /// `node:fs`), which the built-in TypeScript engine resolves.
     static func resolveImport(_ spec: String, from file: String) -> String? {
         guard spec.hasPrefix("./") || spec.hasPrefix("../") || spec == "." || spec == ".." else { return nil }
         let dir = (file as NSString).deletingLastPathComponent
@@ -464,7 +464,7 @@ extension EditorView {
         return start..<end
     }
 
-    /// Where a click on the name in `range` is sent to the language server:
+    /// Where a click on the name in `range` is sent to the language engine:
     /// the start of its last segment, since that is the class or function
     /// the whole name refers to. Clicking `Models` in `App\Models\Product`
     /// opens `Product`, as in VS Code.
