@@ -910,7 +910,7 @@ enum FileGlyph {
         case "jsx": ("react", "r.square.fill", .labelColor)
         case "tsx": ("react_ts", "r.square.fill", .labelColor)
         case "js", "mjs", "cjs": ("javascript", "j.square.fill", .labelColor)
-        case "ts": ("typescript", "t.square.fill", .labelColor)
+        case "ts", "mts", "cts": ("typescript", "t.square.fill", .labelColor)
         case "html", "htm": ("html", "chevron.left.forwardslash.chevron.right", .labelColor)
         case "xml": ("xml", "chevron.left.forwardslash.chevron.right", .labelColor)
         case "css": ("css", "number", .labelColor)

@@ -1,11 +1,11 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 use galaxy_core::analysis::{
     CompletionItem as LspCompletionItem, DocumentSymbolInfo, Range as LspRange, RenameEdit,
 };
 use galaxy_core::javascript::PackageImports;
-use galaxy_core::typescript::{Declaration, DeclarationKind, DocumentIndex};
+use galaxy_core::typescript::{Declaration, DeclarationKind, DocumentIndex, ImportKind};
 
 use crate::typescript_navigation::{
     TypeScriptNavigationCache, typescript_dependency_packages, typescript_package_exports,
@@ -27,17 +27,50 @@ struct WorkspaceExport {
     default: bool,
 }
 
+/// What one workspace file contributes: importable exports and global names.
+#[derive(Debug, Default)]
+struct WorkspaceFile {
+    exports: Vec<WorkspaceExport>,
+    globals: Vec<String>,
+}
+
 /// FFI owns disk-backed workspace state; core supplies the per-file parser.
 #[derive(Debug, Default)]
 pub(super) struct TypeScriptWorkspaceExports {
-    roots: BTreeMap<PathBuf, BTreeMap<String, Vec<WorkspaceExport>>>,
+    roots: BTreeMap<PathBuf, BTreeMap<String, WorkspaceFile>>,
+    /// Per root, the global names of `lib`, `@types` and declaration files;
+    /// `None` when they cannot be known (see `typescript_globals`).
+    ambient: BTreeMap<PathBuf, Option<HashSet<String>>>,
     generation: u64,
 }
 
 impl TypeScriptWorkspaceExports {
     pub(super) fn clear(&mut self) {
         self.roots.clear();
+        self.ambient.clear();
         self.generation += 1;
+    }
+
+    pub(super) fn set_ambient(&mut self, root: &Path, names: Option<HashSet<String>>) {
+        self.generation += 1;
+        self.ambient.insert(root.to_path_buf(), names);
+    }
+
+    /// Whether `name` is certainly not a global for `document`'s project.
+    /// `None` when the project's globals are not known.
+    pub(super) fn is_unknown_global(&self, document: &Path, name: &str) -> Option<bool> {
+        let (root, files) = self
+            .roots
+            .iter()
+            .filter(|(root, _)| document.strip_prefix(root).is_ok())
+            .max_by_key(|(root, _)| root.components().count())?;
+        let ambient = self.ambient.get(root)?.as_ref()?;
+        Some(
+            !ambient.contains(name)
+                && !files
+                    .values()
+                    .any(|file| file.globals.iter().any(|global| global == name)),
+        )
     }
 
     pub(super) fn refresh(&mut self, root: &Path, paths: &[String]) {
@@ -45,7 +78,7 @@ impl TypeScriptWorkspaceExports {
         let mut files = BTreeMap::new();
         for path in paths
             .iter()
-            .filter(|path| is_source_path(path))
+            .filter(|path| is_indexed_path(path))
             .take(MAX_WORKSPACE_TYPESCRIPT_FILES)
         {
             let full_path = root.join(path);
@@ -58,7 +91,7 @@ impl TypeScriptWorkspaceExports {
             let Ok(text) = std::fs::read_to_string(&full_path) else {
                 continue;
             };
-            files.insert(path.clone(), workspace_exports(&full_path, &text, path));
+            files.insert(path.clone(), workspace_file(&full_path, &text, path));
         }
         // A name resolving to more than one module cannot be imported safely.
         if !self.roots.contains_key(root) && self.roots.len() >= MAX_WORKSPACE_TYPESCRIPT_ROOTS {
@@ -74,11 +107,11 @@ impl TypeScriptWorkspaceExports {
             return;
         };
         self.generation += 1;
-        for path in paths.iter().filter(|path| is_source_path(path)) {
+        for path in paths.iter().filter(|path| is_indexed_path(path)) {
             let full_path = root.join(path);
             match std::fs::read_to_string(&full_path) {
                 Ok(text) if text.len() as u64 <= MAX_WORKSPACE_TYPESCRIPT_FILE_BYTES => {
-                    files.insert(path.clone(), workspace_exports(&full_path, &text, path));
+                    files.insert(path.clone(), workspace_file(&full_path, &text, path));
                 }
                 _ => {
                     files.remove(path);
@@ -135,8 +168,8 @@ impl TypeScriptWorkspaceExports {
             .max_by_key(|(root, _)| root.components().count())
             .map(|(root, exports)| {
                 let mut by_name = BTreeMap::<String, Vec<WorkspaceExport>>::new();
-                for file_exports in exports.values() {
-                    for export in file_exports {
+                for file in exports.values() {
+                    for export in &file.exports {
                         by_name
                             .entry(export.name.clone())
                             .or_default()
@@ -154,18 +187,28 @@ impl TypeScriptWorkspaceExports {
     }
 }
 
-fn workspace_exports(path: &Path, text: &str, relative: &str) -> Vec<WorkspaceExport> {
-    DocumentIndex::parse(path, text)
-        .declarations
-        .iter()
-        .filter(|item| item.exported)
-        .map(|declaration| WorkspaceExport {
-            name: declaration.name.clone(),
-            kind: declaration.kind,
-            path: relative.to_owned(),
-            default: declaration.default,
-        })
-        .collect()
+fn workspace_file(path: &Path, text: &str, relative: &str) -> WorkspaceFile {
+    let index = DocumentIndex::parse(path, text);
+    // Declaration files hold globals, not modules to import from.
+    let exports = if relative.ends_with(".d.ts") {
+        Vec::new()
+    } else {
+        index
+            .declarations
+            .iter()
+            .filter(|item| item.exported)
+            .map(|declaration| WorkspaceExport {
+                name: declaration.name.clone(),
+                kind: declaration.kind,
+                path: relative.to_owned(),
+                default: declaration.default,
+            })
+            .collect()
+    };
+    WorkspaceFile {
+        exports,
+        globals: index.global_names,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -282,14 +325,15 @@ pub(super) fn typescript_completions(
             else {
                 continue;
             };
-            let import = if export.default {
-                format!("import {} from {quote}{specifier}{quote};\n", export.name)
-            } else {
-                format!(
-                    "import {{ {} }} from {quote}{specifier}{quote};\n",
-                    export.name
-                )
-            };
+            let edit = import_edit(
+                &index,
+                edit_uri,
+                &specifier,
+                &export.name,
+                export.default,
+                quote,
+                insertion,
+            );
             items
                 .entry(export.name.clone())
                 .or_insert_with(|| LspCompletionItem {
@@ -298,16 +342,7 @@ pub(super) fn typescript_completions(
                         typescript_declaration_kind(export.kind),
                         export.path
                     )),
-                    additional_edits: vec![RenameEdit {
-                        uri: edit_uri.to_owned(),
-                        range: LspRange {
-                            start_line: insertion as u64,
-                            start_character: 0,
-                            end_line: insertion as u64,
-                            end_character: 0,
-                        },
-                        new_text: import,
-                    }],
+                    additional_edits: vec![edit],
                     ..typescript_completion_item(&export.name, export.kind)
                 });
         }
@@ -332,20 +367,12 @@ pub(super) fn typescript_completions(
         if unavailable.contains(name) {
             continue;
         }
+        let edit = import_edit(&index, edit_uri, specifier, name, false, '\'', insertion);
         items
             .entry(name.to_owned())
             .or_insert_with(|| LspCompletionItem {
                 detail: Some(format!("function - {specifier}")),
-                additional_edits: vec![RenameEdit {
-                    uri: edit_uri.to_owned(),
-                    range: LspRange {
-                        start_line: insertion as u64,
-                        start_character: 0,
-                        end_line: insertion as u64,
-                        end_character: 0,
-                    },
-                    new_text: format!("import {{ {name} }} from '{specifier}';\n"),
-                }],
+                additional_edits: vec![edit],
                 ..typescript_completion_item(name, DeclarationKind::Function)
             });
     }
@@ -366,6 +393,7 @@ pub(super) fn typescript_completions(
             if unavailable.contains(name.as_str()) {
                 continue;
             }
+            let edit = import_edit(&index, edit_uri, &specifier, &name, false, '\'', insertion);
             items
                 .entry(name.clone())
                 .or_insert_with(|| LspCompletionItem {
@@ -373,16 +401,7 @@ pub(super) fn typescript_completions(
                         "{} - {specifier}",
                         typescript_declaration_kind(kind)
                     )),
-                    additional_edits: vec![RenameEdit {
-                        uri: edit_uri.to_owned(),
-                        range: LspRange {
-                            start_line: insertion as u64,
-                            start_character: 0,
-                            end_line: insertion as u64,
-                            end_character: 0,
-                        },
-                        new_text: format!("import {{ {name} }} from '{specifier}';\n"),
-                    }],
+                    additional_edits: vec![edit],
                     ..typescript_completion_item(&name, kind)
                 });
         }
@@ -527,11 +546,71 @@ fn is_this_member_access(text: &str, line: usize, character: usize, prefix: &str
         .is_some_and(|before| before.ends_with("this."))
 }
 
+fn is_indexed_path(path: &str) -> bool {
+    is_source_path(path) || path.ends_with(".d.ts")
+}
+
 fn is_source_path(path: &str) -> bool {
     !path.ends_with(".d.ts")
         && [".ts", ".tsx", ".mts", ".cts"]
             .iter()
             .any(|extension| path.ends_with(extension))
+}
+
+/// The edit that imports `name` from `specifier`. Merges into an existing
+/// value import of the same module (`import { a } from 'x'` gains `, name`)
+/// and falls back to a new statement at `insertion`.
+fn import_edit(
+    index: &DocumentIndex,
+    edit_uri: &str,
+    specifier: &str,
+    name: &str,
+    default: bool,
+    quote: char,
+    insertion: usize,
+) -> RenameEdit {
+    let at = |line: usize, character: usize, new_text: String| RenameEdit {
+        uri: edit_uri.to_owned(),
+        range: LspRange {
+            start_line: line as u64,
+            start_character: character as u64,
+            end_line: line as u64,
+            end_character: character as u64,
+        },
+        new_text,
+    };
+    let existing = index.imports.iter().find(|import| {
+        import.specifier == specifier
+            && !import.type_only
+            && !import.bindings.is_empty()
+            && import
+                .bindings
+                .iter()
+                .all(|binding| binding.kind != ImportKind::Namespace)
+    });
+    if !default && let Some(import) = existing {
+        if let Some(last) = import
+            .bindings
+            .iter()
+            .rfind(|binding| binding.kind == ImportKind::Named)
+        {
+            return at(last.range.end.line, last.range.end.col, format!(", {name}"));
+        }
+        // Only a default binding: `import Foo from 'x'` gains `, { name }`.
+        if let Some(last) = import.bindings.last() {
+            return at(
+                last.range.end.line,
+                last.range.end.col,
+                format!(", {{ {name} }}"),
+            );
+        }
+    }
+    let new_text = if default {
+        format!("import {name} from {quote}{specifier}{quote};\n")
+    } else {
+        format!("import {{ {name} }} from {quote}{specifier}{quote};\n")
+    };
+    at(insertion, 0, new_text)
 }
 
 fn import_insertion_point(index: &DocumentIndex, fallback: usize) -> usize {

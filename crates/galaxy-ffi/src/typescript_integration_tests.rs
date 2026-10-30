@@ -83,6 +83,272 @@ fn component_script_source_accepts_svelte_scripts() {
     assert_eq!(virtual_source.lines().nth(2), Some("let count = 0"));
 }
 
+/// Opens a component file on disk with a fresh `Core`.
+fn component_doc(name: &str, text: &str) -> (tempfile::TempDir, Arc<Core>, Arc<DocumentHandle>) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(name);
+    std::fs::write(&path, text).unwrap();
+    let core = Core::new();
+    let document = core
+        .open_document(path.to_string_lossy().into_owned())
+        .unwrap();
+    (dir, core, document)
+}
+
+#[test]
+fn component_virtual_source_blanks_markup_and_keeps_utf16_columns() {
+    let source = "<h1>😀 {a}</h1>\n<script>\nlet a = 1\n</script>\n<p>x</p>\n";
+    let virtual_source = component_virtual_source("A.svelte", source);
+    assert_eq!(virtual_source.lines().count(), source.lines().count());
+    // The emoji is two UTF-16 units, so it becomes two blanks.
+    assert_eq!(virtual_source.lines().next(), Some("               "));
+    assert_eq!(virtual_source.lines().nth(2), Some("let a = 1"));
+    assert!(!virtual_source.contains('<'));
+    assert_eq!(component_virtual_source("a.ts", "x"), "x");
+}
+
+#[test]
+fn component_markup_mentions_matches_words_store_and_kebab_tags() {
+    let text = "<template><my-card />{{ total }} $count</template>\n<script setup>\n</script>\n";
+    assert!(component_markup_mentions(text, "total"));
+    assert!(component_markup_mentions(text, "count"));
+    assert!(component_markup_mentions(text, "MyCard"));
+    assert!(!component_markup_mentions(text, "tot"));
+    assert!(!component_markup_mentions(text, "unused"));
+    assert!(!component_markup_mentions(text, "Total"));
+}
+
+#[test]
+fn vue_script_hover_outline_references_and_rename_use_the_typescript_engine() {
+    let source = "<template>\n  <p>hi</p>\n</template>\n<script setup lang=\"ts\">\nfunction refresh() {}\nconst counter = 1\nrefresh()\nconsole.log(counter)\n</script>\n";
+    let (_dir, core, document) = component_doc("Counter.vue", source);
+
+    assert!(core.request_hover(document.clone(), 4, 10));
+    let hover = core.hover(document.clone()).unwrap();
+    assert!(hover.contents.contains("function `refresh`"), "{hover:?}");
+    assert_eq!(hover.start_line, Some(4));
+
+    assert!(core.request_document_symbols(document.clone()));
+    let names: Vec<_> = core
+        .document_symbols(document.clone())
+        .into_iter()
+        .map(|symbol| (symbol.name, symbol.line))
+        .collect();
+    assert!(names.contains(&("refresh".into(), 4)), "{names:?}");
+    assert!(names.contains(&("counter".into(), 5)), "{names:?}");
+
+    assert!(core.request_references(document.clone(), 6, 1));
+    let lines: Vec<_> = core
+        .references(document.clone())
+        .into_iter()
+        .map(|location| location.line)
+        .collect();
+    assert_eq!(lines, [4, 6]);
+
+    assert!(core.request_rename(document.clone(), 5, 7, "total".into()));
+    let edits = core.rename_edits(document);
+    assert_eq!(
+        edits
+            .iter()
+            .map(|edit| (edit.start_line, edit.start_character))
+            .collect::<Vec<_>>(),
+        [(5, 6), (7, 12)]
+    );
+    assert!(edits.iter().all(|edit| edit.new_text == "total"));
+}
+
+#[test]
+fn vue_template_positions_and_template_used_names_stay_unresolved() {
+    let source = "<template>\n  <p>{{ counter }}</p>\n</template>\n<script setup>\nconst counter = 1\n</script>\n";
+    let (_dir, core, document) = component_doc("Counter.vue", source);
+
+    // The cursor is on `counter` inside the template, which is not analysed.
+    assert!(!core.request_hover(document.clone(), 1, 10));
+    assert!(core.hover(document.clone()).is_none());
+    assert!(!core.request_references(document.clone(), 1, 10));
+    assert!(!core.request_rename(document.clone(), 1, 10, "total".into()));
+
+    // The template uses `counter`, so a script-only rename would break it.
+    assert!(!core.request_rename(document.clone(), 4, 7, "total".into()));
+    assert!(core.rename_edits(document).is_empty());
+}
+
+#[test]
+fn svelte_scripts_share_one_index_and_report_syntax_errors() {
+    let source = "<script context=\"module\">\nexport const shared = 1\n</script>\n<script>\nlet local = shared\nlet broken = (\n</script>\n<h1>{local}</h1>\n";
+    let (_dir, core, document) = component_doc("Card.svelte", source);
+
+    // `shared` from the module script is visible from the instance script.
+    assert!(core.request_definition(document.clone(), 4, 13));
+    assert_eq!(
+        core.definition_locations(document.clone())
+            .into_iter()
+            .map(|location| (location.line, location.column))
+            .collect::<Vec<_>>(),
+        [(1, 13)]
+    );
+    assert!(core.request_references(document.clone(), 4, 13));
+    let lines: Vec<_> = core
+        .references(document.clone())
+        .into_iter()
+        .map(|location| location.line)
+        .collect();
+    assert_eq!(lines, [1, 4]);
+
+    assert!(core.register_document(document.clone(), "svelte".into(), String::new()));
+    until("svelte syntax error", || {
+        core.poll_analysis();
+        !document.lock().diagnostics.is_empty()
+    });
+    let diagnostics = document.lock().diagnostics.clone();
+    // Errors stay inside the scripts; the `{local}` markup never parses.
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| (4..=6).contains(&diagnostic.start_line)),
+        "{diagnostics:?}"
+    );
+}
+
+#[test]
+fn component_without_scripts_has_no_outline_or_diagnostics() {
+    let (_dir, core, document) = component_doc(
+        "Plain.vue",
+        "<template>\n  <div>{{ a + }}</div>\n</template>\n",
+    );
+    assert!(!core.request_document_symbols(document.clone()));
+    assert!(core.register_document(document.clone(), "vue".into(), String::new()));
+    core.poll_analysis();
+    assert!(document.lock().diagnostics.is_empty());
+}
+
+/// Mirrors the published `@inertiajs/vue3` and `@inertiajs/core` type layout.
+#[test]
+fn vue_definition_resolves_inertia_package_reexports() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("package.json"), "{}\n").unwrap();
+    let vue3 = root.join("node_modules/@inertiajs/vue3");
+    let core_pkg = root.join("node_modules/@inertiajs/core");
+    std::fs::create_dir_all(vue3.join("types")).unwrap();
+    std::fs::create_dir_all(core_pkg.join("types")).unwrap();
+    std::fs::write(
+        vue3.join("package.json"),
+        r#"{"name":"@inertiajs/vue3","type":"module","main":"dist/index.js","types":"types/index.d.ts"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        vue3.join("types/index.d.ts"),
+        "export { http, progress, router } from '@inertiajs/core';\n\
+         export { default as Head } from './head';\n\
+         export { InertiaForm, InertiaFormProps, default as useForm } from './useForm';\n",
+    )
+    .unwrap();
+    std::fs::write(
+        vue3.join("types/head.d.ts"),
+        "import { DefineComponent } from 'vue';\n\
+         export type InertiaHead = DefineComponent<{\n    title?: string;\n}>;\n\
+         declare const Head: InertiaHead;\n\
+         export default Head;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        vue3.join("types/useForm.d.ts"),
+        "export interface InertiaFormProps<TForm extends object> { isDirty: boolean; }\n\
+         export type InertiaForm<TForm extends object> = TForm & InertiaFormProps<TForm>;\n\
+         export default function useForm<TForm>(rememberKey: string, data: TForm): InertiaForm<TForm>;\n\
+         export default function useForm<TForm>(data: TForm): InertiaForm<TForm>;\n\
+         export default function useForm<TForm>(): InertiaForm<TForm>;\n\
+         export {};\n",
+    )
+    .unwrap();
+    std::fs::write(
+        core_pkg.join("package.json"),
+        r#"{"name":"@inertiajs/core","type":"module","main":"dist/index.js","types":"types/index.d.ts","exports":{".":{"types":"./types/index.d.ts","import":"./dist/index.js"}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        core_pkg.join("types/index.d.ts"),
+        "import { Config } from './config';\n\
+         import { Router } from './router';\n\
+         export { http } from './http';\n\
+         export { progress, default as setupProgress } from './progress';\n\
+         export * from './types';\n\
+         export { type Config, type Router };\n\
+         export declare const router: Router;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        core_pkg.join("types/router.d.ts"),
+        "import Queue from './queue';\n\
+         export declare class Router {\n\
+         \x20   protected clientVisitQueue: Queue<Promise<void>>;\n\
+         \x20   get<T extends RequestPayload = RequestPayload>(url: URL | string, data?: T): void;\n\
+         \x20   post<T extends RequestPayload = RequestPayload>(url: URL | string, data?: T): void;\n\
+         \x20   put<T extends RequestPayload = RequestPayload>(url: URL | string, data?: T): void;\n\
+         \x20   delete<T extends RequestPayload = RequestPayload>(url: URL | string): void;\n\
+         }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        core_pkg.join("types/http.d.ts"),
+        "export declare const http: {};\n",
+    )
+    .unwrap();
+    let source = "<script setup lang=\"ts\">\n\
+                  import { Head, useForm, router } from '@inertiajs/vue3';\n\
+                  const submit = () => {\n\
+                  \x20   router.put('/couriers/1', {});\n\
+                  \x20   router.post('/couriers', {});\n\
+                  \x20   router.delete('/couriers/1');\n\
+                  };\n\
+                  </script>\n";
+    let page = root.join("resources/js/Pages/Outlets.vue");
+    std::fs::create_dir_all(page.parent().unwrap()).unwrap();
+    std::fs::write(&page, source).unwrap();
+    let core = Core::new();
+    let document = core
+        .open_document(page.to_string_lossy().into_owned())
+        .unwrap();
+
+    let line = "import { Head, useForm, router } from '@inertiajs/vue3';";
+    let cases = [
+        ("Head", "vue3/types/head.d.ts", 4),
+        ("useForm", "vue3/types/useForm.d.ts", 2),
+        ("router", "core/types/index.d.ts", 6),
+    ];
+    for (name, file, expected_line) in cases {
+        let column = line.find(name).unwrap() as u64 + 1;
+        assert!(
+            core.request_definition(document.clone(), 1, column),
+            "{name}"
+        );
+        let locations = core.definition_locations(document.clone());
+        assert_eq!(locations.len(), 1, "{name}: {locations:?}");
+        assert!(
+            locations[0].uri.ends_with(file) && locations[0].line == expected_line,
+            "{name}: {locations:?}"
+        );
+    }
+
+    // `router.put` follows `export declare const router: Router` to the
+    // `Router` class methods in `router.d.ts`.
+    for (line, method, expected_line) in [(3u64, "put", 5), (4, "post", 4), (5, "delete", 6)] {
+        let column = "    router.".len() as u64 + 1;
+        assert!(
+            core.request_definition(document.clone(), line, column),
+            "{method}"
+        );
+        let locations = core.definition_locations(document.clone());
+        assert_eq!(locations.len(), 1, "{method}: {locations:?}");
+        assert!(
+            locations[0].uri.ends_with("core/types/router.d.ts")
+                && locations[0].line == expected_line,
+            "{method}: {locations:?}"
+        );
+    }
+}
+
 #[test]
 fn component_script_insertion_line_stays_inside_script_setup() {
     let source = "<script setup lang=\"ts\">\nconst value = 1\n</script>\n";
@@ -496,6 +762,70 @@ fn vue_completion_auto_imports_dependency_exports() {
     assert_eq!(item.additional_edits[0].line, 1);
     assert_eq!(
         item.additional_edits[0].text,
+        "import { computed } from 'vue';\n"
+    );
+}
+
+#[test]
+fn vue_completion_merges_auto_import_into_an_existing_import() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("package.json"),
+        r#"{"dependencies":{"vue":"3"}}"#,
+    )
+    .unwrap();
+    let complete = |name: &str, source: &str, line: u64, character: u64| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, source).unwrap();
+        let core = Core::new();
+        let document = core
+            .open_document(path.to_string_lossy().into_owned())
+            .unwrap();
+        assert!(core.request_completion(document.clone(), line, character));
+        core.completions(document)
+            .into_iter()
+            .find(|item| item.label == "computed")
+            .unwrap()
+    };
+
+    let merged = complete(
+        "Merge.vue",
+        "<script setup>\nimport { createApp, h } from 'vue'\ncomp\n</script>\n",
+        2,
+        4,
+    );
+    let edit = &merged.additional_edits[0];
+    assert_eq!((edit.line, edit.column), (1, 21));
+    assert_eq!(edit.text, ", computed");
+
+    let default_only = complete(
+        "Default.vue",
+        "<script setup>\nimport Vue from 'vue'\ncomp\n</script>\n",
+        2,
+        4,
+    );
+    let edit = &default_only.additional_edits[0];
+    assert_eq!((edit.line, edit.column), (1, 10));
+    assert_eq!(edit.text, ", { computed }");
+
+    let other_module = complete(
+        "Other.vue",
+        "<script setup>\nimport { x } from 'other'\ncomp\n</script>\n",
+        2,
+        4,
+    );
+    let edit = &other_module.additional_edits[0];
+    assert_eq!((edit.line, edit.column), (2, 0));
+    assert_eq!(edit.text, "import { computed } from 'vue';\n");
+
+    let type_only = complete(
+        "Type.vue",
+        "<script setup lang=\"ts\">\nimport type { Ref } from 'vue'\ncomp\n</script>\n",
+        2,
+        4,
+    );
+    assert_eq!(
+        type_only.additional_edits[0].text,
         "import { computed } from 'vue';\n"
     );
 }
@@ -2083,6 +2413,62 @@ fn typescript_navigation_resolves_imported_decorator_option_keys() {
 }
 
 #[test]
+fn typescript_navigation_resolves_option_keys_of_imported_function_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("node_modules/@lib/core/types")).unwrap();
+    std::fs::create_dir_all(dir.path().join("node_modules/@lib/app/types")).unwrap();
+    std::fs::write(
+        dir.path().join("node_modules/@lib/core/package.json"),
+        r#"{"types":"types/index.d.ts"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("node_modules/@lib/core/types/index.d.ts"),
+        "export * from './options';\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("node_modules/@lib/core/types/options.d.ts"),
+        "interface BaseOptions<R> {\n  resolve: R;\n  title?: string;\n}\n\
+         export interface CsrOptions<R> extends BaseOptions<R> {\n  progress?: boolean;\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("node_modules/@lib/app/package.json"),
+        r#"{"types":"types/index.d.ts"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("node_modules/@lib/app/types/index.d.ts"),
+        "import { CsrOptions } from '@lib/core';\n\
+         type AppOptions<S> = CsrOptions<S>;\n\
+         export declare function createApp<S>(options: AppOptions<S>): void;\n\
+         export declare function createApp<S>(options: AppOptions<S> & { render: 1 }): void;\n",
+    )
+    .unwrap();
+    let main_path = dir.path().join("main.ts");
+    std::fs::write(
+        &main_path,
+        "import { createApp } from '@lib/app';\n\
+         createApp({ resolve: (n) => n, progress: true, other: 1 });\n",
+    )
+    .unwrap();
+    let core = Core::new();
+    let main = core
+        .open_document(main_path.to_string_lossy().into_owned())
+        .unwrap();
+    // `resolve` is declared on the base interface two hops away.
+    assert!(core.request_definition(main.clone(), 1, 15));
+    let definition = core.definition_locations(main.clone());
+    assert_eq!(definition.len(), 1);
+    assert!(definition[0].uri.ends_with("@lib/core/types/options.d.ts"));
+    assert_eq!((definition[0].line, definition[0].column), (1, 2));
+    // A key the type does not declare resolves to nothing.
+    assert!(!core.request_definition(main, 1, 49));
+}
+
+#[test]
 fn typescript_navigation_resolves_imported_object_member_decorator_option_keys() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
@@ -2754,4 +3140,281 @@ fn source_only_watcher_delta_updates_typescript_auto_imports() {
             .iter()
             .all(|item| item.label != "OldUser")
     );
+}
+
+#[test]
+fn route_name_at_accepts_only_the_first_string_of_a_bare_route_call() {
+    let line = "router.delete(route('couriers.destroy', courier.id));";
+    let at = line.find("couriers").unwrap();
+    assert_eq!(route_name_at(line, at + 2), Some("couriers.destroy"));
+    // Either quote counts, the arguments after the name do not.
+    assert_eq!(route_name_at(line, at - 1), Some("couriers.destroy"));
+    assert_eq!(route_name_at(line, line.find("courier.id").unwrap()), None);
+    assert_eq!(route_name_at("confirm('couriers.index')", 12), None);
+    assert_eq!(route_name_at("this.route('couriers.index')", 15), None);
+    assert_eq!(route_name_at("$route('couriers.index')", 12), None);
+    assert_eq!(route_name_at("route(`a.${b}`)", 8), None);
+    assert_eq!(route_name_at("route( 'a.b' )", 9), Some("a.b"));
+    assert_eq!(route_name_at("route('')", 7), None);
+}
+
+#[test]
+fn vue_route_calls_resolve_to_laravel_routes_and_ziggy() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("artisan"), "#!/usr/bin/env php\n").unwrap();
+    std::fs::write(root.join("package.json"), "{}\n").unwrap();
+    std::fs::create_dir_all(root.join("routes")).unwrap();
+    std::fs::write(
+        root.join("routes/web.php"),
+        "<?php\n\nuse Illuminate\\Support\\Facades\\Route;\n\n\
+         Route::put('/couriers/{courier}', [CourierController::class, 'update'])->name('couriers.update');\n",
+    )
+    .unwrap();
+    let ziggy = root.join("node_modules/ziggy-js");
+    std::fs::create_dir_all(ziggy.join("src/js")).unwrap();
+    std::fs::write(
+        ziggy.join("package.json"),
+        r#"{"name":"ziggy-js","type":"module","types":"./src/js/index.d.ts"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        ziggy.join("src/js/index.d.ts"),
+        "export interface Router {}\n\
+         export function route(): Router;\n\
+         export function route(name: string): string;\n",
+    )
+    .unwrap();
+    let source = "<script setup lang=\"ts\">\n\
+                  const go = () => route('couriers.update', 1);\n\
+                  const missing = route('couriers.nope');\n\
+                  const text = confirm('couriers.update');\n\
+                  </script>\n\
+                  <template>\n\
+                  \x20 <a :href=\"route('couriers.update', 1)\">Edit</a>\n\
+                  </template>\n";
+    let page = root.join("resources/js/Pages/Couriers/Index.vue");
+    std::fs::create_dir_all(page.parent().unwrap()).unwrap();
+    std::fs::write(&page, source).unwrap();
+    let core = Core::new();
+    let document = core
+        .open_document(page.to_string_lossy().into_owned())
+        .unwrap();
+    let lines: Vec<&str> = source.lines().collect();
+
+    // The route name, in the script and in a template expression.
+    for line in [1u64, 6] {
+        let column = lines[line as usize].find("couriers.update").unwrap() as u64 + 3;
+        assert!(
+            core.request_definition(document.clone(), line, column),
+            "line {line}"
+        );
+        let locations = core.definition_locations(document.clone());
+        assert_eq!(locations.len(), 1, "{locations:?}");
+        assert!(
+            locations[0].uri.ends_with("routes/web.php"),
+            "{locations:?}"
+        );
+        assert_eq!(locations[0].line, 4, "{locations:?}");
+    }
+
+    // The `route` helper itself, in the script and in the template.
+    for line in [1u64, 6] {
+        let column = lines[line as usize].find("route(").unwrap() as u64 + 2;
+        assert!(
+            core.request_definition(document.clone(), line, column),
+            "line {line}"
+        );
+        let locations = core.definition_locations(document.clone());
+        assert_eq!(locations.len(), 1, "{locations:?}");
+        assert!(
+            locations[0].uri.ends_with("ziggy-js/src/js/index.d.ts") && locations[0].line == 1,
+            "{locations:?}"
+        );
+    }
+
+    // An unknown name and a string that is not a `route()` argument stay quiet.
+    let unknown = lines[2].find("couriers.nope").unwrap() as u64 + 3;
+    assert!(!core.request_definition(document.clone(), 2, unknown));
+    let other = lines[3].find("couriers.update").unwrap() as u64 + 3;
+    assert!(!core.request_definition(document.clone(), 3, other));
+}
+
+#[test]
+fn vue_template_names_resolve_to_script_declarations_and_imports() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("package.json"), "{}\n").unwrap();
+    std::fs::write(
+        root.join("helper.ts"),
+        "export function helper(n: number) { return n; }\n",
+    )
+    .unwrap();
+    let source = "<script setup lang=\"ts\">\n\
+                  import { helper } from './helper';\n\
+                  const deleteOpname = (id: number) => id;\n\
+                  </script>\n\
+                  <template>\n\
+                  \x20 <button @click=\"deleteOpname(op)\">{{ helper(1) }}</button>\n\
+                  \x20 <p>{{ item.deleteOpname }}</p>\n\
+                  </template>\n";
+    let page = root.join("Index.vue");
+    std::fs::write(&page, source).unwrap();
+    let core = Core::new();
+    let document = core
+        .open_document(page.to_string_lossy().into_owned())
+        .unwrap();
+    let lines: Vec<&str> = source.lines().collect();
+
+    let column = lines[5].find("deleteOpname").unwrap() as u64 + 3;
+    assert!(core.request_definition(document.clone(), 5, column));
+    let locations = core.definition_locations(document.clone());
+    assert!(locations[0].uri.ends_with("Index.vue"), "{locations:?}");
+    assert_eq!(locations[0].line, 2, "{locations:?}");
+
+    let column = lines[5].find("helper").unwrap() as u64 + 2;
+    assert!(core.request_definition(document.clone(), 5, column));
+    let locations = core.definition_locations(document.clone());
+    assert!(locations[0].uri.ends_with("helper.ts"), "{locations:?}");
+
+    // A property of another object and a name the scripts lack stay unresolved.
+    let column = lines[6].find("deleteOpname").unwrap() as u64 + 3;
+    assert!(!core.request_definition(document.clone(), 6, column));
+    let column = lines[5].find("op)").unwrap() as u64 + 1;
+    assert!(!core.request_definition(document.clone(), 5, column));
+}
+
+#[test]
+fn typescript_navigation_resolves_vite_import_meta_members_and_env_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("node_modules/vite/types")).unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("node_modules/vite/types/importMeta.d.ts"),
+        "interface ImportMetaEnv extends Record<string, any> {\n  BASE_URL: string\n}\n\n\
+         interface ImportMeta {\n  url: string\n  readonly env: ImportMetaEnv\n  glob: Fn\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join(".env"),
+        "APP_NAME=x\nexport VITE_APP_NAME=\"Cafe\"\n# VITE_OFF=1\n",
+    )
+    .unwrap();
+    let main_path = dir.path().join("src/main.ts");
+    std::fs::write(
+        &main_path,
+        "const a = import.meta.env.VITE_APP_NAME;\nconst b = import.meta.glob('./x');\n\
+         const c = import.meta.env.VITE_OFF;\nconst d = other.glob;\n",
+    )
+    .unwrap();
+    let core = Core::new();
+    let main = core
+        .open_document(main_path.to_string_lossy().into_owned())
+        .unwrap();
+    let locate = |line: u64, column: u64| {
+        core.request_definition(main.clone(), line, column)
+            .then(|| core.definition_locations(main.clone()))
+    };
+
+    let env = locate(0, 22).unwrap();
+    assert!(env[0].uri.ends_with("vite/types/importMeta.d.ts"));
+    assert_eq!((env[0].line, env[0].column), (6, 11));
+    let key = locate(0, 30).unwrap();
+    assert!(key[0].uri.ends_with("/.env"));
+    assert_eq!((key[0].line, key[0].column), (1, 7));
+    let glob = locate(1, 24).unwrap();
+    assert!(glob[0].uri.ends_with("vite/types/importMeta.d.ts"));
+    assert_eq!((glob[0].line, glob[0].column), (7, 2));
+    // Commented-out keys and non-`import.meta` receivers resolve to nothing.
+    assert!(locate(2, 30).is_none());
+    assert!(locate(3, 17).is_none());
+}
+
+/// Opens `source` as `src/main.ts` of a project and returns the "Cannot find
+/// name" messages once diagnostics were computed.
+fn unknown_name_reports(dir: &Path, source: &str) -> Vec<String> {
+    let path = dir.join("src/main.ts");
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(&path, source).unwrap();
+    let core = Core::new();
+    core.open_workspace(dir.to_string_lossy().into_owned())
+        .unwrap();
+    let document = core
+        .open_document(path.to_string_lossy().into_owned())
+        .unwrap();
+    assert!(core.register_document(document.clone(), "typescript".into(), String::new()));
+    // Probe name in a sibling-free file: it is unknown in every project below.
+    let mut messages = Vec::new();
+    for _ in 0..60 {
+        core.poll_analysis();
+        std::thread::sleep(Duration::from_millis(50));
+        messages = document
+            .lock()
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.starts_with("Cannot find name"))
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect();
+        if !messages.is_empty() {
+            break;
+        }
+    }
+    messages
+}
+
+fn typescript_project(dir: &Path) {
+    std::fs::write(dir.join("package.json"), "{}\n").unwrap();
+    let lib = dir.join("node_modules/typescript/lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    std::fs::write(lib.join("lib.d.ts"), "/// <reference lib=\"es5\" />\n").unwrap();
+    std::fs::write(
+        lib.join("lib.es5.d.ts"),
+        "interface Promise<T> {}\ndeclare var console: { log(m: string): void };\n\
+         type Record<K extends keyof any, T> = { [P in K]: T };\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("types")).unwrap();
+    std::fs::write(
+        dir.join("types/globals.d.ts"),
+        "declare var route: (name: string) => string;\n",
+    )
+    .unwrap();
+}
+
+#[test]
+fn typescript_reports_names_no_global_or_declaration_provides() {
+    let dir = tempfile::tempdir().unwrap();
+    typescript_project(dir.path());
+    let source = "import { thing } from './thing';\n\
+         const { theme = 'x', ...rest } = thing;\n\
+         type Cb = (event: string) => void;\n\
+         console.log(route('a'), theme, rest);\n\
+         const p: Promise<Record<string, number>> = missingValue;\n";
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("src/thing.ts"),
+        "export const thing = {};\n",
+    )
+    .unwrap();
+    let reports = unknown_name_reports(dir.path(), source);
+    assert_eq!(reports, ["Cannot find name 'missingValue'.".to_owned()]);
+}
+
+#[test]
+fn typescript_reports_no_unknown_names_when_globals_are_not_knowable() {
+    // No TypeScript installation: lib globals cannot be listed.
+    let bare = tempfile::tempdir().unwrap();
+    std::fs::write(bare.path().join("package.json"), "{}\n").unwrap();
+    assert!(unknown_name_reports(bare.path(), "missingValue;\n").is_empty());
+
+    // Auto-import tooling adds globals at build time.
+    let nuxt = tempfile::tempdir().unwrap();
+    typescript_project(nuxt.path());
+    std::fs::write(
+        nuxt.path().join("package.json"),
+        r#"{"dependencies":{"nuxt":"3"}}"#,
+    )
+    .unwrap();
+    assert!(unknown_name_reports(nuxt.path(), "missingValue;\n").is_empty());
 }

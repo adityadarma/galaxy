@@ -52,6 +52,7 @@ use galaxy_core::workspace::{
 };
 
 mod typescript_editor;
+mod typescript_globals;
 mod typescript_navigation;
 
 use typescript_editor::{
@@ -61,8 +62,9 @@ use typescript_editor::{
 use typescript_navigation::{
     TypeScriptNavigationCache, module_root_location, resolve_typescript_definition_import,
     resolve_typescript_export, resolve_typescript_import_uncached, resolve_typescript_type_export,
-    spawn_warmup, typescript_decorator_option_target, typescript_import_target,
-    typescript_type_member_target, typescript_type_target, workspace_detected,
+    spawn_warmup, typescript_call_option_target, typescript_decorator_option_target,
+    typescript_import_target, typescript_type_member_target, typescript_type_target,
+    workspace_detected,
 };
 
 uniffi::setup_scaffolding!();
@@ -900,7 +902,8 @@ impl Core {
             || is_go_path(path)
             || is_rust_path(path)
             || is_dart_path(path)
-            || is_typescript_path(path))
+            || is_typescript_path(path)
+            || is_component_path(path))
         {
             return false;
         }
@@ -978,8 +981,16 @@ impl Core {
             return false;
         }
         let uri = file_uri(Path::new(&path));
-        if is_typescript_path(Path::new(&path)) {
-            let index = DocumentIndex::parse(&path, &document.lock().editor.doc.text());
+        if is_typescript_path(Path::new(&path)) || is_component_path(Path::new(&path)) {
+            let text = document.lock().editor.doc.text();
+            let Some(source) = component_position_source(&path, &text, line as usize) else {
+                self.analysis
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .set_hover(&uri, None);
+                return false;
+            };
+            let index = DocumentIndex::parse(typescript_index_path(&path), &source);
             let position = Utf16Position::new(line as usize, character as usize);
             let hover = index
                 .symbol_at(position.line, position.col)
@@ -1117,7 +1128,7 @@ impl Core {
             // the FFI panic boundary so such input cannot crash Swift.
             let completion = catch_unwind(AssertUnwindSafe(|| {
                 let text = document.lock().editor.doc.text();
-                let source = component_script_source(&path, &text, line as usize)?;
+                let source = component_position_source(&path, &text, line as usize)?;
                 let script_insertion_line =
                     component_script_insertion_line(&path, &text, line as usize).unwrap_or(0);
                 let index_path = if is_component_path(Path::new(&path)) {
@@ -1377,7 +1388,7 @@ impl Core {
             return false;
         }
         let uri = file_uri(Path::new(&path));
-        if is_typescript_path(Path::new(&path)) {
+        if is_typescript_path(Path::new(&path)) || is_component_path(Path::new(&path)) {
             return self.typescript_references(&document, &uri, line, character);
         }
         if is_dart_path(Path::new(&path)) {
@@ -1417,7 +1428,7 @@ impl Core {
             return false;
         }
         let uri = file_uri(Path::new(&path));
-        if is_typescript_path(Path::new(&path)) {
+        if is_typescript_path(Path::new(&path)) || is_component_path(Path::new(&path)) {
             return self.typescript_rename(&document, &uri, line, character, &new_name);
         }
         if is_dart_path(Path::new(&path)) {
@@ -1539,8 +1550,9 @@ impl Core {
             return false;
         }
         let uri = file_uri(Path::new(&path));
-        if is_typescript_path(Path::new(&path)) {
-            let index = DocumentIndex::parse(&path, &document.lock().editor.doc.text());
+        if is_typescript_path(Path::new(&path)) || is_component_path(Path::new(&path)) {
+            let source = component_virtual_source(&path, &document.lock().editor.doc.text());
+            let index = DocumentIndex::parse(typescript_index_path(&path), &source);
             let symbols = index
                 .declarations
                 .iter()
@@ -2476,7 +2488,8 @@ impl Core {
         }
         for (uri, document) in documents {
             let path = document.path();
-            if !is_typescript_path(Path::new(&path)) {
+            let component = is_component_path(Path::new(&path));
+            if !(is_typescript_path(Path::new(&path)) || component) {
                 continue;
             }
             let (revision, text) = {
@@ -2486,7 +2499,8 @@ impl Core {
             if checked.get(uri) == Some(&revision) {
                 continue;
             }
-            let index = DocumentIndex::parse(&path, &text);
+            let source = component_virtual_source(&path, &text);
+            let index = DocumentIndex::parse(typescript_index_path(&path), &source);
             let mut diagnostics: Vec<_> = index
                 .diagnostics
                 .iter()
@@ -2543,23 +2557,50 @@ impl Core {
                         unnecessary: false,
                     }),
             );
-            // Only names some workspace module exports are reported, so
-            // globals and lib types never warn.
+            // A name some workspace module exports gets an import suggestion.
+            // Any other unknown name is reported only where the project's
+            // globals are fully known (see `typescript_globals`). Components
+            // are skipped: their build tools may auto-import names
+            // (composables, runes) the engine cannot see, and a false report
+            // is worse than none.
             let names = index
                 .unresolved_references
                 .iter()
+                .filter(|_| !component)
                 .map(|(name, _)| name.as_str())
                 .collect::<std::collections::BTreeSet<_>>();
             let suggestions = exports.import_suggestions(Path::new(&path), &names);
+            let reports_unknown_names = !component
+                && typescript_reports_unknown_names(&path)
+                && index.diagnostics.is_empty();
             diagnostics.extend(index.unresolved_references.iter().filter_map(|(name, range)| {
-                let specifier = suggestions.get(name)?;
+                if let Some(specifier) = suggestions.get(name) {
+                    return Some(galaxy_core::analysis::Diagnostic {
+                        uri: uri.clone(),
+                        range: typescript_range(*range),
+                        severity: galaxy_core::analysis::DiagnosticSeverity::Warning,
+                        message: format!(
+                            "Cannot find name '{name}'. Did you forget to import it from '{specifier}'?"
+                        ),
+                        source: Some("galaxy".into()),
+                        code: Some("TS2304".into()),
+                        unnecessary: false,
+                    });
+                }
+                if !reports_unknown_names
+                    || name.starts_with('$')
+                    || TYPESCRIPT_IMPLICIT_NAMES.contains(&name.as_str())
+                {
+                    return None;
+                }
+                exports
+                    .is_unknown_global(Path::new(&path), name)
+                    .filter(|unknown| *unknown)?;
                 Some(galaxy_core::analysis::Diagnostic {
                     uri: uri.clone(),
                     range: typescript_range(*range),
-                    severity: galaxy_core::analysis::DiagnosticSeverity::Warning,
-                    message: format!(
-                        "Cannot find name '{name}'. Did you forget to import it from '{specifier}'?"
-                    ),
+                    severity: galaxy_core::analysis::DiagnosticSeverity::Error,
+                    message: format!("Cannot find name '{name}'."),
                     source: Some("galaxy".into()),
                     code: Some("TS2304".into()),
                     unnecessary: false,
@@ -2668,17 +2709,33 @@ impl Core {
     ) -> bool {
         let path = document.path();
         let text = document.lock().editor.doc.text();
-        let Some(source) = component_script_source(&path, &text, line as usize) else {
-            return false;
+        // `route('couriers.update')` names a Laravel route, in a script or in
+        // a template expression alike.
+        if let Some(location) =
+            laravel_route_definition(Path::new(&path), &text, line as usize, character as usize)
+        {
+            self.analysis
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_definitions(uri, vec![location]);
+            return true;
+        }
+        let Some(source) = component_position_source(&path, &text, line as usize) else {
+            let location = self
+                .component_template_definition(&path, &text, uri, line as usize, character as usize)
+                .or_else(|| {
+                    self.ziggy_route_definition(&path, &text, line as usize, character as usize)
+                });
+            let found = location.is_some();
+            self.analysis
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_definitions(uri, location.into_iter().collect());
+            return found;
         };
         // Component scripts retain their original line and column offsets, so
         // TypeScript locations can be returned directly to the editor.
-        let index_path = if is_component_path(Path::new(&path)) {
-            format!("{path}.ts")
-        } else {
-            path.clone()
-        };
-        let index = DocumentIndex::parse(index_path, &source);
+        let index = DocumentIndex::parse(typescript_index_path(&path), &source);
         let mut locations = typescript_type_target(
             &self.typescript_navigation,
             &path,
@@ -2777,6 +2834,15 @@ impl Core {
                 line as usize,
                 character as usize,
             )
+            .or_else(|| {
+                typescript_call_option_target(
+                    &self.typescript_navigation,
+                    &path,
+                    &index,
+                    line as usize,
+                    character as usize,
+                )
+            })
             .map(|target| vec![target])
             .unwrap_or_default();
         }
@@ -2875,6 +2941,18 @@ impl Core {
         }
         if locations.is_empty()
             && let Some(location) =
+                self.ziggy_route_definition(&path, &text, line as usize, character as usize)
+        {
+            locations.push(location);
+        }
+        if locations.is_empty()
+            && let Some(location) =
+                vite_import_meta_definition(&path, &text, line as usize, character as usize)
+        {
+            locations.push(location);
+        }
+        if locations.is_empty()
+            && let Some(location) =
                 ecmascript_builtin_definition(&text, line as usize, character as usize)
         {
             locations.push(location);
@@ -2887,6 +2965,86 @@ impl Core {
         found
     }
 
+    /// A name in a component's template (`@click="deleteOpname(op)"`,
+    /// `{{ helper(1) }}`) that one of its scripts declares or imports. Names
+    /// the template itself introduces (`v-for` variables) are not in the
+    /// scripts and stay unresolved.
+    fn component_template_definition(
+        &self,
+        path: &str,
+        text: &str,
+        uri: &str,
+        line: usize,
+        character: usize,
+    ) -> Option<LspDefinitionLocation> {
+        if !is_component_path(Path::new(path)) {
+            return None;
+        }
+        let line_text = text.lines().nth(line)?;
+        let (start, end) = identifier_span_utf16(line_text, character)?;
+        if line_text[..start].ends_with('.') {
+            return None;
+        }
+        let name = &line_text[start..end];
+        let source = component_virtual_source(path, text);
+        let index = DocumentIndex::parse(typescript_index_path(path), &source);
+        if let Some(binding) = index
+            .imports
+            .iter()
+            .flat_map(|import| import.bindings.iter())
+            .find(|binding| binding.local_name == name)
+        {
+            return typescript_import_target(
+                &self.typescript_navigation,
+                path,
+                &index,
+                binding.range.start.line,
+                binding.range.start.col,
+            )
+            .map(|(target, _)| target);
+        }
+        let declaration = index.unique_runtime_declaration(name)?;
+        Some(LspDefinitionLocation {
+            uri: uri.to_owned(),
+            range: typescript_range(declaration.range),
+        })
+    }
+
+    /// The `route` helper under the cursor (`route(...)` with no local
+    /// declaration or import), which Laravel apps get from Ziggy: its
+    /// declaration in the `ziggy-js` package.
+    fn ziggy_route_definition(
+        &self,
+        path: &str,
+        text: &str,
+        line: usize,
+        character: usize,
+    ) -> Option<LspDefinitionLocation> {
+        let line_text = text.lines().nth(line)?;
+        let (start, end) = identifier_span_utf16(line_text, character)?;
+        if &line_text[start..end] != "route" {
+            return None;
+        }
+        let before = line_text[..start].chars().next_back();
+        if before.is_some_and(|ch| ch == '.' || ch == '$' || ch.is_alphanumeric() || ch == '_') {
+            return None;
+        }
+        if !line_text[end..].trim_start().starts_with('(') {
+            return None;
+        }
+        let target = resolve_typescript_definition_import(
+            &self.typescript_navigation,
+            Path::new(path),
+            "ziggy-js",
+        )?;
+        let (target, declaration) =
+            resolve_typescript_export(&self.typescript_navigation, target, "route")?;
+        Some(LspDefinitionLocation {
+            uri: file_uri(&target),
+            range: typescript_range(declaration.range),
+        })
+    }
+
     fn typescript_references(
         &self,
         document: &Arc<DocumentHandle>,
@@ -2895,7 +3053,15 @@ impl Core {
         character: u64,
     ) -> bool {
         let path = document.path();
-        let index = DocumentIndex::parse(&path, &document.lock().editor.doc.text());
+        let text = document.lock().editor.doc.text();
+        let Some(source) = component_position_source(&path, &text, line as usize) else {
+            self.analysis
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_references(uri, Vec::new());
+            return false;
+        };
+        let index = DocumentIndex::parse(typescript_index_path(&path), &source);
         let mut locations: Vec<LspDefinitionLocation> = index
             .symbol_at(line as usize, character as usize)
             .map(|symbol| {
@@ -2980,10 +3146,22 @@ impl Core {
         new_name: &str,
     ) -> bool {
         let path = document.path();
-        let index = DocumentIndex::parse(&path, &document.lock().editor.doc.text());
-        let edits: Vec<LspRenameEdit> = if valid_javascript_identifier(new_name) {
+        let text = document.lock().editor.doc.text();
+        let source = component_position_source(&path, &text, line as usize);
+        let index = source
+            .as_deref()
+            .map(|source| DocumentIndex::parse(typescript_index_path(&path), source));
+        let edits: Vec<LspRenameEdit> = if valid_javascript_identifier(new_name)
+            && let Some(index) = &index
+        {
             index
                 .symbol_at(line as usize, character as usize)
+                // The template is not analysed. Renaming a name it uses would
+                // leave the markup stale, so such renames are refused.
+                .filter(|symbol| {
+                    !is_component_path(Path::new(&path))
+                        || !component_markup_mentions(&text, &symbol.name)
+                })
                 .map(|symbol| {
                     symbol
                         .occurrences
@@ -3228,6 +3406,231 @@ fn is_php_path(path: &Path) -> bool {
 
 const ECMASCRIPT_BUILTINS: &str = include_str!("../../galaxy-core/stubs/ecmascript.d.ts");
 
+/// Byte span of the identifier touching UTF-16 `character` in `line_text`.
+fn identifier_span_utf16(line_text: &str, character: usize) -> Option<(usize, usize)> {
+    let is_word = |ch: char| ch.is_alphanumeric() || ch == '_' || ch == '$';
+    let mut utf16 = 0;
+    let mut byte = line_text.len();
+    for (index, ch) in line_text.char_indices() {
+        if utf16 + ch.len_utf16() > character {
+            byte = index;
+            break;
+        }
+        utf16 += ch.len_utf16();
+    }
+    let at_cursor = line_text[byte..].chars().next().is_some_and(is_word);
+    let anchor = if at_cursor {
+        byte
+    } else {
+        let previous = line_text[..byte].char_indices().next_back()?;
+        if !is_word(previous.1) {
+            return None;
+        }
+        previous.0
+    };
+    let start = line_text[..anchor]
+        .char_indices()
+        .rev()
+        .take_while(|(_, ch)| is_word(*ch))
+        .last()
+        .map_or(anchor, |(index, _)| index);
+    let end = line_text[anchor..]
+        .char_indices()
+        .find(|(_, ch)| !is_word(*ch))
+        .map_or(line_text.len(), |(index, _)| anchor + index);
+    Some((start, end))
+}
+
+/// The Laravel route named by the string literal under the cursor when it is
+/// the first argument of `route(`. Reads `routes/*.php` of the nearest
+/// ancestor holding an `artisan` script.
+fn laravel_route_definition(
+    path: &Path,
+    text: &str,
+    line: usize,
+    character: usize,
+) -> Option<LspDefinitionLocation> {
+    let line_text = text.lines().nth(line)?;
+    let name = route_name_at(line_text, character)?;
+    let root = path
+        .ancestors()
+        .skip(1)
+        .find(|dir| dir.join("artisan").is_file())?;
+    let item = galaxy_core::php::framework::laravel::Index::find_route(root, name)?;
+    let loc = item.loc?;
+    Some(LspDefinitionLocation {
+        uri: file_uri(&loc.path),
+        range: LspRange {
+            start_line: u64::from(loc.line),
+            start_character: u64::from(loc.column),
+            end_line: u64::from(loc.line),
+            end_character: u64::from(loc.column) + name.encode_utf16().count() as u64,
+        },
+    })
+}
+
+/// Contents of the single-line string literal under UTF-16 `character` when
+/// it is the first argument of a bare `route(` call. Scanning from each
+/// `route(` keeps `:href="route('a.b')"` working, where the call itself sits
+/// inside an attribute's quotes.
+fn route_name_at(line_text: &str, character: usize) -> Option<&str> {
+    let mut search = 0;
+    while let Some(found) = line_text[search..].find("route") {
+        let call = search + found;
+        search = call + "route".len();
+        if line_text[..call]
+            .chars()
+            .next_back()
+            .is_some_and(|ch| ch == '.' || ch == '$' || ch.is_alphanumeric() || ch == '_')
+        {
+            continue;
+        }
+        let after = line_text[search..].trim_start();
+        let Some(after) = after.strip_prefix('(') else {
+            continue;
+        };
+        let after = after.trim_start();
+        let Some(quote) = after
+            .chars()
+            .next()
+            .filter(|ch| matches!(ch, '\'' | '"' | '`'))
+        else {
+            continue;
+        };
+        let open = line_text.len() - after.len();
+        let Some(length) = after[1..].find(quote) else {
+            continue;
+        };
+        let close = open + 1 + length;
+        let name = &line_text[open + 1..close];
+        let (from, to) = (
+            line_text[..open].encode_utf16().count(),
+            line_text[..=close].encode_utf16().count(),
+        );
+        if character >= from && character <= to && !name.is_empty() && !name.contains("${") {
+            return Some(name);
+        }
+    }
+    None
+}
+
+/// Vite's `import.meta.*`: members resolve to the project's
+/// `vite/types/importMeta.d.ts`, and `import.meta.env.VITE_*` keys to the
+/// `.env` file that defines them.
+fn vite_import_meta_definition(
+    path: &str,
+    text: &str,
+    line: usize,
+    character: usize,
+) -> Option<LspDefinitionLocation> {
+    let line_text = text.lines().nth(line)?;
+    let token = token_at_utf16_position(line_text, character)?;
+    if token.is_empty() {
+        return None;
+    }
+    let start = token.as_ptr() as usize - line_text.as_ptr() as usize;
+    let before = &line_text[..start];
+    let interface = if before.ends_with("import.meta.env.") {
+        "ImportMetaEnv"
+    } else if before.ends_with("import.meta.") {
+        "ImportMeta"
+    } else {
+        return None;
+    };
+    let ancestors = Path::new(path).ancestors().skip(1).collect::<Vec<_>>();
+    let types = ancestors
+        .iter()
+        .map(|dir| dir.join("node_modules/vite/types/importMeta.d.ts"))
+        .find(|candidate| candidate.is_file());
+    if let Some(types) = &types
+        && let Some(range) = interface_member_range(types, interface, token)
+    {
+        return Some(LspDefinitionLocation {
+            uri: file_uri(types),
+            range,
+        });
+    }
+    if interface != "ImportMetaEnv" {
+        return None;
+    }
+    let root = ancestors.iter().find(|dir| {
+        dir.join("package.json").is_file()
+            || ["js", "ts", "mjs", "mts"]
+                .iter()
+                .any(|extension| dir.join(format!("vite.config.{extension}")).is_file())
+    })?;
+    [
+        ".env.local",
+        ".env",
+        ".env.development",
+        ".env.production",
+        ".env.example",
+    ]
+    .iter()
+    .find_map(|name| {
+        let file = root.join(name);
+        let contents = std::fs::read_to_string(&file).ok()?;
+        let (row, column) = contents.lines().enumerate().find_map(|(row, entry)| {
+            let trimmed = entry.trim_start();
+            let declaration = trimmed
+                .strip_prefix("export ")
+                .unwrap_or(trimmed)
+                .trim_start();
+            let rest = declaration.strip_prefix(token)?;
+            rest.trim_start()
+                .starts_with('=')
+                .then(|| (row, entry.len() - declaration.len()))
+        })?;
+        Some(LspDefinitionLocation {
+            uri: file_uri(&file),
+            range: LspRange {
+                start_line: row as u64,
+                start_character: column as u64,
+                end_line: row as u64,
+                end_character: (column + token.len()) as u64,
+            },
+        })
+    })
+}
+
+/// The range of `member` inside `interface <name> { ... }` of a declaration
+/// file, when it is declared exactly once.
+fn interface_member_range(file: &Path, interface: &str, member: &str) -> Option<LspRange> {
+    let contents = std::fs::read_to_string(file).ok()?;
+    let mut inside = false;
+    let mut found = Vec::new();
+    for (row, entry) in contents.lines().enumerate() {
+        let trimmed = entry.trim_start();
+        if !inside {
+            inside = trimmed.strip_prefix("interface ").is_some_and(|rest| {
+                rest.strip_prefix(interface)
+                    .is_some_and(|tail| tail.starts_with([' ', '<', '{']))
+            });
+            continue;
+        }
+        if entry.starts_with('}') {
+            inside = false;
+            continue;
+        }
+        let declaration = trimmed.strip_prefix("readonly ").unwrap_or(trimmed);
+        if let Some(tail) = declaration.strip_prefix(member)
+            && tail.starts_with(['?', ':', '(', '<'])
+        {
+            let column = entry.len() - declaration.len();
+            found.push((row, column));
+        }
+    }
+    let [(row, column)] = found.as_slice() else {
+        return None;
+    };
+    Some(LspRange {
+        start_line: *row as u64,
+        start_character: *column as u64,
+        end_line: *row as u64,
+        end_character: (*column + member.len()) as u64,
+    })
+}
+
 fn ecmascript_builtin_definition(
     text: &str,
     line: usize,
@@ -3456,6 +3859,32 @@ fn is_typescript_path(path: &Path) -> bool {
     )
 }
 
+/// Names a TypeScript file may use without declaring them: function-scope
+/// and CommonJS bindings that no `lib.*.d.ts` declares.
+const TYPESCRIPT_IMPLICIT_NAMES: &[&str] = &[
+    "arguments",
+    "undefined",
+    "require",
+    "module",
+    "exports",
+    "__dirname",
+    "__filename",
+    "globalThis",
+];
+
+/// Files whose unknown names are reported. Declaration files describe names
+/// owned elsewhere, and `.svelte.ts` modules use compiler runes.
+fn typescript_reports_unknown_names(path: &str) -> bool {
+    !path.ends_with(".d.ts")
+        && !path.ends_with(".svelte.ts")
+        && matches!(
+            Path::new(path)
+                .extension()
+                .and_then(|extension| extension.to_str()),
+            Some("ts" | "tsx" | "mts" | "cts")
+        )
+}
+
 fn is_component_path(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|extension| extension.to_str()),
@@ -3499,6 +3928,112 @@ fn component_script_source(path: &str, text: &str, line: usize) -> Option<String
         search = body_end + "</script>".len();
     }
     None
+}
+
+/// Path the TypeScript engine parses a document under. Component scripts are
+/// parsed as TypeScript, which also accepts plain JavaScript.
+fn typescript_index_path(path: &str) -> String {
+    if is_component_path(Path::new(path)) {
+        format!("{path}.ts")
+    } else {
+        path.to_owned()
+    }
+}
+
+/// Byte ranges of every `<script>` body in a Vue or Svelte component, e.g.
+/// Vue's `<script>` plus `<script setup>`, or Svelte's module script.
+fn component_script_bodies(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut bodies = Vec::new();
+    let mut search = 0;
+    while let Some(relative_start) = text[search..].find("<script") {
+        let start = search + relative_start;
+        let Some(tag_end) = text[start..].find('>').map(|end| start + end) else {
+            break;
+        };
+        let body_start = tag_end + 1;
+        let Some(body_end) = text[body_start..]
+            .find("</script>")
+            .map(|end| body_start + end)
+        else {
+            break;
+        };
+        bodies.push(body_start..body_end);
+        search = body_end + "</script>".len();
+    }
+    bodies
+}
+
+/// Appends `markup` as blanks of the same UTF-16 width, keeping newlines, so
+/// positions in the result match the original document.
+fn push_blanked(out: &mut String, markup: &str) {
+    for character in markup.chars() {
+        if character == '\n' {
+            out.push('\n');
+        } else {
+            out.extend(std::iter::repeat_n(' ', character.len_utf16()));
+        }
+    }
+}
+
+/// All scripts of a component as one TypeScript document, with the markup
+/// blanked. Lines and UTF-16 columns map 1:1 to the component, so engine
+/// locations need no translation. Plain TypeScript files pass through.
+fn component_virtual_source(path: &str, text: &str) -> String {
+    if !is_component_path(Path::new(path)) {
+        return text.to_owned();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut copied = 0;
+    for body in component_script_bodies(text) {
+        push_blanked(&mut out, &text[copied..body.start]);
+        out.push_str(&text[body.clone()]);
+        copied = body.end;
+    }
+    push_blanked(&mut out, &text[copied..]);
+    out
+}
+
+/// Source for a position request: `None` when the cursor of a component is
+/// outside its scripts, so template markup never resolves to script symbols.
+fn component_position_source(path: &str, text: &str, line: usize) -> Option<String> {
+    component_script_source(path, text, line)?;
+    Some(component_virtual_source(path, text))
+}
+
+/// Whether a component's markup (template, styles) mentions `name`, which a
+/// script-only rename would leave stale. Covers Svelte's `$store` form and
+/// the kebab-case tag of a PascalCase component (`<my-card>` for `MyCard`).
+fn component_markup_mentions(text: &str, name: &str) -> bool {
+    let mut markup = String::with_capacity(text.len());
+    let mut copied = 0;
+    for body in component_script_bodies(text) {
+        markup.push_str(&text[copied..body.start]);
+        copied = body.end;
+    }
+    markup.push_str(&text[copied..]);
+    let mut forms = vec![name.to_owned()];
+    if name.chars().next().is_some_and(char::is_uppercase) {
+        let mut kebab = String::new();
+        for (index, character) in name.char_indices() {
+            if character.is_uppercase() && index > 0 {
+                kebab.push('-');
+            }
+            kebab.extend(character.to_lowercase());
+        }
+        if kebab.contains('-') {
+            forms.push(kebab);
+        }
+    }
+    // `$` is not a word character here, so `$count` mentions `count`.
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    forms.iter().any(|form| {
+        markup.match_indices(form.as_str()).any(|(start, _)| {
+            let before = markup[..start].chars().next_back();
+            let after = markup[start + form.len()..].chars().next();
+            !before.is_some_and(word)
+                && !after.is_some_and(|c| word(c) || (c == '-' && form.contains('-')))
+        })
+    })
 }
 
 /// Returns the first body line for the script containing `line`.
@@ -3618,10 +4153,13 @@ fn spawn_workspace_indexing(
             let paths = workspace.build_file_index().paths().collect::<Vec<_>>();
             publish_workspace_typescript_diagnostics(&analysis, &root, &paths);
             publish_workspace_rust_diagnostics(&analysis, &root, &paths, &rust_engines);
-            typescript_exports
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .refresh(&root, &paths);
+            // Globals are scanned before taking the lock; it reads thousands of files.
+            let ambient = typescript_globals::scan_ambient_globals(&root, &paths);
+            {
+                let mut exports = typescript_exports.lock().unwrap_or_else(|e| e.into_inner());
+                exports.refresh(&root, &paths);
+                exports.set_ambient(&root, ambient);
+            }
             send_workspace_index_started(&listener, &root, paths.len() as u64);
             let (total, changed) = refresh_workspace_index(&workspace, &paths, &listener);
             let mut workers = Vec::new();

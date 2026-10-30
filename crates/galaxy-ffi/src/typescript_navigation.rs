@@ -309,6 +309,9 @@ pub(super) fn typescript_decorator_option_target(
     character: usize,
 ) -> Option<LspDefinitionLocation> {
     let usage = index.decorator_option_at(line, character)?;
+    if !usage.in_decorator {
+        return None;
+    }
     let (import, binding) = index.import_binding_by_range(usage.binding_range)?;
     let imported_name = direct_imported_name(binding)?;
     let decorator_path =
@@ -339,6 +342,50 @@ pub(super) fn typescript_decorator_option_target(
         uri: file_uri(&member.0),
         range: typescript_range(member.1),
     })
+}
+
+/// An object key passed to an imported function whose first parameter has a
+/// named type (`createApp({ resolve })`): the key's member in that type.
+/// Overloads are tried in source order and the first that has the key wins.
+pub(super) fn typescript_call_option_target(
+    cache: &Mutex<TypeScriptNavigationCache>,
+    importer_path: &str,
+    index: &DocumentIndex,
+    line: usize,
+    character: usize,
+) -> Option<LspDefinitionLocation> {
+    let usage = index.decorator_option_at(line, character)?;
+    if usage.in_decorator || usage.member_name.is_some() {
+        return None;
+    }
+    let (import, binding) = index.import_binding_by_range(usage.binding_range)?;
+    let imported_name = direct_imported_name(binding)?;
+    let function_path =
+        resolve_typescript_definition_import(cache, Path::new(importer_path), &import.specifier)?;
+    let (function_path, function) = resolve_typescript_export(cache, function_path, imported_name)?;
+    let function_index = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .index(&function_path)?;
+    function_index
+        .function_option_types(&function.name)
+        .into_iter()
+        .find_map(|type_name| {
+            let (type_path, type_name) =
+                resolve_decorator_type(cache, &function_path, &function_index, type_name)?;
+            let member = resolve_decorator_option_member(
+                cache,
+                &type_path,
+                &type_name,
+                &usage.key_name,
+                0,
+                &mut HashSet::new(),
+            )?;
+            Some(LspDefinitionLocation {
+                uri: file_uri(&member.0),
+                range: typescript_range(member.1),
+            })
+        })
 }
 
 fn resolve_decorator_type(
@@ -541,6 +588,64 @@ pub(super) fn resolve_typescript_type_member_target(
                 &path,
                 &target_index,
                 &declaration.name,
+                member_name,
+                0,
+                &mut HashSet::new(),
+            )?;
+            Some(LspDefinitionLocation {
+                uri: file_uri(&member_path),
+                range: typescript_range(member.range),
+            })
+        }
+        TypeMemberTarget::ImportedInstance(range) => {
+            let (import, binding) = index.import_binding_by_range(*range)?;
+            let imported_name = direct_imported_name(binding)?;
+            let module = resolve_typescript_definition_import(
+                cache,
+                Path::new(importer_path),
+                &import.specifier,
+            )?;
+            let (path, declaration) = resolve_typescript_export(cache, module, imported_name)?;
+            if declaration.kind != DeclarationKind::Variable {
+                return None;
+            }
+            let value_index = cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .index(&path)?;
+            // `export declare const router: Router` names its type directly.
+            let type_name = value_index.callable_type_annotation(&declaration.name)?;
+            let (type_path, type_name) = if value_index.type_declaration(type_name).is_some() {
+                (path.clone(), type_name.to_owned())
+            } else {
+                // The annotation names an imported type, which may be a class
+                // (`import { Router } from './router'`).
+                let (import, binding) = value_index.imports.iter().find_map(|import| {
+                    import
+                        .bindings
+                        .iter()
+                        .find(|binding| {
+                            binding.local_name == type_name
+                                && matches!(binding.kind, ImportKind::Named | ImportKind::Default)
+                        })
+                        .map(|binding| (import, binding))
+                })?;
+                let imported_name = binding.imported_name.as_deref()?;
+                let target = resolve_typescript_definition_import(cache, &path, &import.specifier)?;
+                let (type_path, type_declaration) =
+                    resolve_typescript_type_export(cache, target.clone(), imported_name)
+                        .or_else(|| resolve_typescript_export(cache, target, imported_name))?;
+                (type_path, type_declaration.name)
+            };
+            let type_index = cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .index(&type_path)?;
+            let (member_path, member) = resolve_inherited_member(
+                cache,
+                &type_path,
+                &type_index,
+                &type_name,
                 member_name,
                 0,
                 &mut HashSet::new(),
@@ -991,8 +1096,13 @@ fn resolve_typescript_type_export_inner(
         .exports
         .iter()
         .filter_map(|export| {
+            let specifier = export.specifier.as_deref()?;
+            if export.exported_name.is_none() && !export.type_only {
+                // `export * from './types'` re-exports every name, types included.
+                return Some((specifier, name));
+            }
             (export.type_only && export.exported_name.as_deref() == Some(name))
-                .then_some((export.specifier.as_deref()?, export.name.as_deref()?))
+                .then_some((specifier, export.name.as_deref()?))
         })
         .filter_map(|(specifier, imported_name)| {
             resolve_typescript_definition_import(cache, &path, specifier).and_then(|target| {

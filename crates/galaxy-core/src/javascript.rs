@@ -187,11 +187,19 @@ pub fn resolve_typescript_specifier(
             let Some(target) = substitute_path_wildcard(target, wildcard) else {
                 continue;
             };
-            if let Some(resolved) = resolve_module_path(
-                project.base_url.as_deref().unwrap_or(&project.root),
-                &target,
-            ) {
+            let base = project.base_url.as_deref().unwrap_or(&project.root);
+            if let Some(resolved) = resolve_module_path(base, &target) {
                 return Some(resolved);
+            }
+            // An alias to a package folder (`"ziggy-js": ["./vendor/tightenco/ziggy"]`)
+            // follows that package's `types`/`exports`, like a bare package.
+            if !target.starts_with('/') && !target.contains('\\') {
+                let directory = lexical_normalize(&base.join(&target));
+                if directory.join("package.json").is_file()
+                    && let Some(resolved) = resolve_package_root(&directory, "")
+                {
+                    return Some(resolved);
+                }
             }
         }
     }
@@ -731,9 +739,18 @@ pub fn relative_import_candidates(specifier: &str, from: &Path) -> Vec<PathBuf> 
 /// The candidate order matches [`relative_import_candidates`]. Package specifiers
 /// return `None`; the TypeScript engine resolves them.
 pub fn resolve_relative_import(specifier: &str, from: &Path) -> Option<PathBuf> {
-    relative_import_candidates(specifier, from)
+    if let Some(file) = relative_import_candidates(specifier, from)
         .into_iter()
         .find(|candidate| candidate.is_file())
+    {
+        return Some(file);
+    }
+    // A folder that is a package (`../../vendor/tightenco/ziggy`) follows its
+    // manifest's `types`/`exports`, as bundlers and `tsc` do.
+    let directory = lexical_normalize(&from.parent()?.join(specifier));
+    (directory.join("package.json").is_file())
+        .then(|| resolve_package_root(&directory, ""))
+        .flatten()
 }
 
 fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
@@ -1743,6 +1760,64 @@ mod tests {
         assert_eq!(
             resolve_typescript_specifier(&detected, "exact", &from),
             Some(project.join("generated/exact.cts"))
+        );
+    }
+
+    #[test]
+    fn resolves_a_relative_import_of_a_package_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("vendor/tightenco/ziggy");
+        std::fs::create_dir_all(package.join("src/js")).unwrap();
+        std::fs::write(
+            package.join("package.json"),
+            r#"{"name":"ziggy-js","types":"./src/js/index.d.ts"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("src/js/index.d.ts"),
+            "export const ZiggyVue: {};\n",
+        )
+        .unwrap();
+        let importer = dir.path().join("resources/js/app.ts");
+        std::fs::create_dir_all(importer.parent().unwrap()).unwrap();
+        std::fs::write(&importer, "").unwrap();
+        assert_eq!(
+            resolve_relative_import("../../vendor/tightenco/ziggy", &importer),
+            Some(package.join("src/js/index.d.ts"))
+        );
+        assert_eq!(
+            resolve_relative_import("../../vendor/missing", &importer),
+            None
+        );
+    }
+
+    #[test]
+    fn resolves_a_paths_alias_that_points_at_a_package_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let package = dir.path().join("vendor/tightenco/ziggy");
+        std::fs::create_dir_all(package.join("src/js")).unwrap();
+        std::fs::write(
+            package.join("package.json"),
+            r#"{"name":"ziggy-js","types":"./src/js/index.d.ts"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("src/js/index.d.ts"),
+            "export function route(): void;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("tsconfig.json"),
+            r#"{"compilerOptions":{"paths":{"ziggy-js":["./vendor/tightenco/ziggy"]}}}"#,
+        )
+        .unwrap();
+        let importer = dir.path().join("resources/js/app.ts");
+        std::fs::create_dir_all(importer.parent().unwrap()).unwrap();
+        std::fs::write(&importer, "").unwrap();
+        let project = TypeScriptProject::detect(&importer).unwrap();
+        assert_eq!(
+            resolve_typescript_specifier(&project, "ziggy-js", &importer),
+            Some(package.join("src/js/index.d.ts"))
         );
     }
 

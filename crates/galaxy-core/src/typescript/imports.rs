@@ -203,10 +203,8 @@ pub(super) fn collect_decorator_option_uses(
     let mut uses = Vec::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
-        if node.kind() == "decorator"
-            && let Some(call) = node
-                .named_child(0)
-                .filter(|node| node.kind() == "call_expression")
+        if node.kind() == "call_expression"
+            && let call = node
             && let Some(function) = call.child_by_field_name("function")
             && let Some((name, member_name)) = decorator_callee(text, function)
             && let Some(binding_occurrence) = decorator_binding_occurrence(function)
@@ -224,10 +222,12 @@ pub(super) fn collect_decorator_option_uses(
         {
             let mut cursor = object.walk();
             for property in object.named_children(&mut cursor) {
-                if property.kind() != "pair" {
-                    continue;
-                }
-                let Some(key) = property.child_by_field_name("key") else {
+                let key = match property.kind() {
+                    "pair" => property.child_by_field_name("key"),
+                    "method_definition" => property.child_by_field_name("name"),
+                    _ => None,
+                };
+                let Some(key) = key else {
                     continue;
                 };
                 if !matches!(key.kind(), "property_identifier" | "identifier") {
@@ -237,6 +237,9 @@ pub(super) fn collect_decorator_option_uses(
                     uses.push(DecoratorOptionUse {
                         binding_range: binding.range,
                         member_name: member_name.map(ToOwned::to_owned),
+                        in_decorator: node
+                            .parent()
+                            .is_some_and(|parent| parent.kind() == "decorator"),
                         key_name: key_name.to_owned(),
                         key_range: locations.range(key),
                     });
@@ -409,9 +412,17 @@ pub(super) fn index_export(
         }
     }
     if !found {
+        // `export default Head;` names a local binding, the form published
+        // declaration files use for components such as Inertia's `Head`.
+        let local = default
+            .then(|| node.child_by_field_name("value"))
+            .flatten()
+            .filter(|value| value.kind() == "identifier");
         exports.push(Export {
-            name: None,
-            name_range: None,
+            name: local
+                .and_then(|value| node_text(text, value))
+                .map(str::to_owned),
+            name_range: local.map(|value| locations.range(value)),
             exported_name: if default {
                 Some("default".to_owned())
             } else {

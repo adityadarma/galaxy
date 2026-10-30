@@ -181,15 +181,18 @@ impl Index {
     }
 
     fn read_routes(&mut self) {
-        let mut routes = Vec::new();
-        for path in walk(&self.root.join("routes")) {
-            if path.extension().and_then(|e| e.to_str()) == Some("php")
-                && let Some(text) = read(&path)
-            {
-                scan_routes(&path, &text, &mut routes);
-            }
+        self.routes = routes_in(&self.root);
+    }
+
+    /// Where the route called `name` is defined in the Laravel application
+    /// at `root`, read straight from `routes/*.php` so callers outside the
+    /// PHP engine (a Vue file calling Ziggy's `route()`) need no full index.
+    /// `None` for any other project or an unknown name.
+    pub fn find_route(root: &Path, name: &str) -> Option<Item> {
+        if !root.join("artisan").is_file() {
+            return None;
         }
-        self.routes = routes;
+        routes_in(root).into_iter().find(|item| item.name == name)
     }
 
     fn read_views(&mut self) {
@@ -701,6 +704,19 @@ impl Index {
     pub fn find<'a>(items: &'a [Item], name: &str) -> Option<&'a Item> {
         items.iter().find(|item| item.name == name)
     }
+}
+
+/// Every named route under `root/routes`.
+fn routes_in(root: &Path) -> Vec<Item> {
+    let mut routes = Vec::new();
+    for path in walk(&root.join("routes")) {
+        if path.extension().and_then(|e| e.to_str()) == Some("php")
+            && let Some(text) = read(&path)
+        {
+            scan_routes(&path, &text, &mut routes);
+        }
+    }
+    routes
 }
 
 /// Route names with the method and path they answer, from one routes file.
@@ -1267,6 +1283,22 @@ mod tests {
             "POST /users"
         );
         assert_eq!(Index::find(&index.routes, "home").unwrap().detail, "GET /");
+    }
+
+    #[test]
+    fn find_route_reads_only_laravel_applications() {
+        let dir = project();
+        let found = Index::find_route(dir.path(), "admin.users.store").expect("route");
+        assert!(
+            found
+                .loc
+                .expect("location")
+                .path
+                .ends_with("routes/web.php")
+        );
+        assert!(Index::find_route(dir.path(), "nope").is_none());
+        let plain = tempfile::tempdir().unwrap();
+        assert!(Index::find_route(plain.path(), "home").is_none());
     }
 
     #[test]

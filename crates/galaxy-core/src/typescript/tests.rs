@@ -102,6 +102,40 @@ fn indexes_named_default_class_extending_a_call_expression() {
 }
 
 #[test]
+fn resolves_default_export_of_a_local_identifier() {
+    let index = DocumentIndex::parse(
+        "head.d.ts",
+        "export type InertiaHead = {};\ndeclare const Head: InertiaHead;\nexport default Head;\n",
+    );
+
+    let declaration = index.exported_declaration("default").expect("Head");
+    assert_eq!(declaration.name, "Head");
+    assert_eq!(declaration.range.start.line, 1);
+    // An anonymous default expression still has no local name.
+    let anonymous = DocumentIndex::parse("a.ts", "export default 1 + 2;\n");
+    assert!(anonymous.exported_declaration("default").is_none());
+}
+
+#[test]
+fn resolves_overloaded_default_function_to_first_signature() {
+    let index = DocumentIndex::parse(
+        "useForm.d.ts",
+        "export default function useForm(a: string): void;\n\
+         export default function useForm(): void;\n",
+    );
+
+    let declaration = index.exported_declaration("default").expect("useForm");
+    assert_eq!(declaration.name, "useForm");
+    assert_eq!(declaration.range.start.line, 0);
+    // Two different names under one export stay ambiguous.
+    let conflict = DocumentIndex::parse(
+        "b.ts",
+        "export default function a() {}\nexport default function b() {}\n",
+    );
+    assert!(conflict.exported_declaration("default").is_none());
+}
+
+#[test]
 fn indexes_exact_static_module_specifier_ranges() {
     let index = DocumentIndex::parse(
         "main.ts",
@@ -938,4 +972,86 @@ fn class_without_superclass_still_checks_constructor_arity() {
         "{:?}",
         index.type_diagnostics
     );
+}
+
+fn unresolved(source: &str) -> Vec<String> {
+    DocumentIndex::parse("a.ts", source)
+        .unresolved_references
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
+}
+
+#[test]
+fn unresolved_references_ignore_names_the_file_binds() {
+    // Destructuring defaults, loop variables, catch patterns, signature
+    // parameters, enum members, namespaces and import aliases all bind names.
+    let source = "\
+const { theme = 'x', a: { b = 1 }, ...rest } = load();\n\
+use(theme, b, rest);\n\
+for (const key in object) { use(key); }\n\
+try {} catch ({ message }) { use(message); }\n\
+type Handler = (event: string, ...args: number[]) => void;\n\
+type Pair = [first: string, second?: number];\n\
+interface Bag { [key: string]: unknown; call(this: Bag, input: string): void }\n\
+enum Color { Red = 1, Green = Red }\n\
+namespace Outer.Inner { export const v = 1; }\n\
+import legacy = require('legacy');\n\
+import Alias = Outer.Inner;\n\
+declare function external(): void;\n\
+use(legacy, Alias, external, Outer);\n";
+    let found = unresolved(source);
+    for name in [
+        "theme", "b", "rest", "key", "message", "event", "args", "first", "second", "input", "Red",
+        "Outer", "legacy", "Alias", "external",
+    ] {
+        assert!(
+            !found.iter().any(|found| found == name),
+            "{name} in {found:?}"
+        );
+    }
+    // Only the genuinely unknown names remain.
+    assert!(
+        found
+            .iter()
+            .all(|name| matches!(name.as_str(), "load" | "use" | "object")),
+        "{found:?}"
+    );
+}
+
+#[test]
+fn unresolved_references_still_report_unknown_names() {
+    let found = unresolved("import { h } from 'vue';\nconst x = h(App, props);\nlet y: Missing;\n");
+    assert_eq!(found, ["App", "props", "Missing"]);
+    // `<div>` is an intrinsic element, `<Panel>` a reference.
+    let jsx = DocumentIndex::parse("a.tsx", "const v = <div><Panel /></div>;\n");
+    let names = jsx
+        .unresolved_references
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["Panel"]);
+}
+
+#[test]
+fn global_names_come_from_scripts_and_global_blocks() {
+    let script = DocumentIndex::parse(
+        "globals.d.ts",
+        "declare var route: number;\ninterface Window { a: 1 }\ndeclare namespace NodeJS {}\n",
+    );
+    assert_eq!(script.global_names, ["route", "Window", "NodeJS"]);
+    assert!(!script.is_module());
+
+    let module = DocumentIndex::parse(
+        "types.d.ts",
+        "import { X } from './x';\nexport interface Hidden {}\ndeclare global { var route: X; interface Window { a: 1 } }\n",
+    );
+    assert_eq!(module.global_names, ["route", "Window"]);
+    assert!(module.is_module());
+
+    let namespaced = DocumentIndex::parse(
+        "react.d.ts",
+        "export function f(): void;\nexport as namespace React;\n",
+    );
+    assert_eq!(namespaced.global_names, ["React"]);
 }

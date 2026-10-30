@@ -157,6 +157,65 @@ final class NavigationTests: XCTestCase {
         XCTAssertEqual(EditorView.lastSegmentStart(in: "Foo", range: 0..<3), 0)
     }
 
+    func testTemplateLiteralTextIsNotAColumnLink() {
+        let text = "if (confirm(`Yakin menghapus ${courier.name}?`)) {"
+        let ns = text as NSString
+        XCTAssertTrue(EditorView.isTemplateText(in: text, at: ns.range(of: "menghapus").location))
+        XCTAssertFalse(EditorView.isTemplateText(in: text, at: ns.range(of: "courier").location),
+                       "an interpolation is code")
+        XCTAssertFalse(EditorView.isTemplateText(in: text, at: ns.range(of: "confirm").location))
+        XCTAssertFalse(EditorView.isTemplateText(in: text, at: ns.range(of: ")) {").location))
+    }
+
+    func testCommandHoverInVueSkipsStringTextAndPrimitiveTypes() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-vue-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let file = dir.appendingPathComponent("Index.vue")
+        let lines = [
+            "<script setup lang=\"ts\">",
+            "interface OpnameData {",
+            "    outlet_id: number;",
+            "}",
+            "const remove = (opname: OpnameData) => {",
+            "    if (confirm('Apakah Anda yakin ingin menghapus draf opname ini?')) {",
+            "        router.delete(route('opnames.destroy', opname.id));",
+            "    }",
+            "};",
+            "</script>",
+            "<template>",
+            "  <button @click=\"remove(opname)\">Hapus draf</button>",
+            "</template>",
+        ]
+        try (lines.joined(separator: "\n") + "\n").write(to: file, atomically: true, encoding: .utf8)
+        let c = MainWindowController(bridge: CoreBridge())
+        c.showWindow(nil)
+        defer { c.window?.orderOut(nil) }
+        try c.openFile(at: file)
+        let v = c.editorView
+        v.onDefinitionClick = { _ in true }
+        let deadline = Date().addingTimeInterval(5)
+        while v.document?.viewport(firstLine: 5, count: 1).styles.isEmpty ?? true, Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
+        func link(_ row: Int, _ word: String) -> Bool {
+            let text = lines[row]
+            let column = (text as NSString).range(of: word).location + 1
+            v.lastMousePoint = NSPoint(x: v.textOriginX + v.xOffset(in: text, column: UInt64(column)) + 0.5,
+                                       y: CGFloat(row) * v.metrics.lineHeight + v.metrics.lineHeight / 2)
+            v.updateDefinitionLink(commandHeld: true)
+            return v.definitionLink != nil
+        }
+        XCTAssertFalse(link(5, "yakin"), "words in a plain string are text")
+        XCTAssertFalse(link(5, "menghapus"))
+        XCTAssertFalse(link(2, "number"), "primitive types are not links in Vue")
+        XCTAssertTrue(link(6, "opnames.destroy"), "a route() name stays a link")
+        XCTAssertTrue(link(6, "route("), "the route helper stays a link")
+        XCTAssertTrue(link(4, "OpnameData"), "a user type stays a link")
+        XCTAssertTrue(link(11, "remove("), "a script name used in a template handler is a link")
+        XCTAssertFalse(link(11, "Hapus"), "template text is not a link")
+    }
+
     func testCommandHoverUnderlinesWordAndClearsOnRelease() throws {
         let c = try makeController(text: "use Foo\\BarService;\nsecond")
         let v = c.editorView

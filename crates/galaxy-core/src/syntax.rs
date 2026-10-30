@@ -207,9 +207,7 @@ impl SyntaxLanguage {
             Self::Markdown => tree_sitter_md_025::HIGHLIGHT_QUERY_BLOCK,
             Self::Python => tree_sitter_python::HIGHLIGHTS_QUERY,
             Self::Go => tree_sitter_go::HIGHLIGHTS_QUERY,
-            Self::Html | Self::Blade | Self::Vue | Self::Svelte => {
-                tree_sitter_html::HIGHLIGHTS_QUERY
-            }
+            Self::Html | Self::Blade | Self::Vue | Self::Svelte => html_highlights(),
             Self::Css => tree_sitter_css::HIGHLIGHTS_QUERY,
             Self::Bash => BASH_HIGHLIGHTS,
             Self::Nginx => NGINX_HIGHLIGHTS,
@@ -490,6 +488,18 @@ fn php_highlights() -> &'static str {
     })
 }
 
+/// The grammar's HTML query, which colors an attribute's value but not the
+/// quotes around it. They take the value's color, as in `title="Stock"`.
+fn html_highlights() -> &'static str {
+    static QUERY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    QUERY.get_or_init(|| {
+        format!(
+            "{}\n(quoted_attribute_value [\"\\\"\" \"'\"] @string)\n",
+            tree_sitter_html::HIGHLIGHTS_QUERY
+        )
+    })
+}
+
 /// The upstream Rust query styles attribute names but leaves `#[...]`
 /// delimiters unscoped, causing `#` to fall back to the plain foreground.
 fn rust_highlights() -> &'static str {
@@ -545,6 +555,8 @@ const TYPESCRIPT_HIGHLIGHTS: &str = r#"
 [(this) (this_type)] @variable.builtin
 [(true) (false) (null) (undefined)] @constant
 (identifier) @variable
+; Destructured bindings: `({ initialPage, onFlash }: Params)`.
+(shorthand_property_identifier_pattern) @variable
 [
   "async" "await" "break" "case" "catch" "class" "const" "continue"
   "debugger" "default" "delete" "do" "else" "export" "extends" "finally"
@@ -552,7 +564,10 @@ const TYPESCRIPT_HIGHLIGHTS: &str = r#"
   "of" "return" "static" "switch" "throw" "try" "typeof" "var" "void"
   "while" "with" "yield" "as" "interface" "implements" "private"
    "protected" "public" "readonly" "type" "namespace" "declare" "keyof"
+    "get" "set" "global" "module" "enum" "satisfies" "is" "asserts" "infer"
+    "override" "accessor"
 ] @keyword
+(meta_property ["meta" "target"] @keyword)
 (abstract_class_declaration "abstract" @keyword)
 [
   ";" "." "," "(" ")" "[" "]" "{" "}" ":"
@@ -574,6 +589,7 @@ const JAVASCRIPT_HIGHLIGHTS: &str = r#"
 (function_declaration name: (identifier) @function)
 (call_expression function: (identifier) @function)
 [("const") ("let") ("var") ("function") ("class") ("return") ("if") ("else") ("for") ("while") ("import") ("export") ("async") ("await") ("new")] @keyword
+(meta_property ["meta" "target"] @keyword)
 [("+") ("-") ("*") ("/") ("=") ("==") ("===") ("=>") ("!") ("&&") ("||")] @operator
 [("(") (")") ("[") ("]") ("{") ("}") (",") (";") (".")] @punctuation
 "#;
@@ -2124,6 +2140,92 @@ mod tests {
                 && HighlightScope::from_capture(names[capture.index as usize])
                     == Some(HighlightScope::Type)
         })));
+    }
+
+    /// Mirrors Inertia's `router.d.ts`: destructured parameters and accessor
+    /// keywords were left unstyled. A method named `get` stays a function.
+    #[test]
+    fn typescript_query_highlights_destructured_parameters_and_accessors() {
+        let language = SyntaxLanguage::TypeScript;
+        let source = "declare class Router {\n    init({ initialPage, onFlash }: P): void;\n    get activePolls(): number;\n    get<T>(url: string): void;\n    set mode(value: string);\n}\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let doc = Document::from_text(source);
+        let runs = style_runs_for_viewport(&doc, &tree, language, 0, 6);
+        let scope = |line: usize, needle: &str| {
+            let column = source.lines().nth(line).unwrap().find(needle).unwrap();
+            runs.iter()
+                .filter(|run| run.line == line && run.start <= column && column < run.end)
+                .next_back()
+                .map(|run| run.scope)
+        };
+
+        assert_eq!(scope(1, "initialPage"), Some(HighlightScope::Variable));
+        assert_eq!(scope(1, "onFlash"), Some(HighlightScope::Variable));
+        assert_eq!(scope(2, "get"), Some(HighlightScope::Keyword));
+        assert_eq!(scope(2, "activePolls"), Some(HighlightScope::Function));
+        assert_eq!(scope(3, "get"), Some(HighlightScope::Function));
+        assert_eq!(scope(4, "set"), Some(HighlightScope::Keyword));
+    }
+
+    /// `title="Stock"`: the quotes take the value's color instead of the plain
+    /// foreground, and `declare global` is a keyword like `declare module`.
+    #[test]
+    fn html_attribute_quotes_and_declare_global_are_colored() {
+        let language = SyntaxLanguage::Html;
+        let source = "<Head title=\"Stock\" />\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let doc = Document::from_text(source);
+        let runs = style_runs_for_viewport(&doc, &tree, language, 0, 1);
+        let opening = source.find('"').unwrap();
+        let closing = source.rfind('"').unwrap();
+        for at in [opening, closing] {
+            assert!(
+                runs.iter().any(|run| run.start <= at
+                    && at < run.end
+                    && run.scope == HighlightScope::String),
+                "quote at {at}: {runs:?}"
+            );
+        }
+
+        let language = SyntaxLanguage::TypeScript;
+        let source = "declare global {\n    var route: string;\n}\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let doc = Document::from_text(source);
+        let runs = style_runs_for_viewport(&doc, &tree, language, 0, 3);
+        let column = source.find("global").unwrap();
+        assert!(
+            runs.iter().any(|run| run.line == 0
+                && run.start <= column
+                && column < run.end
+                && run.scope == HighlightScope::Keyword),
+            "{runs:?}"
+        );
+    }
+
+    /// `import.meta.env`: `meta` is a keyword like `import`, not plain text.
+    #[test]
+    fn import_meta_is_highlighted_as_a_keyword() {
+        for language in [SyntaxLanguage::TypeScript, SyntaxLanguage::JavaScript] {
+            let source = "const a = import.meta.env.VITE;\n";
+            let mut parser = Parser::new();
+            parser.set_language(&language.grammar()).unwrap();
+            let tree = parser.parse(source, None).unwrap();
+            let doc = Document::from_text(source);
+            let runs = style_runs_for_viewport(&doc, &tree, language, 0, 1);
+            let at = source.find("meta").unwrap();
+            assert!(
+                runs.iter().any(|run| run.start <= at
+                    && at < run.end
+                    && run.scope == HighlightScope::Keyword),
+                "{language:?}: {runs:?}"
+            );
+        }
     }
 
     /// Mirrors app/utilities/storage.ts: `new X(...)` colours `X` as a class

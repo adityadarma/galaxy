@@ -119,9 +119,72 @@ pub(super) fn unresolved_references(
             // `catch (error)`, class expressions and named function
             // expressions bind names outside `collect_scoped_declarations`.
             "catch_clause" | "class" | "function_expression" => {
-                if let Some(name) = node
+                if node.kind() == "catch_clause"
+                    && let Some(parameter) = node.child_by_field_name("parameter")
+                {
+                    declare_pattern_names(parameter, text, &mut declared);
+                } else if let Some(name) = node
                     .child_by_field_name("parameter")
                     .or_else(|| node.child_by_field_name("name"))
+                    .and_then(|name| node_text(text, name))
+                {
+                    declared.insert(name);
+                }
+            }
+            // Parameters of function types, signatures and named tuple
+            // members, `[key: string]` and `for (const x of xs)` bind names
+            // the scope walk does not track.
+            "required_parameter" | "optional_parameter" => {
+                for field in ["pattern", "name"] {
+                    if let Some(pattern) = node.child_by_field_name(field) {
+                        declare_pattern_names(pattern, text, &mut declared);
+                    }
+                }
+            }
+            "index_signature" | "function_signature" => {
+                if let Some(name) = node
+                    .child_by_field_name("name")
+                    .and_then(|name| node_text(text, name))
+                {
+                    declared.insert(name);
+                }
+            }
+            "for_in_statement" => {
+                if let Some(left) = node.child_by_field_name("left") {
+                    declare_pattern_names(left, text, &mut declared);
+                }
+            }
+            "enum_body" => {
+                let mut cursor = node.walk();
+                for member in node.named_children(&mut cursor) {
+                    let name = if member.kind() == "enum_assignment" {
+                        member.child_by_field_name("name")
+                    } else {
+                        Some(member)
+                    };
+                    if let Some(name) = name.and_then(|name| node_text(text, name)) {
+                        declared.insert(name.trim_matches(['\'', '"']));
+                    }
+                }
+            }
+            // `import a = require('x')` and `import B = A.C`.
+            "import_require_clause" | "import_alias" => {
+                if let Some(name) = node
+                    .named_child(0)
+                    .filter(|name| name.kind() == "identifier")
+                    .and_then(|name| node_text(text, name))
+                {
+                    declared.insert(name);
+                }
+            }
+            // `namespace A.B {}` declares `A`.
+            "internal_module" | "module" => {
+                let mut name = node.child_by_field_name("name");
+                while let Some(current) = name.filter(|name| name.kind() == "nested_identifier") {
+                    name = current.child_by_field_name("object");
+                }
+                if let Some(name) = name
+                    .filter(|name| name.kind() == "identifier")
                     .and_then(|name| node_text(text, name))
                 {
                     declared.insert(name);
@@ -137,7 +200,20 @@ pub(super) fn unresolved_references(
             }
             // Ambient blocks (`declare global`, `declare module 'x'`) talk
             // about names owned elsewhere.
-            "ambient_declaration" => continue,
+            "ambient_declaration" => {
+                // `declare function f(): void` names `f` for the whole file.
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    if child.kind() == "function_signature"
+                        && let Some(name) = child
+                            .child_by_field_name("name")
+                            .and_then(|name| node_text(text, name))
+                    {
+                        declared.insert(name);
+                    }
+                }
+                continue;
+            }
             "identifier" | "type_identifier" => {
                 let range = locations.range(node);
                 // `Ns.Type`: only `Ns` is looked up in this file.
@@ -147,12 +223,29 @@ pub(super) fn unresolved_references(
                             .child_by_field_name("name")
                             .is_some_and(|name| name.id() == node.id())
                 });
+                // Only the head of `A.B` is looked up; `<div>` is an intrinsic
+                // element, not a reference.
+                let trailing_segment = node.parent().is_some_and(|parent| {
+                    parent.kind() == "nested_identifier"
+                        && parent
+                            .child_by_field_name("object")
+                            .is_none_or(|object| object.id() != node.id())
+                });
+                let intrinsic_element = node.parent().is_some_and(|parent| {
+                    matches!(
+                        parent.kind(),
+                        "jsx_opening_element" | "jsx_closing_element" | "jsx_self_closing_element"
+                    )
+                }) && node_text(text, node)
+                    .is_some_and(|name| name.starts_with(|ch: char| ch.is_ascii_lowercase()));
                 if !declared_ranges.contains(&(
                     range.start.line,
                     range.start.col,
                     range.end.line,
                     range.end.col,
                 )) && !qualified_member
+                    && !trailing_segment
+                    && !intrinsic_element
                     && is_local_reference(node)
                     && let Some(name) = node_text(text, node)
                 {
@@ -172,6 +265,31 @@ pub(super) fn unresolved_references(
         .collect::<Vec<_>>();
     unresolved.sort_by_key(|(_, range)| (range.start.line, range.start.col));
     unresolved
+}
+
+/// Every name a binding pattern introduces. Loose on purpose: default values
+/// inside the pattern count as names too, which can only hide a report.
+fn declare_pattern_names<'a>(
+    node: Node<'_>,
+    text: &'a str,
+    declared: &mut std::collections::HashSet<&'a str>,
+) {
+    if matches!(
+        node.kind(),
+        "identifier" | "shorthand_property_identifier_pattern"
+    ) {
+        if let Some(name) = node_text(text, node) {
+            declared.insert(name);
+        }
+        return;
+    }
+    if node.kind() == "type_annotation" {
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        declare_pattern_names(child, text, declared);
+    }
 }
 
 pub(super) fn collect_scoped_declarations(
@@ -355,13 +473,16 @@ pub(super) fn collect_pattern_declarations(
                 collect_pattern_declarations(value, kind, scope, text, locations, declarations);
             }
         }
-        "assignment_pattern" => {
+        "assignment_pattern" | "object_assignment_pattern" => {
             if let Some(left) = node.child_by_field_name("left") {
                 collect_pattern_declarations(left, kind, scope, text, locations, declarations);
             }
         }
         "rest_pattern" => {
-            if let Some(argument) = node.child_by_field_name("argument") {
+            if let Some(argument) = node
+                .child_by_field_name("argument")
+                .or_else(|| node.named_child(0))
+            {
                 collect_pattern_declarations(argument, kind, scope, text, locations, declarations);
             }
         }

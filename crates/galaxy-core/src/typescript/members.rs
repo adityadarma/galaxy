@@ -144,18 +144,56 @@ fn callable_decorator_option_type(
     text: &str,
     locations: &Locations,
 ) -> Option<DecoratorOptionType> {
-    let value = node.named_child(1)?;
+    let value = node.child_by_field_name("value")?;
     if value.kind() == "type_identifier" {
         return Some(DecoratorOptionType {
             members: Vec::new(),
             references: vec![node_text(text, value)?.to_owned()],
         });
     }
-    let function = (value.kind() == "function_type").then_some(value)?;
+    if value.kind() != "function_type" {
+        return decorator_option_shape(value, text, locations);
+    }
+    let function = value;
     let parameters = function.child_by_field_name("parameters")?;
     let parameter = sole_type_parameter(parameters)?;
     let annotation = parameter.child_by_field_name("type")?;
     decorator_option_shape(annotation.named_child(0)?, text, locations)
+}
+
+/// `(function name, first parameter type name)` for every function
+/// declaration or overload signature whose first parameter has a named type.
+pub(super) fn collect_function_option_types(root: Node<'_>, text: &str) -> Vec<(String, String)> {
+    let mut types = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if matches!(node.kind(), "function_declaration" | "function_signature")
+            && let Some(name) = node.child_by_field_name("name")
+            && let Some(name) = node_text(text, name)
+            && let Some(parameters) = node.child_by_field_name("parameters")
+            && let Some(parameter) = parameters.named_child(0)
+            && matches!(
+                parameter.kind(),
+                "required_parameter" | "optional_parameter"
+            )
+            && let Some(annotation) = parameter.child_by_field_name("type")
+            && let Some(annotated) = annotation.named_child(0)
+            && let Some(type_name) = match annotated.kind() {
+                "type_identifier" => Some(annotated),
+                "generic_type" => annotated
+                    .named_child(0)
+                    .filter(|base| base.kind() == "type_identifier"),
+                _ => None,
+            }
+            && let Some(type_name) = node_text(text, type_name)
+        {
+            types.push((name.to_owned(), type_name.to_owned()));
+        }
+        let mut cursor = node.walk();
+        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        stack.extend(children.into_iter().rev());
+    }
+    types
 }
 
 pub(super) fn collect_callable_type_annotations(
@@ -287,6 +325,11 @@ fn collect_decorator_option_shape(
         "generic_type" => {
             let base = node.named_child(0)?;
             if node_text(text, base) != Some("Partial") {
+                // `Options<T>`: the members are those of `Options`.
+                if base.kind() == "type_identifier" {
+                    references.push(node_text(text, base)?.to_owned());
+                    return Some(());
+                }
                 return None;
             }
             let arguments = node.named_child(1)?;
@@ -518,6 +561,21 @@ pub(super) fn collect_type_member_uses(
                 {
                     uses.push(TypeMemberUse {
                         target: TypeMemberTarget::ImportedClass(binding.range),
+                        member_name,
+                        member_range: locations.range(property),
+                    });
+                    continue;
+                }
+                // `router.put(...)` with `import { router } from '@inertiajs/vue3'`:
+                // the host follows the export's type annotation to `Router`.
+                // PascalCase receivers are enums or classes, resolved elsewhere.
+                if receiver.chars().next().is_some_and(char::is_lowercase)
+                    && let Some(binding) = imported_binding
+                        .clone()
+                        .find(|binding| binding.kind == ImportKind::Named)
+                {
+                    uses.push(TypeMemberUse {
+                        target: TypeMemberTarget::ImportedInstance(binding.range),
                         member_name,
                         member_range: locations.range(property),
                     });

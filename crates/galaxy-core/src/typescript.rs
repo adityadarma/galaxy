@@ -9,6 +9,7 @@ use tree_sitter::{Language, Node, Parser};
 
 use crate::position::Utf16Position;
 
+mod ambient;
 mod diagnostics;
 mod enums;
 mod framework;
@@ -18,6 +19,8 @@ mod members;
 mod symbols;
 mod syntax;
 
+pub use self::ambient::ambient_global_names;
+use self::ambient::collect_global_names;
 use self::diagnostics::*;
 use self::enums::*;
 use self::imports::*;
@@ -166,6 +169,8 @@ pub struct DecoratorOptionUse {
     pub binding_range: Utf16Range,
     /// The directly called member, when the imported binding is an object.
     pub member_name: Option<String>,
+    /// True for `@decorator({...})`, false for an ordinary `call({...})`.
+    pub in_decorator: bool,
     pub key_name: String,
     pub key_range: Utf16Range,
 }
@@ -204,6 +209,9 @@ pub enum TypeMemberTarget {
     ImportedClass(Utf16Range),
     /// A method on an instance exported by a module factory such as `Env.create`.
     ImportedFactory(Utf16Range),
+    /// A member of a named value import whose declaration has a type
+    /// annotation, e.g. Inertia's `export declare const router: Router`.
+    ImportedInstance(Utf16Range),
     /// A direct member of `this` in a class extending this value import.
     SuperImported(Utf16Range),
     /// A direct member of `this` in a class extending a local superclass.
@@ -303,6 +311,10 @@ pub struct DocumentIndex {
     /// declares or imports. Globals are included; the host matches these
     /// against workspace exports to report missing imports.
     pub unresolved_references: Vec<(String, Utf16Range)>,
+    /// Names this file adds to the global scope: every top-level declaration
+    /// of a script, or the `declare global` blocks and `export as namespace`
+    /// of a module.
+    pub global_names: Vec<String>,
     export_assignment: bool,
     namespace_members: Vec<NamespaceMemberUse>,
     symbols: Vec<SymbolOccurrences>,
@@ -315,6 +327,7 @@ pub struct DocumentIndex {
     decorator_option_uses: Vec<DecoratorOptionUse>,
     decorator_option_types: Vec<(String, DecoratorOptionType)>,
     callable_type_annotations: Vec<CallableTypeAnnotation>,
+    function_option_types: Vec<(String, String)>,
     callable_member_type_annotations: Vec<CallableMemberTypeAnnotation>,
 }
 
@@ -358,6 +371,7 @@ impl DocumentIndex {
         collect_type_navigation_declarations(root, text, &locations, &mut type_declarations);
         let decorator_option_types = collect_decorator_option_types(root, text, &locations);
         let callable_type_annotations = collect_callable_type_annotations(root, text);
+        let function_option_types = collect_function_option_types(root, text);
         let callable_member_type_annotations = collect_callable_member_type_annotations(root, text);
         let symbols = resolve_symbols(text, root, &locations, false);
         let import_symbols = resolve_symbols(text, root, &locations, true);
@@ -427,6 +441,7 @@ impl DocumentIndex {
             diagnostics: diagnostics(root, &locations),
             type_diagnostics,
             unresolved_references: unresolved_references(text, root, &locations),
+            global_names: collect_global_names(root, text),
             export_assignment,
             namespace_members,
             symbols,
@@ -439,8 +454,15 @@ impl DocumentIndex {
             decorator_option_uses,
             decorator_option_types,
             callable_type_annotations,
+            function_option_types,
             callable_member_type_annotations,
         }
+    }
+
+    /// Whether the file has a top-level import or export, which keeps its
+    /// declarations out of the global scope.
+    pub fn is_module(&self) -> bool {
+        !self.imports.is_empty() || !self.exports.is_empty() || self.export_assignment
     }
 
     /// Returns a literal dynamic import whose module string contains the cursor.
@@ -653,10 +675,15 @@ impl DocumentIndex {
                     && !item.type_only
             })
             .collect::<Vec<_>>();
-        if exports.len() != 1 {
+        // Overloads export one name several times, e.g. Inertia's
+        // `export default function useForm(...)` signatures.
+        let name = exports.first()?.name.as_deref()?;
+        if exports
+            .iter()
+            .any(|item| item.name.as_deref() != Some(name))
+        {
             return None;
         }
-        let name = exports[0].name.as_deref()?;
         let declarations = self
             .declarations
             .iter()
@@ -668,7 +695,18 @@ impl DocumentIndex {
                     )
             })
             .collect::<Vec<_>>();
-        (declarations.len() == 1).then(|| declarations[0])
+        match declarations.as_slice() {
+            [declaration] => Some(declaration),
+            // Overload signatures: the first one is the definition target.
+            [first, rest @ ..]
+                if rest.iter().all(|item| {
+                    item.kind == first.kind && first.kind == DeclarationKind::Function
+                }) =>
+            {
+                Some(first)
+            }
+            _ => None,
+        }
     }
 
     /// Returns one unambiguous runtime declaration by name. Used as a
@@ -810,6 +848,16 @@ impl DocumentIndex {
         } else {
             None
         }
+    }
+
+    /// First-parameter type names of each declaration or overload of a function,
+    /// in source order.
+    pub fn function_option_types(&self, name: &str) -> Vec<&str> {
+        self.function_option_types
+            .iter()
+            .filter(|(function, _)| function == name)
+            .map(|(_, type_name)| type_name.as_str())
+            .collect()
     }
 
     /// Returns a variable's direct named callable type annotation.
@@ -1000,6 +1048,7 @@ impl DocumentIndex {
             | TypeMemberTarget::ImportedValue(_)
             | TypeMemberTarget::ImportedClass(_)
             | TypeMemberTarget::ImportedFactory(_)
+            | TypeMemberTarget::ImportedInstance(_)
             | TypeMemberTarget::SuperImported(_)
             | TypeMemberTarget::SuperLocal(_)
             | TypeMemberTarget::SuperImportedChain { .. }

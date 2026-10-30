@@ -281,7 +281,7 @@ extension EditorView {
     static func builtins(for document: DocumentHandle) -> (names: Set<String>, caseInsensitive: Bool)? {
         if isPHP(document) { return (phpBuiltins, true) }
         switch document.syntaxLanguage() {
-        case "TypeScript", "TSX", "JavaScript": return (typeScriptBuiltins, false)
+        case "TypeScript", "TSX", "JavaScript", "Vue", "Svelte": return (typeScriptBuiltins, false)
         case "Rust": return (rustBuiltins, false)
         case "Go": return (goBuiltins, false)
         case "Python": return (pythonBuiltins, false)
@@ -388,7 +388,14 @@ extension EditorView {
         // `$` of a variable as punctuation.
         let units = Array(text.utf16)
         let nameStart = units[range.lowerBound] == UInt16(UInt8(ascii: "$")) ? range.lowerBound + 1 : range.lowerBound
-        guard let run = styles.first(where: { Int($0.start) <= nameStart && nameStart < Int($0.end) }) else {
+        // Several runs can cover the name (Vue puts a broad `function` capture
+        // around a whole call, with the string inside it). A string literal
+        // wins, and its widest run is the whole literal, quotes included.
+        let covering = styles.filter { Int($0.start) <= nameStart && nameStart < Int($0.end) }
+        let literal = covering.filter { $0.scope == "string" }.max { ($0.end - $0.start) < ($1.end - $1.start) }
+        guard let run = literal ?? covering.first else {
+            // Without a syntax run, literal text of a template string is not a name.
+            if Self.isTemplateText(in: text, at: range.lowerBound) { return nil }
             return qualified(range, in: text, document: document)
         }
         if Self.nonNavigableScopes.contains(run.scope) { return nil }
@@ -409,8 +416,18 @@ extension EditorView {
 
     /// Whether `column` sits inside a `${...}` expression in a template literal.
     static func isTemplateInterpolation(in text: String, at column: Int) -> Bool {
+        templateState(in: text, at: column).interpolation
+    }
+
+    /// Whether `column` sits in the literal text of a template literal.
+    static func isTemplateText(in text: String, at column: Int) -> Bool {
+        let state = templateState(in: text, at: column)
+        return state.inTemplate && !state.interpolation
+    }
+
+    private static func templateState(in text: String, at column: Int) -> (inTemplate: Bool, interpolation: Bool) {
         let units = Array(text.utf16)
-        guard column >= 0, column < units.count else { return false }
+        guard column >= 0, column < units.count else { return (false, false) }
         let backtick = UInt16(UInt8(ascii: "`"))
         let dollar = UInt16(UInt8(ascii: "$"))
         let openBrace = UInt16(UInt8(ascii: "{"))
@@ -431,7 +448,7 @@ extension EditorView {
             }
             i += 1
         }
-        return inTemplate && interpolationDepth > 0
+        return (inTemplate, interpolationDepth > 0)
     }
 
     /// In PHP, `App\Models\Product` is one name: the link covers all of it.
