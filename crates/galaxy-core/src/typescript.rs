@@ -10,6 +10,7 @@ use tree_sitter::{Language, Node, Parser};
 use crate::position::Utf16Position;
 
 mod ambient;
+pub mod calls;
 mod diagnostics;
 mod enums;
 mod framework;

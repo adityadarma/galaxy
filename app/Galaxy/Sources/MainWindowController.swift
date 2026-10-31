@@ -112,6 +112,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// Commit behind the annotated line; what the blame card shows.
     var blameCommit: BlameCommitInfo?
     var blameRefreshItem: DispatchWorkItem?
+    /// `editor.inlineParameterHints`.
+    var inlineParameterHintsEnabled = true
+    var parameterHintsItem: DispatchWorkItem?
+    /// Last request: document, revision and lines asked for, and when.
+    var parameterHintsRequest: (doc: ObjectIdentifier, revision: UInt64, lines: Range<Int>, at: Date, empty: Bool)?
+    var parameterHintsGeneration = 0
+    var parameterHintsInFlight = false
+    /// One delayed retry after an empty answer (the engine may be indexing).
+    var parameterHintsRetried = false
     var blameShowItem: DispatchWorkItem?
     var blameHideItem: DispatchWorkItem?
     /// Scroll notifications can arrive much faster than display refresh.
@@ -338,6 +347,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             if self?.isMarkdownPreviewShown == true { self?.updateMarkdownPreview() }
             self?.updateBlameAnnotation()
             self?.scheduleBlameRefresh()
+            self?.scheduleParameterHints()
         }
         editorView.onSnippetInvalidated = { [weak self] in
             self?.snippetSession = nil

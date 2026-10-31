@@ -215,6 +215,9 @@ final class EditorView: NSView {
     var forcedCaretVisible: Bool?
 
     private var layouts = TwoGenerationCache<String, CTLine>(capacity: 1024)
+    /// Parameter-name hints by displayed line text; see `setInlineHints`.
+    private(set) var inlineHints: [String: [InlineHint]] = [:]
+    private var hintLabels: [String: (line: CTLine, width: CGFloat)] = [:]
     /// Colored layouts include resolved theme colors, so they need their own
     /// cache key and are cleared when the font or appearance changes.
     private var syntaxLayouts = TwoGenerationCache<String, CTLine>(capacity: 512)
@@ -290,6 +293,7 @@ final class EditorView: NSView {
             if appliedWrapColumns != nil { oldValue?.setWrapColumns(columns: nil) }
             appliedWrapColumns = nil
             contentTextWidth = 0
+            if document !== oldValue { setInlineHints([:]) }
             applyWrapColumns()
             syntaxAwaiting = document?.syntaxLanguage() != nil
             startSyntaxPollingIfNeeded()
@@ -412,6 +416,7 @@ final class EditorView: NSView {
         metrics = Metrics(font: newFont)
         layouts.removeAll()
         syntaxLayouts.removeAll()
+        hintLabels.removeAll()
         contentTextWidth = 0
         reloadDocument()
     }
@@ -964,6 +969,7 @@ final class EditorView: NSView {
                     CTLineDraw(ctLine, context)
                     if rows.count > 1 { context.restoreGState() }
                 }
+                drawInlineHints(text: line.text, rows: rows, top: top, originX: originX, context: context)
             }
 
             // A folded range is stood in for by a small "..." after its header.
@@ -1142,7 +1148,14 @@ final class EditorView: NSView {
         for column in columns {
             let origin = point(column: column, text: text, rows: rows, top: top, originX: originX)
             let x0 = origin.x
-            let x1 = x0 + xOffset(in: text, column: UInt64(column + 1)) - xOffset(in: text, column: UInt64(column))
+            var cellWidth = xOffset(in: text, column: UInt64(column + 1))
+                - xOffset(in: text, column: UInt64(column))
+            // The kern on this character reserves the following hint's room;
+            // keep its whitespace marker inside the character's real cell.
+            if let hint = inlineHints[text]?.first(where: { $0.column == column + 1 }) {
+                cellWidth -= hintAdvance(hint.label)
+            }
+            let x1 = x0 + max(0, cellWidth)
             let midY = origin.y + midOffset
             if units[column] == tab {
                 context.fill(CGRect(x: x0 + 2, y: midY - 0.5, width: max(1, x1 - x0 - 4), height: 1))
@@ -1156,7 +1169,29 @@ final class EditorView: NSView {
     /// X offset of a UTF-16 column within a line's text.
     func xOffset(in text: String, column: UInt64) -> CGFloat {
         guard column > 0, !text.isEmpty else { return 0 }
-        return CGFloat(CTLineGetOffsetForStringIndex(layout(for: text), CFIndex(column), nil))
+        let line = layout(for: text)
+        // Core Text puts the caret halfway through a kerned gap; a hinted
+        // argument starts after the label, where its glyph is drawn.
+        if let hints = inlineHints[text], hints.contains(where: { $0.column == Int(column) }),
+           let x = Self.glyphX(in: line, stringIndex: CFIndex(column)) {
+            return x
+        }
+        return CGFloat(CTLineGetOffsetForStringIndex(line, CFIndex(column), nil))
+    }
+
+    /// X of the glyph drawn for `stringIndex`, if one starts there.
+    private static func glyphX(in line: CTLine, stringIndex: CFIndex) -> CGFloat? {
+        for run in CTLineGetGlyphRuns(line) as? [CTRun] ?? [] {
+            let range = CTRunGetStringRange(run)
+            guard stringIndex >= range.location, stringIndex < range.location + range.length else { continue }
+            let count = CTRunGetGlyphCount(run)
+            var indices = [CFIndex](repeating: 0, count: count)
+            var positions = [CGPoint](repeating: .zero, count: count)
+            CTRunGetStringIndices(run, CFRange(location: 0, length: count), &indices)
+            CTRunGetPositions(run, CFRange(location: 0, length: count), &positions)
+            if let i = indices.firstIndex(of: stringIndex) { return positions[i].x }
+        }
+        return nil
     }
 
     /// Cached `CTLine` for `text`. Identical strings (blank lines, repeated
@@ -1167,7 +1202,8 @@ final class EditorView: NSView {
         // context fill colour, which is unreadable in dark mode. With it,
         // one cached layout works for every colour and appearance.
         let fromContext = NSAttributedString.Key(kCTForegroundColorFromContextAttributeName as String)
-        let attributed = NSAttributedString(string: text, attributes: [.font: font, fromContext: true])
+        let attributed = NSMutableAttributedString(string: text, attributes: [.font: font, fromContext: true])
+        addHintSpacing(to: attributed, text: text)
         let line = CTLineCreateWithAttributedString(attributed)
         layouts.insert(line, for: text)
         layoutsCreated += 1
@@ -1204,10 +1240,94 @@ final class EditorView: NSView {
                 attributed.addAttribute(.foregroundColor, value: color.withAlphaComponent(Self.fadedAlpha), range: run)
             }
         }
+        addHintSpacing(to: attributed, text: text)
         let line = CTLineCreateWithAttributedString(attributed)
         syntaxLayouts.insert(line, for: key)
         layoutsCreated += 1
         return line
+    }
+}
+
+// MARK: Inline parameter hints
+
+extension EditorView {
+    /// A parameter name drawn before the argument at UTF-16 `column`.
+    struct InlineHint: Equatable {
+        let column: Int
+        let label: String
+    }
+
+    static let hintPadding: CGFloat = 3
+    static let hintGap: CGFloat = 2
+
+    /// Replaces the hints, keyed by the displayed text of their line. Keying
+    /// by text keeps an edited line from showing hints made for its old text.
+    func setInlineHints(_ hints: [String: [InlineHint]]) {
+        guard hints != inlineHints else { return }
+        inlineHints = hints
+        // Layouts carry the space reserved for the labels.
+        layouts.removeAll()
+        syntaxLayouts.removeAll()
+        needsDisplay = true
+        onLayoutChange?()
+    }
+
+    /// Room a label takes in the line: the label, its padding and a gap on
+    /// both sides.
+    func hintAdvance(_ label: String) -> CGFloat {
+        hintLabel(label).width + 2 * Self.hintPadding + 2 * Self.hintGap
+    }
+
+    /// Widens the character before each hinted argument (Core Text kerning),
+    /// so carets, selections and clicks all measure through the labels.
+    func addHintSpacing(to attributed: NSMutableAttributedString, text: String) {
+        guard let hints = inlineHints[text] else { return }
+        let string = text as NSString
+        for hint in hints where hint.column > 0 && hint.column <= string.length {
+            let previous = string.rangeOfComposedCharacterSequence(at: hint.column - 1)
+            // Only the last unit of a composed character may carry the space.
+            guard NSMaxRange(previous) == hint.column else { continue }
+            attributed.addAttribute(.kern, value: hintAdvance(hint.label), range: previous)
+        }
+    }
+
+    /// Draws the labels of `text` into the space `addHintSpacing` reserved.
+    func drawInlineHints(text: String, rows: LineRows, top: CGFloat, originX: CGFloat, context: CGContext) {
+        guard let hints = inlineHints[text] else { return }
+        let hintFont = self.hintFont
+        let pillHeight = max(0, metrics.lineHeight - 4)
+        let textHeight = hintFont.ascender - hintFont.descender
+        for hint in hints {
+            let row = rows.row(containing: hint.column)
+            // A soft wrap between the space and its argument: skip the label.
+            guard hint.column > 0, rows.row(containing: hint.column - 1) == row else { continue }
+            let at = point(column: hint.column, text: text, rows: rows, top: top, originX: originX)
+            let label = hintLabel(hint.label)
+            let pill = CGRect(x: at.x - Self.hintGap - label.width - 2 * Self.hintPadding,
+                              y: at.y + 2, width: label.width + 2 * Self.hintPadding, height: pillHeight)
+            context.addPath(CGPath(roundedRect: pill, cornerWidth: 3, cornerHeight: 3, transform: nil))
+            context.setFillColor(NSColor.secondaryLabelColor.withAlphaComponent(0.12).cgColor)
+            context.fillPath()
+            context.setFillColor(NSColor.secondaryLabelColor.cgColor)
+            context.textPosition = CGPoint(x: pill.minX + Self.hintPadding,
+                                           y: at.y + (metrics.lineHeight - textHeight) / 2 + hintFont.ascender)
+            CTLineDraw(label.line, context)
+        }
+    }
+
+    private var hintFont: NSFont {
+        NSFont(descriptor: font.fontDescriptor, size: max(8, (font.pointSize * 0.85).rounded())) ?? font
+    }
+
+    private func hintLabel(_ label: String) -> (line: CTLine, width: CGFloat) {
+        if let cached = hintLabels[label] { return cached }
+        let fromContext = NSAttributedString.Key(kCTForegroundColorFromContextAttributeName as String)
+        let line = CTLineCreateWithAttributedString(NSAttributedString(
+            string: label, attributes: [.font: hintFont, fromContext: true]))
+        let entry = (line: line, width: ceil(CGFloat(CTLineGetTypographicBounds(line, nil, nil, nil))))
+        if hintLabels.count > 512 { hintLabels.removeAll() }
+        hintLabels[label] = entry
+        return entry
     }
 }
 

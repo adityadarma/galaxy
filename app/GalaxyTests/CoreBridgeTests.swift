@@ -85,7 +85,7 @@ final class CoreBridgeTests: XCTestCase {
 
         let bridge = CoreBridge()
         let document = try bridge.openDocument(path: source.path)
-        for (line, character) in [(0, 14), (1, 33)] {
+        for (line, character) in [(0, 14), (1, 34)] {
             bridge.requestDefinition(document: document, line: UInt64(line), character: UInt64(character))
             let locations = bridge.definitionLocations(document: document)
             XCTAssertEqual(locations.count, 1, "cursor \(line):\(character)")

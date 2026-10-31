@@ -131,14 +131,14 @@ final class DiffTabTests: XCTestCase {
         XCTAssertEqual(c.secondaryEditorView.document?.text(), "one\ntwo\nthree\nfour\n")
     }
 
-    func testAnAlreadyOpenFileTurnsIntoTheDiffInPlace() throws {
+    func testAnAlreadyOpenFileKeepsItsTabWhenOpeningTheDiff() throws {
         let c = try makeController()
         defer { c.window?.orderOut(nil) }
         let ws = try XCTUnwrap(c.workspace)
         c.openWorkspaceFile(ws, FileEntry(name: "tracked.txt", relPath: "tracked.txt", isDir: false), preview: false)
         XCTAssertFalse(c.isDiffPaneShown)
         c.openWorkspaceDiff(ws, relPath: "tracked.txt")
-        XCTAssertEqual(c.tabBar.items.count, 1, "no second tab for the same file")
+        XCTAssertEqual(c.tabBar.items.count, 2, "the diff has its own tab")
         XCTAssertTrue(c.isDiffPaneShown)
     }
 

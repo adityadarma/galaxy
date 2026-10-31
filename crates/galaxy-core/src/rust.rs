@@ -14,6 +14,7 @@ use crate::lang::{
     Action, Completion, Edit, HoverResult, ItemKind, Occurrence, OutlineSymbol, Problem, Severity,
     Signature, Target,
 };
+use crate::parameter_hints::{self, Argument, Parameter, ParameterHint};
 
 const MAX_FILES: usize = 4_000;
 const MAX_FILE_BYTES: u64 = 2 << 20;
@@ -243,6 +244,53 @@ impl RustEngine {
             parameters,
             active,
         })
+    }
+
+    /// Parameter-name hints for the calls on lines `first..=last`. Free and
+    /// associated functions only: method calls would need the receiver's
+    /// type, which the engine looks up by reading the project.
+    pub fn parameter_hints(
+        &mut self,
+        path: &Path,
+        text: &str,
+        first: u32,
+        last: u32,
+    ) -> Vec<ParameterHint> {
+        self.sync_document(path, text);
+        let Some(tree) = parse_tree(text) else {
+            return Vec::new();
+        };
+        let mut sources: HashMap<PathBuf, Option<String>> = HashMap::new();
+        let mut out = Vec::new();
+        for (name, associated, arguments) in rust_call_sites(text, tree.root_node(), first, last) {
+            let declarations: Vec<_> = self
+                .resolve_nonlocal(path, &name)
+                .into_iter()
+                .filter(|item| item.kind == ItemKind::Function)
+                .collect();
+            let [declaration] = declarations.as_slice() else {
+                continue;
+            };
+            let source = sources.entry(declaration.path.clone()).or_insert_with(|| {
+                if declaration.path == path {
+                    Some(text.to_owned())
+                } else {
+                    self.document(&declaration.path)
+                        .map(|(_, text)| text.to_owned())
+                        .or_else(|| std::fs::read_to_string(&declaration.path).ok())
+                }
+            });
+            let Some(source) = source.as_deref() else {
+                continue;
+            };
+            if let Some(parameters) =
+                rust_parameters_at(source, declaration.line, declaration.column, associated)
+            {
+                out.extend(parameter_hints::hints(&parameters, &arguments));
+            }
+        }
+        out.sort_by_key(|hint| (hint.line, hint.column));
+        out
     }
 
     pub fn definition(&mut self, path: &Path, text: &str, line: u32, column: u32) -> Vec<Target> {
@@ -1683,6 +1731,132 @@ fn call_at(text: &str, byte: usize) -> Option<(String, u32)> {
     Some((name.to_owned(), active))
 }
 
+/// Calls on lines `first..=last`: the called name, whether it is called
+/// by path (`Type::f(x)`, where `self` is an argument), and the arguments.
+fn rust_call_sites(
+    text: &str,
+    root: Node<'_>,
+    first: u32,
+    last: u32,
+) -> Vec<(String, bool, Vec<Argument>)> {
+    let (first, last) = (first as usize, last as usize);
+    let mut out = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.end_position().row < first || node.start_position().row > last {
+            continue;
+        }
+        if node.kind() == "call_expression"
+            && out.len() < parameter_hints::MAX_CALLS
+            && let Some(call) = rust_call_site(text, node)
+        {
+            out.push(call);
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    out
+}
+
+fn rust_call_site(text: &str, call: Node<'_>) -> Option<(String, bool, Vec<Argument>)> {
+    let mut function = call.child_by_field_name("function")?;
+    if function.kind() == "generic_function" {
+        function = function.child_by_field_name("function")?;
+    }
+    let (name, associated) = match function.kind() {
+        "identifier" => (function, false),
+        "scoped_identifier" => (function.child_by_field_name("name")?, true),
+        _ => return None,
+    };
+    let name = name.utf8_text(text.as_bytes()).ok()?;
+    // Tuple structs and enum variants (`Some(x)`) take no named parameters.
+    if name.starts_with(|c: char| c.is_uppercase()) {
+        return None;
+    }
+    let list = call.child_by_field_name("arguments")?;
+    let mut cursor = list.walk();
+    let arguments: Vec<_> = list
+        .named_children(&mut cursor)
+        .filter(|argument| {
+            !matches!(
+                argument.kind(),
+                "attribute_item" | "line_comment" | "block_comment"
+            )
+        })
+        .map(|argument| {
+            let value = match argument.kind() {
+                "reference_expression" => argument.child_by_field_name("value").unwrap_or(argument),
+                _ => argument,
+            };
+            let named = match value.kind() {
+                "identifier" => Some(value),
+                "field_expression" => value.child_by_field_name("field"),
+                _ => None,
+            };
+            Argument {
+                line: argument.start_position().row as u32,
+                column: utf16_column(text, argument.start_byte()),
+                name: named
+                    .and_then(|node| node.utf8_text(text.as_bytes()).ok())
+                    .map(str::to_owned),
+                spread: false,
+                named: false,
+            }
+        })
+        .collect();
+    (!arguments.is_empty()).then(|| (name.to_owned(), associated, arguments))
+}
+
+/// Parameters of the function whose name is at `line`/`column` of `text`.
+/// `self` counts only when the function is called by path.
+fn rust_parameters_at(
+    text: &str,
+    line: u32,
+    column: u32,
+    associated: bool,
+) -> Option<Vec<Parameter>> {
+    let tree = parse_tree(text)?;
+    let byte = cursor_byte(text, line, column);
+    let mut node = tree.root_node().descendant_for_byte_range(byte, byte)?;
+    while !matches!(node.kind(), "function_item" | "function_signature_item") {
+        node = node.parent()?;
+    }
+    let list = node.child_by_field_name("parameters")?;
+    let mut cursor = list.walk();
+    let mut out = Vec::new();
+    for parameter in list.named_children(&mut cursor) {
+        match parameter.kind() {
+            "self_parameter" if associated => out.push(Parameter {
+                name: "self".to_owned(),
+                rest: false,
+            }),
+            "parameter" => {
+                let pattern = parameter.child_by_field_name("pattern")?;
+                let pattern = if pattern.kind() == "mut_pattern" {
+                    let mut inner = pattern.walk();
+                    pattern.named_children(&mut inner).last().unwrap_or(pattern)
+                } else {
+                    pattern
+                };
+                let name = if pattern.kind() == "identifier" {
+                    pattern
+                        .utf8_text(text.as_bytes())
+                        .ok()?
+                        .trim_start_matches('_')
+                } else {
+                    ""
+                };
+                out.push(Parameter {
+                    name: name.to_owned(),
+                    rest: false,
+                });
+            }
+            _ => {}
+        }
+    }
+    Some(out)
+}
+
 fn deepest_call(node: Node<'_>, byte: usize) -> Option<Node<'_>> {
     if node.start_byte() > byte || node.end_byte() < byte {
         return None;
@@ -2104,6 +2278,29 @@ mod tests {
         let signature = engine.signature(path, source, 2, argument).unwrap();
         assert!(signature.label.contains("fn brew"));
         assert_eq!(signature.active, 1);
+    }
+
+    #[test]
+    fn parameter_hints_name_function_arguments() {
+        let path = Path::new("/tmp/hints.rs");
+        let source = "fn brew(\n    minutes: u8,\n    mut cups: HashMap<u8, u8>,\n) {}\nstruct Pot;\nimpl Pot { fn fill(&self, litres: u8) {} }\nfn main() { brew(5, map); brew(minutes, &cups); Pot::fill(&pot, 2); Some(1); }";
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        engine.install(Built::default());
+        let found = engine.parameter_hints(path, source, 6, 6);
+        let line = source.lines().nth(6).unwrap();
+        let labels: Vec<(u32, &str)> = found
+            .iter()
+            .map(|hint| (hint.column, hint.label.as_str()))
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                (line.find("5,").unwrap() as u32, "minutes:"),
+                (line.find("map").unwrap() as u32, "cups:"),
+                (line.find("&pot").unwrap() as u32, "self:"),
+                (line.find("2)").unwrap() as u32, "litres:"),
+            ]
+        );
     }
 
     #[test]

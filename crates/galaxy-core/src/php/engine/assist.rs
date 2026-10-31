@@ -7,8 +7,9 @@ use super::{
     receiver_start, word_start,
 };
 use crate::lang::{Action, Edit, OutlineSymbol, Signature};
+use crate::parameter_hints::{self, Argument, Parameter, ParameterHint};
 use crate::php::framework;
-use crate::php::parse::{ClassKind, MemberKind, parse_file, parse_with_tree};
+use crate::php::parse::{ClassKind, FileSymbols, MemberKind, parse_file, parse_with_tree};
 
 const MAX_IMPORT_CHOICES: usize = 8;
 
@@ -116,6 +117,117 @@ fn signature_of(name: &str, detail: &str, doc: Option<&str>, commas: usize) -> S
     }
 }
 
+/// The called name before the `(` at `paren` and the text before that
+/// name; `None` when the parenthesis does not open a call.
+fn call_name(text: &str, paren: usize) -> Option<(&str, &str)> {
+    let before = text[..paren].trim_end();
+    let name_start = before
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '\\') || !c.is_ascii()))
+        .map_or(0, |(i, c)| i + c.len_utf8());
+    let name = &before[name_start..];
+    if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    let head = &before[..name_start];
+    if member_operator(head).is_none()
+        && (NOT_CALLS.contains(&name.to_ascii_lowercase().as_str())
+            || ends_with_word(head, "function")
+            || ends_with_word(head, "fn")
+            || ends_with_word(head, "class"))
+    {
+        return None;
+    }
+    Some((name, head))
+}
+
+/// `$name` from a declared parameter such as `?string $name = null`.
+fn php_parameter(declared: &str) -> Parameter {
+    let declared = declared.split('=').next().unwrap_or("").trim();
+    let rest = declared.contains("...");
+    let name = declared
+        .split_whitespace()
+        .last()
+        .map(|word| word.trim_start_matches(['&', '.']))
+        .filter(|word| word.starts_with('$'))
+        .unwrap_or("");
+    Parameter {
+        name: name.trim_start_matches('$').to_owned(),
+        rest,
+    }
+}
+
+/// Calls on lines `first..=last` with arguments: the byte of each `(` and
+/// the arguments it passes.
+fn php_call_sites(
+    text: &str,
+    root: tree_sitter::Node<'_>,
+    first: u32,
+    last: u32,
+) -> Vec<(usize, Vec<Argument>)> {
+    let (first, last) = (first as usize, last as usize);
+    let mut out = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.end_position().row < first || node.start_position().row > last {
+            continue;
+        }
+        if out.len() < parameter_hints::MAX_CALLS
+            && matches!(
+                node.kind(),
+                "function_call_expression"
+                    | "member_call_expression"
+                    | "nullsafe_member_call_expression"
+                    | "scoped_call_expression"
+                    | "object_creation_expression"
+            )
+            && let Some(list) = node.child_by_field_name("arguments").or_else(|| {
+                let mut cursor = node.walk();
+                node.named_children(&mut cursor)
+                    .find(|child| child.kind() == "arguments")
+            })
+        {
+            let mut cursor = list.walk();
+            let arguments: Vec<_> = list
+                .named_children(&mut cursor)
+                .filter(|argument| argument.kind() == "argument")
+                .map(|argument| php_argument(text, argument))
+                .collect();
+            if !arguments.is_empty() {
+                out.push((list.start_byte(), arguments));
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    out
+}
+
+fn php_argument(text: &str, argument: tree_sitter::Node<'_>) -> Argument {
+    let (line, column, _) = position_of(text, argument.start_byte());
+    let mut cursor = argument.walk();
+    let value = argument.named_children(&mut cursor).last();
+    let spread = value.is_some_and(|value| value.kind() == "variadic_unpacking");
+    let name = value.and_then(|value| {
+        let named = match value.kind() {
+            "variable_name" => value,
+            "member_access_expression" | "nullsafe_member_access_expression" => {
+                value.child_by_field_name("name")?
+            }
+            _ => return None,
+        };
+        named.utf8_text(text.as_bytes()).ok().map(str::to_owned)
+    });
+    Argument {
+        line,
+        column,
+        name,
+        spread,
+        named: argument.child_by_field_name("name").is_some(),
+    }
+}
+
 impl PhpEngine {
     /// The signature of the call the cursor is in, with the argument being
     /// typed. `None` outside a call or for a callee it cannot find.
@@ -141,28 +253,50 @@ impl PhpEngine {
         paren: usize,
         commas: usize,
     ) -> Option<Signature> {
-        let before = text[..paren].trim_end();
-        let name_start = before
-            .char_indices()
-            .rev()
-            .find(|(_, c)| !(c.is_ascii_alphanumeric() || matches!(c, '_' | '\\') || !c.is_ascii()))
-            .map_or(0, |(i, c)| i + c.len_utf8());
-        let name = &before[name_start..];
-        if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
-            return None;
-        }
-        let head = &before[..name_start];
-        let operator = member_operator(head);
-        if operator.is_none()
-            && (NOT_CALLS.contains(&name.to_ascii_lowercase().as_str())
-                || ends_with_word(head, "function")
-                || ends_with_word(head, "fn")
-                || ends_with_word(head, "class"))
-        {
-            return None;
-        }
-
+        // Cheap text check first: typing outside a call never parses.
+        call_name(text, paren)?;
         let (file, tree) = parse_with_tree(path, text)?;
+        let (name, detail, doc) = self.callee(text, &file, &tree, paren)?;
+        Some(signature_of(&name, &detail, doc.as_deref(), commas))
+    }
+
+    /// Parameter-name hints for the calls on lines `first..=last`.
+    pub fn parameter_hints(
+        &mut self,
+        path: &Path,
+        text: &str,
+        first: u32,
+        last: u32,
+    ) -> Vec<ParameterHint> {
+        let previous = self.register_current(path, text);
+        let mut out = Vec::new();
+        if let Some((file, tree)) = parse_with_tree(path, text) {
+            for (paren, arguments) in php_call_sites(text, tree.root_node(), first, last) {
+                if let Some((_, detail, _)) = self.callee(text, &file, &tree, paren) {
+                    let parameters: Vec<_> = parameters_of(&detail)
+                        .iter()
+                        .map(|parameter| php_parameter(parameter))
+                        .collect();
+                    out.extend(parameter_hints::hints(&parameters, &arguments));
+                }
+            }
+        }
+        self.restore_current(path, previous);
+        out.sort_by_key(|hint| (hint.line, hint.column));
+        out
+    }
+
+    /// Name, parameter detail and docblock of the callee whose argument
+    /// list opens at `paren`.
+    fn callee(
+        &mut self,
+        text: &str,
+        file: &FileSymbols,
+        tree: &tree_sitter::Tree,
+        paren: usize,
+    ) -> Option<(String, String, Option<String>)> {
+        let (name, head) = call_name(text, paren)?;
+        let operator = member_operator(head);
         let row = position_of(text, paren).0;
         let class = file
             .classes
@@ -171,8 +305,8 @@ impl PhpEngine {
             .cloned();
         let ctx = Ctx {
             src: text,
-            tree: &tree,
-            file: &file,
+            tree,
+            file,
             byte: paren,
             class,
         };
@@ -182,22 +316,20 @@ impl PhpEngine {
             let fqn = self.eval(&ctx, receiver, 0)?;
             let class = self.class(&fqn)?;
             let (_, member) = self.find_member(&class, name, true)?;
-            return Some(signature_of(
-                &member.name,
-                &member.detail,
-                member.doc.as_deref(),
-                commas,
+            return Some((
+                member.name.clone(),
+                member.detail.clone(),
+                member.doc.clone(),
             ));
         }
         if ends_with_word(head, "new") {
             let fqn = self.class_ref(&ctx, name)?;
             let class = self.class(&fqn)?;
             let (_, constructor) = self.find_member(&class, "__construct", true)?;
-            return Some(signature_of(
-                &class.name,
-                &constructor.detail,
-                constructor.doc.as_deref(),
-                commas,
+            return Some((
+                class.name.clone(),
+                constructor.detail.clone(),
+                constructor.doc.clone(),
             ));
         }
         let namespaced = (!file.namespace.is_empty() && !name.starts_with('\\'))
@@ -206,11 +338,10 @@ impl PhpEngine {
             .as_deref()
             .and_then(|fqn| self.function(fqn))
             .or_else(|| self.function(name))?;
-        Some(signature_of(
-            &function.name,
-            &function.detail,
-            function.doc.as_deref(),
-            commas,
+        Some((
+            function.name.clone(),
+            function.detail.clone(),
+            function.doc.clone(),
         ))
     }
 
@@ -452,6 +583,46 @@ mod tests {
         // Keywords and declarations are not calls.
         assert_eq!(signature_at(&format!("{HEAD}        if (|{TAIL}")), None);
         assert_eq!(signature_at("<?php\nfunction add(|\n{}\n"), None);
+    }
+
+    #[test]
+    fn parameter_hints_label_methods_constructors_and_functions() {
+        let dir = project();
+        let mut engine = PhpEngine::new(dir.path());
+        let path = dir.path().join("app/Report.php");
+        let body = "        $order->add(1, $b);\n        $o = new Order(7, name: 'x');\n        str_replace('a', 'b', $subject);\n        $order->add(...$all);";
+        let text = format!("{HEAD}{body}{TAIL}");
+        let found = engine.parameter_hints(&path, &text, 0, 40);
+        let labels: Vec<(u32, u32, &str)> = found
+            .iter()
+            .map(|hint| (hint.line, hint.column, hint.label.as_str()))
+            .collect();
+        // `$b` repeats its parameter; `name:` is already named; a spread
+        // hides every position.
+        assert!(labels.contains(&(9, 20, "a:")), "{labels:?}");
+        assert!(
+            !labels.iter().any(|(_, _, label)| *label == "b:"),
+            "{labels:?}"
+        );
+        assert!(labels.contains(&(10, 23, "id:")), "{labels:?}");
+        assert!(
+            !labels.iter().any(|(_, _, label)| *label == "name:"),
+            "{labels:?}"
+        );
+        assert!(
+            labels
+                .iter()
+                .any(|(line, _, label)| *line == 11 && *label == "search:"),
+            "{labels:?}"
+        );
+        assert!(!labels.iter().any(|(line, _, _)| *line == 12), "{labels:?}");
+        assert_eq!(
+            php_parameter("?string &...$rest = null"),
+            Parameter {
+                name: "rest".into(),
+                rest: true
+            }
+        );
     }
 
     #[test]

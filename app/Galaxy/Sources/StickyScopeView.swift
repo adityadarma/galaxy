@@ -153,6 +153,9 @@ final class StickyScopeView: NSView {
             context.clip(to: CGRect(x: textX, y: top, width: max(0, bounds.width - textX), height: metrics.lineHeight))
             context.textPosition = CGPoint(x: textX, y: top + metrics.ascent)
             CTLineDraw(line, context)
+            // The layout keeps room for parameter hints; fill it the same way.
+            editor.drawInlineHints(text: row.text, rows: EditorView.LineRows(breaks: []),
+                                   top: top, originX: textX, context: context)
             context.restoreGState()
         }
 

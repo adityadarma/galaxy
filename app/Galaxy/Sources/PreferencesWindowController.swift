@@ -24,6 +24,7 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
     private let whitespacePopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let autoClosingTagsBox = NSButton(checkboxWithTitle: "Auto close tags (HTML, PHP, JSX)", target: nil, action: nil)
     private let linkedEditingBox = NSButton(checkboxWithTitle: "Rename matching tag while editing", target: nil, action: nil)
+    private let parameterHintsBox = NSButton(checkboxWithTitle: "Show parameter names before call arguments", target: nil, action: nil)
     private let autoSavePopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let autoSaveDelay = NSStepper(frame: .zero)
     private let autoSaveDelayLabel = NSTextField(labelWithString: "")
@@ -33,7 +34,7 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
         NSButton(checkboxWithTitle: $0, target: nil, action: nil)
     }
     private var editorControls: [NSControl] {
-        [tabSizePopup, insertSpacesBox, whitespacePopup, autoClosingTagsBox, linkedEditingBox,
+        [tabSizePopup, insertSpacesBox, whitespacePopup, parameterHintsBox, autoClosingTagsBox, linkedEditingBox,
          autoSavePopup, autoSaveDelay, gitBlameBox] + excludeBoxes
     }
 
@@ -106,6 +107,8 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
         whitespacePopup.setAccessibilityLabel("Render whitespace")
         whitespacePopup.target = self; whitespacePopup.action = #selector(saveWhitespace(_:))
         stack.addArrangedSubview(row("Whitespace", whitespacePopup))
+        parameterHintsBox.target = self; parameterHintsBox.action = #selector(saveParameterHints(_:))
+        stack.addArrangedSubview(row("", parameterHintsBox))
 
         stack.addArrangedSubview(section("Tags"))
         autoClosingTagsBox.target = self; autoClosingTagsBox.action = #selector(saveAutoClosingTags(_:))
@@ -205,6 +208,7 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
         whitespacePopup.selectItem(at: Self.whitespaceModes.firstIndex { $0.value == settings.effectiveRenderWhitespace } ?? 2)
         autoClosingTagsBox.state = settings.effectiveAutoClosingTags ? .on : .off
         linkedEditingBox.state = settings.effectiveLinkedEditing ? .on : .off
+        parameterHintsBox.state = settings.effectiveInlineParameterHints ? .on : .off
         gitBlameBox.state = settings.effectiveGitBlame ? .on : .off
         let hidden = Set(settings.effectiveFilesExclude)
         for box in excludeBoxes { box.state = hidden.contains(box.title) ? .on : .off }
@@ -245,6 +249,9 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
     @objc private func saveAutoClosingTags(_ sender: Any?) { store(autoClosingTagsBox.state == .on, "autoClosingTags") }
     @objc private func saveLinkedEditing(_ sender: Any?) { store(linkedEditingBox.state == .on, "linkedEditing") }
     @objc private func saveGitBlame(_ sender: Any?) { store(gitBlameBox.state == .on, "gitBlame") }
+    @objc private func saveParameterHints(_ sender: Any?) {
+        store(parameterHintsBox.state == .on, "inlineParameterHints")
+    }
 
     @objc private func saveFilesExclude(_ sender: Any?) {
         guard let box = sender as? NSButton else { return }

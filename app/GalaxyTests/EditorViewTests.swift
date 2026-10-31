@@ -240,6 +240,28 @@ final class EditorViewTests: XCTestCase {
         return 0.2126 * color.redComponent + 0.7152 * color.greenComponent + 0.0722 * color.blueComponent
     }
 
+    /// A hint widens the character before its argument, so the argument and
+    /// everything after it move right by the label's room, and clicks map
+    /// through the same layout.
+    func testInlineHintsReserveRoomBeforeTheirArgument() throws {
+        let text = "add(1, 2)"
+        let (view, _, url) = try makeView(text: text)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let before = view.xOffset(in: text, column: 4)
+        let afterComma = view.xOffset(in: text, column: 7)
+        view.setInlineHints([text: [EditorView.InlineHint(column: 4, label: "a:"),
+                                    EditorView.InlineHint(column: 7, label: "b:")]])
+        let room = view.hintAdvance("a:")
+        XCTAssertGreaterThan(room, 0)
+        XCTAssertEqual(view.xOffset(in: text, column: 3), view.xOffset(in: "add", column: 3), accuracy: 0.01)
+        XCTAssertEqual(view.xOffset(in: text, column: 4), before + room, accuracy: 0.5)
+        XCTAssertEqual(view.xOffset(in: text, column: 7), afterComma + room + view.hintAdvance("b:"), accuracy: 0.5)
+        // Other lines are unaffected, and clearing restores the layout.
+        XCTAssertEqual(view.xOffset(in: "add(9, 2)", column: 4), before, accuracy: 0.01)
+        view.setInlineHints([:])
+        XCTAssertEqual(view.xOffset(in: text, column: 4), before, accuracy: 0.01)
+    }
+
     func testGutterGrowsWithDigitCount() throws {
         let (small, _, u1) = try makeView(text: "a\nb")
         let (large, _, u2) = try makeView(text: (0..<12_000).map { "l\($0)" }.joined(separator: "\n"))

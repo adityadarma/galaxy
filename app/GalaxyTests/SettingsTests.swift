@@ -96,6 +96,16 @@ final class SettingsTests: XCTestCase {
         XCTAssertEqual(doc.text(), "<divxy>s</divx>")
     }
 
+    func testInlineParameterHintsDefaultToOnAndWorkspaceCanTurnThemOff() throws {
+        XCTAssertTrue(GalaxySettings.empty.effectiveInlineParameterHints)
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-settings-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try #"{"editor":{"inlineParameterHints":false}}"#.write(to: url, atomically: true, encoding: .utf8)
+        let workspace = try GalaxySettings.load(from: url)
+        XCTAssertFalse(GalaxySettings.empty.merged(with: workspace).effectiveInlineParameterHints)
+        XCTAssertTrue(GalaxySettings.completionItems().contains { $0.label == "inlineParameterHints" })
+    }
+
     func testSettingsCompletionContainsEditorKeys() {
         let labels = Set(GalaxySettings.completionItems().map(\.label))
         XCTAssertTrue(labels.isSuperset(of: ["editor", "insertSpaces", "tabSize"]))

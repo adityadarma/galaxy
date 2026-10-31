@@ -65,6 +65,7 @@ extension MainWindowController {
             self.lastScrollDecorationUpdate = Date()
             if !self.minimap.isHidden { self.minimap.needsDisplay = true }
             self.updateStickyScope()
+            self.scheduleParameterHints()
         }
     }
 
@@ -88,6 +89,8 @@ extension MainWindowController {
         editorView.wrapSuspended = suspended
         secondaryEditorView.wrapSuspended = true
         updateStickyScope()
+        parameterHintsRequest = nil
+        scheduleParameterHints(after: 0)
     }
 
     // MARK: View menu

@@ -37,6 +37,7 @@ use galaxy_core::lang::{
 use galaxy_core::movement::{self, Motion};
 use galaxy_core::multicursor;
 use galaxy_core::navigation::{self, Location, NavHistory};
+use galaxy_core::parameter_hints;
 use galaxy_core::php::{self, PhpEngine};
 use galaxy_core::position::Utf16Position;
 use galaxy_core::rust::{self, RustEngine};
@@ -1290,6 +1291,99 @@ impl Core {
         false
     }
 
+    /// Parameter names to show before the call arguments on lines
+    /// `first_line..first_line + line_count`, computed from the engines'
+    /// own declarations (VS Code's inline-parameters). Calls the engine
+    /// cannot resolve get no labels. Never panics into Swift.
+    pub fn parameter_hints(
+        &self,
+        document: Arc<DocumentHandle>,
+        first_line: u64,
+        line_count: u64,
+    ) -> ParameterHints {
+        let path = document.path();
+        // Text, revision and displayed lines come from one snapshot, so the
+        // editor can tell an answer about older text from a current one.
+        let doc = document.lock().editor.doc.clone();
+        let empty = ParameterHints {
+            revision: doc.revision(),
+            lines: Vec::new(),
+        };
+        if path.is_empty() || line_count == 0 {
+            return empty;
+        }
+        let first = u32::try_from(first_line).unwrap_or(u32::MAX);
+        let last = first.saturating_add(u32::try_from(line_count - 1).unwrap_or(u32::MAX));
+        catch_unwind(AssertUnwindSafe(|| {
+            let file = Path::new(&path);
+            let text = doc.text();
+            let hints = if is_typescript_path(file) || is_component_path(file) {
+                self.typescript_parameter_hints(&path, &text, first, last)
+            } else if is_rust_path(file) {
+                self.rust_engine(file)
+                    .map(|engine| {
+                        let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                        if engine.is_ready() {
+                            engine.parameter_hints(file, &text, first, last)
+                        } else {
+                            Vec::new()
+                        }
+                    })
+                    .unwrap_or_default()
+            } else if is_php_path(file) {
+                self.php_engine(file)
+                    .map(|engine| {
+                        let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                        if engine.is_ready() {
+                            engine.parameter_hints(file, &text, first, last)
+                        } else {
+                            Vec::new()
+                        }
+                    })
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let mut lines: Vec<ParameterHintLine> = Vec::new();
+            for hint in hints {
+                let line = hint.line as usize;
+                if line >= doc.line_count() {
+                    continue;
+                }
+                if lines
+                    .last()
+                    .is_none_or(|last| last.line != u64::from(hint.line))
+                {
+                    lines.push(ParameterHintLine {
+                        line: u64::from(hint.line),
+                        text: viewport::display_text(&doc, line),
+                        hints: Vec::new(),
+                    });
+                }
+                let Some(entry) = lines.last_mut() else {
+                    continue;
+                };
+                // Column 0 has no character to widen; columns past the
+                // displayed part of a long line are never drawn.
+                let column = u64::from(hint.column);
+                if column == 0 || column > entry.text.encode_utf16().count() as u64 {
+                    continue;
+                }
+                entry.hints.push(ParameterHintInfo {
+                    line: entry.line,
+                    column,
+                    label: hint.label,
+                });
+            }
+            lines.retain(|line| !line.hints.is_empty());
+            ParameterHints {
+                revision: doc.revision(),
+                lines,
+            }
+        }))
+        .unwrap_or(empty)
+    }
+
     pub fn signature_help(&self, document: Arc<DocumentHandle>) -> Option<SignatureInfo> {
         let path = document.path();
         if path.is_empty() {
@@ -1768,6 +1862,29 @@ pub fn expand_snippet(
         text: expansion.text,
         stops,
     }
+}
+
+/// A parameter name drawn before the argument at `line`/`column` (UTF-16).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ParameterHintInfo {
+    pub line: u64,
+    pub column: u64,
+    pub label: String,
+}
+
+/// The hints of one line, with the displayed text they were computed for.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ParameterHintLine {
+    pub line: u64,
+    pub text: String,
+    pub hints: Vec<ParameterHintInfo>,
+}
+
+/// Parameter hints for a range of lines at document `revision`.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct ParameterHints {
+    pub revision: u64,
+    pub lines: Vec<ParameterHintLine>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -2736,10 +2853,96 @@ impl Core {
         // Component scripts retain their original line and column offsets, so
         // TypeScript locations can be returned directly to the editor.
         let index = DocumentIndex::parse(typescript_index_path(&path), &source);
+        let locations = self.typescript_targets(&path, &text, uri, &index, line, character);
+        let found = !locations.is_empty();
+        self.analysis
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_definitions(uri, locations);
+        found
+    }
+
+    /// Resolves each call's callee like Go to Definition, then reads the
+    /// parameters at the target. Vue and Svelte templates are not analysed.
+    fn typescript_parameter_hints(
+        &self,
+        path: &str,
+        text: &str,
+        first: u32,
+        last: u32,
+    ) -> Vec<parameter_hints::ParameterHint> {
+        use galaxy_core::typescript::calls;
+        let source = component_virtual_source(path, text);
+        let index_path = typescript_index_path(path);
+        let calls = calls::call_sites(
+            Path::new(&index_path),
+            &source,
+            first as usize,
+            last as usize,
+        );
+        if calls.is_empty() {
+            return Vec::new();
+        }
+        let uri = file_uri(Path::new(path));
+        let index = DocumentIndex::parse(&index_path, &source);
+        // Target files read once per request: (parse path, source).
+        let mut targets: HashMap<String, Option<(String, String)>> = HashMap::new();
+        let mut out = Vec::new();
+        for call in calls.into_iter().take(parameter_hints::MAX_CALLS) {
+            let locations = self.typescript_targets(
+                path,
+                text,
+                &uri,
+                &index,
+                call.callee_line as u64,
+                call.callee_column as u64,
+            );
+            let Some(location) = locations.first() else {
+                continue;
+            };
+            let target = targets.entry(location.uri.clone()).or_insert_with(|| {
+                if location.uri == uri {
+                    return Some((index_path.clone(), source.clone()));
+                }
+                let target = location.uri.strip_prefix("file://")?;
+                let target_text = std::fs::read_to_string(target).ok()?;
+                Some((
+                    typescript_index_path(target),
+                    component_virtual_source(target, &target_text),
+                ))
+            });
+            let Some((target_path, target_source)) = target else {
+                continue;
+            };
+            if let Some(parameters) = calls::parameters_at(
+                Path::new(target_path.as_str()),
+                target_source,
+                location.range.start_line as usize,
+                location.range.start_character as usize,
+            ) {
+                out.extend(parameter_hints::hints(&parameters, &call.arguments));
+            }
+        }
+        out.sort_by_key(|hint| (hint.line, hint.column));
+        out.dedup_by_key(|hint| (hint.line, hint.column));
+        out
+    }
+
+    /// Go to Definition targets of the script position `line`/`character`,
+    /// given the document's already parsed `index`.
+    fn typescript_targets(
+        &self,
+        path: &str,
+        text: &str,
+        uri: &str,
+        index: &DocumentIndex,
+        line: u64,
+        character: u64,
+    ) -> Vec<LspDefinitionLocation> {
         let mut locations = typescript_type_target(
             &self.typescript_navigation,
-            &path,
-            &index,
+            path,
+            index,
             line as usize,
             character as usize,
         )
@@ -2748,8 +2951,8 @@ impl Core {
         if locations.is_empty() {
             locations = typescript_import_target(
                 &self.typescript_navigation,
-                &path,
-                &index,
+                path,
+                index,
                 line as usize,
                 character as usize,
             )
@@ -2758,7 +2961,7 @@ impl Core {
         }
         if locations.is_empty()
             && let Some(location) =
-                ecmascript_primitive_type_definition(&text, line as usize, character as usize)
+                ecmascript_primitive_type_definition(text, line as usize, character as usize)
         {
             locations.push(location);
         }
@@ -2837,16 +3040,16 @@ impl Core {
         if locations.is_empty() {
             locations = typescript_decorator_option_target(
                 &self.typescript_navigation,
-                &path,
-                &index,
+                path,
+                index,
                 line as usize,
                 character as usize,
             )
             .or_else(|| {
                 typescript_call_option_target(
                     &self.typescript_navigation,
-                    &path,
-                    &index,
+                    path,
+                    index,
                     line as usize,
                     character as usize,
                 )
@@ -2857,8 +3060,8 @@ impl Core {
         if locations.is_empty() {
             locations = typescript_type_member_target(
                 &self.typescript_navigation,
-                &path,
-                &index,
+                path,
+                index,
                 line as usize,
                 character as usize,
             )
@@ -2949,34 +3152,29 @@ impl Core {
         }
         if locations.is_empty()
             && let Some(location) =
-                self.ziggy_route_definition(&path, &text, line as usize, character as usize)
+                self.ziggy_route_definition(path, text, line as usize, character as usize)
         {
             locations.push(location);
         }
         if locations.is_empty()
             && let Some(location) =
-                vite_import_meta_definition(&path, &text, line as usize, character as usize)
+                vite_import_meta_definition(path, text, line as usize, character as usize)
         {
             locations.push(location);
         }
         if locations.is_empty()
             && let Some(location) =
-                svelte_rune_definition(&path, &text, line as usize, character as usize)
+                svelte_rune_definition(path, text, line as usize, character as usize)
         {
             locations.push(location);
         }
         if locations.is_empty()
             && let Some(location) =
-                ecmascript_builtin_definition(&text, line as usize, character as usize)
+                ecmascript_builtin_definition(text, line as usize, character as usize)
         {
             locations.push(location);
         }
-        let found = !locations.is_empty();
-        self.analysis
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .set_definitions(uri, locations);
-        found
+        locations
     }
 
     /// A name in a component's template (`@click="deleteOpname(op)"`,

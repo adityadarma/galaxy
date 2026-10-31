@@ -3538,3 +3538,61 @@ fn svelte_component_package_import_goes_to_the_component_class() {
         assert_eq!((found[0].line, found[0].column), (1, 15));
     }
 }
+
+#[test]
+fn parameter_hints_follow_local_imported_and_package_callees() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("package.json"), "{}\n").unwrap();
+    std::fs::create_dir_all(root.join("node_modules/fmt")).unwrap();
+    std::fs::write(
+        root.join("node_modules/fmt/package.json"),
+        r#"{"name":"fmt","types":"./index.d.ts"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("node_modules/fmt/index.d.ts"),
+        "export declare function pad(value: string, width: number): string;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("math.ts"),
+        "export function clamp(value: number, min: number, max: number) {\n\treturn value;\n}\n",
+    )
+    .unwrap();
+    let path = root.join("Card.svelte");
+    let source = "<script lang=\"ts\">\n\timport { clamp } from './math';\n\timport { pad } from 'fmt';\n\tfunction greet(name: string, ...rest: string[]) {}\n\tconst value = 1;\n\tclamp(value, 0, 10);\n\tpad('x', 4);\n\tgreet('Ada', 'a', 'b');\n\tunknown(1);\n</script>\n\n<p>{greet('x')}</p>\n";
+    std::fs::write(&path, source).unwrap();
+    let core = Core::new();
+    let document = core
+        .open_document(path.to_string_lossy().into_owned())
+        .unwrap();
+
+    let hints = core.parameter_hints(document.clone(), 0, 20);
+    assert_eq!(hints.revision, document.revision());
+    assert!(
+        hints
+            .lines
+            .iter()
+            .all(|line| line.text == document.display_line(line.line)),
+        "each line carries the text its columns refer to"
+    );
+    let found: Vec<(u64, u64, &str)> = hints
+        .lines
+        .iter()
+        .flat_map(|line| &line.hints)
+        .map(|hint| (hint.line, hint.column, hint.label.as_str()))
+        .collect();
+    assert_eq!(
+        found,
+        vec![
+            // `value` repeats its parameter name.
+            (5, 14, "min:"),
+            (5, 17, "max:"),
+            (6, 5, "value:"),
+            (6, 10, "width:"),
+            (7, 7, "name:"),
+            (7, 14, "...rest:"),
+        ]
+    );
+}

@@ -105,6 +105,7 @@ extension MainWindowController {
             autoClosingTags = settings.effectiveAutoClosingTags
             linkedEditing = settings.effectiveLinkedEditing
         setGitBlame(settings.effectiveGitBlame)
+            setInlineParameterHints(settings.effectiveInlineParameterHints)
             if let ws = self.workspace, ws.setExplorerExcludes(globs: settings.effectiveFilesExclude) {
                 explorer.refresh()
             }

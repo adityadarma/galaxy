@@ -14,6 +14,8 @@ struct GalaxySettings: Equatable {
     var linkedEditing: Bool? = nil
     /// Author and age of the caret line, after the text (`editor.gitBlame`).
     var gitBlame: Bool? = nil
+    /// Parameter names before call arguments (`editor.inlineParameterHints`).
+    var inlineParameterHints: Bool? = nil
     /// `files.exclude` as written in the file: glob to on/off. Entries are
     /// layered over `defaultFilesExclude`, so `false` turns a default off.
     var filesExclude: [String: Bool]? = nil
@@ -36,6 +38,7 @@ struct GalaxySettings: Equatable {
             autoClosingTags: override.autoClosingTags ?? autoClosingTags,
             linkedEditing: override.linkedEditing ?? linkedEditing,
             gitBlame: override.gitBlame ?? gitBlame,
+            inlineParameterHints: override.inlineParameterHints ?? inlineParameterHints,
             filesExclude: filesExclude.map { $0.merging(override.filesExclude ?? [:]) { _, new in new } }
                 ?? override.filesExclude
         )
@@ -45,6 +48,7 @@ struct GalaxySettings: Equatable {
     var effectiveAutoClosingTags: Bool { autoClosingTags ?? true }
     var effectiveLinkedEditing: Bool { linkedEditing ?? true }
     var effectiveGitBlame: Bool { gitBlame ?? true }
+    var effectiveInlineParameterHints: Bool { inlineParameterHints ?? true }
     /// Globs the explorer hides: the defaults, then the file's entries on top.
     var effectiveFilesExclude: [String] {
         var all = Dictionary(uniqueKeysWithValues: Self.defaultFilesExclude.map { ($0, true) })
@@ -96,6 +100,7 @@ struct GalaxySettings: Equatable {
                               autoClosingTags: editor["autoClosingTags"] as? Bool,
                               linkedEditing: editor["linkedEditing"] as? Bool,
                               gitBlame: editor["gitBlame"] as? Bool,
+                              inlineParameterHints: editor["inlineParameterHints"] as? Bool,
                               filesExclude: filesExclude)
     }
 
@@ -108,6 +113,7 @@ struct GalaxySettings: Equatable {
             CompletionInfo(label: "autoClosingTags", detail: "boolean: add </tag> after > (HTML, PHP, JSX)", insertText: "autoClosingTags", isSnippet: false),
             CompletionInfo(label: "linkedEditing", detail: "boolean: rename the matching tag", insertText: "linkedEditing", isSnippet: false),
             CompletionInfo(label: "gitBlame", detail: "boolean: show who last changed the caret line", insertText: "gitBlame", isSnippet: false),
+            CompletionInfo(label: "inlineParameterHints", detail: "boolean: show parameter names before call arguments", insertText: "inlineParameterHints", isSnippet: false),
             CompletionInfo(label: "files.autoSave", detail: "off | afterDelay | onFocusChange", insertText: "files.autoSave", isSnippet: false),
             CompletionInfo(label: "files.autoSaveDelay", detail: "milliseconds", insertText: "files.autoSaveDelay", isSnippet: false),
             CompletionInfo(label: "files.exclude", detail: "object: globs hidden in the explorer, e.g. {\"**/.git\": true}", insertText: "files.exclude", isSnippet: false),
@@ -142,6 +148,7 @@ extension GalaxySettings {
     /// Keys `load` also accepts at the top level instead of under `editor`.
     private static let editorKeys: Set<String> = [
         "insertSpaces", "tabSize", "renderWhitespace", "autoClosingTags", "linkedEditing", "gitBlame",
+        "inlineParameterHints",
     ]
 
     /// Sets `section.key` in the settings file at `url` (the Settings window
