@@ -268,9 +268,10 @@ extension MainWindowController {
         path.isEmpty ? nil : URL(fileURLWithPath: path).resolvingSymlinksInPath().standardizedFileURL.path
     }
 
-    func tabIndex(forPath path: String) -> Int? {
+    /// The plain tab of a file, or with `diff` its working-tree diff tab.
+    func tabIndex(forPath path: String, diff: Bool = false) -> Int? {
         guard let key = Self.fileKey(path) else { return nil }
-        return tabs.firstIndex { $0.fileKey == key }
+        return tabs.firstIndex { $0.fileKey == key && ($0.diffBase != nil) == diff }
     }
 
     /// Shows the shortcut hints over the editor, or hides them.

@@ -275,7 +275,8 @@ extension MainWindowController {
 
     /// Opens `relPath` beside its committed version (left, read-only) and the
     /// working copy (right, editable). A file with no committed version opens
-    /// as a normal tab. A tab already open for the file turns into the diff.
+    /// as a normal tab. The diff gets its own tab, shared document with the
+    /// file's plain tab, which stays as it is.
     func openWorkspaceDiff(_ workspace: Workspace, relPath: String) {
         let name = (relPath as NSString).lastPathComponent
         guard let base = (try? workspace.gitBaseDocument(relPath: relPath)) ?? nil else {
@@ -283,7 +284,7 @@ extension MainWindowController {
         }
         diffRevealPending = true
         let path = URL(fileURLWithPath: workspace.root()).appendingPathComponent(relPath).path
-        if let i = tabIndex(forPath: path) {
+        if let i = tabIndex(forPath: path, diff: true) {
             tabs[i].isPreview = false
             tabs[i].diffBase = base
             if activeIndex == i {

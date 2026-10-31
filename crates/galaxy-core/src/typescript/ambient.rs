@@ -44,6 +44,52 @@ pub(super) fn collect_global_names(root: Node<'_>, text: &str) -> Vec<String> {
     names
 }
 
+/// Exported declarations of every `declare module 'name' { ... }` block,
+/// paired with the module name.
+pub(super) fn collect_ambient_module_exports(
+    root: Node<'_>,
+    text: &str,
+    locations: &Locations,
+) -> Vec<(String, Declaration)> {
+    let mut found = Vec::new();
+    let mut cursor = root.walk();
+    for node in root.named_children(&mut cursor) {
+        if node.kind() != "ambient_declaration" {
+            continue;
+        }
+        let mut children = node.walk();
+        for module in node.named_children(&mut children) {
+            if module.kind() != "module" {
+                continue;
+            }
+            let Some(name) = module
+                .child_by_field_name("name")
+                .filter(|name| name.kind() == "string")
+                .and_then(|name| node_text(text, name))
+            else {
+                continue;
+            };
+            let name = name.trim_matches(['\'', '"']);
+            let Some(body) = module.child_by_field_name("body") else {
+                continue;
+            };
+            let mut statements = body.walk();
+            for statement in body.named_children(&mut statements) {
+                if statement.kind() != "export_statement" {
+                    continue;
+                }
+                let mut items = statement.walk();
+                for item in statement.named_children(&mut items) {
+                    for declaration in declarations_from_node(item, true, false, text, locations) {
+                        found.push((name.to_owned(), declaration));
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
 fn collect_ambient(node: Node<'_>, text: &str, is_module: bool, names: &mut Vec<String>) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {

@@ -3418,3 +3418,123 @@ fn typescript_reports_no_unknown_names_when_globals_are_not_knowable() {
     .unwrap();
     assert!(unknown_name_reports(nuxt.path(), "missingValue;\n").is_empty());
 }
+
+#[test]
+fn svelte_runes_resolve_to_the_svelte_package_declarations() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("package.json"), "{}\n").unwrap();
+    std::fs::create_dir_all(root.join("node_modules/svelte/types")).unwrap();
+    std::fs::write(
+        root.join("node_modules/svelte/types/index.d.ts"),
+        "declare function $state<T>(initial: T): T;\n\n\
+         declare function $props(): any;\ndeclare namespace $props {\n}\n",
+    )
+    .unwrap();
+    let path = root.join("+layout.svelte");
+    let source = "<script lang=\"ts\">\n\tlet { children } = $props();\n\tlet n = $state(0);\n</script>\n\n<main>\n\t{@render children()}\n</main>\n";
+    std::fs::write(&path, source).unwrap();
+    let core = Core::new();
+    let document = core
+        .open_document(path.to_string_lossy().into_owned())
+        .unwrap();
+
+    assert!(core.request_definition(document.clone(), 1, 22));
+    let props = core.definition_locations(document.clone());
+    assert!(
+        props[0]
+            .uri
+            .ends_with("node_modules/svelte/types/index.d.ts")
+    );
+    assert_eq!((props[0].line, props[0].column), (2, 17));
+    assert!(core.request_definition(document.clone(), 2, 12));
+    let state = core.definition_locations(document.clone());
+    assert_eq!((state[0].line, state[0].column), (0, 17));
+
+    // `children` in the template goes to the destructured prop.
+    assert!(core.request_definition(document.clone(), 6, 12));
+    let children = core.definition_locations(document.clone());
+    assert!(children[0].uri.ends_with("+layout.svelte"));
+    assert_eq!(children[0].line, 1);
+}
+
+#[test]
+fn svelte_import_from_a_declare_module_block_goes_to_the_exported_declaration() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("package.json"), "{}\n").unwrap();
+    std::fs::create_dir_all(root.join("node_modules/svelte/types")).unwrap();
+    std::fs::write(
+        root.join("node_modules/svelte/package.json"),
+        r#"{"name":"svelte","types":"./types/index.d.ts","exports":{".":{"types":"./types/index.d.ts"},"./transition":{"types":"./types/index.d.ts"}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("node_modules/svelte/types/index.d.ts"),
+        "/// <reference types=\"esrap\" />\n\ndeclare module 'svelte' {\n\t/** docs */\n\texport function onMount<T>(fn: () => T): void;\n\texport interface ComponentConstructorOptions {}\n}\n\ndeclare module 'svelte/transition' {\n\texport function fly(node: Element): void;\n}\n",
+    )
+    .unwrap();
+    let path = root.join("Page.svelte");
+    let source = "<script lang=\"ts\">\n\timport { onMount } from 'svelte';\n\timport { fly } from 'svelte/transition';\n\tonMount(() => {});\n\tfly(null);\n</script>\n";
+    std::fs::write(&path, source).unwrap();
+    let core = Core::new();
+    let document = core
+        .open_document(path.to_string_lossy().into_owned())
+        .unwrap();
+    let locate = |line: u64, column: u64| {
+        let found = core.request_definition(document.clone(), line, column);
+        assert!(found, "no definition at {line}:{column}");
+        core.definition_locations(document.clone())
+    };
+    let mount = locate(3, 3);
+    assert!(mount[0].uri.ends_with("svelte/types/index.d.ts"));
+    assert_eq!(mount[0].line, 4);
+    let mount_import = locate(1, 12);
+    assert_eq!(mount_import[0].line, 4);
+    let fly = locate(4, 2);
+    assert_eq!(fly[0].line, 9);
+}
+
+#[test]
+fn svelte_component_package_import_goes_to_the_component_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("package.json"), "{}\n").unwrap();
+    let dist = root.join("node_modules/icons/dist");
+    std::fs::create_dir_all(dist.join("icons")).unwrap();
+    std::fs::write(
+        root.join("node_modules/icons/package.json"),
+        r#"{"name":"icons","exports":{".":{"types":"./dist/index.d.ts","svelte":"./dist/index.js"}}}"#,
+    )
+    .unwrap();
+    std::fs::write(dist.join("index.d.ts"), "export * from './icons/index';\n").unwrap();
+    std::fs::write(
+        dist.join("icons/index.d.ts"),
+        "export { default as Github } from './github.svelte';\n",
+    )
+    .unwrap();
+    std::fs::write(dist.join("icons/github.svelte"), "<svg></svg>\n").unwrap();
+    std::fs::write(
+        dist.join("icons/github.svelte.d.ts"),
+        "import { SvelteComponentTyped } from \"svelte\";\nexport default class Github extends SvelteComponentTyped {\n}\n",
+    )
+    .unwrap();
+    let path = root.join("Card.svelte");
+    let source =
+        "<script lang=\"ts\">\n\timport { Github } from 'icons';\n</script>\n\n<Github />\n";
+    std::fs::write(&path, source).unwrap();
+    let core = Core::new();
+    let document = core
+        .open_document(path.to_string_lossy().into_owned())
+        .unwrap();
+
+    for (line, column) in [(1, 11), (4, 2)] {
+        assert!(core.request_definition(document.clone(), line, column));
+        let found = core.definition_locations(document.clone());
+        assert!(
+            found[0].uri.ends_with("icons/github.svelte.d.ts"),
+            "{found:?}"
+        );
+        assert_eq!((found[0].line, found[0].column), (1, 15));
+    }
+}

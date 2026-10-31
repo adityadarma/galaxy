@@ -202,6 +202,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             enterNextFullScreen()
             return
         }
+        // A window shown while another one is full screen joins that Space.
+        // Windows that were not full screen wait for the full-screen
+        // transitions to end, then leave for a regular desktop.
+        if pendingWindowSessions[0].fullScreen != true, fullScreenPending != nil || !fullScreenQueue.isEmpty {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                MainActor.assumeIsolated { self?.restoreNextPendingWindow() }
+            }
+            return
+        }
         let session = pendingWindowSessions.removeFirst()
         if let root = session.workspace,
            let existing = windowController(forWorkspaceAt: root) {
@@ -210,6 +219,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             restoreNextPendingWindow()
             return
         }
+        let fromFullScreen = session.fullScreen != true && isAnyWindowFullScreen
         let controller = makeWindowController()
         if !controller.restore(session) { controller.newDocument(nil) }
         showMainWindow(controller, concealedForFullScreen: session.fullScreen == true)
@@ -217,8 +227,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             fullScreenQueue.append(window)
             enterNextFullScreen()
         }
-        DispatchQueue.main.async { [weak self] in
-            self?.restoreNextPendingWindow()
+        // The next window is restored once this one has left the full-screen
+        // Space, so two transitions never overlap.
+        moveToRegularDesktop(controller, fromFullScreen) { [weak self] in
+            DispatchQueue.main.async { self?.restoreNextPendingWindow() }
         }
     }
 
@@ -299,18 +311,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         activeWindowController?.window?.styleMask.contains(.fullScreen) == true
     }
 
+    private var isAnyWindowFullScreen: Bool {
+        windowControllers.contains { $0.window?.styleMask.contains(.fullScreen) == true }
+    }
+
     /// A window shown while another one is full screen joins that Space.
     /// AppKit has no switch to refuse that, so the window enters full screen
     /// and leaves it again: on exit, macOS puts it on a regular desktop.
-    private func moveToRegularDesktop(_ controller: MainWindowController, _ fromFullScreen: Bool) {
+    private func moveToRegularDesktop(
+        _ controller: MainWindowController,
+        _ fromFullScreen: Bool,
+        completion: (() -> Void)? = nil
+    ) {
         guard fromFullScreen, let window = controller.window,
-              !window.styleMask.contains(.fullScreen) else { return }
-        var token: NSObjectProtocol?
-        token = NotificationCenter.default.addObserver(
+              !window.styleMask.contains(.fullScreen) else {
+            completion?()
+            return
+        }
+        let finish = FullScreenExit(completion: completion)
+        var enterToken: NSObjectProtocol?
+        enterToken = NotificationCenter.default.addObserver(
             forName: NSWindow.didEnterFullScreenNotification, object: window, queue: .main
         ) { _ in
-            if let token { NotificationCenter.default.removeObserver(token) }
+            if let enterToken { NotificationCenter.default.removeObserver(enterToken) }
+            var exitToken: NSObjectProtocol?
+            exitToken = NotificationCenter.default.addObserver(
+                forName: NSWindow.didExitFullScreenNotification, object: window, queue: .main
+            ) { _ in
+                if let exitToken { NotificationCenter.default.removeObserver(exitToken) }
+                MainActor.assumeIsolated { finish.run() }
+            }
             MainActor.assumeIsolated { window.toggleFullScreen(nil) }
+        }
+        // If a transition never reports, do not stall the windows behind it.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+            MainActor.assumeIsolated { finish.run() }
         }
         window.toggleFullScreen(nil)
     }
@@ -361,5 +396,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         return windowControllers.first {
             $0 !== excluded && MainWindowController.fileKey($0.workspace?.root() ?? "") == root
         }
+    }
+}
+
+/// Runs a completion handler once, however many signals report the end of a
+/// window's trip through full screen.
+@MainActor
+private final class FullScreenExit {
+    private var completion: (() -> Void)?
+
+    init(completion: (() -> Void)?) { self.completion = completion }
+
+    func run() {
+        let handler = completion
+        completion = nil
+        handler?()
     }
 }

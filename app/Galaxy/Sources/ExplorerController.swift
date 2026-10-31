@@ -918,6 +918,7 @@ enum FileGlyph {
         case "py": ("python", "p.square.fill", .labelColor)
         case "go": ("go", "doc", .labelColor)
         case "vue": ("vue", "v.square.fill", .labelColor)
+        case "svelte": ("svelte", "s.square.fill", .labelColor)
         case "prisma": ("prisma", "cylinder", .labelColor)
         case "c", "h", "cpp", "hpp", "m", "mm": (nil, "c.square.fill", .systemIndigo)
         case "png", "jpg", "jpeg", "gif", "svg", "webp", "icns": ("image", "photo", .labelColor)

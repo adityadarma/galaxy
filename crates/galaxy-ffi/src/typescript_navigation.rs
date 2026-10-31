@@ -160,6 +160,17 @@ pub(super) fn typescript_resolution_dependencies(
 
 pub(super) fn prefer_typescript_declaration(target: PathBuf) -> PathBuf {
     let declaration = target.with_extension("d.ts");
+    // Component packages (`lucide-svelte`) ship `github.svelte` beside its
+    // typed `github.svelte.d.ts`; the declaration names the component class.
+    if target
+        .extension()
+        .is_some_and(|extension| matches!(extension.to_str(), Some("svelte" | "vue")))
+    {
+        let mut typed = target.clone().into_os_string();
+        typed.push(".d.ts");
+        let typed = PathBuf::from(typed);
+        return if typed.is_file() { typed } else { target };
+    }
     if target
         .extension()
         .is_some_and(|extension| extension == "js")
@@ -233,6 +244,7 @@ pub(super) fn typescript_import_target(
                     range: typescript_range(declaration.range),
                 })
         })
+        .or_else(|| ambient_module_location(cache, &target_path, &import.specifier, imported_name))
         .unwrap_or_else(|| module_root_location(&target_path));
     Some((location, occurrences.occurrences))
 }
@@ -280,6 +292,7 @@ pub(super) fn typescript_type_target(
                 uri: file_uri(&path),
                 range: typescript_range(declaration.range),
             })
+            .or_else(|| ambient_module_location(cache, &target, &import.specifier, imported_name))
             .unwrap_or_else(|| module_root_location(&target)),
     )
 }
@@ -926,6 +939,24 @@ fn unique_type_member_location(
     Some(LspDefinitionLocation {
         uri: file_uri(path),
         range: typescript_range(member.range),
+    })
+}
+
+/// An export that `target` declares inside `declare module 'specifier' { }`.
+pub(super) fn ambient_module_location(
+    cache: &Mutex<TypeScriptNavigationCache>,
+    target: &Path,
+    specifier: &str,
+    name: &str,
+) -> Option<LspDefinitionLocation> {
+    let index = cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .index(target)?;
+    let declaration = index.ambient_module_export(specifier, name)?;
+    Some(LspDefinitionLocation {
+        uri: file_uri(target),
+        range: typescript_range(declaration.range),
     })
 }
 

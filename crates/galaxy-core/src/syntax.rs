@@ -584,6 +584,7 @@ const JAVASCRIPT_HIGHLIGHTS: &str = r#"
 (number) @number
 [(true) (false) (null) (undefined)] @constant
 (identifier) @variable
+(shorthand_property_identifier_pattern) @variable
 (property_identifier) @property
 (private_property_identifier) @property
 (function_declaration name: (identifier) @function)
@@ -937,8 +938,19 @@ fn svelte_overlay(
         blocks: Vec::new(),
     };
     scan.walk(tree.root_node());
+    scan.tags();
     scan.braced_expressions();
     let mut overlay = scan.overlay;
+    // Claims come from tags and braces separately; `subtract` needs them
+    // sorted and disjoint.
+    overlay.claimed.sort_unstable();
+    overlay.claimed.dedup_by(|next, kept| {
+        let overlaps = next.0 <= kept.1;
+        if overlaps {
+            kept.1 = kept.1.max(next.1);
+        }
+        overlaps
+    });
     overlay.spans.retain_mut(|span| {
         span.0 = span.0.max(start_byte);
         span.1 = span.1.min(end_byte);
@@ -1117,6 +1129,9 @@ impl VueScan<'_> {
     }
 }
 
+/// Largest document whose markup is scanned from the top for tag attributes.
+const MAX_TAG_SCAN_BYTES: usize = 512 * 1024;
+
 struct SvelteScan<'a> {
     rope: &'a Rope,
     window: (usize, usize),
@@ -1136,6 +1151,98 @@ impl SvelteScan<'_> {
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             self.walk(child);
+        }
+    }
+
+    fn claim(&mut self, from: usize, to: usize, scope: HighlightScope) {
+        if from < to && to > self.window.0 && from < self.window.1 {
+            self.overlay.claimed.push((from, to));
+            self.overlay.spans.push((from, to, scope));
+        }
+    }
+
+    /// Attribute names and values of every start tag in the window. The HTML
+    /// grammar ends a tag at the `>` of `onclick={() => f()}` and splits
+    /// `on:x={{ a: 'b' }}` at its spaces, losing the attributes that follow,
+    /// so the markup is scanned as text: scripts, styles, comments and
+    /// braced expressions are skipped, the rest is read tag by tag.
+    fn tags(&mut self) {
+        // A tag can start above the window, so read from the top of the file
+        // (components are small; huge files fall back to the window).
+        let whole = self.rope.len_bytes() <= MAX_TAG_SCAN_BYTES;
+        let (base, end) = if whole {
+            (0, self.rope.len_bytes())
+        } else {
+            self.window
+        };
+        let Some(text) = text_between(self.rope, base, end) else {
+            return;
+        };
+        let bytes = text.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => {
+                    i = find_balanced_close(&text, i + 1, "}").map_or(i + 1, |close| close + 1);
+                }
+                b'<' if text[i..].starts_with("<!--") => {
+                    i = text[i..].find("-->").map_or(bytes.len(), |end| i + end + 3);
+                }
+                b'<' if bytes.get(i + 1) == Some(&b'/')
+                    && bytes.get(i + 2).is_some_and(u8::is_ascii_alphabetic) =>
+                {
+                    let Some(end) = text[i..].find('>').map(|at| i + at) else {
+                        i += 1;
+                        continue;
+                    };
+                    let name_end = text[i + 2..end]
+                        .find(char::is_whitespace)
+                        .map_or(end, |at| i + 2 + at);
+                    self.claim(base + i, base + i + 2, HighlightScope::Punctuation);
+                    self.claim(base + i + 2, base + name_end, HighlightScope::Tag);
+                    self.claim(base + end, base + end + 1, HighlightScope::Punctuation);
+                    i = end + 1;
+                }
+                b'<' if bytes.get(i + 1).is_some_and(u8::is_ascii_alphabetic) => {
+                    let name_end = text[i + 1..]
+                        .find(|c: char| c.is_whitespace() || matches!(c, '>' | '/'))
+                        .map_or(bytes.len(), |at| i + 1 + at);
+                    let name = &text[i + 1..name_end];
+                    let (attributes, length) = svelte_tag_attributes(&text[i..]);
+                    for (from, to, scope) in attributes {
+                        self.claim(base + i + from, base + i + to, scope);
+                    }
+                    if length > 1 {
+                        // The HTML grammar loses names and brackets after a
+                        // tag it mis-parses, so they are claimed here too.
+                        self.claim(base + i, base + i + 1, HighlightScope::Punctuation);
+                        self.claim(base + i + 1, base + name_end, HighlightScope::Tag);
+                        let close = base + i + length;
+                        let width = if text[..i + length].ends_with("/>") {
+                            2
+                        } else {
+                            1
+                        };
+                        self.claim(close - width, close, HighlightScope::Punctuation);
+                    }
+                    i += length.max(1);
+                    // Script and style bodies are code, not markup.
+                    let closing = if name.eq_ignore_ascii_case("script") {
+                        Some("</script")
+                    } else if name.eq_ignore_ascii_case("style") {
+                        Some("</style")
+                    } else {
+                        None
+                    };
+                    if let Some(closing) = closing
+                        && length > 1
+                        && !text[..i].ends_with("/>")
+                    {
+                        i = text[i..].find(closing).map_or(bytes.len(), |at| i + at);
+                    }
+                }
+                _ => i += 1,
+            }
         }
     }
 
@@ -1212,6 +1319,19 @@ impl SvelteScan<'_> {
             return;
         };
         let expression = svelte_expression(&expr);
+        // The expression follows the block keyword (`@render`, `#if`), so its
+        // bytes start `shift` bytes after the opening brace.
+        let shift = expression.as_ptr() as usize - expr.as_ptr() as usize;
+        if let Some(keyword) = svelte_keyword(&expr) {
+            self.overlay.spans.push((
+                from + keyword.start,
+                from + keyword.end,
+                HighlightScope::Keyword,
+            ));
+        }
+        if let Some(each) = svelte_each_parts(&expr) {
+            self.each_parts(&expr, from, &each);
+        }
         if expression.trim().is_empty() {
             return;
         }
@@ -1223,9 +1343,43 @@ impl SvelteScan<'_> {
             SyntaxLanguage::JavaScript,
             &wrapped,
             &tree,
-            from.saturating_sub(1),
-            (from, to),
+            (from + shift).saturating_sub(1),
+            (from + shift, to),
         );
+    }
+
+    /// `as item, index (key)` of an `{#each}` block: the `as` keyword, the
+    /// binding pattern (parsed as function parameters) and the key expression.
+    fn each_parts(&mut self, expr: &str, from: usize, each: &SvelteEach) {
+        self.overlay.spans.push((
+            from + each.as_keyword.start,
+            from + each.as_keyword.end,
+            HighlightScope::Keyword,
+        ));
+        const PREFIX: &str = "(function(";
+        let binding = &expr[each.binding.clone()];
+        let wrapped = format!("{PREFIX}{binding}){{}})");
+        if let Some(tree) = cached_parse(SyntaxLanguage::JavaScript, &wrapped) {
+            let start = from + each.binding.start;
+            self.captures(
+                SyntaxLanguage::JavaScript,
+                &wrapped,
+                &tree,
+                start.saturating_sub(PREFIX.len()),
+                (start, from + each.binding.end),
+            );
+        }
+        if let Some(key) = &each.key
+            && let Some(tree) = cached_parse(SyntaxLanguage::JavaScript, &expr[key.clone()])
+        {
+            self.captures(
+                SyntaxLanguage::JavaScript,
+                &expr[key.clone()],
+                &tree,
+                from + key.start,
+                (from + key.start, from + key.end),
+            );
+        }
     }
 
     fn captures(
@@ -1258,24 +1412,180 @@ impl SvelteScan<'_> {
     }
 }
 
+/// Attribute names (`Attribute`) and plain or quoted values (`String`) of one
+/// start tag, as byte ranges within `tag`, plus the tag's length. Braced
+/// values are left to the template-expression pass. A tag without its closing
+/// `>` (half typed, or `a<b` in text) yields nothing and a length of 1.
+fn svelte_tag_attributes(tag: &str) -> (Vec<(usize, usize, HighlightScope)>, usize) {
+    let bytes = tag.as_bytes();
+    let mut out = Vec::new();
+    if bytes.first() != Some(&b'<') {
+        return (out, 1);
+    }
+    let is_space = |byte: u8| byte.is_ascii_whitespace();
+    let skip_braces = |at: usize| find_balanced_close(tag, at + 1, "}").map(|close| close + 1);
+    let mut i = 1;
+    while i < bytes.len() && !is_space(bytes[i]) && !matches!(bytes[i], b'>' | b'/') {
+        i += 1;
+    }
+    let mut terminated = false;
+    while i < bytes.len() {
+        if is_space(bytes[i]) || bytes[i] == b'/' {
+            i += 1;
+            continue;
+        }
+        match bytes[i] {
+            b'>' => {
+                terminated = true;
+                i += 1;
+                break;
+            }
+            b'{' => match skip_braces(i) {
+                Some(next) => i = next,
+                None => break,
+            },
+            _ => {
+                let start = i;
+                while i < bytes.len()
+                    && !is_space(bytes[i])
+                    && !matches!(bytes[i], b'=' | b'>' | b'/' | b'{')
+                {
+                    i += 1;
+                }
+                if i == start {
+                    i += 1;
+                    continue;
+                }
+                out.push((start, i, HighlightScope::Attribute));
+                let mut equals = i;
+                while equals < bytes.len() && is_space(bytes[equals]) {
+                    equals += 1;
+                }
+                if bytes.get(equals) != Some(&b'=') {
+                    continue;
+                }
+                i = equals + 1;
+                while i < bytes.len() && is_space(bytes[i]) {
+                    i += 1;
+                }
+                match bytes.get(i) {
+                    Some(&quote @ (b'"' | b'\'')) => {
+                        let Some(close) = tag[i + 1..].find(quote as char) else {
+                            break;
+                        };
+                        let end = i + 1 + close + 1;
+                        out.push((i, end, HighlightScope::String));
+                        i = end;
+                    }
+                    Some(b'{') => match skip_braces(i) {
+                        Some(next) => i = next,
+                        None => break,
+                    },
+                    Some(_) => {
+                        let value = i;
+                        while i < bytes.len() && !is_space(bytes[i]) && bytes[i] != b'>' {
+                            i += 1;
+                        }
+                        out.push((value, i, HighlightScope::String));
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+    if terminated {
+        (out, i)
+    } else {
+        (Vec::new(), 1)
+    }
+}
+
+/// Block keywords that precede the JavaScript of a Svelte braced construct.
+/// `:else if` comes before `:else` so the longer form wins.
+const SVELTE_KEYWORDS: [&str; 18] = [
+    "#each", "#if", "#key", "#snippet", "#await", ":else if", ":else", ":then", ":catch", "/each",
+    "/if", "/key", "/snippet", "/await", "@html", "@const", "@render", "@debug",
+];
+
+/// Byte range of the block keyword (`@render`, `#if`) that starts `text`.
+fn svelte_keyword(text: &str) -> Option<std::ops::Range<usize>> {
+    let start = text.len() - text.trim_start().len();
+    let rest = &text[start..];
+    SVELTE_KEYWORDS
+        .iter()
+        .find(|keyword| {
+            rest.strip_prefix(**keyword)
+                .is_some_and(|tail| !tail.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
+        })
+        .map(|keyword| start..start + keyword.len())
+}
+
 /// Returns the JS expression within a Svelte braced construct. Prefixes are
 /// markup syntax; the remainder is parsed by the JavaScript grammar.
 fn svelte_expression(text: &str) -> &str {
-    let text = text.trim_start();
-    if let Some(rest) = text.strip_prefix("#each") {
-        return rest.trim_start().split_once(" as ").map_or_else(
-            || rest.trim_start(),
-            |(expression, _)| expression.trim_end(),
-        );
+    let Some(keyword) = svelte_keyword(text) else {
+        return text.trim_start();
+    };
+    let rest = text[keyword.end..].trim_start();
+    if &text[keyword] == "#each" {
+        return rest
+            .split_once(" as ")
+            .map_or(rest, |(expression, _)| expression.trim_end());
     }
-    for prefix in [
-        "#if", ":else if", "#await", ":then", ":catch", "@html", "@const",
-    ] {
-        if let Some(rest) = text.strip_prefix(prefix) {
-            return rest.trim_start();
+    rest
+}
+
+/// Byte ranges, within the braces' text, of the parts after `as` in `{#each}`.
+struct SvelteEach {
+    as_keyword: std::ops::Range<usize>,
+    binding: std::ops::Range<usize>,
+    key: Option<std::ops::Range<usize>>,
+}
+
+/// Splits `#each items as item, index (key)` into its `as` keyword, binding
+/// pattern and parenthesised key. `None` for other constructs or without `as`.
+fn svelte_each_parts(expr: &str) -> Option<SvelteEach> {
+    let keyword = svelte_keyword(expr)?;
+    if &expr[keyword.clone()] != "#each" {
+        return None;
+    }
+    let as_at = expr[keyword.end..].find(" as ")? + keyword.end + 1;
+    let tail_start = as_at + 2;
+    let tail = expr[tail_start..].trim_end();
+    let lead = tail.len() - tail.trim_start().len();
+    let binding_start = tail_start + lead;
+    let mut binding_end = tail_start + tail.len();
+    let mut key = None;
+    if tail.ends_with(')') {
+        let mut depth = 0usize;
+        let open = tail
+            .bytes()
+            .enumerate()
+            .rev()
+            .find_map(|(i, byte)| match byte {
+                b')' => {
+                    depth += 1;
+                    None
+                }
+                b'(' => {
+                    depth -= 1;
+                    (depth == 0).then_some(i)
+                }
+                _ => None,
+            });
+        if let Some(open) = open
+            && tail_start + open > binding_start
+        {
+            key = Some(tail_start + open..tail_start + tail.len());
+            binding_end = tail_start + open;
         }
     }
-    text
+    let binding_end = binding_start + expr[binding_start..binding_end].trim_end().len();
+    (binding_start < binding_end).then_some(SvelteEach {
+        as_keyword: as_at..as_at + 2,
+        binding: binding_start..binding_end,
+        key,
+    })
 }
 
 /// Finds a delimiter outside JavaScript strings, comments, template literals,
@@ -2742,6 +3052,212 @@ mod tests {
         assert!(has("color", HighlightScope::Property), "{runs:?}");
         assert!(has("total", HighlightScope::Variable), "{runs:?}");
         assert!(has("count", HighlightScope::Variable), "{runs:?}");
+    }
+
+    #[test]
+    fn svelte_render_and_html_tags_highlight_keyword_and_expression() {
+        let src = "<script>let { children } = $props();</script>\n{@render children()}\n{@html raw}\n{#if ready}x{/if}";
+        let doc = Document::from_text(src);
+        let mut parser = Parser::new();
+        parser
+            .set_language(&SyntaxLanguage::Svelte.grammar())
+            .unwrap();
+        let tree = parser.parse(doc.text(), None).unwrap();
+        let runs = style_runs_for_viewport(&doc, &tree, SyntaxLanguage::Svelte, 0, 6);
+        let has = |text: &str, nth: usize, scope: HighlightScope| {
+            let start = src.match_indices(text).nth(nth).unwrap().0;
+            let end = start + text.len();
+            runs.iter().any(|run| {
+                let line_start = doc.rope().line_to_byte(run.line);
+                run.scope == scope && line_start + run.start == start && line_start + run.end == end
+            })
+        };
+        assert!(has("@render", 0, HighlightScope::Keyword), "{runs:?}");
+        assert!(has("@html", 0, HighlightScope::Keyword), "{runs:?}");
+        assert!(has("#if", 0, HighlightScope::Keyword), "{runs:?}");
+        assert!(has("raw", 0, HighlightScope::Variable), "{runs:?}");
+        assert!(has("children", 1, HighlightScope::Function), "{runs:?}");
+        // No run may start inside the keyword itself.
+        assert!(!has("render", 0, HighlightScope::Variable), "{runs:?}");
+    }
+
+    #[test]
+    fn svelte_each_binding_key_and_closing_tags_are_highlighted() {
+        let src = "{#each entries as entry, idx (entry.uid)}\n{#each rows as { label }}{label}{/each}\n{/each}\n{#if a}x{:else if b}y{:else}z{/if}";
+        let doc = Document::from_text(src);
+        let mut parser = Parser::new();
+        parser
+            .set_language(&SyntaxLanguage::Svelte.grammar())
+            .unwrap();
+        let tree = parser.parse(doc.text(), None).unwrap();
+        let runs = style_runs_for_viewport(&doc, &tree, SyntaxLanguage::Svelte, 0, 5);
+        let at = |text: &str, nth: usize| {
+            let start = src.match_indices(text).nth(nth).unwrap().0;
+            runs.iter()
+                .filter(|run| {
+                    let line_start = doc.rope().line_to_byte(run.line);
+                    line_start + run.start == start && line_start + run.end == start + text.len()
+                })
+                .map(|run| run.scope)
+                .collect::<Vec<_>>()
+        };
+        assert!(at(" as ", 0).is_empty());
+        assert!(at("as", 0).contains(&HighlightScope::Keyword), "{runs:?}");
+        assert!(at("as", 1).contains(&HighlightScope::Keyword), "{runs:?}");
+        // Binding, index and key expression are all coloured.
+        assert!(
+            at("entry", 0).contains(&HighlightScope::Variable),
+            "{runs:?}"
+        );
+        assert!(at("idx", 0).contains(&HighlightScope::Variable), "{runs:?}");
+        assert!(
+            at("entry", 1).contains(&HighlightScope::Variable),
+            "{runs:?}"
+        );
+        assert!(at("uid", 0).contains(&HighlightScope::Property), "{runs:?}");
+        // Destructured binding.
+        assert!(
+            at("label", 0).contains(&HighlightScope::Variable),
+            "{runs:?}"
+        );
+        // `:else` first matches the start of `:else if`, so take its second hit.
+        for (closing, nth) in [("/each", 0), ("/if", 0), (":else if", 0), (":else", 1)] {
+            assert!(
+                at(closing, nth).contains(&HighlightScope::Keyword),
+                "{closing}: {runs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn svelte_attributes_after_braced_objects_keep_their_colors() {
+        let src = "<div\n\tin:receive={{ key: 'a b' }}\n\tout:send={{ key: 'a b' }}\n\tclass=\"x y\"\n\taria-label=\"Toggle menu\"\n\tdisabled\n\tid=main\n></div>\n<Languages size={14} />";
+        let doc = Document::from_text(src);
+        let mut parser = Parser::new();
+        parser
+            .set_language(&SyntaxLanguage::Svelte.grammar())
+            .unwrap();
+        let tree = parser.parse(doc.text(), None).unwrap();
+        let runs = style_runs_for_viewport(&doc, &tree, SyntaxLanguage::Svelte, 0, 12);
+        let at = |text: &str| {
+            let start = src.find(text).unwrap();
+            runs.iter()
+                .filter(|run| {
+                    let line_start = doc.rope().line_to_byte(run.line);
+                    line_start + run.start == start && line_start + run.end == start + text.len()
+                })
+                .map(|run| run.scope)
+                .collect::<Vec<_>>()
+        };
+        for name in [
+            "in:receive",
+            "out:send",
+            "class",
+            "aria-label",
+            "disabled",
+            "id",
+            "size",
+        ] {
+            assert!(
+                at(name).contains(&HighlightScope::Attribute),
+                "{name}: {runs:?}"
+            );
+        }
+        for value in ["\"x y\"", "\"Toggle menu\"", "main"] {
+            assert!(
+                at(value).contains(&HighlightScope::String),
+                "{value}: {runs:?}"
+            );
+        }
+        assert!(at("14").contains(&HighlightScope::Number), "{runs:?}");
+        assert!(at("Languages").contains(&HighlightScope::Tag), "{runs:?}");
+    }
+
+    #[test]
+    fn svelte_attributes_survive_arrow_functions_and_tags_above_the_viewport() {
+        let src = "<script lang=\"ts\">\nlet a: Array<string> = []; if (1 < 2) {}\n</script>\n<button\n\tclass=\"md:hidden p-2\"\n\tonclick={() => (open = !open)}\n\taria-label=\"Toggle menu\"\n>\n\tx\n</button>";
+        let doc = Document::from_text(src);
+        let mut parser = Parser::new();
+        parser
+            .set_language(&SyntaxLanguage::Svelte.grammar())
+            .unwrap();
+        let tree = parser.parse(doc.text(), None).unwrap();
+        // Viewport on the lines that hold the attributes only.
+        let runs = style_runs_for_viewport(&doc, &tree, SyntaxLanguage::Svelte, 4, 3);
+        let at = |text: &str| {
+            let start = src.find(text).unwrap();
+            runs.iter()
+                .filter(|run| {
+                    let line_start = doc.rope().line_to_byte(run.line);
+                    line_start + run.start == start && line_start + run.end == start + text.len()
+                })
+                .map(|run| run.scope)
+                .collect::<Vec<_>>()
+        };
+        for name in ["class", "onclick", "aria-label"] {
+            assert!(
+                at(name).contains(&HighlightScope::Attribute),
+                "{name}: {runs:?}"
+            );
+        }
+        for value in ["\"md:hidden p-2\"", "\"Toggle menu\""] {
+            assert!(
+                at(value).contains(&HighlightScope::String),
+                "{value}: {runs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn svelte_tag_attributes_skip_braces_and_quotes() {
+        let tag =
+            "<a href={u} title='x > y' {...rest} data-k = \"v\" on:click={() => f('}')} hidden>";
+        let (attributes, length) = svelte_tag_attributes(tag);
+        assert_eq!(length, tag.len());
+        assert!(svelte_tag_attributes("<p>a<b and more").0.is_empty());
+        let found = attributes
+            .into_iter()
+            .map(|(from, to, scope)| (&tag[from..to], scope))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            found,
+            [
+                ("href", HighlightScope::Attribute),
+                ("title", HighlightScope::Attribute),
+                ("'x > y'", HighlightScope::String),
+                ("data-k", HighlightScope::Attribute),
+                ("\"v\"", HighlightScope::String),
+                ("on:click", HighlightScope::Attribute),
+                ("hidden", HighlightScope::Attribute),
+            ]
+        );
+    }
+
+    #[test]
+    fn svelte_tags_keep_name_and_brackets_after_arrow_attributes() {
+        let src = "<button onclick={() => go()}>\n  <Badge\n    a=\"b\"\n  >x</Badge>\n</button>\n<img src={a} />\n";
+        let doc = Document::from_text(src);
+        let mut parser = Parser::new();
+        parser
+            .set_language(&SyntaxLanguage::Svelte.grammar())
+            .unwrap();
+        let tree = parser.parse(doc.text(), None).unwrap();
+        let runs = style_runs_for_viewport(&doc, &tree, SyntaxLanguage::Svelte, 0, 8);
+        let tagged = |line: usize, text: &str| {
+            let lines: Vec<&str> = src.lines().collect();
+            let start = lines[line].find(text).unwrap();
+            runs.iter().any(|r| {
+                r.line == line
+                    && r.scope == HighlightScope::Tag
+                    && r.start == start
+                    && r.end == start + text.len()
+            })
+        };
+        assert!(tagged(0, "button"));
+        assert!(tagged(1, "Badge"));
+        assert!(tagged(3, "Badge"));
+        assert!(tagged(4, "button"));
+        assert!(tagged(5, "img"));
     }
 
     #[test]

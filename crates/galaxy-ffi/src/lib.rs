@@ -60,11 +60,11 @@ use typescript_editor::{
     typescript_outline_symbol,
 };
 use typescript_navigation::{
-    TypeScriptNavigationCache, module_root_location, resolve_typescript_definition_import,
-    resolve_typescript_export, resolve_typescript_import_uncached, resolve_typescript_type_export,
-    spawn_warmup, typescript_call_option_target, typescript_decorator_option_target,
-    typescript_import_target, typescript_type_member_target, typescript_type_target,
-    workspace_detected,
+    TypeScriptNavigationCache, ambient_module_location, module_root_location,
+    resolve_typescript_definition_import, resolve_typescript_export,
+    resolve_typescript_import_uncached, resolve_typescript_type_export, spawn_warmup,
+    typescript_call_option_target, typescript_decorator_option_target, typescript_import_target,
+    typescript_type_member_target, typescript_type_target, workspace_detected,
 };
 
 uniffi::setup_scaffolding!();
@@ -2791,6 +2791,14 @@ impl Core {
                     uri: file_uri(&target),
                     range: typescript_range(declaration.range),
                 })
+                .or_else(|| {
+                    ambient_module_location(
+                        &self.typescript_navigation,
+                        &target,
+                        &import.specifier,
+                        imported_name,
+                    )
+                })
                 .unwrap_or_else(|| module_root_location(&target)),
             );
         }
@@ -2948,6 +2956,12 @@ impl Core {
         if locations.is_empty()
             && let Some(location) =
                 vite_import_meta_definition(&path, &text, line as usize, character as usize)
+        {
+            locations.push(location);
+        }
+        if locations.is_empty()
+            && let Some(location) =
+                svelte_rune_definition(&path, &text, line as usize, character as usize)
         {
             locations.push(location);
         }
@@ -3512,6 +3526,61 @@ fn route_name_at(line_text: &str, character: usize) -> Option<&str> {
         }
     }
     None
+}
+
+/// Svelte 5 runes (`$props`, `$state`, ...) are compiler globals declared as
+/// `declare function $name` in the installed `svelte` package's types.
+const SVELTE_RUNES: [&str; 7] = [
+    "$props",
+    "$state",
+    "$derived",
+    "$effect",
+    "$bindable",
+    "$inspect",
+    "$host",
+];
+
+fn svelte_rune_definition(
+    path: &str,
+    text: &str,
+    line: usize,
+    character: usize,
+) -> Option<LspDefinitionLocation> {
+    let file_name = Path::new(path).file_name()?.to_str()?;
+    if !(file_name.ends_with(".svelte")
+        || file_name.ends_with(".svelte.ts")
+        || file_name.ends_with(".svelte.js"))
+    {
+        return None;
+    }
+    let line_text = text.lines().nth(line)?;
+    let (start, end) = identifier_span_utf16(line_text, character)?;
+    let name = &line_text[start..end];
+    if !SVELTE_RUNES.contains(&name) {
+        return None;
+    }
+    let types = Path::new(path)
+        .ancestors()
+        .skip(1)
+        .map(|dir| dir.join("node_modules/svelte/types/index.d.ts"))
+        .find(|candidate| candidate.is_file())?;
+    let contents = std::fs::read_to_string(&types).ok()?;
+    let prefix = format!("declare function {name}");
+    let (row, entry) = contents.lines().enumerate().find(|(_, entry)| {
+        entry
+            .strip_prefix(&prefix)
+            .is_some_and(|tail| tail.starts_with(['(', '<']))
+    })?;
+    let column = entry.len() - entry.trim_start().len() + "declare function ".len();
+    Some(LspDefinitionLocation {
+        uri: file_uri(&types),
+        range: LspRange {
+            start_line: row as u64,
+            start_character: column as u64,
+            end_line: row as u64,
+            end_character: (column + name.len()) as u64,
+        },
+    })
 }
 
 /// Vite's `import.meta.*`: members resolve to the project's

@@ -108,6 +108,9 @@ pub struct TypeScriptProject {
     pub tsconfig: Option<PathBuf>,
     base_url: Option<PathBuf>,
     paths: Vec<(String, Vec<String>)>,
+    /// Directory of the config that defined `paths`; targets are relative to
+    /// it when there is no `baseUrl` (SvelteKit's `.svelte-kit/tsconfig.json`).
+    paths_base: Option<PathBuf>,
 }
 
 impl TypeScriptProject {
@@ -137,6 +140,7 @@ impl TypeScriptProject {
             tsconfig: None,
             base_url: None,
             paths: Vec::new(),
+            paths_base: None,
         })
     }
 
@@ -146,6 +150,7 @@ impl TypeScriptProject {
         load_tsconfig_chain(&config, &mut seen, &mut configs)?;
         let mut base_url = None;
         let mut paths = None;
+        let mut paths_base = None;
         for (path, value) in configs {
             let options = value.get("compilerOptions");
             if let Some(base) = options.and_then(|options| options.get("baseUrl")) {
@@ -154,6 +159,7 @@ impl TypeScriptProject {
             }
             if let Some(config_paths) = options.and_then(|options| options.get("paths")) {
                 paths = Some(parse_paths(config_paths)?);
+                paths_base = path.parent().map(Path::to_path_buf);
             }
         }
         Some(Self {
@@ -162,6 +168,7 @@ impl TypeScriptProject {
             tsconfig: Some(config),
             base_url,
             paths: paths.unwrap_or_default(),
+            paths_base,
         })
     }
 }
@@ -187,7 +194,11 @@ pub fn resolve_typescript_specifier(
             let Some(target) = substitute_path_wildcard(target, wildcard) else {
                 continue;
             };
-            let base = project.base_url.as_deref().unwrap_or(&project.root);
+            let base = project
+                .base_url
+                .as_deref()
+                .or(project.paths_base.as_deref())
+                .unwrap_or(&project.root);
             if let Some(resolved) = resolve_module_path(base, &target) {
                 return Some(resolved);
             }
@@ -1760,6 +1771,39 @@ mod tests {
         assert_eq!(
             resolve_typescript_specifier(&detected, "exact", &from),
             Some(project.join("generated/exact.cts"))
+        );
+    }
+
+    #[test]
+    fn resolves_sveltekit_lib_alias_from_generated_tsconfig() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".svelte-kit")).unwrap();
+        std::fs::create_dir_all(root.join("src/lib/components")).unwrap();
+        std::fs::create_dir_all(root.join("src/routes")).unwrap();
+        std::fs::write(root.join("package.json"), "{}").unwrap();
+        std::fs::write(root.join("src/lib/components/Button.svelte"), "").unwrap();
+        std::fs::write(root.join("src/lib/index.ts"), "").unwrap();
+        std::fs::write(
+            root.join(".svelte-kit/tsconfig.json"),
+            r#"{"compilerOptions":{"paths":{"$lib":["../src/lib"],"$lib/*":["../src/lib/*"]}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("tsconfig.json"),
+            r#"{"extends":"./.svelte-kit/tsconfig.json","compilerOptions":{"strict":true}}"#,
+        )
+        .unwrap();
+        let from = root.join("src/routes/+page.svelte");
+        std::fs::write(&from, "").unwrap();
+        let project = TypeScriptProject::detect(&from).unwrap();
+        assert_eq!(
+            resolve_typescript_specifier(&project, "$lib/components/Button.svelte", &from),
+            Some(root.join("src/lib/components/Button.svelte"))
+        );
+        assert_eq!(
+            resolve_typescript_specifier(&project, "$lib", &from),
+            Some(root.join("src/lib/index.ts"))
         );
     }
 

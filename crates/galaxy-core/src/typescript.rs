@@ -20,7 +20,7 @@ mod symbols;
 mod syntax;
 
 pub use self::ambient::ambient_global_names;
-use self::ambient::collect_global_names;
+use self::ambient::{collect_ambient_module_exports, collect_global_names};
 use self::diagnostics::*;
 use self::enums::*;
 use self::imports::*;
@@ -329,6 +329,8 @@ pub struct DocumentIndex {
     callable_type_annotations: Vec<CallableTypeAnnotation>,
     function_option_types: Vec<(String, String)>,
     callable_member_type_annotations: Vec<CallableMemberTypeAnnotation>,
+    /// Exports declared inside `declare module 'x' { ... }` blocks, by module name.
+    ambient_module_exports: Vec<(String, Declaration)>,
 }
 
 impl DocumentIndex {
@@ -442,6 +444,7 @@ impl DocumentIndex {
             type_diagnostics,
             unresolved_references: unresolved_references(text, root, &locations),
             global_names: collect_global_names(root, text),
+            ambient_module_exports: collect_ambient_module_exports(root, text, &locations),
             export_assignment,
             namespace_members,
             symbols,
@@ -707,6 +710,15 @@ impl DocumentIndex {
             }
             _ => None,
         }
+    }
+
+    /// The first export named `name` declared in `declare module 'module' { }`,
+    /// which is how packages such as Svelte publish their types.
+    pub fn ambient_module_export(&self, module: &str, name: &str) -> Option<&Declaration> {
+        self.ambient_module_exports
+            .iter()
+            .find(|(owner, declaration)| owner == module && declaration.name == name)
+            .map(|(_, declaration)| declaration)
     }
 
     /// Returns one unambiguous runtime declaration by name. Used as a
