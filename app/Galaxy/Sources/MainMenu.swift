@@ -112,7 +112,7 @@ enum MainMenu {
         let mdPreview = viewMenu.addItem(withTitle: "Toggle Markdown Preview", action: #selector(MainWindowController.toggleMarkdownPreview(_:)), keyEquivalent: "v")
         mdPreview.keyEquivalentModifierMask = [.command, .shift]
         viewMenu.addItem(withTitle: "Close Editor Split", action: #selector(MainWindowController.closeEditorSplit(_:)), keyEquivalent: "")
-        let search = viewMenu.addItem(withTitle: "Search in Workspace…", action: #selector(MainWindowController.showWorkspaceSearch(_:)), keyEquivalent: "f")
+        let search = viewMenu.addItem(withTitle: "Search in Workspace…", action: #selector(MainWindowController.showSearchSidebar(_:)), keyEquivalent: "f")
         search.keyEquivalentModifierMask = [.command, .shift]
         let explorer = viewMenu.addItem(withTitle: "Show Explorer", action: #selector(MainWindowController.showExplorer(_:)), keyEquivalent: "e")
         explorer.keyEquivalentModifierMask = [.command, .shift]

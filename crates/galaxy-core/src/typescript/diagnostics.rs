@@ -304,19 +304,35 @@ pub(super) fn infer_type(text: &str, node: Node<'_>, state: &mut TypeState) -> T
         "object" => {
             let mut fields = std::collections::BTreeMap::new();
             let mut cursor = node.walk();
-            for pair in node
-                .named_children(&mut cursor)
-                .filter(|n| n.kind() == "pair")
-            {
-                if let (Some(key), Some(value)) = (
-                    pair.child_by_field_name("key")
-                        .and_then(|n| node_text(text, n)),
-                    pair.child_by_field_name("value"),
-                ) {
-                    fields.insert(
-                        key.trim_matches(['\'', '"']).to_owned(),
-                        infer_type(text, value, state),
-                    );
+            for member in node.named_children(&mut cursor) {
+                match member.kind() {
+                    "pair" => {
+                        if let (Some(key), Some(value)) = (
+                            member
+                                .child_by_field_name("key")
+                                .and_then(|n| node_text(text, n)),
+                            member.child_by_field_name("value"),
+                        ) {
+                            fields.insert(
+                                key.trim_matches(['\'', '"']).to_owned(),
+                                infer_type(text, value, state),
+                            );
+                        }
+                    }
+                    // Object shorthand methods are siblings of `pair` nodes:
+                    // `{ write(type: string) {} }` must infer a `write` field.
+                    "method_definition" => {
+                        if let Some(name) = member
+                            .child_by_field_name("name")
+                            .and_then(|n| node_text(text, n))
+                        {
+                            fields.insert(
+                                name.trim_matches(['\'', '"']).to_owned(),
+                                function_type(text, member),
+                            );
+                        }
+                    }
+                    _ => {}
                 }
             }
             Type::Object(fields)

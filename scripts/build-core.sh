@@ -37,9 +37,12 @@ GEN_DIR="$ROOT/app/Galaxy/Generated"
 mkdir -p "$FFI_DIR/include" "$GEN_DIR"
 
 cargo build "${CARGO_FLAGS[@]}"
-cp "$ROOT/target/$PROFILE/libgalaxy_ffi.a" "$FFI_DIR/libgalaxy_ffi.a.tmp"
+STATIC_TMP="$(mktemp "$FFI_DIR/libgalaxy_ffi.a.XXXXXX")"
+trap 'rm -f "$STATIC_TMP"' EXIT
+cp "$ROOT/target/$PROFILE/libgalaxy_ffi.a" "$STATIC_TMP"
 DYLIB="$ROOT/target/$PROFILE/libgalaxy_ffi.dylib"
-mv "$FFI_DIR/libgalaxy_ffi.a.tmp" "$FFI_DIR/libgalaxy_ffi.a"
+mv "$STATIC_TMP" "$FFI_DIR/libgalaxy_ffi.a"
+trap - EXIT
 
 # Generate bindings into a temp dir. The static library and generated Swift
 # wrappers are one ABI unit, so refresh the wrapper timestamps with each Rust

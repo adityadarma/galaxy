@@ -53,7 +53,14 @@ extension MainWindowController {
         // Set the root before Core starts detached scan workers. A fast worker
         // may emit its start event before `openWorkspace` returns.
         statusBar.resetWorkspaceScan(root: url.path)
-        let ws = try bridge.core.openWorkspace(path: url.path)
+        workspaceIndexState = (url.path, 0, 0)
+        let ws: Workspace
+        do {
+            ws = try bridge.core.openWorkspace(path: url.path)
+        } catch {
+            workspaceIndexState = nil
+            throw error
+        }
         workspace = ws
         titleBar.setProjectTitle(ws.name())
         Self.rememberProject(url.path)

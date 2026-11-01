@@ -143,7 +143,7 @@ extension MainWindowController {
     }
 
     /// The selected text if it is a sensible search seed: one line, short.
-    private func selectionSeed() -> String? {
+    func selectionSeed() -> String? {
         guard let doc = editorView.document else { return nil }
         let range = doc.selectedRange()
         guard range.length > 0, range.length <= 200 else { return nil }

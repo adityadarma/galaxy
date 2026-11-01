@@ -96,8 +96,9 @@ extension MainWindowController {
         _ = target.perform(action, with: self)
     }
 
-    /// Closes Go to File, Go to Line, Go to Symbol and the palette, whichever is open.
+    /// Closes transient navigation overlays, whichever is open.
     func closeOverlays() {
+        closeReferencesPeek()
         if isWorkspaceSearchVisible { closeWorkspaceSearch() }
         if isQuickOpenVisible { closeGoToFile() }
         if isOutlinePickerVisible { closeGoToSymbol() }

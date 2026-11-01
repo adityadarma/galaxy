@@ -68,6 +68,22 @@ pub struct RustEngine {
 }
 
 impl RustEngine {
+    pub fn index_stats(&self) -> crate::LanguageIndexStats {
+        let imports = self.uses.values().map(Vec::len).sum();
+        let source_bytes = self.open.values().map(|(_, _, text)| text.len()).sum();
+        crate::LanguageIndexStats {
+            files: self.files.len(),
+            symbols: self.declarations.len(),
+            imports,
+            source_bytes,
+            heap_lower_bound_bytes: self.files.len() * std::mem::size_of::<PathBuf>()
+                + self.declarations.len() * std::mem::size_of::<Declaration>()
+                + imports * std::mem::size_of::<UseBinding>()
+                + source_bytes,
+            ..Default::default()
+        }
+    }
+
     pub fn pending(_root: &Path) -> Self {
         Self {
             declarations: Vec::new(),

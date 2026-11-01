@@ -17,6 +17,7 @@ extension MainWindowController {
     func selectTab(_ index: Int, fromTabBar: Bool = false) {
         guard tabs.indices.contains(index) else { return }
         if activeIndex != index {
+            closeReferencesPeek()
             snippetSession = nil
             snippetDocumentKey = nil
         }

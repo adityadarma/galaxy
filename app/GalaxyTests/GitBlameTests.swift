@@ -4,6 +4,12 @@ import XCTest
 /// Inline git blame: who last changed the caret line, shown after its text.
 @MainActor
 final class GitBlameTests: XCTestCase {
+    func testInlineBlameUsesDimExplicitColor() {
+        let color = EditorView.blameTextColor.usingColorSpace(.sRGB)
+        XCTAssertNotNil(color)
+        XCTAssertLessThan(color?.alphaComponent ?? 1, 0.7)
+    }
+
     nonisolated(unsafe) private var root: URL!
 
     override func setUpWithError() throws {

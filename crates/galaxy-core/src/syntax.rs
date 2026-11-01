@@ -555,6 +555,8 @@ const TYPESCRIPT_HIGHLIGHTS: &str = r#"
 [(this) (this_type)] @variable.builtin
 [(true) (false) (null) (undefined)] @constant
 (identifier) @variable
+; Object shorthand values: `{ type, data }`.
+(shorthand_property_identifier) @variable
 ; Destructured bindings: `({ initialPage, onFlash }: Params)`.
 (shorthand_property_identifier_pattern) @variable
 [
@@ -584,6 +586,7 @@ const JAVASCRIPT_HIGHLIGHTS: &str = r#"
 (number) @number
 [(true) (false) (null) (undefined)] @constant
 (identifier) @variable
+(shorthand_property_identifier) @variable
 (shorthand_property_identifier_pattern) @variable
 (property_identifier) @property
 (private_property_identifier) @property
@@ -2666,6 +2669,32 @@ mod tests {
                 Some(expected),
                 "{needle}: {runs:?}"
             );
+        }
+    }
+
+    #[test]
+    fn typescript_object_shorthand_values_use_variable_scope() {
+        let language = SyntaxLanguage::TypeScript;
+        let source = "const trace = {\n  write(type: string, data?: unknown) {\n    return JSON.stringify({ type, data });\n  },\n};\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let doc = Document::from_text(source);
+        let runs = style_runs_for_viewport(&doc, &tree, language, 0, 5);
+
+        for needle in ["type,", "data }"] {
+            let offset = source.find(needle).unwrap();
+            let prefix = &source[..offset];
+            let line = prefix.bytes().filter(|byte| *byte == b'\n').count();
+            let column = prefix
+                .rsplit_once('\n')
+                .map_or(prefix.len(), |(_, tail)| tail.len());
+            let scope = runs
+                .iter()
+                .filter(|run| run.line == line && run.start <= column && column < run.end)
+                .next_back()
+                .map(|run| run.scope);
+            assert_eq!(scope, Some(HighlightScope::Variable), "{needle}: {runs:?}");
         }
     }
 

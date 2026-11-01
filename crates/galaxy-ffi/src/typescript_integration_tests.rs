@@ -1645,6 +1645,110 @@ fn typescript_navigation_resolves_direct_imports_through_projects_only() {
 }
 
 #[test]
+fn typescript_references_include_every_workspace_importer() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+    let src = dir.path().join("packages/cli/src");
+    let handlers = src.join("commands/handlers");
+    std::fs::create_dir_all(&handlers).unwrap();
+    let commands = src.join("commands/commands.ts");
+    std::fs::write(&commands, "export const Commands = {};\nCommands;\n").unwrap();
+    std::fs::write(
+        handlers.join("api.ts"),
+        "import { Commands } from '../commands';\nCommands;\nCommands;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        handlers.join("serve.ts"),
+        "import { Commands as CliCommands } from '../commands';\nCliCommands;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("index.ts"),
+        "import { Commands } from './commands/commands';\nCommands;\n",
+    )
+    .unwrap();
+    let core = Core::new();
+    let document = core
+        .open_document(commands.to_string_lossy().into_owned())
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let references = loop {
+        core.request_references(document.clone(), 0, 14);
+        let references = core.references(document.clone());
+        if references
+            .iter()
+            .any(|location| location.uri.ends_with("api.ts"))
+            || Instant::now() >= deadline
+        {
+            break references;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(references.len(), 9);
+    assert_eq!(
+        references
+            .iter()
+            .filter(|location| location.uri.ends_with("api.ts"))
+            .count(),
+        3
+    );
+    assert_eq!(
+        references
+            .iter()
+            .filter(|location| location.uri.ends_with("serve.ts"))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn typescript_references_from_exported_function_declaration_include_importers() {
+    // A function or class declaration range starts at the keyword, not at the
+    // name, so the export must be matched by containment.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
+    let src = dir.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let host = src.join("mini-host.ts");
+    std::fs::write(
+        &host,
+        "export function createMiniHost(input: { a: string }) {\n  return input\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("mini.ts"),
+        "import { createMiniHost } from './mini-host';\ncreateMiniHost({ a: '' });\n",
+    )
+    .unwrap();
+    let core = Core::new();
+    let document = core
+        .open_document(host.to_string_lossy().into_owned())
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let references = loop {
+        core.request_references(document.clone(), 0, 20);
+        let references = core.references(document.clone());
+        if references
+            .iter()
+            .any(|location| location.uri.ends_with("mini.ts"))
+            || Instant::now() >= deadline
+        {
+            break references;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        references
+            .iter()
+            .filter(|location| location.uri.ends_with("/mini.ts"))
+            .count(),
+        2,
+        "{references:?}"
+    );
+}
+
+#[test]
 fn typescript_navigation_resolves_package_exports_and_type_only_fallbacks() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();

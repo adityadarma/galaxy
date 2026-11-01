@@ -64,6 +64,26 @@ pub struct DartEngine {
 }
 
 impl DartEngine {
+    pub fn index_stats(&self) -> crate::LanguageIndexStats {
+        let symbols = self
+            .files
+            .values()
+            .map(|file| file.declarations.len())
+            .sum();
+        let imports = self.files.values().map(|file| file.imports.len()).sum();
+        let source_bytes = self.sources.values().map(String::len).sum();
+        crate::LanguageIndexStats {
+            files: self.files.len(),
+            symbols,
+            imports,
+            source_bytes,
+            heap_lower_bound_bytes: self.files.len()
+                * (std::mem::size_of::<PathBuf>() + std::mem::size_of::<FileIndex>())
+                + source_bytes,
+            ..Default::default()
+        }
+    }
+
     pub fn pending(root: &Path) -> Self {
         Self {
             packages: package_roots(root, package_name(root).as_deref()),

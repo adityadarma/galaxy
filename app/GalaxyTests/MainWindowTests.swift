@@ -7,6 +7,15 @@ import XCTest
 final class MainWindowTests: XCTestCase {
     private func settle() { RunLoop.current.run(until: Date().addingTimeInterval(0.4)) }
 
+    func testReferencesPeekIsLazyAtStartup() {
+        let controller = MainWindowController(bridge: CoreBridge())
+        defer { controller.window?.orderOut(nil) }
+
+        XCTAssertNil(controller.loadedReferencesPanel)
+        _ = controller.referencesPanel
+        XCTAssertNotNil(controller.loadedReferencesPanel)
+    }
+
     func testNewDocumentIsVisibleFocusedAndTypable() throws {
         let controller = MainWindowController(bridge: CoreBridge())
         controller.showWindow(nil)

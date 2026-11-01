@@ -34,7 +34,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 
         NSApp.mainMenu = MainMenu.build()
         StartupProbe.mark("menu")
-        let controller = makeWindowController()
+        let controller = makeWindowController(bridge: bridge)
         StartupProbe.mark("window_built")
         let savedSession = Self.shouldRestoreSession ? Session.load(from: controller.sessionURL) : nil
         let resumeFullScreen = Self.shouldRestoreSession
@@ -42,16 +42,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         if pendingURL == nil, let path = Self.launchOpenPath {
             pendingURL = URL(fileURLWithPath: path)
         }
-        // Restore the visible workspace and tabs before the first frame. This
-        // avoids flashing an empty editor when reopening the last project;
-        // background workspace services start after the window is presented.
-        let restoredSession: Bool
-        if pendingURL == nil, let savedSession {
-            pendingWindowSessions = savedSession.otherWindows ?? []
-            restoredSession = controller.restore(savedSession)
-        } else {
-            restoredSession = false
-        }
+        // Workspace and tab restoration can touch many files. Present the
+        // window first so AppKit remains responsive during a large restore.
+        let restoredSession = false
         showMainWindow(controller, concealedForFullScreen: resumeFullScreen)
         NSApp.activate()
         Log.app.info("window ready, core \(self.bridge.version, privacy: .public)")
@@ -355,8 +348,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         return windowControllers.first { $0.window === keyWindow } ?? windowControllers.last
     }
 
-    private func makeWindowController() -> MainWindowController {
-        let controller = MainWindowController(bridge: bridge)
+    private func makeWindowController(bridge suppliedBridge: CoreBridge? = nil) -> MainWindowController {
+        let windowBridge: CoreBridge
+        if let suppliedBridge {
+            windowBridge = suppliedBridge
+        } else {
+            windowBridge = CoreBridge()
+            windowBridge.start()
+        }
+        let controller = MainWindowController(bridge: windowBridge)
         controller.openExistingWorkspace = { [weak self] url in
             guard let self, let existing = self.windowController(forWorkspaceAt: url.path) else {
                 return false

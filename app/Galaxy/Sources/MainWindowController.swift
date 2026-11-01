@@ -76,7 +76,17 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     }
     let editorSplitView = NSSplitView()
     let problemsPanel = ProblemsPanel()
-    let referencesPanel = ReferencesPanel()
+    var loadedReferencesPanel: ReferencesPanel?
+    var referencesPanel: ReferencesPanel {
+        if let panel = loadedReferencesPanel { return panel }
+        let panel = ReferencesPanel()
+        panel.translatesAutoresizingMaskIntoConstraints = true
+        panel.onSelect = { [weak self] location in self?.showReference(location) }
+        panel.onPreview = { [weak self] location in self?.previewReference(location) }
+        panel.onClose = { [weak self] in self?.closeReferencesPeek() }
+        loadedReferencesPanel = panel
+        return panel
+    }
     let terminalPanel = TerminalPanelView()
     /// Shows the active tab's terminal when that tab is a terminal (VS Code
     /// "Move Terminal into Editor Area"). Covers the path bar and editor.
@@ -233,7 +243,17 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// itself recorded as a jump.
     var isNavigating = false
     var definitionRequest: (document: DocumentHandle, position: TextPos)?
-    var referencesRequest: DocumentHandle?
+    var referencesRequest: (
+        document: DocumentHandle,
+        position: TextPos,
+        answered: Bool,
+        inFlight: Bool,
+        deadline: Date,
+        lastAttempt: Date
+    )?
+    var workspaceIndexState: (root: String, completed: UInt64, total: UInt64)?
+    var referencePreviewGeneration = 0
+    var referenceSnippetGeneration = 0
     var renameRequest: DocumentHandle?
     var codeActionRequest: DocumentHandle?
     var outlineRequest: DocumentHandle?
@@ -409,10 +429,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             case let .goModulesFailed(_, message):
                 self?.statusLabel.stringValue = "Go module download failed: \(message)"
             case let .workspaceIndexStarted(root, total):
+                self?.workspaceIndexState = (root, 0, total)
                 self?.statusBar.workspaceIndexStarted(root: root, total: total)
             case let .workspaceIndexProgress(root, completed, total):
+                self?.workspaceIndexState = (root, completed, total)
                 self?.statusBar.workspaceIndexProgress(root: root, completed: completed, total: total)
             case let .workspaceIndexFinished(root, total, changed):
+                if self?.workspaceIndexState?.root == root { self?.workspaceIndexState = nil }
                 self?.statusBar.workspaceIndexFinished(root: root, total: total, changed: changed)
             }
         }
@@ -629,8 +652,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         bottomPanelHeight = bottomPanelContent.heightAnchor.constraint(equalToConstant: 0)
         bottomPanelHeaderHeight = bottomPanelHeader.heightAnchor.constraint(equalToConstant: 0)
         bottomPanelHeader.isHidden = true
-        referencesPanel.translatesAutoresizingMaskIntoConstraints = true
-        referencesPanel.autoresizingMask = [.width]
         // Positioned by frame in `hoverFrame`; without constraints Auto Layout
         // would collapse it to zero size.
         hoverPopover.translatesAutoresizingMaskIntoConstraints = true
@@ -730,7 +751,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         ])
         placeChrome(over: activeGroup)
         problemsPanel.onSelect = { [weak self] problem in self?.showProblem(problem) }
-        referencesPanel.onSelect = { [weak self] location in self?.showReference(location) }
         debugger.onOutput = { [weak self] category, text in self?.debugConsole.append(text, category: category) }
         debugger.onChange = { [weak self] in self?.debugStateChanged() }
         debugger.onStop = { [weak self] path, line in
@@ -742,7 +762,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         outputPanel.isHidden = true
         portsPanel.isHidden = true
         gitGraphPanel.isHidden = true
-        referencesPanel.removeFromSuperview()
         terminalPanel.isHidden = true
         problemsPanel.isHidden = true
         bottomPanelHeader.onSelect = { [weak self] tab in

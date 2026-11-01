@@ -749,6 +749,19 @@ final class SearchSidebarController: NSObject, NSTextFieldDelegate, NSTableViewD
         view.window?.makeFirstResponder(query)
     }
 
+    var queryText: String { query.stringValue }
+
+    /// ⌘⇧F, like VS Code: keeps the previous query unless the editor has a
+    /// selection, runs it, and selects the field text for retyping.
+    func present(seed: String?) {
+        if let seed, !seed.isEmpty, seed != query.stringValue {
+            query.stringValue = seed
+            runSearch()
+        }
+        focus()
+        query.currentEditor()?.selectAll(nil)
+    }
+
     func reset() {
         query.stringValue = ""
         replace.stringValue = ""

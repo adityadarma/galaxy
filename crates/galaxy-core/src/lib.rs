@@ -47,6 +47,20 @@ pub mod watcher;
 pub mod workspace;
 pub mod wrap;
 
+/// Compact telemetry for a language index retained in memory. The byte count
+/// is a conservative lower bound from owned strings and container elements;
+/// allocator overhead and parser-tree allocations are intentionally excluded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LanguageIndexStats {
+    pub files: usize,
+    pub symbols: usize,
+    pub imports: usize,
+    pub reverse_keys: usize,
+    pub reverse_sites: usize,
+    pub source_bytes: usize,
+    pub heap_lower_bound_bytes: usize,
+}
+
 /// Semantic version of the core, exposed to the UI for diagnostics.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

@@ -182,6 +182,21 @@ extension MainWindowController {
         searchSidebar.focus()
     }
 
+    /// ⌘⇧F: opens the Search view in the sidebar, seeded with the selection.
+    @objc func showSearchSidebar(_ sender: Any?) {
+        guard workspace != nil else {
+            NSSound.beep()
+            statusLabel.stringValue = "Open a folder to search the workspace."
+            return
+        }
+        let seed = selectionSeed()
+        closeOverlays()
+        activeSidebarTab = .search
+        updateSidebarContent()
+        setSidebarVisible(true)
+        searchSidebar.present(seed: seed)
+    }
+
     func searchSidebarWorkspace(_ query: String, options: WorkspaceSearchOptions) {
         guard let workspace else { return }
         searchGeneration += 1

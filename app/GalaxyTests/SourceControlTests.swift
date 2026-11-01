@@ -256,4 +256,32 @@ final class SourceControlTests: XCTestCase {
         XCTAssertGreaterThan(changes, 0, "the commit button state follows typing")
         XCTAssertEqual(box.placeholder, "Message (⌘Enter to commit)")
     }
+
+    func testCommandShiftFOpensSidebarSearchSeededWithSelection() {
+        let controller = MainWindowController(bridge: CoreBridge())
+        controller.showWindow(nil)
+        defer { controller.window?.orderOut(nil) }
+        // ⌘⇧F opens the Search view in the sidebar, not a floating panel.
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("galaxy-search-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let file = folder.appendingPathComponent("a.ts")
+        try? "const needle = 1;\n".write(to: file, atomically: true, encoding: .utf8)
+        try? controller.openWorkspace(at: folder)
+        try? controller.openFile(at: file)
+        controller.activeTab?.doc.selectWordAt(pos: TextPos(line: 0, colUtf16: 7))
+        let menuItem = NSApp.mainMenu?.items
+            .compactMap(\.submenu)
+            .flatMap(\.items)
+            .first { $0.action == #selector(MainWindowController.showSearchSidebar(_:)) }
+        XCTAssertEqual(menuItem?.keyEquivalent, "f")
+        XCTAssertEqual(menuItem?.keyEquivalentModifierMask, [.command, .shift])
+        controller.showSearchSidebar(nil)
+        XCTAssertTrue(controller.isSidebarVisible)
+        XCTAssertEqual(controller.activeSidebarTab, .search)
+        XCTAssertFalse(controller.isWorkspaceSearchVisible, "no floating search panel")
+        XCTAssertEqual(controller.searchSidebar.queryText, "needle", "seeded with the selection")
+
+    }
 }

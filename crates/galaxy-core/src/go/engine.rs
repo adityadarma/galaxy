@@ -209,6 +209,23 @@ pub struct GoEngine {
 }
 
 impl GoEngine {
+    pub fn index_stats(&self) -> crate::LanguageIndexStats {
+        let package_symbols = self
+            .index
+            .as_ref()
+            .map_or(0, |index| index.std.len() + index.module.len());
+        let source_bytes = self.open_text.values().map(|text| text.len()).sum();
+        crate::LanguageIndexStats {
+            files: self.parsed.len(),
+            symbols: package_symbols,
+            source_bytes,
+            heap_lower_bound_bytes: self.parsed.len() * std::mem::size_of::<Parsed>()
+                + package_symbols * std::mem::size_of::<String>()
+                + source_bytes,
+            ..Default::default()
+        }
+    }
+
     pub fn new(root: &Path) -> Self {
         let mut engine = Self::with_project(GoProject::detect(root));
         engine.root = root.to_path_buf();

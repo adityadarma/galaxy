@@ -191,6 +191,9 @@ final class EditorView: NSView {
     }
     /// Space between the end of the line and its blame text.
     static let blameGap: CGFloat = 40
+    /// Explicit text colour avoids Core Text ignoring context fill alpha and
+    /// drawing blame as bright editor text on dark themes.
+    static let blameTextColor = NSColor.secondaryLabelColor.withAlphaComponent(0.52)
 
     /// Where the blame text of the annotated line is drawn, in view
     /// coordinates, or `nil` when there is none.
@@ -988,10 +991,10 @@ final class EditorView: NSView {
 
             // Git blame of the caret line, quiet and after the text.
             if let blame = blameAnnotation, blame.line == line.line {
-                let fromContext = NSAttributedString.Key(kCTForegroundColorFromContextAttributeName as String)
                 let note = CTLineCreateWithAttributedString(NSAttributedString(
-                    string: blame.text, attributes: [.font: font, fromContext: true]))
-                context.setFillColor(NSColor.secondaryLabelColor.withAlphaComponent(0.75).cgColor)
+                    string: blame.text,
+                    attributes: [.font: font, .foregroundColor: Self.blameTextColor]
+                ))
                 let end = point(column: line.text.utf16.count, text: line.text, rows: rows, top: top, originX: originX)
                 context.textPosition = CGPoint(x: end.x + Self.blameGap, y: end.y + metrics.ascent)
                 CTLineDraw(note, context)

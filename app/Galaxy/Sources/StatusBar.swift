@@ -158,8 +158,8 @@ final class StatusBar: NSView {
 
     func resetWorkspaceScan(root: String) {
         scanRoot = root
-        workspaceScan.stringValue = ""
-        workspaceScan.isHidden = true
+        workspaceScan.stringValue = "Indexing workspace..."
+        workspaceScan.isHidden = false
     }
 
     func workspaceIndexStarted(root: String, total: UInt64) {

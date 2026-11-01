@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
+use galaxy_core::LanguageIndexStats;
 use galaxy_core::analysis::{
     BuiltinStore, CompletionItem as LspCompletionItem, DefinitionLocation as LspDefinitionLocation,
     Diagnostic as LspDiagnostic, DiagnosticSeverity, HoverInfo as LspHoverInfo, Range as LspRange,
@@ -451,7 +452,7 @@ pub struct Core {
     dart: Arc<Mutex<HashMap<PathBuf, Arc<Mutex<DartEngine>>>>>,
     /// Roots with a snapshot rebuild in flight. Watcher batches are coalesced
     /// here so completion only reads installed in-memory indexes.
-    indexing_roots: Arc<Mutex<HashMap<PathBuf, bool>>>,
+    indexing_roots: Arc<Mutex<HashMap<PathBuf, IndexingState>>>,
     /// Open files handled by built-in analysis, whether or not a language
     /// server serves them.
     php_documents: Mutex<HashMap<String, std::sync::Weak<DocumentHandle>>>,
@@ -475,6 +476,12 @@ pub struct Core {
     typescript_navigation: Arc<Mutex<TypeScriptNavigationCache>>,
     /// Parsed direct exports from visible workspace TypeScript sources.
     typescript_workspace_exports: Arc<Mutex<TypeScriptWorkspaceExports>>,
+}
+
+#[derive(Default)]
+struct IndexingState {
+    rerun: bool,
+    pending_typescript: Vec<String>,
 }
 
 impl Default for Core {
@@ -707,7 +714,7 @@ impl Core {
         self.indexing_roots
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(ws.root().to_path_buf(), false);
+            .insert(ws.root().to_path_buf(), IndexingState::default());
         spawn_workspace_indexing(
             ws.clone(),
             Arc::clone(&self.analysis),
@@ -735,11 +742,11 @@ impl Core {
                 .indexing_roots
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if let Some(dirty) = indexing.get_mut(&root) {
-                *dirty = true;
+            if let Some(state) = indexing.get_mut(&root) {
+                state.rerun = true;
                 return;
             }
-            indexing.insert(root.clone(), false);
+            indexing.insert(root.clone(), IndexingState::default());
         }
         let workspace = match CoreWorkspace::open(root.clone()) {
             Ok(workspace) => workspace,
@@ -768,22 +775,29 @@ impl Core {
         );
     }
 
-    /// Applies a source-only watcher batch directly to Dart/Rust/TypeScript indexes.
-    /// Mixed-language batches fall back to the full snapshot lifecycle because
-    /// they may change module, package, or framework resolution.
+    /// Applies source changes directly. Only project metadata that can change
+    /// module resolution needs a full workspace snapshot rebuild.
     pub fn apply_workspace_changes(&self, root: String, paths: Vec<String>, rescan: bool) {
         let root = PathBuf::from(root);
-        let source_only = !rescan
-            && !paths.is_empty()
-            && paths.iter().all(|path| {
+        if rescan
+            || paths
+                .iter()
+                .any(|path| workspace_index_metadata(Path::new(path)))
+        {
+            self.refresh_workspace_indexes(root.to_string_lossy().into_owned());
+            return;
+        }
+        let paths = paths
+            .into_iter()
+            .filter(|path| {
                 let path = Path::new(path);
                 matches!(
                     path.extension().and_then(|extension| extension.to_str()),
                     Some("dart" | "rs")
                 ) || is_typescript_path(path)
-            });
-        if !source_only {
-            self.refresh_workspace_indexes(root.to_string_lossy().into_owned());
+            })
+            .collect::<Vec<_>>();
+        if paths.is_empty() {
             return;
         }
         {
@@ -791,8 +805,14 @@ impl Core {
                 .indexing_roots
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if let Some(dirty) = indexing.get_mut(&root) {
-                *dirty = true;
+            if let Some(state) = indexing.get_mut(&root) {
+                if paths.iter().all(|path| is_typescript_path(Path::new(path))) {
+                    state.pending_typescript.extend(paths);
+                    state.pending_typescript.sort();
+                    state.pending_typescript.dedup();
+                } else {
+                    state.rerun = true;
+                }
                 return;
             }
         }
@@ -2589,10 +2609,14 @@ impl Core {
             .typescript_checked
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let exports = self
-            .typescript_workspace_exports
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        // Runs on the main thread from `poll_analysis`. A references scan can
+        // hold the workspace index for seconds; skip this tick instead of
+        // freezing the UI. Unchecked documents are retried on the next poll.
+        let exports = match self.typescript_workspace_exports.try_lock() {
+            Ok(exports) => exports,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        };
         {
             let mut generation = self
                 .typescript_checked_exports
@@ -3287,8 +3311,9 @@ impl Core {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let mut target = None;
         if locations.is_empty()
-            && let Some((target, occurrences)) = typescript_import_target(
+            && let Some((import_target, occurrences)) = typescript_import_target(
                 &self.typescript_navigation,
                 &path,
                 &index,
@@ -3296,12 +3321,66 @@ impl Core {
                 character as usize,
             )
         {
-            locations.push(target);
+            locations.push(import_target.clone());
+            target = Some(import_target);
             locations.extend(occurrences.into_iter().map(|range| LspDefinitionLocation {
                 uri: uri.to_owned(),
                 range: typescript_range(range),
             }));
         }
+        if target.is_none()
+            && let Some(symbol) = index.symbol_at(line as usize, character as usize)
+            && let Some(declaration) = index.declarations.iter().find(|declaration| {
+                // The declaration range starts at the keyword for functions and
+                // classes (`function createMiniHost`) but at the name for
+                // variables, so match by containment, not by start.
+                declaration.exported
+                    && declaration.name == symbol.name
+                    && declaration.range.start <= symbol.declaration.start
+                    && symbol.declaration.end <= declaration.range.end
+            })
+        {
+            target = Some(LspDefinitionLocation {
+                uri: uri.to_owned(),
+                range: typescript_range(declaration.range),
+            });
+        }
+        if let Some(target) = target {
+            let (has_workspace_snapshot, workspace_locations) = {
+                let mut exports = self
+                    .typescript_workspace_exports
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                (
+                    exports.has_snapshot_for(Path::new(&path)),
+                    exports.references_to(Path::new(&path), &target, &self.typescript_navigation),
+                )
+            };
+            if !has_workspace_snapshot
+                && let Some(mut project) =
+                    TypeScriptWorkspaceExports::build_nearest_project(Path::new(&path))
+            {
+                locations.extend(project.references_to(
+                    Path::new(&path),
+                    &target,
+                    &self.typescript_navigation,
+                ));
+            } else {
+                locations.extend(workspace_locations);
+            }
+        }
+        locations.sort_by(|a, b| {
+            (&a.uri, a.range.start_line, a.range.start_character).cmp(&(
+                &b.uri,
+                b.range.start_line,
+                b.range.start_character,
+            ))
+        });
+        locations.dedup_by(|a, b| {
+            a.uri == b.uri
+                && a.range.start_line == b.range.start_line
+                && a.range.start_character == b.range.start_character
+        });
         let found = !locations.is_empty();
         self.analysis
             .lock()
@@ -3817,6 +3896,7 @@ fn vite_import_meta_definition(
             range,
         });
     }
+
     if interface != "ImportMetaEnv" {
         return None;
     }
@@ -4395,6 +4475,25 @@ fn typescript_range(range: galaxy_core::typescript::Utf16Range) -> LspRange {
     }
 }
 
+fn workspace_index_metadata(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some(
+            "package.json"
+                | "tsconfig.json"
+                | "jsconfig.json"
+                | "Cargo.toml"
+                | "Cargo.lock"
+                | "go.mod"
+                | "go.sum"
+                | "composer.json"
+                | "composer.lock"
+                | "pubspec.yaml"
+                | "pubspec.lock"
+        )
+    )
+}
+
 /// Built-in language engines keyed by project root, shared across threads.
 type EngineMap<E> = Arc<Mutex<HashMap<PathBuf, Arc<Mutex<E>>>>>;
 
@@ -4408,7 +4507,7 @@ fn spawn_workspace_indexing(
     php_engines: EngineMap<PhpEngine>,
     rust_engines: EngineMap<RustEngine>,
     dart_engines: EngineMap<DartEngine>,
-    indexing_roots: Arc<Mutex<HashMap<PathBuf, bool>>>,
+    indexing_roots: Arc<Mutex<HashMap<PathBuf, IndexingState>>>,
     listener: Option<Arc<dyn CoreListener>>,
 ) {
     let root = workspace.root().to_path_buf();
@@ -4418,17 +4517,45 @@ fn spawn_workspace_indexing(
             let started = Instant::now();
             let retry_workspace = workspace.clone();
             let paths = workspace.build_file_index().paths().collect::<Vec<_>>();
-            publish_workspace_typescript_diagnostics(&analysis, &root, &paths);
+            send_workspace_index_started(&listener, &root, paths.len() as u64);
+            // Parsing a large TypeScript workspace is expensive. Build without
+            // holding the shared snapshot lock so editor requests stay responsive.
+            let typescript_started = Instant::now();
+            let typescript_snapshot = TypeScriptWorkspaceExports::build_with_progress(
+                &root,
+                &paths,
+                |completed, total| {
+                    send_workspace_index_progress(&listener, &root, completed, total)
+                },
+            );
+            let mut typescript_snapshot = typescript_snapshot;
+            // Reverse import index: resolve every import once, off the lock.
+            typescript_snapshot.resolve_imports(&root, &cache);
+            log_language_index(
+                "typescript",
+                &root,
+                typescript_snapshot.index_stats(&root),
+                typescript_started.elapsed(),
+            );
+            let typescript_diagnostics = typescript_snapshot.diagnostics();
+            typescript_exports
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .install(&root, typescript_snapshot);
+            {
+                let mut store = analysis.lock().unwrap_or_else(|e| e.into_inner());
+                for (uri, diagnostics) in typescript_diagnostics {
+                    store.set_diagnostics(&uri, diagnostics);
+                }
+            }
             publish_workspace_rust_diagnostics(&analysis, &root, &paths, &rust_engines);
             // Globals are scanned before taking the lock; it reads thousands of files.
             let ambient = typescript_globals::scan_ambient_globals(&root, &paths);
             {
                 let mut exports = typescript_exports.lock().unwrap_or_else(|e| e.into_inner());
-                exports.refresh(&root, &paths);
                 exports.set_ambient(&root, ambient);
             }
-            send_workspace_index_started(&listener, &root, paths.len() as u64);
-            let (total, changed) = refresh_workspace_index(&workspace, &paths, &listener);
+            let (total, changed) = refresh_workspace_index(&workspace, &paths);
             let mut workers = Vec::new();
             if workspace_detected(&root) {
                 workers.push(spawn_warmup(&root, Arc::clone(&cache)));
@@ -4457,12 +4584,22 @@ fn spawn_workspace_indexing(
                 ms = started.elapsed().as_millis() as u64,
                 "rebuilt built-in workspace indexes"
             );
-            let rerun = indexing_roots
+            let state = indexing_roots
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&root)
-                .unwrap_or(false);
-            if rerun {
+                .unwrap_or_default();
+            if !state.pending_typescript.is_empty() {
+                typescript_exports
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .apply_changes(&root, &state.pending_typescript);
+            }
+            if state.rerun {
+                indexing_roots
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(root.clone(), IndexingState::default());
                 spawn_workspace_indexing(
                     retry_workspace,
                     analysis,
@@ -4551,76 +4688,6 @@ fn publish_workspace_rust_diagnostics(
     }
 }
 
-/// Publishes bounded parser/type diagnostics for workspace TypeScript sources,
-/// not only files that happened to be opened in an editor tab. Dependencies
-/// are intentionally excluded: their declarations belong to package tooling.
-fn publish_workspace_typescript_diagnostics(
-    analysis: &Arc<Mutex<BuiltinStore>>,
-    root: &Path,
-    paths: &[String],
-) {
-    const MAX_FILES: usize = 10_000;
-    for relative in paths
-        .iter()
-        .filter(|path| workspace_typescript_source(path))
-        .take(MAX_FILES)
-    {
-        let path = root.join(relative);
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let index = DocumentIndex::parse(&path, &text);
-        let uri = file_uri(&path);
-        let mut diagnostics: Vec<LspDiagnostic> = index
-            .diagnostics
-            .iter()
-            .map(|diagnostic| LspDiagnostic {
-                uri: uri.clone(),
-                range: LspRange {
-                    start_line: diagnostic.range.start.line as u64,
-                    start_character: diagnostic.range.start.col as u64,
-                    end_line: diagnostic.range.end.line as u64,
-                    end_character: diagnostic.range.end.col as u64,
-                },
-                severity: DiagnosticSeverity::Error,
-                message: diagnostic.message.clone(),
-                source: Some("galaxy".into()),
-                code: None,
-                unnecessary: false,
-            })
-            .collect();
-        diagnostics.extend(
-            index
-                .type_diagnostics
-                .iter()
-                .map(|diagnostic| LspDiagnostic {
-                    uri: uri.clone(),
-                    range: typescript_range(diagnostic.range),
-                    severity: DiagnosticSeverity::Error,
-                    message: diagnostic.message.clone(),
-                    source: Some("galaxy".into()),
-                    code: Some(diagnostic.code.clone()),
-                    unnecessary: false,
-                }),
-        );
-        analysis
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .set_diagnostics(&uri, diagnostics);
-    }
-}
-
-fn workspace_typescript_source(path: &str) -> bool {
-    let normalized = path.replace('\\', "/");
-    !normalized.split('/').any(|part| {
-        matches!(
-            part,
-            "node_modules" | ".git" | "dist" | "build" | "coverage"
-        )
-    }) && is_typescript_path(Path::new(&normalized))
-        && !normalized.ends_with(".d.ts")
-}
-
 fn send_workspace_index_started(listener: &Option<Arc<dyn CoreListener>>, root: &Path, total: u64) {
     if let Some(listener) = listener {
         listener.on_event(CoreEvent::WorkspaceIndexStarted {
@@ -4645,44 +4712,37 @@ fn send_workspace_index_finished(
     }
 }
 
+fn send_workspace_index_progress(
+    listener: &Option<Arc<dyn CoreListener>>,
+    root: &Path,
+    completed: u64,
+    total: u64,
+) {
+    if let Some(listener) = listener {
+        listener.on_event(CoreEvent::WorkspaceIndexProgress {
+            root: root.to_string_lossy().into_owned(),
+            completed,
+            total,
+        });
+    }
+}
+
 /// One manifest is shared by every language service. It records the current
 /// workspace file set and freshness, while language engines own their semantic
 /// payloads. Reopening a workspace always walks it again and updates this
 /// cache incrementally, so additions and removals are never missed.
-fn refresh_workspace_index(
-    workspace: &CoreWorkspace,
-    paths: &[String],
-    listener: &Option<Arc<dyn CoreListener>>,
-) -> (u64, u64) {
+fn refresh_workspace_index(workspace: &CoreWorkspace, paths: &[String]) -> (u64, u64) {
     let root = workspace.root();
-    let root_text = root.to_string_lossy().into_owned();
     let total = paths.len() as u64;
-    if let Some(listener) = listener {
-        listener.on_event(CoreEvent::WorkspaceIndexProgress {
-            root: root_text.clone(),
-            completed: 0,
-            total,
-        });
-    }
     let previous = load_workspace_manifest(root);
     let mut current = BTreeMap::new();
     let mut changed = 0_u64;
-    for (offset, path) in paths.iter().enumerate() {
+    for path in paths {
         if let Some(freshness) = workspace_file_freshness(&root.join(path)) {
             if previous.get(path) != Some(&freshness) {
                 changed += 1;
             }
             current.insert(path.clone(), freshness);
-        }
-        let completed = (offset + 1) as u64;
-        // Each event represents a file whose freshness was actually read. The
-        // UI can choose how often to render these precise counts.
-        if let Some(listener) = listener {
-            listener.on_event(CoreEvent::WorkspaceIndexProgress {
-                root: root_text.clone(),
-                completed,
-                total,
-            });
         }
     }
     changed += previous
@@ -4862,11 +4922,14 @@ fn spawn_go_index(
     std::thread::Builder::new()
         .name("go-index".into())
         .spawn(move || {
+            let started = Instant::now();
             let built = GoEngine::build(&root);
-            engine
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .install(built);
+            let stats = {
+                let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                engine.install(built);
+                engine.index_stats()
+            };
+            log_language_index("go", &root, stats, started.elapsed());
         })
         .ok()
 }
@@ -4880,11 +4943,14 @@ fn spawn_rust_index(
     std::thread::Builder::new()
         .name("rust-index".into())
         .spawn(move || {
+            let started = Instant::now();
             let built = RustEngine::build(&root);
-            engine
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .install(built);
+            let stats = {
+                let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                engine.install(built);
+                engine.index_stats()
+            };
+            log_language_index("rust", &root, stats, started.elapsed());
         })
         .ok()
 }
@@ -4898,11 +4964,14 @@ fn spawn_dart_index(
     std::thread::Builder::new()
         .name("dart-index".into())
         .spawn(move || {
+            let started = Instant::now();
             let built = DartEngine::build(&root);
-            engine
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .install(built);
+            let stats = {
+                let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                engine.install(built);
+                engine.index_stats()
+            };
+            log_language_index("dart", &root, stats, started.elapsed());
         })
         .ok()
 }
@@ -4922,13 +4991,32 @@ fn spawn_php_index(
     std::thread::Builder::new()
         .name("php-index".into())
         .spawn(move || {
+            let started = Instant::now();
             let built = php::build(&root);
-            engine
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .install(built);
+            let stats = {
+                let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                engine.install(built);
+                engine.index_stats()
+            };
+            log_language_index("php", &root, stats, started.elapsed());
         })
         .ok()
+}
+
+fn log_language_index(language: &str, root: &Path, stats: LanguageIndexStats, elapsed: Duration) {
+    tracing::info!(
+        language,
+        root = %root.display(),
+        files = stats.files,
+        symbols = stats.symbols,
+        imports = stats.imports,
+        reverse_keys = stats.reverse_keys,
+        reverse_sites = stats.reverse_sites,
+        source_bytes = stats.source_bytes,
+        heap_lower_bound_bytes = stats.heap_lower_bound_bytes,
+        build_ms = elapsed.as_millis() as u64,
+        "language index ready"
+    );
 }
 
 /// An outline entry; `kind` uses the LSP `SymbolKind` numbering.

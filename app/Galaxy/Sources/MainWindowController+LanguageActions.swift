@@ -27,9 +27,33 @@ extension MainWindowController {
 
     func refreshDefinition() {
         guard let request = definitionRequest else { return }
-        let location = bridge.definitionLocations(document: request.document).first
+        let locations = bridge.definitionLocations(document: request.document)
         definitionRequest = nil
-        if let location { jump(to: location) }
+        showDefinitionLocations(locations, at: request.position)
+    }
+
+    func showDefinitionLocations(_ locations: [DefinitionLocation], at position: TextPos) {
+        guard locations.count > 1 else {
+            guard let location = locations.first else { return }
+            // Like VS Code: going to the definition from the definition itself
+            // shows its references instead of a no-op jump.
+            if let document = activeTab?.doc, isDefinition(location, at: position, in: document) {
+                // The request is cancelled when the caret moves, so pin it to the click.
+                document.goToLine(line: position.line, col: position.colUtf16)
+                startReferences(document: document, position: position)
+            } else {
+                jump(to: location)
+            }
+            return
+        }
+        presentReferencesPeek(at: position)
+        referencesPanel.update(
+            locations,
+            workspaceRoot: workspace?.root(),
+            title: "Definitions",
+            itemName: "definition"
+        )
+        window?.makeFirstResponder(referencesPanel)
     }
 
     /// Opens `location` and records the jump for back/forward.
@@ -40,29 +64,230 @@ extension MainWindowController {
         _ = show(target)
     }
 
+    /// True when `location` starts on the identifier under `position` in `document`.
+    func isDefinition(_ location: DefinitionLocation, at position: TextPos, in document: DocumentHandle) -> Bool {
+        guard let url = URL(string: location.uri), url.isFileURL,
+              location.line == position.line,
+              location.column <= position.colUtf16 else { return false }
+        let target = url.resolvingSymlinksInPath().path
+        let current = URL(fileURLWithPath: document.path()).resolvingSymlinksInPath().path
+        guard target == current else { return false }
+        // Identifiers are short; a distant start on the same line is another symbol.
+        return position.colUtf16 - location.column <= 128
+    }
+
     @objc func findReferences(_ sender: Any?) {
         guard let document = activeTab?.doc else { NSSound.beep(); return }
-        let position = document.primaryCursor()
-        referencesRequest = document
-        bridge.requestReferences(document: document, line: position.line, character: position.colUtf16)
+        let cursor = document.primaryCursor()
+        startReferences(document: document, position: TextPos(line: cursor.line, colUtf16: cursor.colUtf16))
+    }
+
+    func startReferences(document: DocumentHandle, position: TextPos) {
+        closeOverlays()
+        presentReferencesPeek(at: position)
+        let indexingDetail = workspaceIndexState.flatMap { state in
+            document.path().hasPrefix(state.root + "/")
+                ? "Indexing \(state.completed) of \(state.total) files. References will appear when the language index is ready."
+                : nil
+        }
+        referencesPanel.showStatus(
+            "Finding references...",
+            detail: indexingDetail
+                ?? "Searching the workspace. Language indexing may still be in progress."
+        )
+        referencesRequest = (
+            document,
+            position,
+            false,
+            true,
+            Date().addingTimeInterval(5),
+            Date()
+        )
+        requestReferences(document: document, position: position)
     }
 
     func refreshReferences() {
-        guard let document = referencesRequest else { return }
-        let locations = bridge.references(document: document)
-        guard !locations.isEmpty else { return }
-        referencesRequest = nil
-        problemsPanel.isHidden = true
-        referencesPanel.update(locations)
-        if referencesPanel.superview == nil { detailView.addSubview(referencesPanel) }
-        referencesPanel.frame = NSRect(x: 0, y: 0, width: detailView.bounds.width, height: 150)
+        guard var request = referencesRequest else { return }
+        let cursor = request.document.primaryCursor()
+        guard activeTab?.doc === request.document,
+              cursor.line == request.position.line,
+              cursor.colUtf16 == request.position.colUtf16 else {
+            referencesRequest = nil
+            return
+        }
+        let indexing = workspaceIndexState.flatMap { state in
+            request.document.path().hasPrefix(state.root + "/") ? state : nil
+        }
+        if !request.answered {
+            if let indexing {
+                let progress = indexing.total == 0
+                    ? "Indexing workspace..."
+                    : "Indexing \(indexing.completed) of \(indexing.total) files"
+                if bridge.references(document: request.document).isEmpty {
+                    referencesPanel.showStatus(
+                        "Finding references...",
+                        detail: "\(progress). References will appear when the language index is ready."
+                    )
+                }
+                request.deadline = Date().addingTimeInterval(5)
+            }
+            // While indexing, a shown partial result waits for the final
+            // request after indexing ends instead of rescanning every second.
+            let waitingForIndex = indexing != nil && !bridge.references(document: request.document).isEmpty
+            if !request.inFlight, !waitingForIndex, Date().timeIntervalSince(request.lastAttempt) >= 1 {
+                request.inFlight = true
+                request.lastAttempt = Date()
+                referencesRequest = request
+                requestReferences(document: request.document, position: request.position)
+                return
+            }
+        }
+        let locations = bridge.references(document: request.document)
+        guard !locations.isEmpty else {
+            if indexing != nil {
+                request.answered = false
+                referencesRequest = request
+            } else if Date() >= request.deadline {
+                referencesRequest = nil
+                referencesPanel.showStatus(
+                    "No references found",
+                    detail: "Place the cursor on a symbol in a supported language and try again. If the workspace was just opened, wait for indexing to finish."
+                )
+            } else {
+                request.answered = false
+                referencesRequest = request
+            }
+            return
+        }
+        presentReferencesPeek(at: request.position)
+        referencesPanel.update(locations, workspaceRoot: workspace?.root())
+        preloadReferenceSnippets(locations)
+        window?.makeFirstResponder(referencesPanel)
+        if indexing != nil {
+            // Local occurrences can be available before the workspace importer
+            // snapshot. Keep the visible partial result and require one final
+            // request after indexing finishes.
+            request.answered = false
+            referencesRequest = request
+        } else if request.answered {
+            referencesRequest = nil
+        } else {
+            referencesRequest = request
+        }
+    }
+
+    private func requestReferences(document: DocumentHandle, position: TextPos) {
+        bridge.requestReferences(
+            document: document,
+            line: position.line,
+            character: position.colUtf16
+        ) { [weak self, weak document] answered in
+            guard let self, let document, var request = self.referencesRequest,
+                  request.document === document,
+                  request.position == position else { return }
+            request.answered = answered
+            request.inFlight = false
+            request.lastAttempt = Date()
+            self.referencesRequest = request
+            self.refreshReferences()
+        }
+    }
+
+    private func presentReferencesPeek(at position: TextPos) {
+        if referencesPanel.superview == nil {
+            groupChrome.addSubview(referencesPanel, positioned: .above, relativeTo: stickyScopeView)
+        }
+        layoutReferencesPeek(at: position)
         referencesPanel.isHidden = false
     }
 
     func showReference(_ location: DefinitionLocation) {
         guard URL(string: location.uri) != nil else { return }
-        referencesPanel.removeFromSuperview()
+        closeReferencesPeek()
         jump(to: location)
+    }
+
+    func closeReferencesPeek() {
+        referencePreviewGeneration += 1
+        referenceSnippetGeneration += 1
+        referencesRequest = nil
+        loadedReferencesPanel?.removeFromSuperview()
+        window?.makeFirstResponder(editorView)
+    }
+
+    func previewReference(_ location: DefinitionLocation) {
+        guard let url = URL(string: location.uri), url.isFileURL else { return }
+        referencePreviewGeneration += 1
+        let generation = referencePreviewGeneration
+        if let document = allTabs.first(where: { $0.doc.path() == url.path })?.doc {
+            let snapshot = document.viewport(firstLine: 0, count: document.lineCount())
+            referencesPanel.showPreview(
+                path: url.path,
+                text: document.text(),
+                location: location,
+                styles: snapshot.styles,
+                gutterWidth: editorView.textOriginX
+            )
+            return
+        }
+        DispatchQueue.global(qos: .utility).async { [weak self, url, location] in
+            // The peek is not a file viewer. Refuse an unexpectedly large
+            // dependency instead of copying it into NSTextView.
+            let values = try? url.resourceValues(forKeys: [.fileSizeKey])
+            let text: String? = if (values?.fileSize ?? 0) <= 2 * 1_024 * 1_024 {
+                try? String(contentsOf: url, encoding: .utf8)
+            } else {
+                nil
+            }
+            Task { @MainActor [weak self] in
+                guard let self, generation == self.referencePreviewGeneration,
+                      self.referencesPanel.superview != nil else { return }
+                self.referencesPanel.showPreview(
+                    path: url.path,
+                    text: text ?? "Preview unavailable for this file.",
+                    location: location,
+                    gutterWidth: self.editorView.textOriginX
+                )
+            }
+        }
+    }
+
+    private func preloadReferenceSnippets(_ locations: [DefinitionLocation]) {
+        referenceSnippetGeneration += 1
+        let generation = referenceSnippetGeneration
+        let grouped = Dictionary(grouping: locations, by: \.uri)
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            var values: [(DefinitionLocation, String)] = []
+            for (uri, fileLocations) in grouped {
+                guard let url = URL(string: uri), url.isFileURL,
+                      let text = try? String(contentsOf: url, encoding: .utf8) else { continue }
+                for location in fileLocations {
+                    let range = ReferencesPanel.lineRange(in: text, line: Int(location.line))
+                    guard range.length > 0 else { continue }
+                    values.append((location, (text as NSString).substring(with: range)))
+                }
+            }
+            Task { @MainActor [weak self] in
+                guard let self, generation == self.referenceSnippetGeneration,
+                      self.referencesPanel.superview != nil else { return }
+                self.referencesPanel.setSnippets(values)
+            }
+        }
+    }
+
+    func layoutReferencesPeek(at position: TextPos) {
+        let anchor = editorView.convert(
+            editorView.rect(forLine: position.line, column: position.colUtf16),
+            to: groupChrome
+        )
+        let inset: CGFloat = 0
+        let width = max(320, groupChrome.bounds.width)
+        let height = min(320, max(210, groupChrome.bounds.height * 0.42))
+        let x: CGFloat = 0
+        // `groupChrome` is not flipped: smaller Y values are visually below.
+        let below = anchor.minY - height - 2
+        let y = below >= inset ? below : min(groupChrome.bounds.height - height - inset, anchor.maxY + 2)
+        referencesPanel.frame = NSRect(x: x, y: max(inset, y), width: width, height: height)
     }
 
     @objc func renameSymbol(_ sender: Any?) {

@@ -28,6 +28,57 @@ impl WorkspaceListener for Collect {
 }
 
 #[test]
+fn source_changes_during_indexing_do_not_request_full_rerun() {
+    let core = Core::new();
+    let root = tempfile::tempdir().unwrap().path().to_path_buf();
+    core.indexing_roots
+        .lock()
+        .unwrap()
+        .insert(root.clone(), IndexingState::default());
+
+    core.apply_workspace_changes(
+        root.to_string_lossy().into_owned(),
+        vec!["src/commands.ts".into()],
+        false,
+    );
+    {
+        let indexing = core.indexing_roots.lock().unwrap();
+        let state = indexing.get(&root).unwrap();
+        assert!(!state.rerun);
+        assert_eq!(state.pending_typescript, ["src/commands.ts"]);
+    }
+
+    core.apply_workspace_changes(
+        root.to_string_lossy().into_owned(),
+        vec!["README.md".into()],
+        false,
+    );
+    assert!(
+        !core
+            .indexing_roots
+            .lock()
+            .unwrap()
+            .get(&root)
+            .unwrap()
+            .rerun
+    );
+
+    core.apply_workspace_changes(
+        root.to_string_lossy().into_owned(),
+        vec!["tsconfig.json".into()],
+        false,
+    );
+    assert!(
+        core.indexing_roots
+            .lock()
+            .unwrap()
+            .get(&root)
+            .unwrap()
+            .rerun
+    );
+}
+
+#[test]
 fn file_finder_searches_the_workspace() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
@@ -319,7 +370,13 @@ fn workspace_typescript_refresh_keeps_rust_diagnostics() {
     let engines = Arc::new(Mutex::new(HashMap::new()));
     publish_workspace_rust_diagnostics(&analysis, dir.path(), &["src/lib.rs".into()], &engines);
 
-    publish_workspace_typescript_diagnostics(&analysis, dir.path(), &[]);
+    let typescript = TypeScriptWorkspaceExports::build(dir.path(), &[]);
+    for (uri, diagnostics) in typescript.diagnostics() {
+        analysis
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .set_diagnostics(&uri, diagnostics);
+    }
 
     assert!(
         analysis

@@ -974,6 +974,23 @@ fn class_without_superclass_still_checks_constructor_arity() {
     );
 }
 
+#[test]
+fn object_literal_shorthand_methods_are_inferred_as_properties() {
+    let index = DocumentIndex::parse(
+        "mini-host.ts",
+        "const trace = {\n\
+           write(type: string, data?: unknown) { return type }\n\
+         }\n\
+         trace.write('trace.start', {})\n",
+    );
+
+    assert!(
+        index.type_diagnostics.is_empty(),
+        "{:?}",
+        index.type_diagnostics
+    );
+}
+
 fn unresolved(source: &str) -> Vec<String> {
     DocumentIndex::parse("a.ts", source)
         .unresolved_references

@@ -155,6 +155,19 @@ pub struct PhpEngine {
 }
 
 impl PhpEngine {
+    pub fn index_stats(&self) -> crate::LanguageIndexStats {
+        let symbols = self.names.as_ref().map_or(0, |names| names.len());
+        let files = self.scanned.as_ref().map_or(0, HashMap::len);
+        crate::LanguageIndexStats {
+            files,
+            symbols,
+            heap_lower_bound_bytes: files
+                * (std::mem::size_of::<String>() + std::mem::size_of::<PathBuf>())
+                + symbols * std::mem::size_of::<ClassName>(),
+            ..Default::default()
+        }
+    }
+
     pub fn new(root: &Path) -> Self {
         Self::with_frameworks(root, framework::detect_all(root))
     }

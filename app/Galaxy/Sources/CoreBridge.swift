@@ -12,7 +12,9 @@ final class CoreBridge {
     /// AppKit main thread and serialize requests so stale typing work cannot
     /// contend with newer requests.
     private let completionQueue = DispatchQueue(label: "dev.adityadarma.galaxy.completion")
+    private let referencesQueue = DispatchQueue(label: "dev.adityadarma.galaxy.references")
     private var pendingCompletionRequest: DispatchWorkItem?
+    private var pendingReferencesRequest: DispatchWorkItem?
     private(set) var lastEvent: CoreEvent?
     var onEvent: ((CoreEvent) -> Void)?
 
@@ -154,8 +156,49 @@ final class CoreBridge {
         core.definitionLocations(document: document)
     }
 
-    func requestReferences(document: DocumentHandle, line: UInt64, character: UInt64) {
-        _ = core.requestReferences(document: document, line: line, character: character)
+    func requestReferences(
+        document: DocumentHandle,
+        line: UInt64,
+        character: UInt64,
+        completion: @escaping @MainActor @Sendable (Bool) -> Void
+    ) {
+        pendingReferencesRequest?.cancel()
+        let core = core
+        let enqueued = DispatchTime.now().uptimeNanoseconds
+        let item = Self.referencesWorkItem(
+            core: core,
+            document: document,
+            line: line,
+            character: character,
+            enqueued: enqueued,
+            completion: completion
+        )
+        pendingReferencesRequest = item
+        referencesQueue.async(execute: item)
+    }
+
+    nonisolated private static func referencesWorkItem(
+        core: Core,
+        document: DocumentHandle,
+        line: UInt64,
+        character: UInt64,
+        enqueued: UInt64,
+        completion: @escaping @MainActor @Sendable (Bool) -> Void
+    ) -> DispatchWorkItem {
+        DispatchWorkItem {
+            let started = DispatchTime.now().uptimeNanoseconds
+            let answered = core.requestReferences(
+                document: document,
+                line: line,
+                character: character
+            )
+            let finished = DispatchTime.now().uptimeNanoseconds
+            let queue = Double(started - enqueued) / 1_000_000
+            let elapsed = Double(finished - started) / 1_000_000
+            let count = core.references(document: document).count
+            Log.core.info("references answered=\(answered, privacy: .public) items=\(count, privacy: .public) queue_ms=\(queue, privacy: .public) engine_ms=\(elapsed, privacy: .public)")
+            Task { @MainActor in completion(answered) }
+        }
     }
 
     func references(document: DocumentHandle) -> [DefinitionLocation] {

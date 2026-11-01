@@ -12,7 +12,9 @@ use galaxy_core::typescript::{
 
 use crate::{file_uri, is_typescript_path, typescript_range};
 
-const MAX_TYPESCRIPT_NAVIGATION_CACHE_ENTRIES: usize = 256;
+/// Large enough for a monorepo's import targets: when full the cache is
+/// cleared, and a references scan that exceeds it re-parses every target.
+const MAX_TYPESCRIPT_NAVIGATION_CACHE_ENTRIES: usize = 2048;
 pub(super) const MAX_TYPESCRIPT_REEXPORT_DEPTH: usize = 32;
 const MAX_TYPESCRIPT_WARM_SOURCE_CANDIDATES: usize = 5000;
 const MAX_TYPESCRIPT_WARM_IMPORT_TARGETS: usize = 512;
