@@ -112,6 +112,11 @@ extension EditorView {
             toggleFold(line: UInt64(hit.key))
             return
         }
+        if local.x >= gutterShift, local.x < gutterShift + 4,
+           gitLineChanges[pos.line + 1] != nil, event.clickCount == 1 {
+            onGitChangeClick?(pos.line)
+            return
+        }
         if local.x < gutterWidth + gutterShift, event.clickCount == 1 {
             // The chevron column folds; the line numbers set or clear a breakpoint.
             if local.x - gutterShift >= foldZoneMinX, !wrapSuspended, document.foldState(line: pos.line) != .plain {

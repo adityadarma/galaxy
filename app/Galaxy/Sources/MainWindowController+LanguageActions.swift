@@ -147,7 +147,7 @@ extension MainWindowController {
             if indexing != nil {
                 request.answered = false
                 referencesRequest = request
-            } else if Date() >= request.deadline {
+            } else if !request.inFlight, Date() >= request.deadline {
                 referencesRequest = nil
                 referencesPanel.showStatus(
                     "No references found",
@@ -160,7 +160,21 @@ extension MainWindowController {
             return
         }
         presentReferencesPeek(at: request.position)
-        referencesPanel.update(locations, workspaceRoot: workspace?.root())
+        let requestURI = URL(fileURLWithPath: request.document.path()).absoluteString
+        let preferred = locations
+            .filter { $0.uri == requestURI }
+            .min { lhs, rhs in
+                let lhsDistance = abs(Int64(lhs.line) - Int64(request.position.line)) * 1_000_000
+                    + abs(Int64(lhs.column) - Int64(request.position.colUtf16))
+                let rhsDistance = abs(Int64(rhs.line) - Int64(request.position.line)) * 1_000_000
+                    + abs(Int64(rhs.column) - Int64(request.position.colUtf16))
+                return lhsDistance < rhsDistance
+            }
+        referencesPanel.update(
+            locations,
+            workspaceRoot: workspace?.root(),
+            preferredLocation: preferred
+        )
         preloadReferenceSnippets(locations)
         window?.makeFirstResponder(referencesPanel)
         if indexing != nil {
@@ -226,18 +240,29 @@ extension MainWindowController {
                 text: document.text(),
                 location: location,
                 styles: snapshot.styles,
-                gutterWidth: editorView.textOriginX
+                gutterWidth: editorView.textOriginX,
+                stickyScopes: Self.stickyScopeProvider(for: document)
             )
             return
         }
-        DispatchQueue.global(qos: .utility).async { [weak self, url, location] in
+        let core = bridge.core
+        DispatchQueue.global(qos: .utility).async { [weak self, url, location, core] in
             // The peek is not a file viewer. Refuse an unexpectedly large
             // dependency instead of copying it into NSTextView.
             let values = try? url.resourceValues(forKeys: [.fileSizeKey])
-            let text: String? = if (values?.fileSize ?? 0) <= 2 * 1_024 * 1_024 {
-                try? String(contentsOf: url, encoding: .utf8)
-            } else {
-                nil
+            var text: String?
+            var styles: [StyleRun] = []
+            var scopes: (@Sendable (Int) -> [Int])?
+            if (values?.fileSize ?? 0) <= 2 * 1_024 * 1_024,
+               let document = try? core.openDocument(path: url.path) {
+                text = document.text()
+                let deadline = Date().addingTimeInterval(0.5)
+                while document.syntaxLanguage() != nil, Date() < deadline {
+                    if document.pollSyntax() { break }
+                    Thread.sleep(forTimeInterval: 0.005)
+                }
+                styles = document.viewport(firstLine: 0, count: document.lineCount()).styles
+                scopes = Self.stickyScopeProvider(for: document)
             }
             Task { @MainActor [weak self] in
                 guard let self, generation == self.referencePreviewGeneration,
@@ -246,10 +271,17 @@ extension MainWindowController {
                     path: url.path,
                     text: text ?? "Preview unavailable for this file.",
                     location: location,
-                    gutterWidth: self.editorView.textOriginX
+                    styles: styles,
+                    gutterWidth: self.editorView.textOriginX,
+                    stickyScopes: scopes
                 )
             }
         }
+    }
+
+    /// Scope headers of `document` for the peek's sticky rows.
+    private nonisolated static func stickyScopeProvider(for document: DocumentHandle) -> @Sendable (Int) -> [Int] {
+        { line in document.stickyScopes(line: UInt64(line), max: 3).map(Int.init) }
     }
 
     private func preloadReferenceSnippets(_ locations: [DefinitionLocation]) {

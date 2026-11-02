@@ -174,15 +174,15 @@ fn collect_model_query_members(
         && model_extends_lucid_base_model(root, context, model_name)
     {
         Some(TypeMemberTarget::PackageDeclaration {
-            specifier: MODEL_DECLARATION,
-            type_name: MODEL,
+            specifier: MODEL_DECLARATION.to_owned(),
+            type_name: MODEL.to_owned(),
         })
     } else if query_call_model(object, context.text)
         .is_some_and(|model_name| model_extends_lucid_base_model(root, context, model_name))
     {
         Some(TypeMemberTarget::PackageDeclaration {
-            specifier: DECLARATION,
-            type_name: BUILDER,
+            specifier: DECLARATION.to_owned(),
+            type_name: BUILDER.to_owned(),
         })
     } else {
         None
@@ -344,8 +344,8 @@ fn collect_members(
     {
         uses.push(TypeMemberUse {
             target: TypeMemberTarget::PackageDeclaration {
-                specifier: DECLARATION,
-                type_name: BUILDER,
+                specifier: DECLARATION.to_owned(),
+                type_name: BUILDER.to_owned(),
             },
             member_name,
             member_range: context.locations.range(property),

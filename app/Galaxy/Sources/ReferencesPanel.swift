@@ -26,12 +26,16 @@ final class ReferencesPanel: CardView, NSTableViewDataSource, NSTableViewDelegat
     private var snippets: [String: String] = [:]
     private var shownLocations: [DefinitionLocation] = []
     private var shownTitle = ""
+    private var previewedLocation: DefinitionLocation?
     private let title = NSTextField(labelWithString: "References")
     private let count = NSTextField(labelWithString: "0 references")
     private let previewTitle = NSTextField(labelWithString: "")
     private let preview = ReferencesPreviewView()
     private let previewRuler = ReferencesLineNumberRuler()
     private let previewScroll = NSScrollView()
+    /// Holds the preview scroll view with the sticky scope rows above it.
+    private let previewContainer = NSView()
+    private let previewSticky = ReferencesStickyView()
     private let resultsScroll = NSScrollView()
     private let table = ReferencesTableView()
     private let closeButton = NSButton()
@@ -77,6 +81,22 @@ final class ReferencesPanel: CardView, NSTableViewDataSource, NSTableViewDelegat
         previewScroll.hasVerticalRuler = true
         previewScroll.rulersVisible = true
         previewScroll.translatesAutoresizingMaskIntoConstraints = false
+        previewSticky.translatesAutoresizingMaskIntoConstraints = false
+        previewSticky.scrollView = previewScroll
+        previewSticky.onSelect = { [weak self] line, pinned in self?.scrollPreview(toLine: line, above: pinned) }
+        preview.onViewportChange = { [weak self] in self?.refreshSticky() }
+        previewContainer.translatesAutoresizingMaskIntoConstraints = false
+        previewContainer.addSubview(previewScroll)
+        previewContainer.addSubview(previewSticky)
+        NSLayoutConstraint.activate([
+            previewScroll.topAnchor.constraint(equalTo: previewContainer.topAnchor),
+            previewScroll.bottomAnchor.constraint(equalTo: previewContainer.bottomAnchor),
+            previewScroll.leadingAnchor.constraint(equalTo: previewContainer.leadingAnchor),
+            previewScroll.trailingAnchor.constraint(equalTo: previewContainer.trailingAnchor),
+            previewSticky.topAnchor.constraint(equalTo: previewContainer.topAnchor),
+            previewSticky.leadingAnchor.constraint(equalTo: previewContainer.leadingAnchor),
+            previewSticky.trailingAnchor.constraint(equalTo: previewContainer.trailingAnchor),
+        ])
 
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("reference"))
         column.resizingMask = .autoresizingMask
@@ -87,13 +107,13 @@ final class ReferencesPanel: CardView, NSTableViewDataSource, NSTableViewDelegat
         table.backgroundColor = .clear
         table.dataSource = self
         table.delegate = self
-        table.target = self
-        table.action = #selector(clicked(_:))
-        table.doubleAction = #selector(doubleClicked(_:))
         table.onEscape = { [weak self] in self?.dismiss() }
         table.onOpen = { [weak self] in
             guard let self, let location = self.selectedLocation() else { return }
             self.onSelect?(location)
+        }
+        table.onClick = { [weak self] row, clickCount in
+            self?.handleClick(row: row, clickCount: clickCount)
         }
         table.setAccessibilityIdentifier("references-results")
         resultsScroll.documentView = table
@@ -105,7 +125,7 @@ final class ReferencesPanel: CardView, NSTableViewDataSource, NSTableViewDelegat
         split.isVertical = true
         split.dividerStyle = .thin
         split.translatesAutoresizingMaskIntoConstraints = false
-        split.addArrangedSubview(previewScroll)
+        split.addArrangedSubview(previewContainer)
         split.addArrangedSubview(resultsScroll)
 
         addSubview(header)
@@ -120,7 +140,7 @@ final class ReferencesPanel: CardView, NSTableViewDataSource, NSTableViewDelegat
             split.trailingAnchor.constraint(equalTo: trailingAnchor),
             split.bottomAnchor.constraint(equalTo: bottomAnchor),
             resultsScroll.widthAnchor.constraint(greaterThanOrEqualToConstant: 240),
-            previewScroll.widthAnchor.constraint(greaterThanOrEqualToConstant: 320),
+            previewContainer.widthAnchor.constraint(greaterThanOrEqualToConstant: 320),
         ])
     }
 
@@ -131,9 +151,12 @@ final class ReferencesPanel: CardView, NSTableViewDataSource, NSTableViewDelegat
     var titleText: String { title.stringValue }
     var statusText: String { count.stringValue }
     var statusDetail: String { preview.plainText }
+    var previewHasSyntaxHighlighting: Bool { preview.hasSyntaxHighlighting }
     var previewHorizontalOffset: CGFloat { previewScroll.contentView.bounds.origin.x }
     var previewGutterWidth: CGFloat { previewRuler.ruleThickness }
     var previewContentView: NSView { preview }
+    /// Source lines currently pinned over the top of the preview.
+    var previewStickyLines: [Int] { previewSticky.rows.map(\.line) }
     var resultsTableView: NSTableView { table }
     var resultsPaneFraction: CGFloat {
         guard split.bounds.width > 0 else { return 0 }
@@ -154,11 +177,13 @@ final class ReferencesPanel: CardView, NSTableViewDataSource, NSTableViewDelegat
         _ locations: [DefinitionLocation],
         workspaceRoot: String?,
         title panelTitle: String = "References",
-        itemName: String = "reference"
+        itemName: String = "reference",
+        preferredLocation: DefinitionLocation? = nil
     ) {
         guard locations != shownLocations || panelTitle != shownTitle else { return }
         shownLocations = locations
         shownTitle = panelTitle
+        previewedLocation = nil
         title.stringValue = panelTitle
         snippets = [:]
         let grouped = Dictionary(grouping: locations, by: \.uri)
@@ -175,8 +200,9 @@ final class ReferencesPanel: CardView, NSTableViewDataSource, NSTableViewDelegat
         count.stringValue = "(\(locations.count))"
         count.toolTip = "\(locations.count) \(itemName)\(locations.count == 1 ? "" : "s")"
         rebuildRows()
-        if let first = locations.first {
+        if let first = preferredLocation ?? locations.first {
             select(first)
+            preview(first)
         }
     }
 
@@ -188,9 +214,11 @@ final class ReferencesPanel: CardView, NSTableViewDataSource, NSTableViewDelegat
         groups = []
         rows = []
         snippets = [:]
+        previewedLocation = nil
         count.stringValue = status
         previewTitle.stringValue = ""
-        preview.leadingInset = previewRuler.ruleThickness
+        preview.leadingInset = 0
+        preview.scopeProvider = nil
         preview.showStatus(detail)
         table.reloadData()
     }
@@ -200,7 +228,8 @@ final class ReferencesPanel: CardView, NSTableViewDataSource, NSTableViewDelegat
         text: String,
         location: DefinitionLocation,
         styles: [StyleRun] = [],
-        gutterWidth: CGFloat? = nil
+        gutterWidth: CGFloat? = nil,
+        stickyScopes: ((Int) -> [Int])? = nil
     ) {
         previewTitle.stringValue = "\((path as NSString).lastPathComponent):\(location.line + 1):\(location.column + 1)"
         let (attributed, lineRanges) = attributedPreview(text: text, styles: styles)
@@ -209,7 +238,8 @@ final class ReferencesPanel: CardView, NSTableViewDataSource, NSTableViewDelegat
             font: Theme.editorFont,
             width: gutterWidth
         )
-        preview.leadingInset = previewRuler.ruleThickness
+        preview.leadingInset = 0
+        preview.scopeProvider = stickyScopes
         let range = lineRanges.indices.contains(Int(location.line))
             ? lineRanges[Int(location.line)]
             : NSRange(location: 0, length: 0)
@@ -239,6 +269,23 @@ final class ReferencesPanel: CardView, NSTableViewDataSource, NSTableViewDelegat
             snippets[Self.key(location)] = source.trimmingCharacters(in: .whitespacesAndNewlines)
         }
         table.reloadData()
+    }
+
+    private func refreshSticky() {
+        let rows = preview.pinnedScopeLines().compactMap { line in
+            preview.lineAttributed(line).map { ReferencesStickyView.Row(line: line, text: $0) }
+        }
+        previewSticky.show(rows, rowHeight: preview.rowHeight, gutterWidth: previewRuler.ruleThickness)
+    }
+
+    /// A click on a pinned row: scroll its line to just below the pinned rows
+    /// that still enclose it.
+    private func scrollPreview(toLine line: Int, above pinned: Int) {
+        let clip = previewScroll.contentView
+        let y = preview.y(forLine: line) - CGFloat(pinned) * preview.rowHeight
+        let target = NSRect(origin: NSPoint(x: clip.bounds.origin.x, y: y), size: clip.bounds.size)
+        clip.scroll(to: clip.constrainBoundsRect(target).origin)
+        previewScroll.reflectScrolledClipView(clip)
     }
 
     private func attributedPreview(text: String, styles: [StyleRun]) -> (NSMutableAttributedString, [NSRange]) {
@@ -328,7 +375,7 @@ final class ReferencesPanel: CardView, NSTableViewDataSource, NSTableViewDelegat
     func tableViewSelectionDidChange(_ notification: Notification) {
         guard notification.object as? NSTableView === table,
               let location = selectedLocation() else { return }
-        onPreview?(location)
+        preview(location)
     }
 
     override func keyDown(with event: NSEvent) {
@@ -339,18 +386,26 @@ final class ReferencesPanel: CardView, NSTableViewDataSource, NSTableViewDelegat
         super.keyDown(with: event)
     }
 
-    @objc private func clicked(_ sender: Any?) {
-        guard rows.indices.contains(table.clickedRow) else { return }
-        switch rows[table.clickedRow] {
+    func handleClick(row: Int, clickCount: Int) {
+        guard rows.indices.contains(row) else { return }
+        switch rows[row] {
         case let .file(group):
+            guard clickCount == 1 else { return }
             if collapsed.contains(group.uri) { collapsed.remove(group.uri) } else { collapsed.insert(group.uri) }
             rebuildRows()
-        case let .reference(location): onPreview?(location)
+        case let .reference(location):
+            if clickCount == 1 {
+                preview(location)
+            } else if clickCount == 2 {
+                onSelect?(location)
+            }
         }
     }
 
-    @objc private func doubleClicked(_ sender: Any?) {
-        if let location = selectedLocation() { onSelect?(location) }
+    private func preview(_ location: DefinitionLocation) {
+        guard previewedLocation != location else { return }
+        previewedLocation = location
+        onPreview?(location)
     }
 
     @objc private func close(_ sender: Any?) { dismiss() }
@@ -456,6 +511,7 @@ final class ReferencesFileCell: NSTableCellView {
         }
         disclosureLabel.font = .systemFont(ofSize: 12, weight: .semibold)
         nameLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+        nameLabel.lineBreakMode = .byTruncatingMiddle
         directoryLabel.font = .systemFont(ofSize: 12, weight: .medium)
         directoryLabel.textColor = .secondaryLabelColor
         directoryLabel.lineBreakMode = .byTruncatingMiddle
@@ -501,6 +557,13 @@ final class ReferencesFileCell: NSTableCellView {
 private final class ReferencesTableView: NSTableView {
     var onEscape: (() -> Void)?
     var onOpen: (() -> Void)?
+    var onClick: ((Int, Int) -> Void)?
+
+    override func mouseDown(with event: NSEvent) {
+        let clicked = row(at: convert(event.locationInWindow, from: nil))
+        super.mouseDown(with: event)
+        onClick?(clicked, event.clickCount)
+    }
 
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 53 { return onEscape?() ?? () }
@@ -516,11 +579,31 @@ private final class ReferencesPreviewView: NSView {
     private var lineRanges: [NSRange] = []
     private var selectedLine: Int?
     private var lineFields: [NSTextField] = []
+    private let whitespaceMarkers = ReferencesWhitespaceMarkers()
     private let inset = NSSize(width: 10, height: 8)
-    /// The clip view extends under the floating line-number ruler, so text
-    /// starts after the gutter like in the editor.
+    /// The scroll view places the document view beside its line-number ruler.
     var leadingInset: CGFloat = 0
+    /// Header lines of the blocks around a line, outermost first.
+    var scopeProvider: ((Int) -> [Int])?
+    /// Called after the visible lines changed: scrolled, resized or reloaded.
+    var onViewportChange: (() -> Void)?
+    private static let stickyLimit = 3
+    var rowHeight: CGFloat { lineHeight }
     private var lineHeight: CGFloat { ceil(NSLayoutManager().defaultLineHeight(for: Theme.editorFont)) }
+    var hasSyntaxHighlighting: Bool {
+        let base = Theme.editorForeground.resolved(for: effectiveAppearance)
+        var highlighted = false
+        attributed.enumerateAttribute(
+            .foregroundColor,
+            in: NSRange(location: 0, length: attributed.length)
+        ) { value, _, stop in
+            if let color = value as? NSColor, !color.isEqual(base) {
+                highlighted = true
+                stop.pointee = true
+            }
+        }
+        return highlighted
+    }
 
     override var isFlipped: Bool { true }
 
@@ -528,6 +611,15 @@ private final class ReferencesPreviewView: NSView {
         super.init(frame: frameRect)
         wantsLayer = true
         layer?.backgroundColor = Theme.editorBackground.cgColor
+        whitespaceMarkers.translatesAutoresizingMaskIntoConstraints = false
+        whitespaceMarkers.isHidden = true
+        addSubview(whitespaceMarkers)
+        NSLayoutConstraint.activate([
+            whitespaceMarkers.leadingAnchor.constraint(equalTo: leadingAnchor),
+            whitespaceMarkers.trailingAnchor.constraint(equalTo: trailingAnchor),
+            whitespaceMarkers.topAnchor.constraint(equalTo: topAnchor),
+            whitespaceMarkers.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
     }
 
     @available(*, unavailable)
@@ -588,15 +680,15 @@ private final class ReferencesPreviewView: NSView {
         }
         let viewport = enclosingScrollView?.contentSize ?? .zero
         frame.size = NSSize(
-            width: max(viewport.width, ceil(leadingInset + widest + inset.width * 2)),
+            width: max(viewport.width, ceil(leadingInset + widest + inset.width)),
             height: max(viewport.height, ceil(CGFloat(max(1, lineRanges.count)) * lineHeight + inset.height * 2))
         )
         updateVisibleLines()
     }
 
     func updateVisibleLines() {
-        var viewport = visibleRect
-        // A view outside a window can report an infinite or null visible rect.
+        var viewport = enclosingScrollView?.contentView.bounds ?? visibleRect
+        // A view outside a window can report an infinite or null viewport.
         if viewport.isNull || viewport.isInfinite || !viewport.minY.isFinite || !viewport.maxY.isFinite {
             viewport = .zero
         }
@@ -613,8 +705,12 @@ private final class ReferencesPreviewView: NSView {
         let last = min(lineRanges.count, Int(ceil((viewport.maxY - inset.height) / lineHeight)) + 1)
         let visibleCount = max(0, last - first)
         while lineFields.count < visibleCount {
-            let field = NSTextField(labelWithString: "")
+            let field = ReferencesLineField(frame: .zero)
+            field.isEditable = false
             field.isSelectable = false
+            field.isBordered = false
+            field.isBezeled = false
+            field.drawsBackground = false
             field.lineBreakMode = .byClipping
             field.maximumNumberOfLines = 1
             addSubview(field)
@@ -632,13 +728,47 @@ private final class ReferencesPreviewView: NSView {
             field.backgroundColor = selectedLine == line
                 ? NSColor.selectedTextBackgroundColor.withAlphaComponent(0.22)
                 : .clear
+            // Code starts at the ruler edge, as it does in the editor.
             field.frame = NSRect(
-                x: leadingInset + inset.width,
+                x: leadingInset,
                 y: y(forLine: line),
-                width: max(0, frame.width - leadingInset - inset.width * 2),
+                width: max(0, frame.width - leadingInset),
                 height: lineHeight
             )
         }
+        let markerLines = first < last ? (first..<last).map { line in
+                (lineValue(lineRanges[line]).string, y(forLine: line))
+            } : []
+        whitespaceMarkers.update(
+            lines: markerLines,
+            originX: leadingInset,
+            lineHeight: lineHeight
+        )
+        onViewportChange?()
+    }
+
+    func lineAttributed(_ line: Int) -> NSAttributedString? {
+        lineRanges.indices.contains(line) ? lineValue(lineRanges[line]) : nil
+    }
+
+    /// Scope headers to pin over the top row, with the editor's rule: with `n`
+    /// rows pinned, the line `n` rows below the top edge sits in at least `n`
+    /// blocks and each of the first `n` headers has reached its slot.
+    func pinnedScopeLines() -> [Int] {
+        guard let scopeProvider, let clip = enclosingScrollView?.contentView,
+              lineHeight > 0, !lineRanges.isEmpty else { return [] }
+        let topRow = (clip.bounds.origin.y - inset.height) / lineHeight
+        guard topRow > 0 else { return [] }
+        for count in stride(from: Self.stickyLimit, through: 1, by: -1) {
+            let under = min(lineRanges.count - 1, max(0, Int(topRow.rounded(.down)) + count))
+            let chain = scopeProvider(under)
+            guard chain.count >= count else { continue }
+            let headers = Array(chain.prefix(count))
+            if headers.enumerated().allSatisfy({ CGFloat($0.element) <= topRow + CGFloat($0.offset) }) {
+                return headers
+            }
+        }
+        return []
     }
 
     func y(forLine line: Int) -> CGFloat {
@@ -655,6 +785,166 @@ private final class ReferencesPreviewView: NSView {
         return value
     }
 
+}
+
+/// A label whose text starts at the frame edge. `NSTextFieldCell` insets its
+/// text by about 2 pt, which pushed the preview's code right of the editor's.
+private final class ReferencesLineCell: NSTextFieldCell {
+    override func drawingRect(forBounds rect: NSRect) -> NSRect { rect }
+}
+
+private final class ReferencesLineField: NSTextField {
+    override class var cellClass: AnyClass? {
+        get { ReferencesLineCell.self }
+        set {}
+    }
+}
+
+/// Sticky scroll for the preview: the header lines of the blocks around the
+/// top visible line stay pinned, drawn like the editor draws its own.
+@MainActor
+private final class ReferencesStickyView: NSView {
+    struct Row: Equatable {
+        var line: Int
+        var text: NSAttributedString
+    }
+
+    private(set) var rows: [Row] = []
+    weak var scrollView: NSScrollView?
+    /// A click on a row: its line, and how many pinned rows sit above it.
+    var onSelect: ((Int, Int) -> Void)?
+    private var rowHeight: CGFloat = 0
+    private var gutterWidth: CGFloat = 0
+    private var heightConstraint: NSLayoutConstraint!
+
+    override var isFlipped: Bool { true }
+    override var mouseDownCanMoveWindow: Bool { false }
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        heightConstraint = heightAnchor.constraint(equalToConstant: 0)
+        heightConstraint.isActive = true
+        isHidden = true
+        setAccessibilityIdentifier("references-sticky-scope")
+        setAccessibilityRole(.group)
+        layer?.masksToBounds = false
+        layer?.shadowColor = NSColor.black.cgColor
+        layer?.shadowOpacity = 0.28
+        layer?.shadowRadius = 4
+        layer?.shadowOffset = CGSize(width: 0, height: -2)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override func layout() {
+        super.layout()
+        layer?.shadowPath = CGPath(rect: bounds, transform: nil)
+    }
+
+    func show(_ newRows: [Row], rowHeight: CGFloat, gutterWidth: CGFloat) {
+        let height = CGFloat(newRows.count) * rowHeight
+        if heightConstraint.constant != height {
+            heightConstraint.constant = height
+            needsDisplay = true
+        }
+        isHidden = newRows.isEmpty
+        if self.rowHeight != rowHeight || self.gutterWidth != gutterWidth {
+            self.rowHeight = rowHeight
+            self.gutterWidth = gutterWidth
+            needsDisplay = true
+        }
+        guard newRows != rows else { return }
+        rows = newRows
+        setAccessibilityLabel("Scope: " + newRows.map { $0.text.string.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .joined(separator: ", "))
+        needsDisplay = true
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        guard rowHeight > 0, point.y >= 0 else { return }
+        let index = Int(point.y / rowHeight)
+        guard rows.indices.contains(index) else { return }
+        onSelect?(rows[index].line, index)
+    }
+
+    /// The rows cover the preview; wheel events still belong to its scroll view.
+    override func scrollWheel(with event: NSEvent) {
+        if let scrollView { scrollView.scrollWheel(with: event) } else { super.scrollWheel(with: event) }
+    }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .pointingHand)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        Theme.editorBackground.resolved(for: effectiveAppearance).setFill()
+        dirtyRect.intersection(bounds).fill()
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: Theme.editorFont,
+            .foregroundColor: NSColor.secondaryLabelColor,
+        ]
+        for (index, row) in rows.enumerated() {
+            let top = CGFloat(index) * rowHeight
+            let label = "\(row.line + 1)" as NSString
+            let size = label.size(withAttributes: attributes)
+            label.draw(
+                at: NSPoint(x: gutterWidth - EditorView.gutterTrailingPadding - size.width, y: top),
+                withAttributes: attributes
+            )
+            NSGraphicsContext.saveGraphicsState()
+            NSRect(x: gutterWidth, y: top, width: max(0, bounds.width - gutterWidth), height: rowHeight).clip()
+            row.text.draw(at: NSPoint(x: gutterWidth, y: top))
+            NSGraphicsContext.restoreGraphicsState()
+        }
+        NSColor.separatorColor.setFill()
+        NSRect(x: gutterWidth - 1, y: 0, width: 1, height: bounds.height).fill()
+    }
+}
+
+/// Mirrors the editor's non-destructive whitespace markers without changing
+/// the attributed source used for syntax highlighting.
+@MainActor
+private final class ReferencesWhitespaceMarkers: NSView {
+    private var lines: [(String, CGFloat)] = []
+    private var originX: CGFloat = 0
+    private var lineHeight: CGFloat = 0
+
+    override var isFlipped: Bool { true }
+
+    func update(lines: [(String, CGFloat)], originX: CGFloat, lineHeight: CGFloat) {
+        self.lines = lines
+        self.originX = originX
+        self.lineHeight = lineHeight
+        isHidden = lines.isEmpty
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        let font = Theme.editorFont
+        let attributes: [NSAttributedString.Key: Any] = [.font: font]
+        let radius = max(1, (font.pointSize / 13).rounded(.down)) * 0.9
+        Theme.whitespace.setFill()
+        for (text, y) in lines {
+            let source = text as NSString
+            for column in EditorView.whitespaceColumns(in: text, mode: .all) {
+                let prefix = source.substring(to: column) as NSString
+                let character = source.substring(with: NSRange(location: column, length: 1)) as NSString
+                let start = originX + prefix.size(withAttributes: attributes).width
+                let width = character.size(withAttributes: attributes).width
+                let center = NSPoint(x: start + width / 2, y: y + lineHeight / 2)
+                NSBezierPath(ovalIn: NSRect(
+                    x: center.x - radius,
+                    y: center.y - radius,
+                    width: radius * 2,
+                    height: radius * 2
+                )).fill()
+            }
+        }
+    }
 }
 
 @MainActor
@@ -695,7 +985,7 @@ private final class ReferencesLineNumberRuler: NSRulerView {
             .font: numberFont,
             .foregroundColor: NSColor.secondaryLabelColor,
         ]
-        let visible = preview.visibleRect
+        let visible = scrollView?.contentView.bounds ?? preview.visibleRect
         for (index, characterRange) in lineRanges.enumerated() {
             _ = characterRange
             let y = preview.y(forLine: index) - visible.minY

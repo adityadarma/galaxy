@@ -26,7 +26,19 @@ pub struct Position {
 }
 
 /// Zero-based line and column, column counted in UTF-16 code units (LSP).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub struct Utf16Position {
     pub line: usize,
     pub col: usize,

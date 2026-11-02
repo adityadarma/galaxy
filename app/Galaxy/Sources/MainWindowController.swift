@@ -369,6 +369,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             self?.scheduleBlameRefresh()
             self?.scheduleParameterHints()
         }
+        editorView.onGitChangeClick = { [weak self] line in
+            self?.toggleInlineGitHunk(at: line)
+        }
         editorView.onSnippetInvalidated = { [weak self] in
             self?.snippetSession = nil
             self?.snippetDocumentKey = nil

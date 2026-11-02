@@ -271,6 +271,45 @@ extension MainWindowController {
         }
     }
 
+    /// Expands one working-tree change in-place below its marker. The editor
+    /// owns layout; this supplies the corresponding text ranges from HEAD.
+    func toggleInlineGitHunk(at line: UInt64) {
+        if editorView.inlineGitHunk?.anchorLine == line {
+            editorView.inlineGitHunk = nil
+            return
+        }
+        guard let workspace, let tab = activeTab, let path = tab.relPath else { return }
+        let text = tab.doc.text()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self, workspace, path, text, line] in
+            let hunks = (try? workspace.gitDiffHunks(relPath: path, text: text)) ?? []
+            guard let hunk = hunks.first(where: {
+                let first = $0.newStart
+                let length = max($0.newLen, 1)
+                return line >= first && line < first + length
+            }) else { return }
+            let base = (try? workspace.gitBaseDocument(relPath: path)) ?? nil
+            let oldLines = Self.gitLines(base?.text() ?? "", start: hunk.oldStart, count: hunk.oldLen)
+            let newLines = Self.gitLines(text, start: hunk.newStart, count: hunk.newLen)
+            let inline = EditorView.InlineGitHunk(
+                anchorLine: line,
+                oldLines: oldLines,
+                newLines: newLines
+            )
+            Task { @MainActor [weak self] in
+                guard let self, self.activeTab?.relPath == path else { return }
+                self.editorView.inlineGitHunk = inline
+            }
+        }
+    }
+
+    nonisolated private static func gitLines(_ text: String, start: UInt64, count: UInt64) -> [String] {
+        guard count > 0 else { return [] }
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+        let first = min(Int(start), lines.count)
+        let last = min(first + Int(count), lines.count)
+        return lines[first..<last].map(String.init)
+    }
+
     // MARK: Diff tab
 
     /// Opens `relPath` beside its committed version (left, read-only) and the
@@ -411,7 +450,7 @@ extension MainWindowController {
                 markers[change.line] = change.kind
                 return
             }
-            let priority: [GitLineChangeKind: Int] = [.added: 0, .modified: 1, .deleted: 2]
+            let priority: [GitLineChangeKind: Int] = [.added: 0, .deleted: 1, .modified: 2]
             if priority[change.kind, default: 0] > priority[current, default: 0] {
                 markers[change.line] = change.kind
             }

@@ -31,7 +31,7 @@ use self::symbols::*;
 use self::syntax::*;
 
 /// The grammar selected for a document.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DocumentLanguage {
     TypeScript,
     Tsx,
@@ -39,7 +39,7 @@ pub enum DocumentLanguage {
 }
 
 /// A half-open source range in UTF-16 line and column coordinates.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Utf16Range {
     pub start: Utf16Position,
     pub end: Utf16Position,
@@ -52,7 +52,7 @@ fn module_keyword_before(specifier: Utf16Range, position: Utf16Position) -> bool
 }
 
 /// A top-level declaration kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DeclarationKind {
     Function,
     Class,
@@ -65,7 +65,7 @@ pub enum DeclarationKind {
 }
 
 /// All exact same-file occurrences of one lexically resolved symbol.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SymbolOccurrences {
     pub name: String,
     pub kind: DeclarationKind,
@@ -73,7 +73,7 @@ pub struct SymbolOccurrences {
     pub occurrences: Vec<Utf16Range>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct ResolvedDeclaration {
     name: String,
     kind: DeclarationKind,
@@ -81,14 +81,14 @@ struct ResolvedDeclaration {
     scope: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Scope {
     parent: Option<usize>,
     range: Utf16Range,
 }
 
 /// A named top-level declaration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Declaration {
     pub name: String,
     pub kind: DeclarationKind,
@@ -98,7 +98,7 @@ pub struct Declaration {
 }
 
 /// The form of an import binding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ImportKind {
     Default,
     Named,
@@ -106,7 +106,7 @@ pub enum ImportKind {
 }
 
 /// One local name introduced by an import statement.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ImportBinding {
     pub local_name: String,
     pub imported_name: Option<String>,
@@ -116,7 +116,7 @@ pub struct ImportBinding {
 }
 
 /// One static ES module import statement.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Import {
     pub specifier: String,
     /// The exact string literal range, including quotes.
@@ -128,7 +128,7 @@ pub struct Import {
 }
 
 /// One exported name, including names re-exported from another module.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Export {
     /// The local name, when this export has one.
     pub name: Option<String>,
@@ -148,7 +148,7 @@ pub struct Export {
 }
 
 /// A direct member use of a namespace import, such as `api.value`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct NamespaceMemberUse {
     pub namespace_range: Utf16Range,
     pub namespace_name: String,
@@ -157,7 +157,7 @@ pub struct NamespaceMemberUse {
 }
 
 /// A direct property or method access with an explicitly named receiver type.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TypeMemberUse {
     pub target: TypeMemberTarget,
     pub member_name: String,
@@ -165,7 +165,7 @@ pub struct TypeMemberUse {
 }
 
 /// An object key passed to a directly imported decorator invocation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DecoratorOptionUse {
     pub binding_range: Utf16Range,
     /// The directly called member, when the imported binding is an object.
@@ -177,21 +177,21 @@ pub struct DecoratorOptionUse {
 }
 
 /// The directly stated option shape of a callable type alias.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DecoratorOptionType {
     pub members: Vec<TypeMember>,
     pub references: Vec<String>,
 }
 
 /// An explicit named callable type annotation on a variable declaration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CallableTypeAnnotation {
     pub name: String,
     pub type_name: String,
 }
 
 /// An explicit named callable type annotation on a direct object member.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CallableMemberTypeAnnotation {
     pub object_name: String,
     pub member_name: String,
@@ -199,7 +199,7 @@ pub struct CallableMemberTypeAnnotation {
 }
 
 /// The declaration target of a direct type member use.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TypeMemberTarget {
     Named(Utf16Range),
     Imported(Utf16Range),
@@ -243,15 +243,15 @@ pub enum TypeMemberTarget {
     /// names, resolved from the importing file like any import. Emitted by
     /// framework adapters from a public package entry, never an internal path.
     PackageDeclaration {
-        specifier: &'static str,
-        type_name: &'static str,
+        specifier: String,
+        type_name: String,
     },
     Inline(Vec<TypeMember>),
     Union(Vec<TypeMemberTarget>),
 }
 
 /// A property or method declared directly by an interface, object type, or class.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TypeMember {
     pub name: String,
     pub range: Utf16Range,
@@ -263,7 +263,7 @@ pub struct TypeMember {
     pub return_type: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct TypeDeclaration {
     name: String,
     range: Utf16Range,
@@ -272,7 +272,7 @@ struct TypeDeclaration {
     extends: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct QualifiedTypeImport {
     namespace_range: Utf16Range,
     member_range: Utf16Range,
@@ -281,14 +281,14 @@ struct QualifiedTypeImport {
 }
 
 /// A recoverable syntax error reported by Tree-sitter.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ParseDiagnostic {
     pub message: String,
     pub range: Utf16Range,
 }
 
 /// A conservative, same-file TypeScript semantic diagnostic.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TypeDiagnostic {
     pub code: String,
     pub message: String,
@@ -296,7 +296,7 @@ pub struct TypeDiagnostic {
 }
 
 /// Static syntax facts for one source file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DocumentIndex {
     pub path: PathBuf,
     pub language: DocumentLanguage,

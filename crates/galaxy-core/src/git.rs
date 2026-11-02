@@ -1107,11 +1107,12 @@ pub fn diff_lines(
         }
     }
     // A replacement is rendered as one modified marker instead of adjacent
-    // added/deleted stripes.
+    // added/deleted stripes. The LCS tie-breaker emits the added working-tree
+    // line before the deleted HEAD line, whose anchor is the following line.
     for index in 0..changes.len().saturating_sub(1) {
-        if changes[index].kind == GitLineChangeKind::Deleted
-            && changes[index + 1].kind == GitLineChangeKind::Added
-            && changes[index].line == changes[index + 1].line
+        if changes[index].kind == GitLineChangeKind::Added
+            && changes[index + 1].kind == GitLineChangeKind::Deleted
+            && changes[index + 1].line <= changes[index].line + 1
         {
             changes[index].kind = GitLineChangeKind::Modified;
             changes.remove(index + 1);
@@ -1444,12 +1445,13 @@ mod tests {
             ],
         );
         let changes = diff_lines(dir.path(), "tracked.txt", "one\nchanged\ntwo\n").unwrap();
-        assert!(!changes.is_empty());
-        assert!(changes.iter().any(|change| change.line == 2));
-        assert!(changes.iter().all(|change| matches!(
-            change.kind,
-            GitLineChangeKind::Added | GitLineChangeKind::Modified | GitLineChangeKind::Deleted
-        )));
+        assert_eq!(
+            changes,
+            vec![GitLineChange {
+                line: 2,
+                kind: GitLineChangeKind::Modified,
+            }]
+        );
 
         let inserted = diff_lines(dir.path(), "tracked.txt", "one\ntwo\nthree\nfour\n").unwrap();
         assert!(

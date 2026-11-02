@@ -1,20 +1,25 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use galaxy_core::analysis::{
     CompletionItem as LspCompletionItem, DefinitionLocation as LspDefinitionLocation,
     Diagnostic as LspDiagnostic, DiagnosticSeverity, DocumentSymbolInfo, Range as LspRange,
     RenameEdit,
 };
+use galaxy_core::index_scheduler::shared_index_scheduler;
 use galaxy_core::javascript::PackageImports;
 use galaxy_core::typescript::{Declaration, DeclarationKind, DocumentIndex, ImportKind};
 
 use crate::typescript_navigation::{
     TypeScriptNavigationCache, direct_imported_name, module_identity,
-    resolve_typescript_definition_import, resolve_typescript_export,
-    resolve_typescript_type_export, typescript_dependency_packages, typescript_package_exports,
+    resolve_typescript_definition_import, resolve_typescript_export_with_indexes,
+    resolve_typescript_type_export_with_indexes, typescript_dependency_packages,
+    typescript_package_exports,
 };
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 /// Shared built-in completion cap. Engines may collect more candidates, but
 /// the FFI never hands more than this to the UI ranking path.
@@ -23,6 +28,10 @@ const MAX_WORKSPACE_TYPESCRIPT_FILES: usize = 10_000;
 const MAX_WORKSPACE_TYPESCRIPT_FILE_BYTES: u64 = 1_048_576;
 const MAX_WORKSPACE_TYPESCRIPT_ROOTS: usize = 8;
 const MAX_REFERENCES_CACHE_ENTRIES: usize = 256;
+const PARALLEL_WORKSPACE_INDEX_THRESHOLD: usize = 64;
+const TYPESCRIPT_CACHE_SCHEMA: u32 = 1;
+#[cfg_attr(not(test), allow(dead_code))]
+const IMPORT_RESOLUTION_BATCH_SIZE: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ReferencesCacheKey {
@@ -56,6 +65,7 @@ fn range_key(range: &LspRange) -> RangeKey {
 /// One import binding of a workspace file, resolved through re-export chains
 /// to the exported declaration it refers to.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct ImportUse {
     /// Position of the binding in `DocumentIndex::imports`.
     import: usize,
@@ -68,7 +78,7 @@ struct ImportUse {
 /// importing it. Built while indexing, so a references query reads memory and
 /// never resolves a module or touches the disk. May hold extra entries for
 /// files since re-resolved; queries verify against `WorkspaceFile::uses`.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct ImportIndex {
     reverse: HashMap<(PathBuf, RangeKey), BTreeSet<String>>,
 }
@@ -111,17 +121,31 @@ fn export_surface(index: &DocumentIndex) -> ExportSurface {
 }
 
 /// What one workspace file contributes: importable exports and global names.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct WorkspaceFile {
     exports: Vec<WorkspaceExport>,
     globals: Vec<String>,
-    index: DocumentIndex,
+    index: Arc<DocumentIndex>,
     /// `None` until the reverse import index has resolved this file.
     uses: Option<Vec<ImportUse>>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CachedWorkspace {
+    schema: u32,
+    root: PathBuf,
+    files: BTreeMap<String, CachedWorkspaceFile>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CachedWorkspaceFile {
+    size: u64,
+    modified_nanos: u128,
+    index: DocumentIndex,
+}
+
 /// FFI owns disk-backed workspace state; core supplies the per-file parser.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(super) struct TypeScriptWorkspaceExports {
     roots: BTreeMap<PathBuf, BTreeMap<String, WorkspaceFile>>,
     /// Per root, the global names of `lib`, `@types` and declaration files;
@@ -220,32 +244,80 @@ impl TypeScriptWorkspaceExports {
         paths: &[String],
         mut progress: impl FnMut(u64, u64),
     ) -> Self {
-        let mut files = BTreeMap::new();
         let total = paths.len() as u64;
-        let mut indexed = 0;
-        for (offset, path) in paths.iter().enumerate() {
-            if is_indexed_path(path) && indexed < MAX_WORKSPACE_TYPESCRIPT_FILES {
-                indexed += 1;
-                let full_path = root.join(path);
-                if let Ok(metadata) = std::fs::metadata(&full_path)
-                    && metadata.len() <= MAX_WORKSPACE_TYPESCRIPT_FILE_BYTES
-                    && let Ok(text) = std::fs::read_to_string(&full_path)
+        let cache_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let mut cached = load_typescript_cache(root)
+            .filter(|cache| cache.schema == TYPESCRIPT_CACHE_SCHEMA && cache.root == cache_root)
+            .map(|cache| cache.files)
+            .unwrap_or_default();
+        let candidates = paths
+            .iter()
+            .enumerate()
+            .filter(|(_, path)| is_indexed_path(path))
+            .take(MAX_WORKSPACE_TYPESCRIPT_FILES)
+            .map(|(offset, path)| {
+                let cached = cached.remove(path).filter(|cached| {
+                    workspace_file_metadata(&root.join(path))
+                        .is_some_and(|metadata| metadata == (cached.size, cached.modified_nanos))
+                });
+                (offset, path.clone(), cached.map(|cached| cached.index))
+            })
+            .collect::<Vec<_>>();
+        let mut files = BTreeMap::new();
+        if candidates.len() < PARALLEL_WORKSPACE_INDEX_THRESHOLD {
+            let mut next_candidate = 0;
+            for (offset, path) in paths.iter().enumerate() {
+                if candidates
+                    .get(next_candidate)
+                    .is_some_and(|(candidate_offset, _, _)| *candidate_offset == offset)
                 {
-                    files.insert(path.clone(), workspace_file(&full_path, &text, path));
+                    let (_, _, cached) = &candidates[next_candidate];
+                    next_candidate += 1;
+                    if let Some(file) = cached
+                        .clone()
+                        .map(|index| workspace_file_from_index(path, index))
+                        .or_else(|| read_workspace_file(root, path))
+                    {
+                        files.insert(path.clone(), file);
+                    }
+                }
+                let completed = (offset + 1) as u64;
+                if completed == total || completed.is_multiple_of(25) {
+                    progress(completed, total);
                 }
             }
-            let completed = (offset + 1) as u64;
-            if completed == total || completed.is_multiple_of(25) {
-                progress(completed, total);
+        } else {
+            let skipped = paths.len().saturating_sub(candidates.len()) as u64;
+            let resolved = shared_index_scheduler().map_ordered_with_progress(
+                candidates,
+                |(_, path, cached)| {
+                    cached
+                        .map(|index| workspace_file_from_index(&path, index))
+                        .or_else(|| read_workspace_file(root, &path))
+                        .map(|file| (path, file))
+                },
+                |completed, _| {
+                    let completed = skipped + completed as u64;
+                    if completed == total || completed.is_multiple_of(25) {
+                        progress(completed, total);
+                    }
+                },
+            );
+            for (path, file) in resolved.into_iter().flatten() {
+                files.insert(path, file);
             }
         }
-        Self {
+        let built = Self {
             roots: BTreeMap::from([(root.to_path_buf(), files)]),
             ambient: BTreeMap::new(),
             generation: 1,
             references_cache: HashMap::new(),
             import_indexes: BTreeMap::new(),
+        };
+        if let Err(error) = built.save_cache(root) {
+            tracing::warn!(root = %root.display(), %error, "failed to save TypeScript workspace cache");
         }
+        built
     }
 
     pub(super) fn install(&mut self, root: &Path, mut built: Self) {
@@ -354,12 +426,56 @@ impl TypeScriptWorkspaceExports {
                 }
             }
         }
+        if let Err(error) = self.save_cache(root) {
+            tracing::warn!(root = %root.display(), %error, "failed to update TypeScript workspace cache");
+        }
+    }
+
+    fn save_cache(&self, root: &Path) -> io::Result<()> {
+        let Some(files) = self.roots.get(root) else {
+            return Ok(());
+        };
+        let files = files
+            .iter()
+            .filter_map(|(relative, file)| {
+                let (size, modified_nanos) = workspace_file_metadata(&root.join(relative))?;
+                Some((
+                    relative.clone(),
+                    CachedWorkspaceFile {
+                        size,
+                        modified_nanos,
+                        index: (*file.index).clone(),
+                    },
+                ))
+            })
+            .collect();
+        save_typescript_cache(
+            root,
+            &CachedWorkspace {
+                schema: TYPESCRIPT_CACHE_SCHEMA,
+                root: root.canonicalize().unwrap_or_else(|_| root.to_path_buf()),
+                files,
+            },
+        )
     }
 
     /// Bumped whenever the index changes, so cached diagnostics that depend
     /// on it can be recomputed.
     pub(super) fn generation(&self) -> u64 {
         self.generation
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn unresolved_reference_snapshot(&self, document: &Path) -> Option<(PathBuf, Self)> {
+        let (root, files) = self
+            .roots
+            .iter()
+            .filter(|(root, _)| document.strip_prefix(root).is_ok())
+            .max_by_key(|(root, _)| root.components().count())?;
+        files
+            .values()
+            .any(|file| file.uses.is_none())
+            .then(|| (root.clone(), self.clone()))
     }
 
     pub(super) fn has_snapshot_for(&self, document: &Path) -> bool {
@@ -372,26 +488,128 @@ impl TypeScriptWorkspaceExports {
     /// reverse import index. Run by the indexing worker before `install`, so
     /// queries find the work already done; later edits only re-resolve the
     /// files they touch.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn resolve_imports(
         &mut self,
         root: &Path,
         navigation_cache: &Mutex<TypeScriptNavigationCache>,
     ) {
+        self.resolve_imports_with_workers(root, navigation_cache, usize::MAX);
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn resolve_imports_with_workers(
+        &mut self,
+        root: &Path,
+        navigation_cache: &Mutex<TypeScriptNavigationCache>,
+        max_workers: usize,
+    ) {
+        let Some(files) = self.roots.get_mut(root) else {
+            return;
+        };
+        let pending = files
+            .iter()
+            .filter(|(_, file)| file.uses.is_none())
+            .map(|(relative, file)| (relative.clone(), &file.index))
+            .collect::<Vec<_>>();
+        let workspace_indexes = files
+            .values()
+            .map(|file| (module_identity(&file.index.path), Arc::clone(&file.index)))
+            .collect::<HashMap<_, _>>();
+        let resolved = if pending.len() < PARALLEL_WORKSPACE_INDEX_THRESHOLD {
+            let mut memo = HashMap::new();
+            pending
+                .into_iter()
+                .map(|(relative, file_index)| {
+                    let uses = resolve_uses(
+                        &root.join(&relative),
+                        file_index,
+                        navigation_cache,
+                        &workspace_indexes,
+                        &mut memo,
+                    );
+                    (relative, uses)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            let mut batches = Vec::new();
+            let mut batch = Vec::with_capacity(IMPORT_RESOLUTION_BATCH_SIZE);
+            for item in pending {
+                batch.push(item);
+                if batch.len() == IMPORT_RESOLUTION_BATCH_SIZE {
+                    batches.push(std::mem::take(&mut batch));
+                    batch = Vec::with_capacity(IMPORT_RESOLUTION_BATCH_SIZE);
+                }
+            }
+            if !batch.is_empty() {
+                batches.push(batch);
+            }
+            let resolved_batches =
+                shared_index_scheduler().map_ordered_limited(batches, max_workers, |batch| {
+                    let mut memo = HashMap::new();
+                    let local_cache = Mutex::new(TypeScriptNavigationCache::default());
+                    (
+                        batch
+                            .into_iter()
+                            .map(|(relative, file_index)| {
+                                let uses = resolve_uses(
+                                    &root.join(&relative),
+                                    file_index,
+                                    &local_cache,
+                                    &workspace_indexes,
+                                    &mut memo,
+                                );
+                                (relative, uses)
+                            })
+                            .collect::<Vec<_>>(),
+                        local_cache.into_inner().unwrap_or_else(|e| e.into_inner()),
+                    )
+                });
+            let mut resolved = Vec::new();
+            for (batch, local_cache) in resolved_batches {
+                navigation_cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .merge(local_cache);
+                resolved.extend(batch);
+            }
+            resolved
+        };
+        let index = self.import_indexes.entry(root.to_path_buf()).or_default();
+        for (relative, uses) in resolved {
+            for import_use in &uses {
+                index
+                    .reverse
+                    .entry((import_use.target_path.clone(), import_use.target_range))
+                    .or_default()
+                    .insert(relative.clone());
+            }
+            if let Some(file) = files.get_mut(&relative) {
+                file.uses = Some(uses);
+            }
+        }
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn merge_resolved_imports(&mut self, root: &Path, mut resolved: Self) {
+        let Some(resolved_files) = resolved.roots.remove(root) else {
+            return;
+        };
         let Some(files) = self.roots.get_mut(root) else {
             return;
         };
         let index = self.import_indexes.entry(root.to_path_buf()).or_default();
-        let mut memo = HashMap::new();
-        for (relative, file) in files.iter_mut() {
-            if file.uses.is_some() {
+        let mut changed = false;
+        for (relative, resolved_file) in resolved_files {
+            let Some(uses) = resolved_file.uses else {
+                continue;
+            };
+            let Some(file) = files.get_mut(&relative) else {
+                continue;
+            };
+            if file.uses.is_some() || !Arc::ptr_eq(&file.index, &resolved_file.index) {
                 continue;
             }
-            let uses = resolve_uses(
-                &root.join(relative),
-                &file.index,
-                navigation_cache,
-                &mut memo,
-            );
             for import_use in &uses {
                 index
                     .reverse
@@ -400,6 +618,11 @@ impl TypeScriptWorkspaceExports {
                     .insert(relative.clone());
             }
             file.uses = Some(uses);
+            changed = true;
+        }
+        if changed {
+            self.generation += 1;
+            self.references_cache.clear();
         }
     }
 
@@ -431,8 +654,6 @@ impl TypeScriptWorkspaceExports {
         if let Some(cached) = self.references_cache.get(&cache_key) {
             return cached.clone();
         }
-        // Files edited since indexing are resolved here, a few at a time.
-        self.resolve_imports(&root, navigation_cache);
         let Some(target_path) = target
             .uri
             .strip_prefix("file://")
@@ -445,14 +666,42 @@ impl TypeScriptWorkspaceExports {
         let canonical_root = module_identity(&root);
         let mut found = Vec::new();
         let files = &self.roots[&root];
-        let importers = self
-            .import_indexes
-            .get(&root)
-            .and_then(|index| index.reverse.get(&(target_path.clone(), target_range)));
-        for relative in importers.into_iter().flatten() {
-            let Some(file) = files.get(relative) else {
-                continue;
-            };
+        let workspace_indexes = files
+            .values()
+            .map(|file| (module_identity(&file.index.path), Arc::clone(&file.index)))
+            .collect::<HashMap<_, _>>();
+        let Some(target_index) = workspace_indexes.get(&target_path) else {
+            return Vec::new();
+        };
+        let Some(target_declaration) = target_index.declarations.iter().find(|declaration| {
+            range_key(&crate::typescript_range(declaration.range)) == target_range
+        }) else {
+            return Vec::new();
+        };
+        let mut candidate_names = HashSet::from([target_declaration.name.clone()]);
+        if target_declaration.default {
+            candidate_names.insert("default".into());
+        }
+        loop {
+            let before = candidate_names.len();
+            for file in files.values() {
+                for export in &file.index.exports {
+                    if export
+                        .name
+                        .as_ref()
+                        .is_some_and(|name| candidate_names.contains(name))
+                        && let Some(exported_name) = &export.exported_name
+                    {
+                        candidate_names.insert(exported_name.clone());
+                    }
+                }
+            }
+            if candidate_names.len() == before {
+                break;
+            }
+        }
+        let mut memo = HashMap::new();
+        for (relative, file) in files {
             if project_root
                 .as_ref()
                 .is_some_and(|project| !canonical_root.join(relative).starts_with(project))
@@ -460,21 +709,68 @@ impl TypeScriptWorkspaceExports {
                 continue;
             }
             let uri = crate::file_uri(&root.join(relative));
-            for import_use in file.uses.iter().flatten() {
-                if import_use.target_path != target_path || import_use.target_range != target_range
-                {
+            for import in &file.index.imports {
+                if !file.index.import_is_syntax_valid(import) {
                     continue;
                 }
-                let binding = &file.index.imports[import_use.import].bindings[import_use.binding];
-                let Some(occurrences) = file.index.import_binding_occurrences(binding) else {
+                let candidates = import
+                    .bindings
+                    .iter()
+                    .filter_map(|binding| {
+                        let imported_name = direct_imported_name(binding)?;
+                        candidate_names
+                            .contains(imported_name)
+                            .then_some((binding, imported_name))
+                    })
+                    .collect::<Vec<_>>();
+                if candidates.is_empty() {
+                    continue;
+                }
+                let Some(import_path) = resolve_typescript_definition_import(
+                    navigation_cache,
+                    &root.join(relative),
+                    &import.specifier,
+                ) else {
                     continue;
                 };
-                found.extend(occurrences.occurrences.into_iter().map(|range| {
-                    LspDefinitionLocation {
-                        uri: uri.clone(),
-                        range: crate::typescript_range(range),
+                for (binding, imported_name) in candidates {
+                    let resolved = memo
+                        .entry((import_path.clone(), imported_name.to_owned()))
+                        .or_insert_with(|| {
+                            resolve_typescript_type_export_with_indexes(
+                                navigation_cache,
+                                &workspace_indexes,
+                                import_path.clone(),
+                                imported_name,
+                            )
+                            .or_else(|| {
+                                resolve_typescript_export_with_indexes(
+                                    navigation_cache,
+                                    &workspace_indexes,
+                                    import_path.clone(),
+                                    imported_name,
+                                )
+                            })
+                            .map(|(path, declaration)| {
+                                (
+                                    module_identity(&path),
+                                    range_key(&crate::typescript_range(declaration.range)),
+                                )
+                            })
+                        });
+                    if resolved.as_ref() != Some(&(target_path.clone(), target_range)) {
+                        continue;
                     }
-                }));
+                    let Some(occurrences) = file.index.import_binding_occurrences(binding) else {
+                        continue;
+                    };
+                    found.extend(occurrences.occurrences.into_iter().map(|range| {
+                        LspDefinitionLocation {
+                            uri: uri.clone(),
+                            range: crate::typescript_range(range),
+                        }
+                    }));
+                }
             }
         }
         if self.references_cache.len() >= MAX_REFERENCES_CACHE_ENTRIES {
@@ -591,10 +887,12 @@ impl TypeScriptWorkspaceExports {
 
 /// Resolves each direct import binding of one file to the declaration it
 /// refers to. `memo` shares work between files importing the same name.
+#[cfg_attr(not(test), allow(dead_code))]
 fn resolve_uses(
     path: &Path,
     index: &DocumentIndex,
     navigation_cache: &Mutex<TypeScriptNavigationCache>,
+    workspace_indexes: &HashMap<PathBuf, Arc<DocumentIndex>>,
     memo: &mut HashMap<(PathBuf, String), Option<(PathBuf, RangeKey)>>,
 ) -> Vec<ImportUse> {
     let mut uses = Vec::new();
@@ -614,14 +912,16 @@ fn resolve_uses(
             let resolved = memo
                 .entry((import_path.clone(), imported_name.to_owned()))
                 .or_insert_with(|| {
-                    resolve_typescript_type_export(
+                    resolve_typescript_type_export_with_indexes(
                         navigation_cache,
+                        workspace_indexes,
                         import_path.clone(),
                         imported_name,
                     )
                     .or_else(|| {
-                        resolve_typescript_export(
+                        resolve_typescript_export_with_indexes(
                             navigation_cache,
+                            workspace_indexes,
                             import_path.clone(),
                             imported_name,
                         )
@@ -646,8 +946,25 @@ fn resolve_uses(
     uses
 }
 
+fn read_workspace_file(root: &Path, relative: &str) -> Option<WorkspaceFile> {
+    let path = root.join(relative);
+    let metadata = std::fs::metadata(&path).ok()?;
+    if metadata.len() > MAX_WORKSPACE_TYPESCRIPT_FILE_BYTES {
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    Some(workspace_file(&path, &text, relative))
+}
+
+fn workspace_file_from_index(relative: &str, index: DocumentIndex) -> WorkspaceFile {
+    workspace_file_with_index(relative, Arc::new(index))
+}
+
 fn workspace_file(path: &Path, text: &str, relative: &str) -> WorkspaceFile {
-    let index = DocumentIndex::parse(path, text);
+    workspace_file_with_index(relative, Arc::new(DocumentIndex::parse(path, text)))
+}
+
+fn workspace_file_with_index(relative: &str, index: Arc<DocumentIndex>) -> WorkspaceFile {
     // Declaration files hold globals, not modules to import from.
     let exports = if relative.ends_with(".d.ts") {
         Vec::new()
@@ -670,6 +987,52 @@ fn workspace_file(path: &Path, text: &str, relative: &str) -> WorkspaceFile {
         index,
         uses: None,
     }
+}
+
+fn workspace_file_metadata(path: &Path) -> Option<(u64, u128)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let modified_nanos = metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some((metadata.len(), modified_nanos))
+}
+
+fn typescript_cache_path(root: &Path) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    canonical.hash(&mut hasher);
+    Some(
+        PathBuf::from(home)
+            .join("Library/Caches/Galaxy/workspace-index")
+            .join(format!("{:016x}.typescript-v1", hasher.finish())),
+    )
+}
+
+fn load_typescript_cache(root: &Path) -> Option<CachedWorkspace> {
+    let bytes = std::fs::read(typescript_cache_path(root)?).ok()?;
+    bincode::deserialize(&bytes).ok()
+}
+
+fn save_typescript_cache(root: &Path, cache: &CachedWorkspace) -> io::Result<()> {
+    let Some(path) = typescript_cache_path(root) else {
+        return Ok(());
+    };
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("cache path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let bytes = bincode::serialize(cache).map_err(io::Error::other)?;
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&temporary, bytes)?;
+    if let Err(error) = std::fs::rename(&temporary, &path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1251,6 +1614,63 @@ mod tests {
     use super::*;
 
     #[test]
+    fn workspace_build_reuses_fresh_persistent_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("model.ts");
+        std::fs::write(&source, "export class Model {}\n").unwrap();
+        let paths = vec!["model.ts".to_owned()];
+        let first = TypeScriptWorkspaceExports::build(root.path(), &paths);
+        assert_eq!(
+            first.roots[root.path()]["model.ts"].index.declarations[0].name,
+            "Model"
+        );
+
+        let cache_path = typescript_cache_path(root.path()).unwrap();
+        let mut cache: CachedWorkspace =
+            bincode::deserialize(&std::fs::read(&cache_path).unwrap()).unwrap();
+        cache.files.get_mut("model.ts").unwrap().index.declarations[0].name = "CachedModel".into();
+        save_typescript_cache(root.path(), &cache).unwrap();
+
+        let second = TypeScriptWorkspaceExports::build(root.path(), &paths);
+        assert_eq!(
+            second.roots[root.path()]["model.ts"].index.declarations[0].name,
+            "CachedModel",
+            "unchanged file metadata should reuse its serialized DocumentIndex"
+        );
+    }
+
+    #[test]
+    fn workspace_build_reparses_stale_cache_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("model.ts");
+        let paths = vec!["model.ts".to_owned()];
+        std::fs::write(&source, "export class Old {}\n").unwrap();
+        let _ = TypeScriptWorkspaceExports::build(root.path(), &paths);
+
+        std::fs::write(&source, "export class NewModelWithDifferentSize {}\n").unwrap();
+        let rebuilt = TypeScriptWorkspaceExports::build(root.path(), &paths);
+
+        assert_eq!(
+            rebuilt.roots[root.path()]["model.ts"].index.declarations[0].name,
+            "NewModelWithDifferentSize"
+        );
+    }
+
+    #[test]
+    fn corrupt_workspace_cache_falls_back_to_fresh_parse() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("model.ts"), "export class Model {}\n").unwrap();
+        std::fs::write(typescript_cache_path(root.path()).unwrap(), b"not bincode").unwrap();
+
+        let built = TypeScriptWorkspaceExports::build(root.path(), &["model.ts".into()]);
+
+        assert_eq!(
+            built.roots[root.path()]["model.ts"].index.declarations[0].name,
+            "Model"
+        );
+    }
+
+    #[test]
     fn workspace_build_reports_throttled_realtime_progress() {
         let root = tempfile::tempdir().unwrap();
         let paths = (0..53)
@@ -1265,6 +1685,32 @@ mod tests {
         );
 
         assert_eq!(progress, vec![(25, 53), (50, 53), (53, 53)]);
+    }
+
+    #[test]
+    fn parallel_workspace_build_indexes_every_typescript_file() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = (0..PARALLEL_WORKSPACE_INDEX_THRESHOLD)
+            .map(|index| {
+                let path = format!("file-{index}.ts");
+                std::fs::write(
+                    root.path().join(&path),
+                    format!("export const value{index} = {index};\n"),
+                )
+                .unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
+        let mut progress = Vec::new();
+
+        let built = TypeScriptWorkspaceExports::build_with_progress(
+            root.path(),
+            &paths,
+            |completed, total| progress.push((completed, total)),
+        );
+
+        assert_eq!(built.roots[root.path()].len(), paths.len());
+        assert_eq!(progress, vec![(25, 64), (50, 64), (64, 64)]);
     }
 
     #[test]
@@ -1307,6 +1753,52 @@ mod tests {
 
         assert!(exports.has_snapshot_for(&nested));
         assert!(!exports.has_snapshot_for(&outside.path().join("env.ts")));
+    }
+
+    #[test]
+    fn reference_snapshot_is_lazy_and_reused_until_a_file_changes() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("model.ts"), "export class Model {}\n").unwrap();
+        let document = root.path().join("model.ts");
+        let mut exports = TypeScriptWorkspaceExports::build(root.path(), &["model.ts".into()]);
+
+        let (_, mut snapshot) = exports
+            .unresolved_reference_snapshot(&document)
+            .expect("fresh workspace should defer reference resolution");
+        snapshot.resolve_imports_with_workers(
+            root.path(),
+            &Mutex::new(TypeScriptNavigationCache::default()),
+            2,
+        );
+        exports.merge_resolved_imports(root.path(), snapshot);
+        assert!(exports.unresolved_reference_snapshot(&document).is_none());
+
+        exports.apply_changes(root.path(), &["model.ts".into()]);
+        assert!(exports.unresolved_reference_snapshot(&document).is_some());
+    }
+
+    #[test]
+    fn reference_index_merge_does_not_overwrite_a_newer_file() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("model.ts"), "export class Model {}\n").unwrap();
+        std::fs::write(
+            root.path().join("use.ts"),
+            "import { Model } from './model';\nnew Model();\n",
+        )
+        .unwrap();
+        let paths = vec!["model.ts".into(), "use.ts".into()];
+        let mut installed = TypeScriptWorkspaceExports::build(root.path(), &paths);
+        let mut background = installed.clone();
+        installed.apply_changes(root.path(), &["use.ts".into()]);
+        background.resolve_imports_with_workers(
+            root.path(),
+            &Mutex::new(TypeScriptNavigationCache::default()),
+            2,
+        );
+
+        installed.merge_resolved_imports(root.path(), background);
+
+        assert!(installed.roots[root.path()]["use.ts"].uses.is_none());
     }
 
     #[test]
@@ -1397,6 +1889,82 @@ mod tests {
         assert_eq!(stats.reverse_sites, 1);
         assert_eq!(stats.source_bytes, 0, "TypeScript source is not retained");
         assert!(stats.heap_lower_bound_bytes > 0);
+    }
+
+    #[test]
+    fn targeted_references_skip_unrelated_import_resolution() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("package.json"), "{}\n").unwrap();
+        let host = root.path().join("host.ts");
+        let host_text = "export function createHost() {}\n";
+        std::fs::write(&host, host_text).unwrap();
+        std::fs::write(
+            root.path().join("main.ts"),
+            "import { createHost } from './host';\ncreateHost();\n",
+        )
+        .unwrap();
+        let mut paths = vec!["host.ts".into(), "main.ts".into()];
+        for index in 0..200 {
+            let dependency = format!("dep-{index}.ts");
+            let importer = format!("unrelated-{index}.ts");
+            std::fs::write(
+                root.path().join(&dependency),
+                format!("export const Other{index} = {index};\n"),
+            )
+            .unwrap();
+            std::fs::write(
+                root.path().join(&importer),
+                format!("import {{ Other{index} }} from './dep-{index}';\nOther{index};\n"),
+            )
+            .unwrap();
+            paths.push(dependency);
+            paths.push(importer);
+        }
+        let mut exports = TypeScriptWorkspaceExports::build(root.path(), &paths);
+        let navigation = Mutex::new(TypeScriptNavigationCache::default());
+        let target = target_of(&host, host_text, "createHost");
+
+        assert_eq!(exports.references_to(&host, &target, &navigation).len(), 2);
+        assert_eq!(
+            navigation.lock().unwrap().resolutions.len(),
+            1,
+            "unrelated imports must not enter module resolution"
+        );
+    }
+
+    #[test]
+    fn parallel_import_resolution_indexes_every_importer() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("package.json"), "{}\n").unwrap();
+        let host = root.path().join("host.ts");
+        let host_text = "export function createHost() {}\n";
+        std::fs::write(&host, host_text).unwrap();
+        let mut paths = vec!["host.ts".into()];
+        for index in 1..PARALLEL_WORKSPACE_INDEX_THRESHOLD {
+            let relative = format!("importer-{index}.ts");
+            std::fs::write(
+                root.path().join(&relative),
+                "import { createHost } from './host';\ncreateHost();\n",
+            )
+            .unwrap();
+            paths.push(relative);
+        }
+        let mut exports = TypeScriptWorkspaceExports::build(root.path(), &paths);
+        let navigation = Mutex::new(TypeScriptNavigationCache::default());
+
+        exports.resolve_imports(root.path(), &navigation);
+
+        let target = target_of(&host, host_text, "createHost");
+        assert_eq!(
+            exports.references_to(&host, &target, &navigation).len(),
+            (PARALLEL_WORKSPACE_INDEX_THRESHOLD - 1) * 2
+        );
+        let stats = exports.index_stats(root.path());
+        assert_eq!(stats.imports, PARALLEL_WORKSPACE_INDEX_THRESHOLD - 1);
+        assert_eq!(stats.reverse_sites, PARALLEL_WORKSPACE_INDEX_THRESHOLD - 1);
+        let navigation = navigation.lock().unwrap();
+        assert!(navigation.indexes.is_empty());
+        assert!(!navigation.resolutions.is_empty());
     }
 
     #[test]

@@ -21,6 +21,7 @@ final class StatusBar: NSView {
     var onGitGraphClick: (() -> Void)?
     let workspaceScan = StatusBar.label("workspace-scan")
     private var scanRoot: String?
+    private var workspaceIndexText: String?
     let cursor = StatusBar.label("status-cursor")
     let language = StatusBar.label("status-language")
     let indent = StatusBar.label("status-indent")
@@ -158,29 +159,34 @@ final class StatusBar: NSView {
 
     func resetWorkspaceScan(root: String) {
         scanRoot = root
-        workspaceScan.stringValue = "Indexing workspace..."
-        workspaceScan.isHidden = false
+        workspaceIndexText = "Indexing workspace..."
+        updateWorkspaceScan()
     }
 
     func workspaceIndexStarted(root: String, total: UInt64) {
         guard root == scanRoot else { return }
-        workspaceScan.isHidden = false
-        workspaceScan.stringValue = total == 0
+        workspaceIndexText = total == 0
             ? "Indexing files..."
             : "Indexing 0 of \(total) files"
+        updateWorkspaceScan()
     }
 
     func workspaceIndexProgress(root: String, completed: UInt64, total: UInt64) {
         guard root == scanRoot else { return }
-        workspaceScan.isHidden = false
-        workspaceScan.stringValue = "Indexing \(completed) of \(total) files"
+        workspaceIndexText = "Indexing \(completed) of \(total) files"
+        updateWorkspaceScan()
     }
 
     func workspaceIndexFinished(root: String, total: UInt64, changed: UInt64) {
         guard root == scanRoot else { return }
         _ = changed
-        workspaceScan.stringValue = ""
-        workspaceScan.isHidden = true
+        workspaceIndexText = nil
+        updateWorkspaceScan()
+    }
+
+    private func updateWorkspaceScan() {
+        workspaceScan.stringValue = workspaceIndexText ?? ""
+        workspaceScan.isHidden = workspaceScan.stringValue.isEmpty
     }
 
     @objc private func gitClicked(_ sender: Any?) { onGitClick?() }

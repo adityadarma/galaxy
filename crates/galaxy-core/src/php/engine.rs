@@ -95,6 +95,10 @@ pub struct Built {
 /// Composer data, the source tree). Slow on big `vendor/` trees, so callers
 /// run it on a worker thread.
 pub fn build(root: &Path) -> Built {
+    crate::index_scheduler::shared_index_scheduler().run(|| build_inner(root))
+}
+
+fn build_inner(root: &Path) -> Built {
     let autoload = Autoload::load(root);
     let mut names = autoload.all_classes();
     if let VersionSelection::Supported(version) = for_project(root) {

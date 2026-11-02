@@ -177,6 +177,38 @@ fn opening_workspace_indexes_all_files_with_shared_progress() {
 }
 
 #[test]
+fn opening_workspace_defers_reference_index_until_first_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("main.ts");
+    std::fs::write(&path, "export const value = 1;\nconsole.log(value);\n").unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let core = Core::new();
+    core.set_listener(Arc::new(ChannelListener(Mutex::new(tx))));
+    core.open_workspace(dir.path().to_string_lossy().into_owned())
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let event = rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("workspace indexing should finish");
+        if matches!(event, CoreEvent::WorkspaceIndexFinished { .. }) {
+            break;
+        }
+    }
+    assert!(
+        rx.recv_timeout(Duration::from_millis(100)).is_err(),
+        "workspace indexing must not eagerly start reference indexing"
+    );
+
+    let document = core
+        .open_document(path.to_string_lossy().into_owned())
+        .unwrap();
+    assert!(core.request_references(document, 0, 13));
+    assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+}
+
+#[test]
 fn workspace_lists_lazily_and_opens_files() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();

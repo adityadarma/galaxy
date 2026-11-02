@@ -16,20 +16,6 @@ use crate::{file_uri, is_typescript_path, typescript_range};
 /// cleared, and a references scan that exceeds it re-parses every target.
 const MAX_TYPESCRIPT_NAVIGATION_CACHE_ENTRIES: usize = 2048;
 pub(super) const MAX_TYPESCRIPT_REEXPORT_DEPTH: usize = 32;
-const MAX_TYPESCRIPT_WARM_SOURCE_CANDIDATES: usize = 5000;
-const MAX_TYPESCRIPT_WARM_IMPORT_TARGETS: usize = 512;
-const TYPESCRIPT_WARM_EXCLUDED_DIRECTORIES: &[&str] = &[
-    "node_modules",
-    ".git",
-    ".hg",
-    ".svn",
-    "target",
-    "dist",
-    "build",
-    ".next",
-    "coverage",
-    "vendor",
-];
 
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct FileFreshness {
@@ -69,6 +55,22 @@ impl TypeScriptNavigationCache {
     pub(super) fn clear(&mut self) {
         self.indexes.clear();
         self.resolutions.clear();
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn merge(&mut self, other: Self) {
+        for (path, index) in other.indexes {
+            if self.indexes.len() >= MAX_TYPESCRIPT_NAVIGATION_CACHE_ENTRIES {
+                break;
+            }
+            self.indexes.entry(path).or_insert(index);
+        }
+        for (key, resolution) in other.resolutions {
+            if self.resolutions.len() >= MAX_TYPESCRIPT_NAVIGATION_CACHE_ENTRIES {
+                break;
+            }
+            self.resolutions.entry(key).or_insert(resolution);
+        }
     }
 
     pub(super) fn index(&mut self, path: &Path) -> Option<Arc<DocumentIndex>> {
@@ -979,7 +981,16 @@ pub(super) fn resolve_typescript_export(
     path: PathBuf,
     name: &str,
 ) -> Option<(PathBuf, galaxy_core::typescript::Declaration)> {
-    resolve_typescript_export_inner(cache, path, name, 0, &mut HashSet::new())
+    resolve_typescript_export_with_indexes(cache, &HashMap::new(), path, name)
+}
+
+pub(super) fn resolve_typescript_export_with_indexes(
+    cache: &Mutex<TypeScriptNavigationCache>,
+    indexes: &HashMap<PathBuf, Arc<DocumentIndex>>,
+    path: PathBuf,
+    name: &str,
+) -> Option<(PathBuf, galaxy_core::typescript::Declaration)> {
+    resolve_typescript_export_inner(cache, indexes, path, name, 0, &mut HashSet::new())
 }
 
 /// Lists matching value exports from one imported package without walking all dependencies.
@@ -1095,11 +1106,21 @@ pub(super) fn resolve_typescript_type_export(
     path: PathBuf,
     name: &str,
 ) -> Option<(PathBuf, galaxy_core::typescript::Declaration)> {
-    resolve_typescript_type_export_inner(cache, path, name, 0, &mut HashSet::new())
+    resolve_typescript_type_export_with_indexes(cache, &HashMap::new(), path, name)
+}
+
+pub(super) fn resolve_typescript_type_export_with_indexes(
+    cache: &Mutex<TypeScriptNavigationCache>,
+    indexes: &HashMap<PathBuf, Arc<DocumentIndex>>,
+    path: PathBuf,
+    name: &str,
+) -> Option<(PathBuf, galaxy_core::typescript::Declaration)> {
+    resolve_typescript_type_export_inner(cache, indexes, path, name, 0, &mut HashSet::new())
 }
 
 fn resolve_typescript_type_export_inner(
     cache: &Mutex<TypeScriptNavigationCache>,
+    indexes: &HashMap<PathBuf, Arc<DocumentIndex>>,
     path: PathBuf,
     name: &str,
     depth: usize,
@@ -1108,10 +1129,10 @@ fn resolve_typescript_type_export_inner(
     if depth == MAX_TYPESCRIPT_REEXPORT_DEPTH || !visited.insert(module_identity(&path)) {
         return None;
     }
-    let index = cache
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .index(&path)?;
+    let index = indexes
+        .get(&module_identity(&path))
+        .cloned()
+        .or_else(|| cache.lock().unwrap_or_else(|e| e.into_inner()).index(&path))?;
     if let Some(declaration) = index.exported_type_declaration(name) {
         return Some((path, declaration.clone()));
     }
@@ -1120,8 +1141,14 @@ fn resolve_typescript_type_export_inner(
     }
     if let Some((specifier, imported_name)) = local_import_reexport(&index, name, true)
         && let Some(target) = resolve_typescript_definition_import(cache, &path, &specifier)
-        && let Some(found) =
-            resolve_typescript_type_export_inner(cache, target, &imported_name, depth + 1, visited)
+        && let Some(found) = resolve_typescript_type_export_inner(
+            cache,
+            indexes,
+            target,
+            &imported_name,
+            depth + 1,
+            visited,
+        )
     {
         return Some(found);
     }
@@ -1141,6 +1168,7 @@ fn resolve_typescript_type_export_inner(
             resolve_typescript_definition_import(cache, &path, specifier).and_then(|target| {
                 resolve_typescript_type_export_inner(
                     cache,
+                    indexes,
                     target,
                     imported_name,
                     depth + 1,
@@ -1154,6 +1182,7 @@ fn resolve_typescript_type_export_inner(
 
 fn resolve_typescript_export_inner(
     cache: &Mutex<TypeScriptNavigationCache>,
+    indexes: &HashMap<PathBuf, Arc<DocumentIndex>>,
     path: PathBuf,
     name: &str,
     depth: usize,
@@ -1162,17 +1191,23 @@ fn resolve_typescript_export_inner(
     if depth == MAX_TYPESCRIPT_REEXPORT_DEPTH || !visited.insert(module_identity(&path)) {
         return None;
     }
-    let index = cache
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .index(&path)?;
+    let index = indexes
+        .get(&module_identity(&path))
+        .cloned()
+        .or_else(|| cache.lock().unwrap_or_else(|e| e.into_inner()).index(&path))?;
     if let Some(declaration) = index.exported_declaration(name) {
         return Some((path, declaration.clone()));
     }
     if let Some((specifier, imported_name)) = local_import_reexport(&index, name, false)
         && let Some(target) = resolve_typescript_definition_import(cache, &path, &specifier)
-        && let Some(found) =
-            resolve_typescript_export_inner(cache, target, &imported_name, depth + 1, visited)
+        && let Some(found) = resolve_typescript_export_inner(
+            cache,
+            indexes,
+            target,
+            &imported_name,
+            depth + 1,
+            visited,
+        )
     {
         return Some(found);
     }
@@ -1194,12 +1229,16 @@ fn resolve_typescript_export_inner(
         let Some(target) = resolve_typescript_definition_import(cache, &path, specifier) else {
             continue;
         };
-        if let Some(candidate) =
-            resolve_typescript_export_inner(cache, target, imported_name, depth + 1, visited)
-            && !candidates.iter().any(|(candidate_path, declaration)| {
-                candidate_path == &candidate.0 && declaration.range == candidate.1.range
-            })
-        {
+        if let Some(candidate) = resolve_typescript_export_inner(
+            cache,
+            indexes,
+            target,
+            imported_name,
+            depth + 1,
+            visited,
+        ) && !candidates.iter().any(|(candidate_path, declaration)| {
+            candidate_path == &candidate.0 && declaration.range == candidate.1.range
+        }) {
             candidates.push(candidate);
         }
     }
@@ -1276,279 +1315,4 @@ pub(super) fn direct_imported_name(binding: &ImportBinding) -> Option<&str> {
     (!binding.type_only && matches!(binding.kind, ImportKind::Named | ImportKind::Default))
         .then_some(binding.imported_name.as_deref())
         .flatten()
-}
-
-/// A JavaScript package, project configuration, or common framework marker
-/// opts the workspace into the JavaScript/TypeScript navigation warm-up.
-pub(super) fn workspace_detected(root: &Path) -> bool {
-    [
-        "package.json",
-        "tsconfig.json",
-        "jsconfig.json",
-        // Next.js, Nuxt, NestJS, Remix, Gatsby, Astro, SvelteKit, Vite,
-        // Angular, React Native, and Expo.
-        "next.config.js",
-        "next.config.mjs",
-        "next.config.ts",
-        "nuxt.config.js",
-        "nuxt.config.ts",
-        "nest-cli.json",
-        "remix.config.js",
-        "remix.config.mjs",
-        "remix.config.ts",
-        "gatsby-config.js",
-        "gatsby-config.ts",
-        "astro.config.mjs",
-        "astro.config.ts",
-        "svelte.config.js",
-        "svelte.config.ts",
-        "vite.config.js",
-        "vite.config.ts",
-        "angular.json",
-        "app.json",
-        "app.config.js",
-        "app.config.ts",
-    ]
-    .into_iter()
-    .any(|name| root.join(name).is_file())
-}
-
-pub(super) fn spawn_warmup(
-    root: &Path,
-    cache: Arc<Mutex<TypeScriptNavigationCache>>,
-) -> Option<std::thread::JoinHandle<()>> {
-    let root = root.to_path_buf();
-    std::thread::Builder::new()
-        .name("typescript-navigation-warmup".into())
-        // Keep opening a workspace instant while bounding work in large repositories.
-        .spawn(move || warm_typescript_navigation(&root, &cache))
-        .ok()
-}
-
-fn warm_typescript_navigation(root: &Path, cache: &Mutex<TypeScriptNavigationCache>) {
-    let mut sources = vec![root.to_path_buf()];
-    let mut seen_imports = HashSet::new();
-    let mut candidates = 0;
-    let mut warmed = 0;
-
-    while let Some(path) = sources.pop() {
-        let Ok(entries) = std::fs::read_dir(&path) else {
-            continue;
-        };
-        for entry in entries.filter_map(Result::ok) {
-            let path = entry.path();
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
-            if file_type.is_symlink() {
-                continue;
-            }
-            if file_type.is_dir() {
-                if !typescript_warm_excluded_directory(&path)
-                    && sources.len() < MAX_TYPESCRIPT_WARM_SOURCE_CANDIDATES
-                {
-                    sources.push(path);
-                }
-                continue;
-            }
-            if !file_type.is_file() || !is_typescript_path(&path) {
-                continue;
-            }
-            candidates += 1;
-            if candidates > MAX_TYPESCRIPT_WARM_SOURCE_CANDIDATES {
-                return;
-            }
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let index = DocumentIndex::parse(&path, &text);
-            let specifiers = index
-                .imports
-                .iter()
-                .filter(|import| index.import_is_syntax_valid(import))
-                .map(|import| import.specifier.as_str())
-                .chain(
-                    index
-                        .exports
-                        .iter()
-                        .filter_map(|export| export.specifier.as_deref()),
-                );
-            for specifier in specifiers {
-                if warmed == MAX_TYPESCRIPT_WARM_IMPORT_TARGETS {
-                    return;
-                }
-                let importer = module_identity(&path);
-                if !seen_imports.insert((importer, specifier.to_owned())) {
-                    continue;
-                }
-                let Some(target) = resolve_typescript_definition_import(cache, &path, specifier)
-                else {
-                    continue;
-                };
-                if !is_typescript_path(&target) {
-                    continue;
-                }
-                warmed += 1;
-                warm_typescript_declaration_chain(
-                    cache,
-                    target,
-                    0,
-                    &mut warmed,
-                    &mut HashSet::new(),
-                );
-            }
-        }
-    }
-}
-
-fn typescript_warm_excluded_directory(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| TYPESCRIPT_WARM_EXCLUDED_DIRECTORIES.contains(&name))
-}
-
-fn warm_typescript_declaration_chain(
-    cache: &Mutex<TypeScriptNavigationCache>,
-    path: PathBuf,
-    depth: usize,
-    warmed: &mut usize,
-    visited: &mut HashSet<PathBuf>,
-) {
-    if depth == MAX_TYPESCRIPT_REEXPORT_DEPTH
-        || *warmed == MAX_TYPESCRIPT_WARM_IMPORT_TARGETS
-        || !visited.insert(module_identity(&path))
-    {
-        return;
-    }
-    let Some(index) = cache.lock().unwrap_or_else(|e| e.into_inner()).index(&path) else {
-        return;
-    };
-    let specifiers = index
-        .exports
-        .iter()
-        .filter_map(|export| export.specifier.as_deref())
-        .map(ToOwned::to_owned)
-        .collect::<Vec<_>>();
-    for specifier in specifiers {
-        if *warmed == MAX_TYPESCRIPT_WARM_IMPORT_TARGETS {
-            return;
-        }
-        if let Some(target) = resolve_typescript_definition_import(cache, &path, &specifier) {
-            if !is_typescript_path(&target) {
-                continue;
-            }
-            *warmed += 1;
-            warm_typescript_declaration_chain(cache, target, depth + 1, warmed, visited);
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn detects_common_typescript_frameworks_without_package_manifest() {
-        for marker in [
-            "next.config.ts",
-            "nuxt.config.ts",
-            "nest-cli.json",
-            "remix.config.ts",
-            "gatsby-config.ts",
-            "astro.config.mjs",
-            "svelte.config.js",
-            "vite.config.ts",
-            "angular.json",
-            "app.config.ts",
-        ] {
-            let dir = tempfile::tempdir().unwrap();
-            std::fs::write(dir.path().join(marker), "").unwrap();
-            assert!(workspace_detected(dir.path()), "{marker}");
-        }
-
-        let plain = tempfile::tempdir().unwrap();
-        assert!(!workspace_detected(plain.path()));
-    }
-
-    #[test]
-    fn warmup_caches_import_targets_and_reexports() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
-        let package = dir.path().join("node_modules/pkg");
-        std::fs::create_dir_all(&package).unwrap();
-        std::fs::write(package.join("package.json"), r#"{"exports":"./entry.js"}"#).unwrap();
-        std::fs::write(
-            package.join("entry.js"),
-            "export { value } from './types.js';\n",
-        )
-        .unwrap();
-        std::fs::write(
-            package.join("entry.d.ts"),
-            "export { value } from './types.js';\n",
-        )
-        .unwrap();
-        std::fs::write(
-            package.join("types.d.ts"),
-            "export declare const value: number;\n",
-        )
-        .unwrap();
-        std::fs::write(
-            dir.path().join("main.ts"),
-            "import { value } from 'pkg';\nvalue;\n",
-        )
-        .unwrap();
-
-        let cache = Mutex::new(TypeScriptNavigationCache::default());
-        warm_typescript_navigation(dir.path(), &cache);
-
-        let cache = cache.lock().unwrap();
-        assert!(
-            cache
-                .resolutions
-                .values()
-                .any(|resolution| resolution.target.ends_with("entry.d.ts"))
-        );
-        assert!(
-            cache
-                .indexes
-                .keys()
-                .any(|path| path.ends_with("entry.d.ts"))
-        );
-        assert!(
-            cache
-                .indexes
-                .keys()
-                .any(|path| path.ends_with("types.d.ts"))
-        );
-    }
-
-    #[test]
-    fn warmup_excludes_node_modules_sources() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("package.json"), "{}\n").unwrap();
-        let ignored = dir.path().join("node_modules/ignored");
-        std::fs::create_dir_all(&ignored).unwrap();
-        std::fs::write(
-            ignored.join("package.json"),
-            r#"{"exports":"./entry.d.ts"}"#,
-        )
-        .unwrap();
-        std::fs::write(
-            ignored.join("entry.d.ts"),
-            "export declare const ignored: number;\n",
-        )
-        .unwrap();
-        std::fs::write(
-            ignored.join("source.ts"),
-            "import { ignored } from 'ignored';\nignored;\n",
-        )
-        .unwrap();
-
-        let cache = Mutex::new(TypeScriptNavigationCache::default());
-        warm_typescript_navigation(dir.path(), &cache);
-
-        let cache = cache.lock().unwrap();
-        assert!(cache.resolutions.is_empty());
-        assert!(cache.indexes.is_empty());
-    }
 }

@@ -489,6 +489,31 @@ final class EditorViewTests: XCTestCase {
         XCTAssertTrue(inked, "line number glyphs should appear in the gutter")
     }
 
+    func testInlineGitHunkPushesFollowingLinesDown() throws {
+        let (view, _, url) = try makeView(text: "zero\none\ntwo\nthree")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let height = view.metrics.lineHeight
+
+        view.inlineGitHunk = EditorView.InlineGitHunk(
+            anchorLine: 1,
+            oldLines: ["one"],
+            newLines: ["one changed"]
+        )
+
+        XCTAssertEqual(view.rowTop(of: 1), height)
+        XCTAssertEqual(view.rowTop(of: 2), height * 4)
+        XCTAssertEqual(view.line(atY: height * 4.5).line, 2)
+    }
+
+    func testModifiedGitMarkerWinsOverStaleDeletionMarker() {
+        let markers = MainWindowController.gitLineMarkers([
+            GitLineChangeInfo(line: 38, kind: .deleted),
+            GitLineChangeInfo(line: 38, kind: .modified),
+        ])
+
+        XCTAssertEqual(markers[38], .modified)
+    }
+
     /// Regression: Core Text draws black unless told to use the context
     /// colour, which made text invisible in dark mode. Glyph pixels must
     /// contrast with the background in both appearances.

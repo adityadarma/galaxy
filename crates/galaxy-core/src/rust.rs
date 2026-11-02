@@ -96,10 +96,18 @@ impl RustEngine {
     }
 
     pub fn build(root: &Path) -> Built {
+        Self::build_with_scheduler(root, crate::index_scheduler::shared_index_scheduler())
+    }
+
+    pub fn build_with_scheduler(
+        root: &Path,
+        scheduler: &crate::index_scheduler::IndexScheduler,
+    ) -> Built {
         let mut declarations = Vec::new();
         let mut files = Vec::new();
         let mut uses = HashMap::new();
         let roots = cargo_source_roots(root);
+        let mut candidates = Vec::new();
         for source_root in &roots {
             let mut walker = WalkBuilder::new(source_root);
             walker
@@ -107,11 +115,7 @@ impl RustEngine {
                 .git_ignore(true)
                 .git_global(true)
                 .parents(true);
-            for entry in walker
-                .build()
-                .flatten()
-                .take(MAX_FILES.saturating_sub(files.len()))
-            {
+            for entry in walker.build().flatten() {
                 let path = entry.path();
                 if path.extension().and_then(|ext| ext.to_str()) != Some("rs")
                     || entry
@@ -120,12 +124,24 @@ impl RustEngine {
                 {
                     continue;
                 }
-                if let Ok(text) = std::fs::read_to_string(path) {
-                    files.push(path.to_path_buf());
-                    declarations.extend(parse_declarations(path, &text, source_root));
-                    uses.insert(path.to_path_buf(), parse_use_bindings(&text));
-                }
+                candidates.push((path.to_path_buf(), source_root.clone()));
             }
+        }
+        candidates.sort_by(|left, right| left.0.cmp(&right.0));
+        candidates.dedup_by(|left, right| left.0 == right.0);
+        candidates.truncate(MAX_FILES);
+        let indexed = scheduler.map_ordered(candidates, |(path, source_root)| {
+            let text = std::fs::read_to_string(&path).ok()?;
+            Some((
+                path.clone(),
+                parse_declarations(&path, &text, &source_root),
+                parse_use_bindings(&text),
+            ))
+        });
+        for (path, parsed_declarations, parsed_uses) in indexed.into_iter().flatten() {
+            files.push(path.clone());
+            declarations.extend(parsed_declarations);
+            uses.insert(path, parsed_uses);
         }
         declarations.sort_by(|left, right| {
             (&left.name, &left.path, left.line).cmp(&(&right.name, &right.path, right.line))

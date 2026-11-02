@@ -64,9 +64,9 @@ use typescript_editor::{
 use typescript_navigation::{
     TypeScriptNavigationCache, ambient_module_location, module_root_location,
     resolve_typescript_definition_import, resolve_typescript_export,
-    resolve_typescript_import_uncached, resolve_typescript_type_export, spawn_warmup,
+    resolve_typescript_import_uncached, resolve_typescript_type_export,
     typescript_call_option_target, typescript_decorator_option_target, typescript_import_target,
-    typescript_type_member_target, typescript_type_target, workspace_detected,
+    typescript_type_member_target, typescript_type_target,
 };
 
 uniffi::setup_scaffolding!();
@@ -718,7 +718,6 @@ impl Core {
         spawn_workspace_indexing(
             ws.clone(),
             Arc::clone(&self.analysis),
-            Arc::clone(&self.typescript_navigation),
             Arc::clone(&self.typescript_workspace_exports),
             Arc::clone(&self.go),
             Arc::clone(&self.php),
@@ -761,7 +760,6 @@ impl Core {
         spawn_workspace_indexing(
             workspace,
             Arc::clone(&self.analysis),
-            Arc::clone(&self.typescript_navigation),
             Arc::clone(&self.typescript_workspace_exports),
             Arc::clone(&self.go),
             Arc::clone(&self.php),
@@ -2715,6 +2713,11 @@ impl Core {
                 && typescript_reports_unknown_names(&path)
                 && index.diagnostics.is_empty();
             diagnostics.extend(index.unresolved_references.iter().filter_map(|(name, range)| {
+                // TypeScript's standard library provides these names. Do not
+                // mistake an unrelated workspace export for a missing import.
+                if ecmascript_builtin_name(name) {
+                    return None;
+                }
                 if let Some(specifier) = suggestions.get(name) {
                     return Some(galaxy_core::analysis::Diagnostic {
                         uri: uri.clone(),
@@ -4501,7 +4504,6 @@ type EngineMap<E> = Arc<Mutex<HashMap<PathBuf, Arc<Mutex<E>>>>>;
 fn spawn_workspace_indexing(
     workspace: CoreWorkspace,
     analysis: Arc<Mutex<BuiltinStore>>,
-    cache: Arc<Mutex<TypeScriptNavigationCache>>,
     typescript_exports: Arc<Mutex<TypeScriptWorkspaceExports>>,
     go_engines: EngineMap<GoEngine>,
     php_engines: EngineMap<PhpEngine>,
@@ -4528,9 +4530,6 @@ fn spawn_workspace_indexing(
                     send_workspace_index_progress(&listener, &root, completed, total)
                 },
             );
-            let mut typescript_snapshot = typescript_snapshot;
-            // Reverse import index: resolve every import once, off the lock.
-            typescript_snapshot.resolve_imports(&root, &cache);
             log_language_index(
                 "typescript",
                 &root,
@@ -4557,9 +4556,6 @@ fn spawn_workspace_indexing(
             }
             let (total, changed) = refresh_workspace_index(&workspace, &paths);
             let mut workers = Vec::new();
-            if workspace_detected(&root) {
-                workers.push(spawn_warmup(&root, Arc::clone(&cache)));
-            }
             if let Some(project) = go::GoProject::detect(&root) {
                 let project_root = project.root().to_path_buf();
                 let (engine, _) = pending_go_engine(&go_engines, &project_root);
@@ -4576,6 +4572,7 @@ fn spawn_workspace_indexing(
             for worker in workers.into_iter().flatten() {
                 let _ = worker.join();
             }
+            send_workspace_index_progress(&listener, &root, total, total);
             send_workspace_index_finished(&listener, &root, total, changed);
             tracing::debug!(
                 root = %root.display(),
@@ -4603,7 +4600,6 @@ fn spawn_workspace_indexing(
                 spawn_workspace_indexing(
                     retry_workspace,
                     analysis,
-                    cache,
                     typescript_exports,
                     go_engines,
                     php_engines,

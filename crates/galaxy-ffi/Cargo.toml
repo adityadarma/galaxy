@@ -18,6 +18,8 @@ crate-type = ["staticlib", "cdylib", "lib"]
 galaxy-core.workspace = true
 uniffi.workspace = true
 tracing.workspace = true
+bincode.workspace = true
+serde.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

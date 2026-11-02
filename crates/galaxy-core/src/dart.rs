@@ -92,6 +92,13 @@ impl DartEngine {
     }
 
     pub fn build(root: &Path) -> Built {
+        Self::build_with_scheduler(root, crate::index_scheduler::shared_index_scheduler())
+    }
+
+    pub fn build_with_scheduler(
+        root: &Path,
+        scheduler: &crate::index_scheduler::IndexScheduler,
+    ) -> Built {
         let package = package_name(root);
         let mut built = Built {
             packages: package_roots(root, package.as_deref()),
@@ -99,6 +106,9 @@ impl DartEngine {
         };
         let mut roots = vec![root.join("lib")];
         roots.extend(built.packages.values().cloned());
+        roots.sort();
+        roots.dedup();
+        let mut candidates = Vec::new();
         for source_root in roots {
             let mut walker = WalkBuilder::new(&source_root);
             walker
@@ -106,7 +116,7 @@ impl DartEngine {
                 .git_ignore(true)
                 .git_global(true)
                 .parents(true);
-            for entry in walker.build().flatten().take(MAX_FILES) {
+            for entry in walker.build().flatten() {
                 let path = entry.path();
                 if path.extension().and_then(|value| value.to_str()) != Some("dart")
                     || entry
@@ -115,14 +125,20 @@ impl DartEngine {
                 {
                     continue;
                 }
-                if let Ok(text) = std::fs::read_to_string(path) {
-                    built.files.insert(
-                        path.to_path_buf(),
-                        index_file(path, &text, root, &built.packages),
-                    );
-                    built.sources.insert(path.to_path_buf(), text);
-                }
+                candidates.push(path.to_path_buf());
             }
+        }
+        candidates.sort();
+        candidates.dedup();
+        candidates.truncate(MAX_FILES);
+        let indexed = scheduler.map_ordered(candidates, |path| {
+            let text = std::fs::read_to_string(&path).ok()?;
+            let index = index_file(&path, &text, root, &built.packages);
+            Some((path, index, text))
+        });
+        for (path, index, text) in indexed.into_iter().flatten() {
+            built.files.insert(path.clone(), index);
+            built.sources.insert(path, text);
         }
         built
     }

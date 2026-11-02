@@ -1546,6 +1546,32 @@ fn typescript_import_diagnostics_use_project_resolution() {
 }
 
 #[test]
+fn typescript_builtin_utility_types_do_not_suggest_workspace_imports() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("shared")).unwrap();
+    std::fs::write(
+        dir.path().join("shared/record.ts"),
+        "export const Record = 1;\n",
+    )
+    .unwrap();
+    let path = dir.path().join("main.ts");
+    std::fs::write(&path, "type Settings = Record<string, string>;\n").unwrap();
+
+    let core = Core::new();
+    let document = core
+        .open_document(path.to_string_lossy().into_owned())
+        .unwrap();
+    assert!(core.register_document(document.clone(), "typescript".into(), String::new()));
+    core.poll_analysis();
+
+    assert!(
+        document.lock().diagnostics.is_empty(),
+        "{:?}",
+        document.lock().diagnostics
+    );
+}
+
+#[test]
 fn typescript_local_navigation_is_shadow_aware_and_renames_stable_occurrences() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("shadow.ts");

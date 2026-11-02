@@ -176,6 +176,18 @@ final class EditorView: NSView {
     var gitLineChanges: [UInt64: GitLineChangeKind] = [:] {
         didSet { if gitLineChanges != oldValue { needsDisplay = true } }
     }
+    /// A changed hunk expanded below one working-tree line.
+    struct InlineGitHunk: Equatable {
+        let anchorLine: UInt64
+        let oldLines: [String]
+        let newLines: [String]
+    }
+    var inlineGitHunk: InlineGitHunk? {
+        didSet { if inlineGitHunk != oldValue { reloadDocument() } }
+    }
+    /// A click on a Git change marker. The controller supplies the hunk from
+    /// HEAD and toggles its inline representation.
+    var onGitChangeClick: ((UInt64) -> Void)?
     /// `editor.renderWhitespace`; dots everywhere unless settings say otherwise.
     var renderWhitespace: WhitespaceRendering = .all {
         didSet { if renderWhitespace != oldValue { needsDisplay = true } }
@@ -402,15 +414,8 @@ final class EditorView: NSView {
         let visible = rect.intersection(bounds)
         guard !visible.isNull, !visible.isEmpty, lineCount > 0 else { return 0..<0 }
         let height = metrics.lineHeight
-        if rowMapped, let document {
-            let firstRow = UInt64(max(0, floor(visible.minY / height)))
-            let lastRow = UInt64(max(0, ceil(visible.maxY / height) - 1))
-            let first = min(lineCount, Int(document.lineAtRow(row: firstRow).line))
-            let last = min(lineCount, Int(document.lineAtRow(row: lastRow).line) + 1)
-            return first..<max(first, last)
-        }
-        let first = min(lineCount, max(0, Int(floor(visible.minY / height))))
-        let last = min(lineCount, max(0, Int(ceil(visible.maxY / height))))
+        let first = min(lineCount, Int(line(atY: visible.minY).line))
+        let last = min(lineCount, Int(line(atY: max(visible.minY, visible.maxY - 1)).line) + 1)
         return first..<max(first, last)
     }
 
@@ -452,7 +457,8 @@ final class EditorView: NSView {
         lineCount = Int(newCount ?? 0)
         hasFolds = !wrapSuspended && (document?.hasFolds() ?? false)
         rowCount = rowMapped ? Int(document?.totalRows() ?? 0) : lineCount
-        let virtual = CGFloat(rowCount) * metrics.lineHeight
+        let inlineRows = inlineGitHunk.map { $0.oldLines.count + $0.newLines.count } ?? 0
+        let virtual = CGFloat(rowCount + inlineRows) * metrics.lineHeight
         let visible = enclosingScrollView?.contentSize.height ?? 0
         setFrameSize(NSSize(width: frame.width, height: max(virtual, visible)))
         updateDocumentWidth()
@@ -546,13 +552,29 @@ final class EditorView: NSView {
 
     /// Y of the first row of `line`.
     func rowTop(of line: UInt64) -> CGFloat {
-        guard rowMapped, let document else { return CGFloat(line) * metrics.lineHeight }
-        return CGFloat(document.rowOfLine(line: line)) * metrics.lineHeight
+        let row: CGFloat
+        if rowMapped, let document {
+            row = CGFloat(document.rowOfLine(line: line))
+        } else {
+            row = CGFloat(line)
+        }
+        let insertedRows: Int
+        if let hunk = inlineGitHunk, line > hunk.anchorLine {
+            insertedRows = hunk.oldLines.count + hunk.newLines.count
+        } else {
+            insertedRows = 0
+        }
+        return (row + CGFloat(insertedRows)) * metrics.lineHeight
     }
 
     /// The line (and row within it) drawn at document-space `y`.
     func line(atY y: CGFloat) -> (line: UInt64, row: Int) {
-        let row = y.isFinite ? max(0, floor(y / metrics.lineHeight)) : 0
+        var row = y.isFinite ? max(0, floor(y / metrics.lineHeight)) : 0
+        if let hunk = inlineGitHunk {
+            let anchor = rowMapped ? CGFloat(document?.rowOfLine(line: hunk.anchorLine) ?? hunk.anchorLine) : CGFloat(hunk.anchorLine)
+            let inserted = CGFloat(hunk.oldLines.count + hunk.newLines.count)
+            if row > anchor { row = max(anchor, row - inserted) }
+        }
         guard rowMapped, let document else { return (UInt64(min(row, CGFloat(max(lineCount - 1, 0)))), 0) }
         let position = document.lineAtRow(row: UInt64(row))
         return (position.line, Int(position.row))
@@ -1080,13 +1102,38 @@ final class EditorView: NSView {
                 }
                 context.setFillColor(color.cgColor)
                 let markerHeight: CGFloat = change == .deleted ? 3 : block
-                context.fill(CGRect(x: 1 + shift, y: top, width: 3, height: markerHeight))
+                context.fill(CGRect(x: shift, y: top, width: 4, height: markerHeight))
+            }
+            if let hunk = inlineGitHunk, hunk.anchorLine == line.line {
+                drawInlineGitHunk(hunk, below: top + block, context: context)
             }
         }
         if drawnWidth > contentTextWidth {
             contentTextWidth = drawnWidth
             // Not while drawing: resizing the view would start another layout.
             DispatchQueue.main.async { [weak self] in self?.updateDocumentWidth() }
+        }
+    }
+
+    private func drawInlineGitHunk(_ hunk: InlineGitHunk, below top: CGFloat, context: CGContext) {
+        let lineHeight = metrics.lineHeight
+        let numberWidth = gutterRight - Self.gutterPadding
+        let lines = hunk.oldLines.map { (text: $0, color: Theme.diffRemoved, prefix: "-") }
+            + hunk.newLines.map { (text: $0, color: Theme.diffAdded, prefix: "+") }
+        for (index, line) in lines.enumerated() {
+            let y = top + CGFloat(index) * lineHeight
+            context.setFillColor(line.color.cgColor)
+            context.fill(CGRect(x: 0, y: y, width: bounds.width, height: lineHeight))
+            context.setFillColor(line.prefix == "-" ? NSColor.systemRed.cgColor : NSColor.systemGreen.cgColor)
+            context.fill(CGRect(x: gutterShift, y: y, width: 4, height: lineHeight))
+            let marker = layout(for: line.prefix)
+            context.setFillColor(Theme.gutterText.cgColor)
+            context.textPosition = CGPoint(x: gutterShift + numberWidth - 8, y: y + metrics.ascent)
+            CTLineDraw(marker, context)
+            let source = layout(for: line.text)
+            context.setFillColor(Theme.editorForeground.resolved(for: effectiveAppearance).cgColor)
+            context.textPosition = CGPoint(x: textOriginX, y: y + metrics.ascent)
+            CTLineDraw(source, context)
         }
     }
 

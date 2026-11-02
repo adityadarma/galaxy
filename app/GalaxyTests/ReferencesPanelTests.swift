@@ -31,6 +31,23 @@ final class ReferencesPanelTests: XCTestCase {
         XCTAssertEqual(previewed, second, "the first engine result is previewed immediately")
     }
 
+    func testPreferredReferenceIsPreviewedInsteadOfFirstEngineResult() {
+        let panel = ReferencesPanel(frame: NSRect(x: 0, y: 0, width: 800, height: 300))
+        let local = location("/workspace/local.tsx", line: 11, column: 2)
+        let declaration = location("/workspace/model-preference.ts", line: 102, column: 16)
+        var previewed: DefinitionLocation?
+        panel.onPreview = { previewed = $0 }
+
+        panel.update(
+            [local, declaration],
+            workspaceRoot: "/workspace",
+            preferredLocation: declaration
+        )
+
+        XCTAssertEqual(previewed, declaration)
+        XCTAssertEqual(panel.resultsTableView.selectedRow, 3)
+    }
+
     func testSelectingAnotherReferenceImmediatelyUpdatesPreview() {
         let panel = ReferencesPanel(frame: NSRect(x: 0, y: 0, width: 800, height: 300))
         let first = location("/workspace/src/a.ts", line: 17, column: 9)
@@ -44,6 +61,48 @@ final class ReferencesPanelTests: XCTestCase {
         panel.resultsTableView.selectRowIndexes(IndexSet(integer: 2), byExtendingSelection: false)
 
         XCTAssertEqual(previewed, second)
+    }
+
+    func testOpeningReferenceUsesItsRowAfterFileGroupsAreSorted() {
+        let panel = ReferencesPanel(frame: NSRect(x: 0, y: 0, width: 800, height: 300))
+        let zulu = location("/workspace/zulu.ts", line: 2, column: 3)
+        let alpha = location("/workspace/alpha.ts", line: 7, column: 11)
+        var opened: DefinitionLocation?
+        panel.onSelect = { opened = $0 }
+
+        panel.update([zulu, alpha], workspaceRoot: "/workspace")
+        panel.handleClick(row: 3, clickCount: 2)
+
+        XCTAssertEqual(opened, zulu, "the row must retain its URI after file groups are sorted")
+    }
+
+    func testSingleClickDoesNotReplaceSelectionPreviewWithClickedRowCallback() {
+        let panel = ReferencesPanel(frame: NSRect(x: 0, y: 0, width: 800, height: 300))
+        let local = location("/workspace/local.tsx", line: 11, column: 2)
+        let model = location("/workspace/model-preference.ts", line: 102, column: 16)
+        var previews: [DefinitionLocation] = []
+        panel.onPreview = { previews.append($0) }
+        panel.update([local, model], workspaceRoot: "/workspace")
+        previews.removeAll()
+
+        panel.resultsTableView.selectRowIndexes(IndexSet(integer: 3), byExtendingSelection: false)
+        panel.handleClick(row: 3, clickCount: 1)
+
+        XCTAssertEqual(previews, [model], "a single click must issue exactly one preview for its selected row")
+    }
+
+    func testSingleClickPreviewsEventRowWhenTableSelectionIsStillOnFirstResult() {
+        let panel = ReferencesPanel(frame: NSRect(x: 0, y: 0, width: 800, height: 300))
+        let local = location("/workspace/local.tsx", line: 11, column: 2)
+        let model = location("/workspace/model-preference.ts", line: 102, column: 16)
+        var previewed: DefinitionLocation?
+        panel.onPreview = { previewed = $0 }
+        panel.update([local, model], workspaceRoot: "/workspace")
+        XCTAssertEqual(panel.resultsTableView.selectedRow, 1)
+
+        panel.handleClick(row: 3, clickCount: 1)
+
+        XCTAssertEqual(previewed, model, "the mouse event row must win over stale table selection")
     }
 
     func testRefreshingUnchangedReferencesKeepsTheUserSelection() {
@@ -242,6 +301,7 @@ final class ReferencesPanelTests: XCTestCase {
         header.frame = NSRect(x: 0, y: 0, width: 280, height: 30)
         header.layoutSubtreeIfNeeded()
         XCTAssertEqual(header.disclosureLabel.font?.pointSize, 12)
+        XCTAssertEqual(header.nameLabel.lineBreakMode, .byTruncatingMiddle)
         XCTAssertEqual(header.disclosureLabel.frame.minY, header.bounds.height - header.disclosureLabel.frame.maxY)
 
         let result = try XCTUnwrap(panel.tableView(table, viewFor: column, row: 1) as? ReferencesResultCell)
@@ -318,6 +378,35 @@ final class ReferencesPanelTests: XCTestCase {
         let panel = try XCTUnwrap(controller.loadedReferencesPanel)
         XCTAssertEqual(panel.statusText, "Finding references...")
         XCTAssertTrue(panel.statusDetail.contains("Indexing 12 of 80 files"))
+    }
+
+    func testInFlightReferencesDoNotTimeOutWhileLazyIndexBuilds() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("galaxy-references-\(UUID().uuidString).ts")
+        try "export function value() {}\n"
+            .write(to: url, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let controller = MainWindowController(bridge: CoreBridge())
+        controller.showWindow(nil)
+        defer { controller.window?.orderOut(nil) }
+        try controller.openFile(at: url)
+        let document = try XCTUnwrap(controller.activeTab?.doc)
+        controller.findReferences(nil)
+        let cursor = document.primaryCursor()
+        controller.referencesRequest = (
+            document,
+            TextPos(line: cursor.line, colUtf16: cursor.colUtf16),
+            false,
+            true,
+            Date.distantPast,
+            Date.distantPast
+        )
+
+        controller.refreshReferences()
+
+        XCTAssertNotNil(controller.referencesRequest)
+        XCTAssertEqual(controller.loadedReferencesPanel?.statusText, "Finding references...")
     }
 
     func testPartialReferencesStayPendingUntilIndexingFinishes() throws {
@@ -422,6 +511,33 @@ final class ReferencesPanelTests: XCTestCase {
         XCTAssertTrue(rendered.contains("// header"), "rendered: \(rendered)")
     }
 
+    func testReferencePreviewHighlightsFileThatIsNotOpen() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("galaxy-reference-preview-\(UUID().uuidString).ts")
+        try "export const highlighted = 1;\nconsole.log(highlighted);\n"
+            .write(to: url, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        let controller = MainWindowController(bridge: CoreBridge())
+        controller.showWindow(nil)
+        defer { controller.window?.orderOut(nil) }
+        controller.newDocument(nil)
+        let target = location(url.path, line: 0, column: 13)
+        controller.showDefinitionLocations(
+            [target, location("/workspace/other.ts", line: 0, column: 0)],
+            at: TextPos(line: 0, colUtf16: 0)
+        )
+
+        controller.previewReference(target)
+        waitUntil { controller.loadedReferencesPanel?.previewHasSyntaxHighlighting == true }
+
+        XCTAssertEqual(controller.loadedReferencesPanel?.previewHasSyntaxHighlighting, true)
+    }
+
+    func testReferencePreviewUsesTheEditorWhitespaceMarkers() {
+        XCTAssertEqual(EditorView.whitespaceColumns(in: "    let value = 1", mode: .all), [0, 1, 2, 3, 7, 13, 15])
+    }
+
     func testPreviewSourceIsVisibleThroughScrollViewBesideRuler() throws {
         let panel = ReferencesPanel(frame: NSRect(x: 0, y: 0, width: 900, height: 300))
         let window = NSWindow(
@@ -463,7 +579,48 @@ final class ReferencesPanelTests: XCTestCase {
         XCTAssertGreaterThan(ink, 50, "source text must be visible right of the line-number gutter")
         let first = try XCTUnwrap(panel.previewContentView.subviews
             .compactMap { $0 as? NSTextField }.first { !$0.isHidden })
-        XCTAssertGreaterThanOrEqual(first.frame.minX, 60, "text must start after the gutter")
+        XCTAssertEqual(first.frame.minX, 0, "code starts at the ruler edge, with no extra left space")
+    }
+
+    private func makeScrolledPanel(scopes: @escaping @Sendable (Int) -> [Int]) throws -> (ReferencesPanel, NSWindow) {
+        let panel = ReferencesPanel(frame: NSRect(x: 0, y: 0, width: 900, height: 300))
+        let window = NSWindow(contentRect: panel.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+        window.contentView = panel
+        window.orderFrontRegardless()
+        let target = location("/workspace/src/scopes.ts", line: 40, column: 2)
+        let text = (0..<80).map { "line \($0)" }.joined(separator: "\n")
+        panel.update([target], workspaceRoot: "/workspace")
+        panel.showPreview(
+            path: "/workspace/src/scopes.ts",
+            text: text,
+            location: target,
+            gutterWidth: 60,
+            stickyScopes: scopes
+        )
+        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+        return (panel, window)
+    }
+
+    func testPreviewPinsEnclosingScopeHeaderWhileScrolled() throws {
+        let (panel, window) = try makeScrolledPanel { line in line >= 1 ? [0] : [] }
+        defer { window.orderOut(nil) }
+        XCTAssertEqual(panel.previewStickyLines, [0], "the block header stays pinned over the scrolled preview")
+    }
+
+    func testPreviewPinsNothingAtTheTop() throws {
+        let (panel, window) = try makeScrolledPanel { line in line >= 1 ? [0] : [] }
+        defer { window.orderOut(nil) }
+        let scroll = try XCTUnwrap(panel.previewContentView.enclosingScrollView)
+        scroll.contentView.scroll(to: .zero)
+        scroll.reflectScrolledClipView(scroll.contentView)
+        RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+        XCTAssertTrue(panel.previewStickyLines.isEmpty)
+    }
+
+    func testPreviewWithoutScopesPinsNothing() throws {
+        let (panel, window) = try makeScrolledPanel { _ in [] }
+        defer { window.orderOut(nil) }
+        XCTAssertTrue(panel.previewStickyLines.isEmpty)
     }
 
     func testMultipleDefinitionTargetsOpenPeek() throws {

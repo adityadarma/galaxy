@@ -480,6 +480,13 @@ impl GoEngine {
     /// parses the module's own files. Slow with a big module, so callers run
     /// it on a worker thread without holding the engine.
     pub fn build(root: &Path) -> Built {
+        Self::build_with_scheduler(root, crate::index_scheduler::shared_index_scheduler())
+    }
+
+    pub fn build_with_scheduler(
+        root: &Path,
+        scheduler: &crate::index_scheduler::IndexScheduler,
+    ) -> Built {
         let Some(project) = GoProject::detect(root) else {
             return Built {
                 project: None,
@@ -493,18 +500,26 @@ impl GoEngine {
         let module = module_paths(&project);
         let integrations = detect_all(&project);
         let ctx = BuildContext::host();
-        let mut parsed = Vec::new();
-        'packages: for path in &module {
+        let mut candidates = Vec::new();
+        for path in &module {
             let Some(dir) = project.import_dir(path) else {
                 continue;
             };
-            for file in go_files(&dir, &ctx) {
-                if parsed.len() >= PREPARSE_FILES {
-                    break 'packages;
-                }
-                if let Some((stamp, parsed_file)) = read_file(&file) {
-                    parsed.push((file, stamp, parsed_file));
-                }
+            candidates.extend(go_files(&dir, &ctx));
+        }
+        let mut parsed = Vec::new();
+        for batch in candidates.chunks(PREPARSE_FILES) {
+            let indexed = scheduler.map_ordered(batch.to_vec(), |file| {
+                read_file(&file).map(|(stamp, parsed_file)| (file, stamp, parsed_file))
+            });
+            parsed.extend(
+                indexed
+                    .into_iter()
+                    .flatten()
+                    .take(PREPARSE_FILES - parsed.len()),
+            );
+            if parsed.len() == PREPARSE_FILES {
+                break;
             }
         }
         Built {

@@ -2418,6 +2418,25 @@ mod tests {
     }
 
     #[test]
+    fn typescript_arrow_function_parentheses_are_punctuation() {
+        let language = SyntaxLanguage::TypeScript;
+        let source = "const task = async () => {};\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let doc = Document::from_text(source);
+        let runs = style_runs_for_viewport(&doc, &tree, language, 0, 1);
+        let punctuation = runs
+            .iter()
+            .filter(|run| run.scope == HighlightScope::Punctuation)
+            .map(|run| &source[run.start..run.end])
+            .collect::<Vec<_>>();
+
+        assert_eq!(punctuation.iter().filter(|&&token| token == "(").count(), 1);
+        assert_eq!(punctuation.iter().filter(|&&token| token == ")").count(), 1);
+    }
+
+    #[test]
     fn typescript_query_highlights_abstract_as_keyword() {
         let language = SyntaxLanguage::TypeScript;
         let source = "export declare abstract class Chainable {}\n";

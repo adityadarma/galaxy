@@ -21,6 +21,7 @@ pub mod git;
 pub mod go;
 pub mod grapheme;
 pub mod history;
+pub mod index_scheduler;
 pub mod javascript;
 pub mod jsonc;
 pub mod keymap;
