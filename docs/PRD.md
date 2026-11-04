@@ -120,7 +120,7 @@ Acceptance: Go to File results appear in < 30 ms per keystroke on 100k files.
 
 ### 7.6 Code Intelligence (P0)
 - Built-in engines run inside the Galaxy process; no external language servers, Node, or plugins are installed or launched.
-- Languages: PHP/Blade/Laravel, Go, TypeScript/JavaScript, Rust, Dart/Flutter. Other languages get syntax highlighting only.
+- Languages: PHP/Blade/Laravel, Go, TypeScript/JavaScript, Rust, Dart/Flutter, and the `<script>` blocks of Vue and Svelte components. Other languages get syntax highlighting only.
 - Engines index the workspace in the background and read dependencies statically (`composer.json`/`vendor/`, `go.mod`/module cache, `node_modules` type declarations, `.dart_tool/package_config.json`); project code is never executed.
 - P0 features:
   - Diagnostics (underline + Problems panel)

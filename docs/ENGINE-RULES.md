@@ -55,8 +55,12 @@ follows the same layering. Keep a change in the lowest layer that can hold it.
 ## Rules
 
 1. Activate from evidence. An adapter turns on from an import of a known
-   package or a marker file, never from a project path or a variable name
-   (`$query`, `query`, `subQuery` prove nothing).
+    package or a marker file, never from a project path or a variable name
+    (`$query`, `query`, `subQuery` prove nothing).
+   Template ownership needs application-level evidence, not only a dependency:
+   Laravel recognizes Blade templates only when both `artisan` and
+   `bootstrap/app.php` exist. A `laravel/framework` or `illuminate/*`
+   dependency may enable Eloquent support without claiming `.blade.php` files.
 2. Fail closed. Unknown shape, ambiguity, cycle, malformed syntax, path escape
    or a non-unique target yields no result. A wrong jump is worse than none.
 3. One direction. Adapters emit neutral facts (for TypeScript,

@@ -10,7 +10,8 @@ settings. Workspace settings take precedence.
   "editor": {
     "insertSpaces": true,
     "tabSize": 4,
-    "renderWhitespace": "all"
+    "renderWhitespace": "all",
+    "inlineParameterHints": true
   }
 }
 ```
@@ -19,6 +20,10 @@ settings. Workspace settings take precedence.
 - `editor.tabSize`: a positive tab width. Default `4`.
 - `editor.renderWhitespace`: how whitespace is drawn. Supported values are
   `none`, `boundary`, and `all`; default `all`.
+- `editor.inlineParameterHints`: show parameter names before call arguments in
+  TypeScript/JavaScript, Vue/Svelte scripts, PHP, and Rust. Default `true`.
+  Hints are hidden while word wrap is active. Vue and Svelte templates and
+  Rust method-call syntax (`value.method(...)`) are not analysed.
 
 Galaxy ships built-in snippets, selected by file extension, for Rust, Go,
 Python, JavaScript/TypeScript, PHP/Laravel/Blade, Dart/Flutter, Java, Kotlin,
@@ -72,15 +77,27 @@ Nothing needs to be installed.
 | TypeScript/JavaScript | built-in engine for navigation, completion, diagnostics, and type declarations |
 | Rust | built-in engine for navigation, completion, outline, references, rename, and syntax diagnostics |
 | Dart/Flutter | built-in engine (see below) |
-| Python, Swift, Vue, Svelte | syntax highlighting only; no built-in engine yet |
+| Vue, Svelte | TypeScript engine inside `<script>` blocks (see below) |
+| Python, Swift | syntax highlighting only; no built-in engine yet |
 
 Syntax highlighting also covers PHP (`.php`) and Blade files (`.blade.php`,
 which use the PHP grammar for their PHP sections).
 
-### PHP, Blade, and Laravel
+### PHP, Blade, and Frameworks
 
 The PHP engine reads source files, `composer.json`, and `vendor/` statically.
 PHP is never executed.
+
+Plain Composer projects retain PHP intelligence in every `.php` file, including
+files whose names end in `.blade.php`. A file is treated as a Blade template
+only when Galaxy detects a Laravel application from both `artisan` and
+`bootstrap/app.php`. Blade analysis is limited to PHP regions and statically
+provable Laravel contexts.
+
+Projects that require `laravel/framework` or `illuminate/*` can use Laravel's
+Eloquent member forwarding without being treated as Laravel applications. This
+does not enable Blade template handling. CodeIgniter and Symfony activate only
+when their respective project markers or Composer dependencies provide evidence.
 
 ### Go
 
@@ -112,12 +129,26 @@ local named routes, and lexically scoped provider/BLoC types
 `BlocProvider.of<T>`). Runtime branches, ambiguous nested scopes, and dynamic
 injection are still rejected.
 
+### Vue and Svelte
+
+The TypeScript engine analyses the `<script>` blocks of `.vue` and `.svelte`
+files: completion with auto-imports, Go to Definition, hover, references,
+rename, outline, and syntax and type diagnostics. All scripts of one component
+share a scope, so Vue's `<script>` and `<script setup>`, or Svelte's module and
+instance scripts, see each other's names.
+
+Templates are not analysed. A request with the cursor in the template returns
+nothing, and renaming a script name the template or styles mention is refused
+so the markup is never left stale. Missing-import warnings are not reported in
+components, because build tools may auto-import names the engine cannot see.
+
 ### Removed settings
 
 The `lsp.servers` and `servers` settings are no longer read. Format Document,
 Go to Type Definition, Go to Implementation, Go to Workspace Symbol, semantic
-tokens, and inlay hints were removed together with the language servers and
-have no replacement yet.
+tokens, and general-purpose inlay hints were removed together with the language
+servers. Built-in inline parameter-name hints are available through
+`editor.inlineParameterHints`.
 
 ## Local Data
 

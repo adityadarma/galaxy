@@ -1,18 +1,18 @@
 # Galaxy User Guide
 
-Galaxy adalah editor macOS native untuk membuka workspace, mengedit file,
-menjalankan tool terminal, dan memakai analisis kode bawaan.
+Galaxy is a native macOS editor for opening workspaces, editing files, running
+terminal tools, and using built-in code analysis.
 
-## Build Lokal
+## Local Build
 
-Persyaratan:
+Requirements:
 
-- macOS 14 atau lebih baru.
-- Xcode dengan Swift 6.
-- Rust toolchain sesuai `rust-toolchain.toml` bila tersedia.
-- `xcodegen` untuk membuat project Xcode.
+- macOS 14 or later.
+- Xcode with Swift 6.
+- The Rust toolchain specified by `rust-toolchain.toml`, when available.
+- `xcodegen` to generate the Xcode project.
 
-Build dan jalankan aplikasi lokal:
+Build and run the app locally:
 
 ```sh
 scripts/build-core.sh
@@ -22,45 +22,48 @@ xcodebuild -project app/Galaxy.xcodeproj -scheme Galaxy \
 open app/build/Build/Products/Debug/Galaxy.app
 ```
 
-CLI helper dapat dipasang ke `~/.local/bin`:
+The CLI helper can be installed in `~/.local/bin`:
 
 ```sh
 scripts/install-cli.sh
 galaxy /path/to/project
 ```
 
-## Membuka Workspace
+## Opening a Workspace
 
-- `File > Open File or Folder…` membuka file atau folder.
-- `File > Open Folder…` membuka workspace folder.
-- Explorer menampilkan file dan folder workspace.
-- Klik file sekali untuk preview tab; edit atau double-click membuat tab tetap.
-- Tab menyimpan posisi caret dan scroll masing-masing.
-- Perubahan Git ditandai pada explorer, folder ancestor, dan tab.
+- `File > Open File or Folder…` opens a file or folder.
+- `File > Open Folder…` opens a folder as a workspace.
+- Explorer displays workspace files and folders.
+- Click a file once to open a preview tab; editing or double-clicking pins it.
+- Each tab retains its own caret and scroll position.
+- Git changes are marked in Explorer, ancestor folders, and tabs.
 
 ## Editing
 
-- `Cmd+S`: simpan.
-- `Cmd+Shift+S`: simpan sebagai file baru.
+- `Cmd+S`: save.
+- `Cmd+Shift+S`: save as a new file.
 - `Cmd+Z` / `Cmd+Shift+Z`: undo / redo.
 - `Cmd+F`: find.
 - `Cmd+Option+F`: find and replace.
 - `Ctrl+G`: go to line.
 - `Cmd+P`: go to file.
 - `Cmd+Shift+O`: go to symbol.
-- `Cmd+D`: tambah occurrence berikutnya ke multi-cursor.
-- `Cmd+Shift+L`: pilih semua occurrence.
-- `Cmd+Option+Up` / `Cmd+Option+Down`: tambah cursor di atas/bawah.
+- `Cmd+D`: add the next occurrence to the multi-cursor selection.
+- `Cmd+Shift+L`: select all occurrences.
+- `Cmd+Option+Up` / `Cmd+Option+Down`: add a cursor above or below.
 - `Cmd+/`: toggle line comment.
 - `Cmd+.`: code actions.
 
-Editor mendukung auto-indent, bracket pairing, bracket matching, UTF-16
-positions, multi-cursor, IME melalui `NSTextInputClient`, dan undo transaction.
+The editor supports automatic indentation, bracket pairing, bracket matching,
+UTF-16 positions, multiple cursors, IME through `NSTextInputClient`, and
+transactional undo.
 
-## Navigasi Kode
+## Code Navigation
 
-Engine bawaan Galaxy menyediakan fitur berikut untuk PHP, Blade, Laravel, dan
-Go. Bahasa lain hanya mendapat syntax highlighting sampai engine-nya ada.
+Galaxy's built-in engines provide the following features for PHP/Blade,
+Go, Rust, Dart/Flutter, TypeScript/JavaScript, and Vue/Svelte scripts. See
+[`Feature.md`](../Feature.md) for the exact per-language support matrix and
+current limitations.
 
 - Hover.
 - Completion.
@@ -70,60 +73,70 @@ Go. Bahasa lain hanya mendapat syntax highlighting sampai engine-nya ada.
 - Rename symbol.
 - Code actions.
 - Document symbols.
-- Diagnostics di editor, gutter, scrollbar, dan Problems panel.
+- Diagnostics in the editor, gutter, scrollbar, and Problems panel.
 
-Klik diagnostic di Problems panel untuk membuka file dan lokasi terkait.
-Breadcrumb di bawah path file menunjukkan symbol aktif. Klik breadcrumb untuk
-menuju deklarasinya.
+Find References opens an inline References Peek below the active symbol. The
+left pane previews source without leaving the current file; the right pane
+groups references by file and shows source-line snippets. Single-click a result
+to preview it, double-click or press Return to navigate, and press Escape to
+close the peek. `Cmd`-click on a declaration name also opens References Peek,
+matching VS Code.
 
-Go to Definition (`F12`, atau `Cmd`-klik) dijawab oleh engine bawaan. Untuk
-PHP/Blade, buka root Laravel atau proyek Composer (folder yang memuat
-`composer.json`) agar engine menemukan `vendor/` dan autoload. Untuk Go, buka
-folder yang memuat `go.mod` (atau `go.work`); engine membaca GOROOT dan module
-cache untuk paket standar dan dependensi. Modul yang belum diunduh
-(`go mod download`) tidak punya completion atau definition.
+Click a diagnostic in the Problems panel to open its file and location. The
+breadcrumb below the file path shows the active symbol; click it to navigate to
+the declaration.
+
+Go to Definition (`F12` or `Cmd`-click) is handled by the built-in engine. For
+PHP, open the Composer project containing `composer.json` so the engine can
+find `vendor/` and autoload information. Blade-specific behavior requires a
+Laravel application root with `artisan` and `bootstrap/app.php`; an Eloquent
+dependency alone still supports PHP members but does not turn `.blade.php`
+files into templates. For Go, open the folder containing `go.mod` or `go.work`;
+the engine reads GOROOT and the module cache for standard packages and
+dependencies. Modules that have not been downloaded with `go mod download`
+have no completion or definition data.
 
 ## Terminal
 
-- `Cmd+J`: buka/tutup terminal.
-- Klik `+` untuk membuat terminal tab baru.
-- Tab terminal tetap menjalankan PTY saat panel disembunyikan.
-- Copy/paste memakai clipboard macOS.
-- Double-click `path:line:column` pada output terminal untuk membuka file.
-- Scrollback terminal menyimpan hingga 10.000 baris.
+- `Cmd+J`: open or close the terminal.
+- Click `+` to create a terminal tab.
+- Terminal tabs keep their PTY running while the panel is hidden.
+- Copy and paste use the macOS clipboard.
+- Double-click `path:line:column` in terminal output to open the file.
+- Terminal scrollback retains up to 10,000 lines.
 
 ## Split Editor
 
-Gunakan menu `View` atau Command Palette:
+Use the `View` menu or Command Palette:
 
 - `Split Editor Right`.
 - `Split Editor Down`.
 - `Close Editor Split`.
 
-Kedua pane mengikuti tab aktif dan berbagi document state yang sama.
+Both panes follow the active tab and share the same document state.
 
-## Search dan Git
+## Search and Git
 
 - `Cmd+Shift+F`: workspace search.
-- Search mendukung regex, case-sensitive, whole word, include glob, dan
-  exclude glob.
-- Hasil dibatasi 10.000 match dan dapat dibuka langsung ke lokasi.
-- Status bar menampilkan branch dan jumlah file berubah.
-- Gutter menampilkan diff terhadap `HEAD` untuk file yang dibuka.
+- Search supports regular expressions, case sensitivity, whole-word matching,
+  include globs, and exclude globs.
+- Results are capped at 10,000 matches and can be opened directly.
+- The status bar shows the branch and changed-file count.
+- The gutter displays the open file's diff against `HEAD`.
 
 ## Settings
 
-Buka melalui `View > Open User Settings (JSON)…` atau workspace settings.
-Settings global berada di:
+Open settings through `View > Open User Settings (JSON)…` or workspace
+settings. Global settings are stored at:
 
 ```text
 ~/Library/Application Support/Galaxy/settings.json
 ```
 
-Workspace settings berada di:
+Workspace settings are stored at:
 
 ```text
 .galaxy/settings.json
 ```
 
-Workspace settings mengoverride global settings.
+Workspace settings override global settings.
