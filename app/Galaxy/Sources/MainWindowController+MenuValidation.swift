@@ -12,10 +12,12 @@ extension MainWindowController: NSMenuItemValidation {
              #selector(findNext(_:)), #selector(findPrevious(_:)), #selector(useSelectionForFind(_:)):
             return hasDocument
         case #selector(refreshExplorer(_:)), #selector(collapseExplorerFolders(_:)),
-             #selector(explorerNewFile(_:)), #selector(explorerNewFolder(_:)),
-             #selector(revealInFinder(_:)), #selector(copyExplorerPath(_:)),
-             #selector(copyExplorerRelativePath(_:)):
+              #selector(explorerNewFile(_:)), #selector(explorerNewFolder(_:)),
+              #selector(revealInFinder(_:)), #selector(copyExplorerPath(_:)),
+              #selector(copyExplorerRelativePath(_:)), #selector(pasteExplorerItem(_:)):
             return workspace != nil
+        case #selector(copyExplorerItem(_:)):
+            return workspace != nil && explorer.selectedEntry != nil
         // From a key or the palette (a tab menu sets its own state).
         case #selector(closeOtherTabs(_:)):
             return tabs.contains { $0 !== activeTab && !$0.isPinned }

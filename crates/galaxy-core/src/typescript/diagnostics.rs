@@ -332,6 +332,13 @@ pub(super) fn infer_type(text: &str, node: Node<'_>, state: &mut TypeState) -> T
                             );
                         }
                     }
+                    // Object shorthand values are siblings of `pair` nodes:
+                    // `{ data, cache }` keeps the existing bindings' types.
+                    "shorthand_property_identifier" => {
+                        if let Some(name) = node_text(text, member) {
+                            fields.insert(name.to_owned(), infer_type(text, member, state));
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -393,6 +400,24 @@ fn ecmascript_global(name: &str) -> Option<Type> {
                 Type::Function(
                     Vec::new(),
                     0,
+                    Box::new(Type::Primitive("number")),
+                    Vec::new(),
+                ),
+            ),
+            (
+                "parse".to_owned(),
+                Type::Function(
+                    vec![Type::Primitive("string")],
+                    1,
+                    Box::new(Type::Primitive("number")),
+                    Vec::new(),
+                ),
+            ),
+            (
+                "UTC".to_owned(),
+                Type::Function(
+                    vec![Type::Primitive("number")],
+                    1,
                     Box::new(Type::Primitive("number")),
                     Vec::new(),
                 ),

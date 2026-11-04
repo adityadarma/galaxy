@@ -255,59 +255,214 @@ extension MainWindowController {
     func refreshGitDiff() {
         guard let workspace, let tab = activeTab, let path = tab.relPath else {
             editorView.gitLineChanges = [:]
+            scrollView.diagnosticScroller.updateGit(changes: [:], lineCount: 1)
             return
         }
         let text = tab.doc.text()
+        let document = tab.doc
         let wantsHunks = tab.diffBase != nil
-        DispatchQueue.global(qos: .utility).async { [weak self, workspace, path, text] in
+        let open = editorView.inlineGitHunk
+        DispatchQueue.global(qos: .utility).async { [weak self, workspace, path, text, open, document] in
             let changes = (try? workspace.gitDiffLines(relPath: path, text: text)) ?? []
             let mapped = Self.gitLineMarkers(changes)
-            let map = wantsHunks ? DiffLineMap((try? workspace.gitDiffHunks(relPath: path, text: text)) ?? []) : nil
+            let hunks = (open != nil || wantsHunks) ? ((try? workspace.gitDiffHunks(relPath: path, text: text)) ?? []) : []
+            let map = wantsHunks ? DiffLineMap(hunks) : nil
+            // An open inline hunk follows the edit: same HEAD hunk, new text.
+            // It closes once the change is gone, e.g. after an undo.
+            let refreshed = open.map { Self.refreshedInlineHunk($0, hunks: hunks, workspace: workspace, document: document, path: path, text: text) }
             Task { @MainActor [weak self] in
                 guard let self, self.activeTab?.relPath == path else { return }
                 self.editorView.gitLineChanges = mapped
+                self.scrollView.diagnosticScroller.updateGit(changes: mapped, lineCount: document.lineCount())
+                if let refreshed, self.editorView.inlineGitHunk == open { self.editorView.inlineGitHunk = refreshed }
                 if let map, self.isDiffPaneShown { self.applyDiff(map) }
             }
         }
     }
 
-    /// Expands one working-tree change in-place below its marker. The editor
-    /// owns layout; this supplies the corresponding text ranges from HEAD.
+    /// Expands one working-tree change in a peek zone below its last line. The
+    /// editor owns layout; this supplies the HEAD side and the context rows.
     func toggleInlineGitHunk(at line: UInt64) {
-        if editorView.inlineGitHunk?.anchorLine == line {
+        if let open = editorView.inlineGitHunk, open.contains(line: line) {
             editorView.inlineGitHunk = nil
             return
         }
+        showInlineGitHunk { hunks in
+            hunks.firstIndex { line >= $0.newStart && line < $0.newStart + max($0.newLen, 1) }
+        }
+    }
+
+    /// The zone's header buttons.
+    func handleInlineHunkAction(_ action: EditorView.InlineHunkAction) {
+        guard let open = editorView.inlineGitHunk else { return }
+        let current = open.newStart
+        switch action {
+        case .close:
+            editorView.inlineGitHunk = nil
+        case .next:
+            showInlineGitHunk { hunks in hunks.firstIndex { $0.newStart > current } ?? (hunks.isEmpty ? nil : 0) }
+        case .previous:
+            showInlineGitHunk { hunks in hunks.lastIndex { $0.newStart < current } ?? hunks.indices.last }
+        case .stage:
+            stageInlineGitHunk(open)
+        case .revert:
+            revertInlineGitHunk(open)
+        }
+    }
+
+    /// Stages only the open hunk. The zone stays: it compares with HEAD, and
+    /// the Source Control list shows the file as staged.
+    private func stageInlineGitHunk(_ hunk: EditorView.InlineGitHunk) {
         guard let workspace, let tab = activeTab, let path = tab.relPath else { return }
         let text = tab.doc.text()
-        DispatchQueue.global(qos: .userInitiated).async { [weak self, workspace, path, text, line] in
-            let hunks = (try? workspace.gitDiffHunks(relPath: path, text: text)) ?? []
-            guard let hunk = hunks.first(where: {
-                let first = $0.newStart
-                let length = max($0.newLen, 1)
-                return line >= first && line < first + length
-            }) else { return }
-            let base = (try? workspace.gitBaseDocument(relPath: path)) ?? nil
-            let oldLines = Self.gitLines(base?.text() ?? "", start: hunk.oldStart, count: hunk.oldLen)
-            let newLines = Self.gitLines(text, start: hunk.newStart, count: hunk.newLen)
-            let inline = EditorView.InlineGitHunk(
-                anchorLine: line,
-                oldLines: oldLines,
-                newLines: newLines
-            )
+        let oldStart = hunk.oldStart
+        DispatchQueue.global(qos: .userInitiated).async { [weak self, workspace, path, text, oldStart] in
+            let failure: String? = {
+                do {
+                    try workspace.gitStageHunk(relPath: path, text: text, oldStart: oldStart)
+                    return nil
+                } catch {
+                    return "Could not stage the change."
+                }
+            }()
             Task { @MainActor [weak self] in
-                guard let self, self.activeTab?.relPath == path else { return }
-                self.editorView.inlineGitHunk = inline
+                guard let self else { return }
+                if let failure {
+                    self.statusLabel.stringValue = failure
+                } else {
+                    self.statusLabel.stringValue = "Staged the change."
+                    // The peek is for a working-tree change. Closing it gives
+                    // immediate feedback even though gutter markers compare
+                    // the editor to HEAD and still include staged changes.
+                    self.editorView.inlineGitHunk = nil
+                    self.refreshGitStatus()
+                }
             }
         }
     }
 
-    nonisolated private static func gitLines(_ text: String, start: UInt64, count: UInt64) -> [String] {
-        guard count > 0 else { return [] }
+    private func showInlineGitHunk(choose: @escaping @Sendable ([GitDiffHunkInfo]) -> Int?) {
+        guard let workspace, let tab = activeTab, let path = tab.relPath else { return }
+        let text = tab.doc.text()
+        let document = tab.doc
+        DispatchQueue.global(qos: .userInitiated).async { [weak self, workspace, path, text, document] in
+            let hunks = (try? workspace.gitDiffHunks(relPath: path, text: text)) ?? []
+            guard let index = choose(hunks), hunks.indices.contains(index) else { return }
+            let inline = Self.inlineHunk(hunks, index: index, workspace: workspace, document: document, path: path, text: text)
+            Task { @MainActor [weak self] in
+                guard let self, self.activeTab?.relPath == path else { return }
+                self.editorView.inlineGitHunk = inline
+                self.editorView.revealLine(Int(inline.newStart))
+            }
+        }
+    }
+
+    /// Puts the HEAD lines back in place of the hunk's working-tree lines.
+    private func revertInlineGitHunk(_ hunk: EditorView.InlineGitHunk) {
+        guard let document = activeTab?.doc else { return }
+        let text = document.text()
         let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
-        let first = min(Int(start), lines.count)
-        let last = min(first + Int(count), lines.count)
-        return lines[first..<last].map(String.init)
+        let total = UInt64(text.utf16.count)
+        let offset = { (line: Int) -> UInt64 in
+            min(total, UInt64(lines.prefix(line).reduce(0) { $0 + $1.utf16.count + 1 }))
+        }
+        let first = Int(hunk.newStart)
+        let end = first + Int(hunk.newLen)
+        let start = offset(first)
+        var body = hunk.oldLines.joined(separator: "\n")
+        if !hunk.oldLines.isEmpty, end < lines.count { body += "\n" }
+        // Restoring lines after the last line of a file with no final newline.
+        if hunk.newLen == 0, !hunk.oldLines.isEmpty, end >= lines.count, !text.isEmpty, !text.hasSuffix("\n") {
+            body = "\n" + body
+        }
+        document.commitText(text: body, replacement: Utf16Range(location: start, length: offset(end) - start))
+        editorView.didChangeDocument()
+    }
+
+    nonisolated private static func inlineHunk(
+        _ hunks: [GitDiffHunkInfo],
+        index: Int,
+        workspace: Workspace,
+        document: DocumentHandle,
+        path: String,
+        text: String
+    ) -> EditorView.InlineGitHunk {
+        typealias Row = EditorView.InlineGitHunk.Row
+        let hunk = hunks[index]
+        let base = (try? workspace.gitBaseDocument(relPath: path)) ?? nil
+        let oldAll = gitLines(base?.text() ?? "")
+        let newAll = gitLines(text)
+        let oldStart = Int(hunk.oldStart), oldLen = Int(hunk.oldLen)
+        let newStart = Int(hunk.newStart), newLen = Int(hunk.newLen)
+        let context = 3
+        // Runs by 0-based line: the working tree for context and added rows,
+        // HEAD for removed ones.
+        let newFirst = newStart - min(context, oldStart, newStart)
+        let newCount = min(newAll.count, newStart + newLen + context) - newFirst
+        let newStyles = styleRuns(document, first: newFirst, count: newCount)
+        let oldStyles = styleRuns(base, first: oldStart, count: min(oldLen, max(oldAll.count - oldStart, 0)))
+        var rows: [Row] = []
+        let before = min(context, oldStart, newStart)
+        for k in stride(from: before, to: 0, by: -1) where newStart - k < newAll.count {
+            rows.append(Row(kind: .context, oldNumber: oldStart - k + 1, newNumber: newStart - k + 1, text: newAll[newStart - k],
+                            styles: newStyles[newStart - k] ?? []))
+        }
+        for i in 0..<oldLen where oldStart + i < oldAll.count {
+            rows.append(Row(kind: .removed, oldNumber: oldStart + i + 1, newNumber: nil, text: oldAll[oldStart + i],
+                            styles: oldStyles[oldStart + i] ?? []))
+        }
+        for i in 0..<newLen where newStart + i < newAll.count {
+            rows.append(Row(kind: .added, oldNumber: nil, newNumber: newStart + i + 1, text: newAll[newStart + i],
+                            styles: newStyles[newStart + i] ?? []))
+        }
+        for j in 0..<context {
+            let n = newStart + newLen + j, o = oldStart + oldLen + j
+            guard n < newAll.count, o < oldAll.count else { break }
+            rows.append(Row(kind: .context, oldNumber: o + 1, newNumber: n + 1, text: newAll[n], styles: newStyles[n] ?? []))
+        }
+        // The zone sits under the last changed line; a pure deletion has none,
+        // so it sits under the line before the gap.
+        let last = newLen == 0 ? max(newStart - 1, 0) : newStart + newLen - 1
+        return EditorView.InlineGitHunk(
+            anchorLine: UInt64(min(last, max(newAll.count - 1, 0))),
+            rows: rows,
+            oldStart: hunk.oldStart,
+            newStart: hunk.newStart,
+            newLen: hunk.newLen,
+            fileName: (path as NSString).lastPathComponent,
+            index: index,
+            total: hunks.count
+        )
+    }
+
+    /// `open` rebuilt from the current text, or nil when its change is gone.
+    nonisolated private static func refreshedInlineHunk(
+        _ open: EditorView.InlineGitHunk,
+        hunks: [GitDiffHunkInfo],
+        workspace: Workspace,
+        document: DocumentHandle,
+        path: String,
+        text: String
+    ) -> EditorView.InlineGitHunk? {
+        let index = hunks.firstIndex { $0.oldStart == open.oldStart }
+            ?? hunks.firstIndex { open.contains(line: $0.newStart) || $0.newStart == open.newStart }
+        guard let index else { return nil }
+        return inlineHunk(hunks, index: index, workspace: workspace, document: document, path: path, text: text)
+    }
+
+    /// Syntax runs of `count` lines from `first`, keyed by 0-based line.
+    nonisolated private static func styleRuns(_ document: DocumentHandle?, first: Int, count: Int) -> [Int: [StyleRun]] {
+        guard let document, count > 0 else { return [:] }
+        let snapshot = document.viewport(firstLine: UInt64(first), count: UInt64(count))
+        return Dictionary(grouping: snapshot.styles, by: { Int($0.line) })
+    }
+
+    /// Lines of `text`; a final newline ends the last line rather than adding one.
+    nonisolated private static func gitLines(_ text: String) -> [String] {
+        guard !text.isEmpty else { return [] }
+        var lines = text.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        if text.hasSuffix("\n") { lines.removeLast() }
+        return lines
     }
 
     // MARK: Diff tab
@@ -448,6 +603,11 @@ extension MainWindowController {
         changes.reduce(into: [:]) { markers, change in
             guard let current = markers[change.line] else {
                 markers[change.line] = change.kind
+                return
+            }
+            if (current == .added && change.kind == .deleted)
+                || (current == .deleted && change.kind == .added) {
+                markers[change.line] = .modified
                 return
             }
             let priority: [GitLineChangeKind: Int] = [.added: 0, .deleted: 1, .modified: 2]

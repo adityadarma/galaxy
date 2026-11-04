@@ -7,6 +7,8 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
     private let font = NSPopUpButton(frame: .zero, pullsDown: false)
     private let fontSize = NSStepper(frame: .zero)
     private let fontSizeLabel = NSTextField(labelWithString: "")
+    private let lineSpacing = NSStepper(frame: .zero)
+    private let lineSpacingLabel = NSTextField(labelWithString: "")
 
     // AI Commit settings (OpenAI-compatible API)
     private let baseURLField = NSTextField()
@@ -331,6 +333,10 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
         fontSize.minValue = 10; fontSize.maxValue = 24; fontSize.increment = 1; fontSize.doubleValue = size
         fontSize.target = self; fontSize.action = #selector(saveFontSize(_:))
         updateFontSizeLabel()
+        let spacing = UserDefaults.standard.object(forKey: "EditorLineSpacing") as? Double ?? 0
+        lineSpacing.minValue = 0; lineSpacing.maxValue = 12; lineSpacing.increment = 1; lineSpacing.doubleValue = spacing
+        lineSpacing.target = self; lineSpacing.action = #selector(saveLineSpacing(_:))
+        updateLineSpacingLabel()
 
         stack.addArrangedSubview(row("Theme", appearance))
         stack.addArrangedSubview(row("Editor font", font))
@@ -338,6 +344,10 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
         sizeRow.spacing = 12
         sizeRow.arrangedSubviews[0].widthAnchor.constraint(equalToConstant: 120).isActive = true
         stack.addArrangedSubview(sizeRow)
+        let spacingRow = NSStackView(views: [NSTextField(labelWithString: "Line spacing"), lineSpacing, lineSpacingLabel])
+        spacingRow.spacing = 12
+        spacingRow.arrangedSubviews[0].widthAnchor.constraint(equalToConstant: 120).isActive = true
+        stack.addArrangedSubview(spacingRow)
         return pane(stack)
     }
 
@@ -468,6 +478,12 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
         onChange()
     }
 
+    @objc private func saveLineSpacing(_ sender: Any?) {
+        UserDefaults.standard.set(lineSpacing.doubleValue, forKey: "EditorLineSpacing")
+        updateLineSpacingLabel()
+        onChange()
+    }
+
     private func configure(_ field: NSTextField, key: String, placeholder: String, label: String) {
         field.placeholderString = placeholder
         field.stringValue = UserDefaults.standard.string(forKey: key) ?? ""
@@ -497,6 +513,7 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
     }
 
     private func updateFontSizeLabel() { fontSizeLabel.stringValue = "\(Int(fontSize.doubleValue)) pt" }
+    private func updateLineSpacingLabel() { lineSpacingLabel.stringValue = "\(Int(lineSpacing.doubleValue)) pt" }
 
     private static func installedFontFamilies() -> [String] {
         NSFontManager.shared.availableFontFamilies

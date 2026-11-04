@@ -167,6 +167,25 @@ final class ReferencesPanelTests: XCTestCase {
         XCTAssertEqual(panel.previewHorizontalOffset, 0)
     }
 
+    func testPreviewHeaderShowsFileLocationAndReferenceCount() {
+        let panel = ReferencesPanel(frame: NSRect(x: 0, y: 0, width: 900, height: 300))
+        let first = location("/workspace/app/Services/ToastAlertService.php", line: 6, column: 12)
+        let second = location("/workspace/app/Http/PermissionController.php", line: 3, column: 8)
+        panel.update([first, second], workspaceRoot: "/workspace")
+
+        panel.showPreview(
+            path: "/workspace/app/Services/ToastAlertService.php",
+            text: "<?php\n",
+            location: first
+        )
+
+        XCTAssertEqual(
+            panel.titleText,
+            "ToastAlertService.php  app/Services - References"
+        )
+        XCTAssertEqual(panel.statusText, "(2)")
+    }
+
     func testPreviewDrawsCodePixels() throws {
         let panel = ReferencesPanel(frame: NSRect(x: 0, y: 0, width: 900, height: 300))
         let target = location("/workspace/src/a.ts", line: 1, column: 0)
@@ -294,18 +313,18 @@ final class ReferencesPanelTests: XCTestCase {
         column.width = 280
         table.addTableColumn(column)
 
-        XCTAssertEqual(panel.tableView(table, heightOfRow: 0), 30)
-        XCTAssertEqual(panel.tableView(table, heightOfRow: 1), 28)
+        XCTAssertEqual(panel.tableView(table, heightOfRow: 0), 28)
+        XCTAssertEqual(panel.tableView(table, heightOfRow: 1), 26)
 
         let header = try XCTUnwrap(panel.tableView(table, viewFor: column, row: 0) as? ReferencesFileCell)
-        header.frame = NSRect(x: 0, y: 0, width: 280, height: 30)
+        header.frame = NSRect(x: 0, y: 0, width: 280, height: 28)
         header.layoutSubtreeIfNeeded()
         XCTAssertEqual(header.disclosureLabel.font?.pointSize, 12)
         XCTAssertEqual(header.nameLabel.lineBreakMode, .byTruncatingMiddle)
         XCTAssertEqual(header.disclosureLabel.frame.minY, header.bounds.height - header.disclosureLabel.frame.maxY)
 
         let result = try XCTUnwrap(panel.tableView(table, viewFor: column, row: 1) as? ReferencesResultCell)
-        result.frame = NSRect(x: 0, y: 0, width: 280, height: 28)
+        result.frame = NSRect(x: 0, y: 0, width: 280, height: 26)
         result.layoutSubtreeIfNeeded()
         XCTAssertEqual(result.sourceLabel.frame.minY, result.bounds.height - result.sourceLabel.frame.maxY)
     }

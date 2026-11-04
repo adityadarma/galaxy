@@ -88,7 +88,7 @@ impl PhpEngine {
         }
     }
 
-    pub(super) fn function(&mut self, fqn: &str) -> Option<Arc<FunctionInfo>> {
+    pub(in crate::php) fn function(&mut self, fqn: &str) -> Option<Arc<FunctionInfo>> {
         let key = fqn.trim_start_matches('\\').to_lowercase();
         for file in self.open.values() {
             if let Some(found) = file.functions.iter().find(|f| f.fqn.to_lowercase() == key) {

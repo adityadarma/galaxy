@@ -87,6 +87,7 @@ enum Lookup {
 pub struct Built {
     autoload: Autoload,
     names: Vec<ClassName>,
+    files: usize,
     scanned: HashMap<String, PathBuf>,
     frameworks: Vec<Arc<dyn Framework>>,
 }
@@ -100,7 +101,7 @@ pub fn build(root: &Path) -> Built {
 
 fn build_inner(root: &Path) -> Built {
     let autoload = Autoload::load(root);
-    let mut names = autoload.all_classes();
+    let (mut names, mut files) = autoload.indexed_classes();
     if let VersionSelection::Supported(version) = for_project(root) {
         names.extend(Stubs::for_version(version).class_names().iter().cloned());
     }
@@ -115,17 +116,21 @@ fn build_inner(root: &Path) -> Built {
             });
             scanned.entry(fqn.to_lowercase()).or_insert(path);
         }
+        files = scanned.len();
     }
     Built {
         autoload,
         names,
+        files,
         scanned,
         frameworks: framework::detect_all(root),
     }
 }
 
 /// The PHP project containing `file`: the nearest ancestor with a
-/// `composer.json`, else one with `.git`, else the file's own folder.
+/// `vendor/composer`, else `composer.json`, else one with `.git`, else the
+/// file's own folder. A file in a dependency must use the application's
+/// Composer map so definitions can cross from one vendor package to another.
 pub fn project_root(file: &Path) -> PathBuf {
     let marker = |name: &str| {
         file.ancestors()
@@ -133,7 +138,8 @@ pub fn project_root(file: &Path) -> PathBuf {
             .find(|dir| dir.join(name).exists())
             .map(Path::to_path_buf)
     };
-    marker("composer.json")
+    marker("vendor/composer")
+        .or_else(|| marker("composer.json"))
         .or_else(|| marker(".git"))
         .or_else(|| file.parent().map(Path::to_path_buf))
         .unwrap_or_else(|| PathBuf::from("/"))
@@ -146,6 +152,7 @@ pub struct PhpEngine {
     parsed: HashMap<PathBuf, Parsed>,
     open: HashMap<PathBuf, Arc<FileSymbols>>,
     names: Option<Arc<Vec<ClassName>>>,
+    files: usize,
     scanned: Option<HashMap<String, PathBuf>>,
     deferred: bool,
     building: bool,
@@ -161,7 +168,7 @@ pub struct PhpEngine {
 impl PhpEngine {
     pub fn index_stats(&self) -> crate::LanguageIndexStats {
         let symbols = self.names.as_ref().map_or(0, |names| names.len());
-        let files = self.scanned.as_ref().map_or(0, HashMap::len);
+        let files = self.files;
         crate::LanguageIndexStats {
             files,
             symbols,
@@ -184,6 +191,7 @@ impl PhpEngine {
             parsed: HashMap::new(),
             open: HashMap::new(),
             names: None,
+            files: 0,
             scanned: None,
             deferred: false,
             building: false,
@@ -214,6 +222,7 @@ impl PhpEngine {
             parsed: HashMap::new(),
             open: HashMap::new(),
             names: None,
+            files: 0,
             scanned: None,
             deferred: true,
             building: true,
@@ -247,8 +256,20 @@ impl PhpEngine {
         stale
     }
 
+    /// Marks the current snapshot for replacement by a worker. The old index
+    /// stays available for navigation until [`Self::install`] atomically puts
+    /// the rebuilt Composer/vendor snapshot in place.
+    pub fn begin_rebuild(&mut self) -> bool {
+        if self.building {
+            return false;
+        }
+        self.building = true;
+        true
+    }
+
     pub fn install(&mut self, built: Built) {
         self.autoload = built.autoload;
+        self.files = built.files;
         self.scanned = Some(built.scanned);
         self.names = Some(Arc::new(built.names));
         self.functions = None;
@@ -273,6 +294,7 @@ impl PhpEngine {
         self.autoload = Autoload::load(&self.root);
         self.parsed.clear();
         self.names = None;
+        self.files = 0;
         self.scanned = None;
         self.functions = None;
     }

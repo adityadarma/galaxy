@@ -215,6 +215,12 @@ enum Theme {
         return selected
     }
 
+    /// Extra points between editor rows, shared by the main editor and peek.
+    static var editorLineSpacing: CGFloat {
+        let defaults = UserDefaults.standard
+        return max(0, min(12, defaults.object(forKey: "EditorLineSpacing") as? CGFloat ?? 0))
+    }
+
     /// Status bar: compact, secondary text.
     static var statusFont: NSFont { .systemFont(ofSize: 11) }
     static let statusHeight: CGFloat = 24
@@ -275,4 +281,3 @@ enum GitFileStatus: Equatable {
         }
     }
 }
-

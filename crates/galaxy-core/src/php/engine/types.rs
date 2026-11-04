@@ -132,7 +132,7 @@ impl PhpEngine {
 
     /// The type of `receiver->name` (a read) or `receiver->name(args)`,
     /// with template parameters replaced by what the receiver binds them to.
-    pub(super) fn member_type(
+    pub(in crate::php) fn member_type(
         &mut self,
         ctx: &Ctx<'_>,
         receiver: &str,
@@ -170,6 +170,11 @@ impl PhpEngine {
             return self.member_type(ctx, &relation, "getResults", Some(""));
         };
         let parts = args.map(split_args).unwrap_or_default();
+        if !call && member.kind == MemberKind::Property && member.ty.is_none() {
+            if let Some(ty) = self.constructor_property_type(ctx, &chain[0].0, name) {
+                return Some(ty);
+            }
+        }
         if let Some(index) = member.class_arg {
             return self.class_from_class_const(ctx, parts.get(index)?);
         }
@@ -203,6 +208,49 @@ impl PhpEngine {
         }
         let out = generics::subst(&declared.take()?, &env, receiver);
         (!out.is_empty()).then_some(out)
+    }
+
+    /// Infer an untyped property from a conventional constructor assignment:
+    /// `__construct(Service $service) { $this->service = $service; }`.
+    fn constructor_property_type(
+        &mut self,
+        ctx: &Ctx<'_>,
+        class: &Arc<ClassInfo>,
+        name: &str,
+    ) -> Option<String> {
+        static CONSTRUCTOR: OnceLock<Regex> = OnceLock::new();
+        static ASSIGNMENT: OnceLock<Regex> = OnceLock::new();
+        static PARAMETER: OnceLock<Regex> = OnceLock::new();
+        let (source, file) = if ctx
+            .class
+            .as_ref()
+            .is_some_and(|current| current.fqn == class.fqn)
+        {
+            (ctx.src.to_owned(), ctx.file.clone())
+        } else {
+            (
+                std::fs::read_to_string(&class.path).ok()?,
+                self.load(&class.path)?.as_ref().clone(),
+            )
+        };
+        let constructor = CONSTRUCTOR
+            .get_or_init(|| Regex::new(r"(?s)function\s+__construct\s*\((.*?)\)").expect("valid"))
+            .captures(&source)?
+            .get(1)?
+            .as_str();
+        let parameter = ASSIGNMENT
+            .get_or_init(|| Regex::new(r"\$this->(\w+)\s*=\s*\$(\w+)").expect("valid"))
+            .captures_iter(&source)
+            .find(|assignment| &assignment[1] == name)?
+            .get(2)?
+            .as_str();
+        let ty = PARAMETER
+            .get_or_init(|| Regex::new(r"([\\\w?|&]+)\s+\$(\w+)\b").expect("valid"))
+            .captures_iter(constructor)
+            .find(|parameter_match| &parameter_match[2] == parameter)?
+            .get(1)?
+            .as_str();
+        resolve_type(ty, &file.namespace, &file.uses, &class.fqn)
     }
 
     /// Evaluates the `return` expression of a method as written in its own
@@ -294,6 +342,12 @@ impl PhpEngine {
                 self.variable_type(ctx, name, depth)
             };
             pos = end;
+            // `$base()` where `$base = function () { return Model::query(); }`.
+            if s[pos..].starts_with('(') && name != "this" {
+                let close = skip_balanced(s, pos)?;
+                current = self.closure_return(ctx, name, depth);
+                pos = close;
+            }
         } else {
             let end = read_name(s);
             if end == 0 {
@@ -343,6 +397,71 @@ impl PhpEngine {
             return None;
         }
         current
+    }
+
+    /// What `$name()` returns when `$name` was assigned a closure: the type
+    /// of the expression in its `return` statement.
+    fn closure_return(&mut self, ctx: &Ctx<'_>, name: &str, depth: u8) -> Option<String> {
+        let var = format!("${name}");
+        let mut node = ctx
+            .tree
+            .root_node()
+            .descendant_for_byte_range(ctx.byte, ctx.byte)?;
+        while !is_scope(node.kind()) {
+            node = node.parent()?;
+        }
+        // The nearest earlier assignment of a closure to the variable.
+        let mut best: Option<Node<'_>> = None;
+        let mut stack = vec![node];
+        while let Some(current) = stack.pop() {
+            let mut cursor = current.walk();
+            for child in current.named_children(&mut cursor) {
+                if child.id() != node.id()
+                    && is_scope(child.kind())
+                    && child.kind() != "anonymous_function"
+                    && child.kind() != "arrow_function"
+                {
+                    continue;
+                }
+                if child.kind() == "assignment_expression"
+                    && child.end_byte() <= ctx.byte
+                    && let (Some(left), Some(right)) = (
+                        child.child_by_field_name("left"),
+                        child.child_by_field_name("right"),
+                    )
+                    && left.kind() == "variable_name"
+                    && ctx.src[left.byte_range()] == var
+                    && matches!(right.kind(), "anonymous_function" | "arrow_function")
+                    && best.is_none_or(|b| child.start_byte() > b.start_byte())
+                {
+                    best = Some(child);
+                }
+                stack.push(child);
+            }
+        }
+        let closure = best?.child_by_field_name("right")?;
+        if closure.kind() == "arrow_function" {
+            let body = closure.child_by_field_name("body")?;
+            return self.eval(ctx, &ctx.src[body.byte_range()], depth + 1);
+        }
+        let body = closure.child_by_field_name("body")?;
+        let mut stack = vec![body];
+        while let Some(current) = stack.pop() {
+            let mut cursor = current.walk();
+            for child in current.named_children(&mut cursor) {
+                if is_scope(child.kind()) {
+                    continue;
+                }
+                if child.kind() == "return_statement"
+                    && let Some(value) = child.named_child(0)
+                    && let Some(ty) = self.eval(ctx, &ctx.src[value.byte_range()], depth + 1)
+                {
+                    return Some(ty);
+                }
+                stack.push(child);
+            }
+        }
+        None
     }
 
     pub(super) fn variable_type(&mut self, ctx: &Ctx<'_>, name: &str, depth: u8) -> Option<String> {
@@ -419,8 +538,20 @@ impl PhpEngine {
                         let re = param_doc_regex(var);
                         let caps = re.captures(doc)?;
                         resolve_type(&caps[1], &ctx.file.namespace, &ctx.file.uses, self_fqn)
-                    })
-                    .or_else(|| self.builder_callback_parameter_type(ctx, scope, var, depth));
+                    });
+                // `function (Builder $query)` names the class but not the model;
+                // the call the closure is passed to knows it.
+                let declared = match declared {
+                    Some(ty) if !ty.contains('<') => {
+                        let inferred = self.builder_callback_parameter_type(ctx, scope, var, depth);
+                        match inferred {
+                            Some(better) if generics::base(&better) == ty => Some(better),
+                            _ => Some(ty),
+                        }
+                    }
+                    None => self.builder_callback_parameter_type(ctx, scope, var, depth),
+                    other => other,
+                };
                 offer(scope.start_byte(), Source::Resolved(declared));
             }
         }
@@ -585,7 +716,13 @@ impl PhpEngine {
             .find(|node| node.kind() == "member_call_expression")?;
         let method = &ctx.src[call.child_by_field_name("name")?.byte_range()];
         let receiver = call.child_by_field_name("object")?;
-        let ty = self.eval(ctx, &ctx.src[receiver.byte_range()], depth + 1)?;
+        // The receiver is written outside the closure; with the cursor inside
+        // it, `$query` would resolve to the closure's own parameter.
+        let at_receiver = Ctx {
+            byte: receiver.start_byte(),
+            ..ctx.clone()
+        };
+        let ty = self.eval(&at_receiver, &ctx.src[receiver.byte_range()], depth + 1)?;
         let chain = self.lineage_env(&ty);
         let frameworks = self.frameworks.clone();
         frameworks

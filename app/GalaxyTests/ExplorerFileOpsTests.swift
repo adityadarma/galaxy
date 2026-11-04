@@ -102,6 +102,44 @@ final class ExplorerFileOpsTests: XCTestCase {
         c.window?.attachedSheet.map { c.window?.endSheet($0) }
     }
 
+    func testNewFileAndFolderUseInlineNames() throws {
+        let c = try makeController()
+        defer { c.window?.orderOut(nil) }
+        c.explorer.reveal(relPath: "src")
+
+        c.explorerNewFile(nil)
+        XCTAssertEqual(c.explorer.renameFieldForTesting?.currentEditor()?.selectedRange,
+                       NSRange(location: 0, length: 0))
+        XCTAssertEqual(c.explorer.renameFieldForTesting?.stringValue, "")
+        try finishTyping(c, "new.rs")
+        XCTAssertTrue(exists("src/new.rs"))
+
+        c.explorerNewFolder(nil)
+        try finishTyping(c, "generated")
+        XCTAssertTrue(exists("src/generated"))
+    }
+
+    func testNewExplorerItemSurvivesAnEmptyFocusLoss() throws {
+        let c = try makeController()
+        defer { c.window?.orderOut(nil) }
+        c.explorer.reveal(relPath: "src")
+
+        c.explorerNewFile(nil)
+        let entry = try XCTUnwrap(c.explorer.renamingEntry)
+        let field = try XCTUnwrap(c.explorer.renameFieldForTesting)
+        c.explorer.controlTextDidEndEditing(Notification(name: NSControl.textDidEndEditingNotification, object: field))
+
+        XCTAssertFalse(exists(entry.relPath), "an empty new-file field remains virtual until a name is confirmed")
+
+        let resumed = expectation(description: "empty name field resumes")
+        DispatchQueue.main.async {
+            XCTAssertEqual(c.explorer.renamingEntry?.relPath, entry.relPath)
+            XCTAssertEqual(c.explorer.renameFieldForTesting?.stringValue, "")
+            resumed.fulfill()
+        }
+        wait(for: [resumed], timeout: 1)
+    }
+
     func testDeletingAsksThenClosesCleanTabsAndKeepsEditedOnes() throws {
         let c = try makeController()
         defer { c.window?.orderOut(nil) }
@@ -140,7 +178,7 @@ final class ExplorerFileOpsTests: XCTestCase {
         XCTAssertEqual(c.explorer.selectedEntry?.relPath, "README.md")
         XCTAssertNil(c.activeTab, "right click does not open the file")
         XCTAssertEqual(menu.items.filter { !$0.isSeparatorItem }.map(\.title),
-                       ["New File…", "New Folder…", "Reveal in Finder", "Copy Path", "Copy Relative Path",
+                       ["New File…", "New Folder…", "Reveal in Finder", "Copy", "Paste", "Copy Path", "Copy Relative Path",
                         "Rename…", "Move to Trash"])
         for item in menu.items where !item.isSeparatorItem {
             XCTAssertTrue(c.validateMenuItem(item), item.title)
@@ -157,5 +195,24 @@ final class ExplorerFileOpsTests: XCTestCase {
         c.explorer.reveal(relPath: "src/main.rs")
         c.copyExplorerRelativePath(nil)
         XCTAssertEqual(pasteboard.string(forType: .string), "src/main.rs")
+    }
+
+    func testCopyingExplorerFilePastesIntoAnotherWindow() throws {
+        let source = try makeController()
+        defer { source.window?.orderOut(nil) }
+        let destinationRoot = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-destination-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: destinationRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: destinationRoot) }
+        let destination = MainWindowController(bridge: CoreBridge())
+        destination.showWindow(nil)
+        defer { destination.window?.orderOut(nil) }
+        try destination.openWorkspace(at: destinationRoot)
+
+        source.explorer.reveal(relPath: "src/net")
+        source.copyExplorerItem(nil)
+        destination.pasteExplorerItem(nil)
+
+        let copied = destinationRoot.appendingPathComponent("net/tcp.rs")
+        XCTAssertEqual(try String(contentsOf: copied, encoding: .utf8), "tcp\n")
     }
 }

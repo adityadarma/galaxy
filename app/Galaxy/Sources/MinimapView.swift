@@ -66,9 +66,12 @@ final class MinimapView: NSView {
 
     weak var editor: EditorView?
     weak var scrollView: NSScrollView?
+    /// Problems in the active document, shown as VS Code-style overview-ruler
+    /// marks at the minimap's right edge.
+    private var diagnosticMarkers: [(line: UInt64, severity: UInt8)] = []
     private var isDragging = false
     private var isHovering = false
-    private var cache: (document: ObjectIdentifier, revision: UInt64, first: Int, count: Int, lines: [String])?
+    private var cache: (document: ObjectIdentifier, revision: UInt64, first: Int, count: Int, lines: [String], styles: [StyleRun])?
 
     override var isFlipped: Bool { true }
     override var isOpaque: Bool { true }
@@ -119,15 +122,28 @@ final class MinimapView: NSView {
                              topLine: visible.top, bottomLine: visible.bottom)
     }
 
-    private func fetchLines(_ document: DocumentHandle, first: Int, count: Int) -> [String] {
+    private func fetchContent(_ document: DocumentHandle, first: Int, count: Int) -> (lines: [String], styles: [StyleRun]) {
         let id = ObjectIdentifier(document)
         let revision = document.revision()
         if let c = cache, c.document == id, c.revision == revision, c.first == first, c.count == count {
-            return c.lines
+            return (c.lines, c.styles)
         }
-        let lines = document.lines(first: UInt64(first), count: UInt64(count))
-        cache = (id, revision, first, count, lines)
-        return lines
+        let snapshot = document.viewport(firstLine: UInt64(first), count: UInt64(count))
+        let lines = snapshot.lines.map(\.text)
+        cache = (id, revision, first, count, lines, snapshot.styles)
+        return (lines, snapshot.styles)
+    }
+
+    func updateDiagnosticMarkers(_ markers: [(line: UInt64, severity: UInt8)]) {
+        guard diagnosticMarkers.map(\ .line) != markers.map(\ .line)
+            || diagnosticMarkers.map(\ .severity) != markers.map(\ .severity) else { return }
+        diagnosticMarkers = markers
+        needsDisplay = true
+    }
+
+    /// Y of a document line in the currently scrolled minimap overview.
+    static func markerY(line: UInt64, offset: CGFloat) -> CGFloat {
+        CGFloat(line) * rowHeight - offset
     }
 
     // MARK: Drawing
@@ -143,19 +159,44 @@ final class MinimapView: NSView {
 
         let first = min(Int(geometry.offset / Self.rowHeight), editor.lineCount - 1)
         let capacity = Int(ceil(bounds.height / Self.rowHeight)) + 1
-        let lines = fetchLines(document, first: first, count: min(capacity, editor.lineCount - first))
+        let content = fetchContent(document, first: first, count: min(capacity, editor.lineCount - first))
         let originY = CGFloat(first) * Self.rowHeight - geometry.offset
 
-        var bars: [CGRect] = []
-        for (index, text) in lines.enumerated() where !text.isEmpty {
+        var bars: [NSColor: [CGRect]] = [:]
+        let stylesByLine = Dictionary(grouping: content.styles, by: { Int($0.line) })
+        for (index, text) in content.lines.enumerated() where !text.isEmpty {
             let y = originY + CGFloat(index) * Self.rowHeight + 0.25
             for run in Self.runs(in: text) {
-                bars.append(CGRect(x: Self.leftPadding + CGFloat(run.start), y: y,
-                                   width: CGFloat(run.end - run.start), height: Self.rowHeight - 0.5))
+                var boundaries = [run.start, run.end]
+                for style in stylesByLine[first + index] ?? [] {
+                    boundaries.append(min(max(Int(style.start), run.start), run.end))
+                    boundaries.append(min(max(Int(style.end), run.start), run.end))
+                }
+                boundaries.sort()
+                for (start, end) in zip(boundaries, boundaries.dropFirst()) where start < end {
+                    let scope = (stylesByLine[first + index] ?? []).last {
+                        Int($0.start) <= start && Int($0.end) >= end
+                    }?.scope
+                    let color = scope.map { Theme.syntax($0, appearance: effectiveAppearance) }
+                        ?? Theme.editorForeground.resolved(for: effectiveAppearance)
+                    bars[color, default: []].append(CGRect(x: Self.leftPadding + CGFloat(start), y: y,
+                                                             width: CGFloat(end - start), height: Self.rowHeight - 0.5))
+                }
             }
         }
-        context.setFillColor(Theme.editorForeground.resolved(for: effectiveAppearance).withAlphaComponent(0.45).cgColor)
-        context.fill(bars)
+        for (color, rects) in bars {
+            context.setFillColor(color.withAlphaComponent(0.55).cgColor)
+            context.fill(rects)
+        }
+
+        // Error, warning, and info stay visible on the overview ruler even
+        // when the corresponding editor line is outside the text viewport.
+        for marker in diagnosticMarkers {
+            let y = Self.markerY(line: marker.line, offset: geometry.offset)
+            guard y + Self.rowHeight >= 0, y <= bounds.height else { continue }
+            Theme.diagnostic(marker.severity).setFill()
+            NSRect(x: bounds.maxX - 5, y: y, width: 5, height: max(Self.rowHeight, 3)).fill()
+        }
 
         let alpha: CGFloat = isDragging ? 0.2 : (isHovering ? 0.14 : 0.09)
         context.setFillColor(NSColor.labelColor.resolved(for: effectiveAppearance).withAlphaComponent(alpha).cgColor)

@@ -87,7 +87,7 @@ extension MainWindowController {
         presentReferencesPeek(at: position)
         let indexingDetail = workspaceIndexState.flatMap { state in
             document.path().hasPrefix(state.root + "/")
-                ? "Indexing \(state.completed) of \(state.total) files. References will appear when the language index is ready."
+                ? "Scanning workspace \(state.completed) of \(state.total) files. References will appear when the language index is ready."
                 : nil
         }
         referencesPanel.showStatus(
@@ -121,8 +121,8 @@ extension MainWindowController {
         if !request.answered {
             if let indexing {
                 let progress = indexing.total == 0
-                    ? "Indexing workspace..."
-                    : "Indexing \(indexing.completed) of \(indexing.total) files"
+                    ? "Scanning workspace..."
+                    : "Scanning workspace \(indexing.completed) of \(indexing.total) files"
                 if bridge.references(document: request.document).isEmpty {
                     referencesPanel.showStatus(
                         "Finding references...",
@@ -313,7 +313,8 @@ extension MainWindowController {
             to: groupChrome
         )
         let inset: CGFloat = 0
-        let width = max(320, groupChrome.bounds.width)
+        let minimapInset: CGFloat = minimapEnabled && !isDiffPaneShown ? MinimapView.width : 0
+        let width = max(0, groupChrome.bounds.width - minimapInset)
         let height = min(320, max(210, groupChrome.bounds.height * 0.42))
         let x: CGFloat = 0
         // `groupChrome` is not flipped: smaller Y values are visually below.

@@ -439,8 +439,18 @@ pub(super) fn index_export(
     }
 }
 
-pub(super) fn is_export_assignment(text: &str, node: Node<'_>) -> bool {
-    node_text(text, node).is_some_and(|source| source.trim_start().starts_with("export ="))
+pub(super) fn export_assignment_name(text: &str, node: Node<'_>) -> Option<String> {
+    let source = node_text(text, node)?.trim_start();
+    let name = source
+        .strip_prefix("export =")?
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    (!name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte == b'_' || byte == b'$' || byte.is_ascii_alphanumeric()))
+    .then(|| name.to_owned())
 }
 
 pub(super) fn source_specifier(text: &str, node: Node<'_>) -> Option<String> {

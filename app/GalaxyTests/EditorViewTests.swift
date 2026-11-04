@@ -500,9 +500,50 @@ final class EditorViewTests: XCTestCase {
             newLines: ["one changed"]
         )
 
+        // Header row plus one removed and one added row.
         XCTAssertEqual(view.rowTop(of: 1), height)
-        XCTAssertEqual(view.rowTop(of: 2), height * 4)
-        XCTAssertEqual(view.line(atY: height * 4.5).line, 2)
+        let hunkHeight = try XCTUnwrap(view.inlineGitHunk).height(lineHeight: height)
+        XCTAssertEqual(view.rowTop(of: 2), height * 2 + hunkHeight)
+        XCTAssertEqual(view.line(atY: height * 2 + hunkHeight + height / 2).line, 2)
+    }
+
+    func testInlineGitHunkHeaderButtonsAreHitTestable() throws {
+        let (view, _, url) = try makeView(text: "zero\none\ntwo\nthree")
+        defer { try? FileManager.default.removeItem(at: url) }
+        view.inlineGitHunk = EditorView.InlineGitHunk(anchorLine: 1, oldLines: ["one"], newLines: ["one changed"])
+        let hunk = try XCTUnwrap(view.inlineGitHunk)
+        let top = view.inlineHunkTop(hunk)
+
+        let close = try XCTUnwrap(view.inlineHunkButtonRects(top: top).first { $0.action == .close }).rect
+        XCTAssertEqual(view.inlineHunkHit(at: NSPoint(x: close.midX, y: close.midY)), .button(.close))
+        XCTAssertEqual(view.inlineHunkHit(at: NSPoint(x: 20, y: top + view.metrics.lineHeight * 1.5)), .zone)
+        XCTAssertNil(view.inlineHunkHit(at: NSPoint(x: 20, y: top - 1)), "text above the zone is not part of it")
+        XCTAssertNil(view.inlineHunkHit(at: NSPoint(x: 20, y: top + hunk.height(lineHeight: view.metrics.lineHeight))))
+    }
+
+    func testInlineGitHunkButtonsStayLeftOfTheMinimap() throws {
+        let (view, _, url) = try makeView(text: "zero\none\ntwo\nthree")
+        defer { try? FileManager.default.removeItem(at: url) }
+        view.inlineGitHunk = EditorView.InlineGitHunk(anchorLine: 1, oldLines: ["one"], newLines: ["one changed"])
+        let top = view.inlineHunkTop(try XCTUnwrap(view.inlineGitHunk))
+        let before = try XCTUnwrap(view.inlineHunkButtonRects(top: top).map(\.rect.maxX).max())
+
+        view.rightInset = 80
+        let after = try XCTUnwrap(view.inlineHunkButtonRects(top: top).map(\.rect.maxX).max())
+        XCTAssertEqual(after, before - 80, accuracy: 0.5, "the minimap's width is kept clear")
+    }
+
+    func testInlineGitHunkButtonsHaveRoomAndOnlyEnabledActionsAreClickable() throws {
+        let (view, _, url) = try makeView(text: "zero\none\ntwo\nthree")
+        defer { try? FileManager.default.removeItem(at: url) }
+        view.inlineGitHunk = EditorView.InlineGitHunk(anchorLine: 1, oldLines: ["one"], newLines: ["one changed"])
+        let hunk = try XCTUnwrap(view.inlineGitHunk)
+        let rects = view.inlineHunkButtonRects(top: view.inlineHunkTop(hunk))
+
+        XCTAssertEqual(rects.count, 5)
+        XCTAssertEqual(rects[1].rect.minX - rects[0].rect.minX, 30, accuracy: 0.5)
+        XCTAssertFalse(EditorView.inlineHunkActionIsEnabled(.next, hunk: hunk))
+        XCTAssertTrue(EditorView.inlineHunkActionIsEnabled(.close, hunk: hunk))
     }
 
     func testModifiedGitMarkerWinsOverStaleDeletionMarker() {
@@ -512,6 +553,26 @@ final class EditorViewTests: XCTestCase {
         ])
 
         XCTAssertEqual(markers[38], .modified)
+    }
+
+    func testScrollerSplitsGitAndProblemLanes() {
+        let lanes = DiagnosticScroller.lanes(in: NSRect(x: 0, y: 0, width: 14, height: 100))
+
+        XCTAssertEqual(lanes.git.minX, 0)
+        XCTAssertEqual(lanes.git.maxX, lanes.problems.minX)
+        XCTAssertEqual(lanes.problems.maxX, 14)
+    }
+
+    func testGitBarSitsRightOfLineNumbers() throws {
+        let (view, _, url) = try makeView(text: "zero\none\ntwo")
+        defer { try? FileManager.default.removeItem(at: url) }
+        view.forcedCaretVisible = false
+        view.gitLineChanges = [1: .added]
+        let rep = try bitmap(view)
+        let y = view.metrics.lineHeight / 2
+        let barX = view.gutterRight + EditorView.gitBarOffset + EditorView.gitBarWidth / 2
+
+        XCTAssertNotEqual(try luminance(rep, view, x: barX, y: y), try luminance(rep, view, x: 1, y: y))
     }
 
     /// Regression: Core Text draws black unless told to use the context

@@ -20,25 +20,21 @@ extension MainWindowController {
     @objc func explorerNewFile(_ sender: Any?) { createExplorerItem(folder: false) }
     @objc func explorerNewFolder(_ sender: Any?) { createExplorerItem(folder: true) }
 
-    /// Creates a file or folder in the selected folder (or the selected
-    /// file's folder, else the root), shows it, and opens a new file.
+    /// Adds an in-memory item, then lets the user name it inline.
     private func createExplorerItem(folder: Bool) {
-        guard let workspace else { return NSSound.beep() }
         let parent = explorer.targetFolder
-        guard let name = askNewName(folder ? "New Folder" : "New File", parent),
-              !name.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+        guard explorer.beginNewItem(parent: parent, folder: folder) else { return NSSound.beep() }
+    }
+
+    func createExplorerItem(parent: String, folder: Bool, name: String) {
+        guard let workspace else { return }
         do {
             let rel = folder
                 ? try workspace.createFolder(parentRelPath: parent, name: name)
                 : try workspace.createFile(parentRelPath: parent, name: name)
             explorer.refresh()
             explorer.reveal(relPath: rel)
-            // The watcher reports it too, a moment later.
             updateFileFinder(changed: [rel])
-            if !folder {
-                let entry = FileEntry(name: (rel as NSString).lastPathComponent, relPath: rel, isDir: false)
-                openWorkspaceFile(workspace, entry, preview: false)
-            }
         } catch {
             report(error, while: folder ? "create folder" : "create file")
         }
@@ -67,6 +63,49 @@ extension MainWindowController {
         guard workspace != nil else { return NSSound.beep() }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(explorer.selectedEntry?.relPath ?? ".", forType: .string)
+    }
+
+    /// Copies the selected filesystem item as a file URL, so another Galaxy
+    /// window can paste it into its own workspace.
+    @objc func copyExplorerItem(_ sender: Any?) {
+        guard let workspace, let entry = explorer.selectedEntry else { return NSSound.beep() }
+        let url = URL(fileURLWithPath: workspace.root()).appendingPathComponent(entry.relPath)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.writeObjects([url as NSURL])
+    }
+
+    /// Copies filesystem URLs from any app window into the selected folder.
+    @objc func pasteExplorerItem(_ sender: Any?) {
+        guard let workspace else { return NSSound.beep() }
+        let items = NSPasteboard.general.readObjects(
+            forClasses: [NSURL.self],
+            options: [.urlReadingFileURLsOnly: true]
+        ) as? [URL] ?? []
+        guard !items.isEmpty else { return NSSound.beep() }
+        let destination = URL(fileURLWithPath: workspace.root()).appendingPathComponent(explorer.targetFolder)
+        let manager = FileManager.default
+        var pasted: [String] = []
+        for source in items {
+            let source = source.standardizedFileURL
+            let target = destination.appendingPathComponent(source.lastPathComponent).standardizedFileURL
+            guard source != target else { continue }
+            guard !manager.fileExists(atPath: target.path) else {
+                statusLabel.stringValue = "Cannot paste: \(target.lastPathComponent) already exists."
+                continue
+            }
+            do {
+                try manager.copyItem(at: source, to: target)
+                let rel = target.path.replacingOccurrences(of: workspace.root() + "/", with: "")
+                pasted.append(rel)
+            } catch {
+                report(error, while: "paste \(source.lastPathComponent)")
+            }
+        }
+        guard !pasted.isEmpty else { return }
+        explorer.refresh()
+        explorer.reveal(relPath: pasted[0])
+        updateFileFinder(changed: pasted)
+        refreshGitStatus()
     }
 
     // MARK: Rename and delete (M2-05)
@@ -153,6 +192,12 @@ extension MainWindowController {
         let mods = event.modifierFlags.intersection([.command, .shift, .control, .option])
         guard explorer.selectedEntry != nil else { return false }
         switch (event.keyCode, mods) {
+        case (8, [.command]): // ⌘C
+            copyExplorerItem(nil)
+            return true
+        case (9, [.command]): // ⌘V
+            pasteExplorerItem(nil)
+            return true
         case (36, []), (76, []): // Return, keypad Enter
             renameExplorerItem(nil)
             return true
@@ -176,6 +221,9 @@ extension MainWindowController {
         add("New Folder…", #selector(explorerNewFolder(_:)))
         menu.addItem(.separator())
         add("Reveal in Finder", #selector(revealInFinder(_:)))
+        menu.addItem(.separator())
+        add("Copy", #selector(copyExplorerItem(_:)), key: "c", mods: .command)
+        add("Paste", #selector(pasteExplorerItem(_:)), key: "v", mods: .command)
         menu.addItem(.separator())
         add("Copy Path", #selector(copyExplorerPath(_:)))
         add("Copy Relative Path", #selector(copyExplorerRelativePath(_:)))

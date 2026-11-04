@@ -21,3 +21,5 @@ pub use engine::{
     PhpEngine, Problem, RefQuery, Severity, Signature, Target, build, finish, outline,
     project_root, valid_name,
 };
+
+pub(crate) use stubs::builtin_function_names;

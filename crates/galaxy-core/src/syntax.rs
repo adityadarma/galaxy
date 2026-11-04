@@ -39,6 +39,7 @@ pub enum SyntaxLanguage {
     Python,
     Go,
     Html,
+    Xml,
     Css,
     Bash,
     Nginx,
@@ -65,7 +66,7 @@ pub enum SyntaxLanguage {
 }
 
 impl SyntaxLanguage {
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 32] = [
         Self::Rust,
         Self::TypeScript,
         Self::Tsx,
@@ -77,6 +78,7 @@ impl SyntaxLanguage {
         Self::Python,
         Self::Go,
         Self::Html,
+        Self::Xml,
         Self::Css,
         Self::Bash,
         Self::Nginx,
@@ -112,6 +114,7 @@ impl SyntaxLanguage {
             Self::Python => "Python",
             Self::Go => "Go",
             Self::Html => "HTML",
+            Self::Xml => "XML",
             Self::Css => "CSS",
             Self::Bash => "Bash",
             Self::Nginx => "Nginx",
@@ -149,6 +152,7 @@ impl SyntaxLanguage {
             Self::Ini => Some(";"),
             Self::Json
             | Self::Html
+            | Self::Xml
             | Self::Css
             | Self::Markdown
             | Self::Blade
@@ -173,6 +177,7 @@ impl SyntaxLanguage {
             Self::Html | Self::Blade | Self::Vue | Self::Svelte => {
                 tree_sitter_html::LANGUAGE.into()
             }
+            Self::Xml => tree_sitter_xml::LANGUAGE_XML.into(),
             Self::Css => tree_sitter_css::LANGUAGE.into(),
             Self::Bash => tree_sitter_bash::LANGUAGE.into(),
             Self::Nginx => tree_sitter_nginx::LANGUAGE.into(),
@@ -199,7 +204,7 @@ impl SyntaxLanguage {
             Self::Rust => rust_highlights(),
             Self::TypeScript | Self::Tsx => TYPESCRIPT_HIGHLIGHTS,
             Self::JavaScript => JAVASCRIPT_HIGHLIGHTS,
-            Self::Json => tree_sitter_json::HIGHLIGHTS_QUERY,
+            Self::Json => json_highlights(),
             Self::Toml => tree_sitter_toml_ng::HIGHLIGHTS_QUERY,
             Self::Yaml => tree_sitter_yaml::HIGHLIGHTS_QUERY,
             // The inline grammar is injected by M3-05; this captures Markdown
@@ -208,7 +213,8 @@ impl SyntaxLanguage {
             Self::Python => tree_sitter_python::HIGHLIGHTS_QUERY,
             Self::Go => tree_sitter_go::HIGHLIGHTS_QUERY,
             Self::Html | Self::Blade | Self::Vue | Self::Svelte => html_highlights(),
-            Self::Css => tree_sitter_css::HIGHLIGHTS_QUERY,
+            Self::Xml => tree_sitter_xml::XML_HIGHLIGHT_QUERY,
+            Self::Css => css_highlights(),
             Self::Bash => BASH_HIGHLIGHTS,
             Self::Nginx => NGINX_HIGHLIGHTS,
             Self::Php => php_highlights(),
@@ -221,7 +227,7 @@ impl SyntaxLanguage {
             Self::Swift => tree_sitter_swift::HIGHLIGHTS_QUERY,
             Self::Sql => tree_sitter_sequel::HIGHLIGHTS_QUERY,
             Self::Make => tree_sitter_make::HIGHLIGHTS_QUERY,
-            Self::Ini => tree_sitter_ini::HIGHLIGHTS_QUERY,
+            Self::Ini => ini_highlights(),
             Self::PowerShell => tree_sitter_powershell::HIGHLIGHTS_QUERY,
             Self::Dart => dart_highlights(),
             Self::R => tree_sitter_r::HIGHLIGHTS_QUERY,
@@ -262,6 +268,8 @@ impl SyntaxLanguage {
             .unwrap_or(path)
             .to_ascii_lowercase();
         let by_name = match name.as_str() {
+            ".env" => Some(Self::Ini),
+            "composer.lock" => Some(Self::Json),
             "dockerfile" => Some(Self::Bash),
             "www.conf" => Some(Self::Ini),
             "cargo.toml" => Some(Self::Toml),
@@ -274,6 +282,9 @@ impl SyntaxLanguage {
         }
         if name.ends_with(".blade.php") {
             return Some(Self::Blade);
+        }
+        if name.starts_with(".env.") {
+            return Some(Self::Ini);
         }
         if name.starts_with("dockerfile.") {
             return Some(Self::Bash);
@@ -294,6 +305,7 @@ impl SyntaxLanguage {
             "py" | "pyw" => Some(Self::Python),
             "go" => Some(Self::Go),
             "html" | "htm" => Some(Self::Html),
+            "xml" => Some(Self::Xml),
             "vue" => Some(Self::Vue),
             "svelte" => Some(Self::Svelte),
             "css" => Some(Self::Css),
@@ -308,7 +320,7 @@ impl SyntaxLanguage {
             "swift" => Some(Self::Swift),
             "sql" => Some(Self::Sql),
             "mk" | "mak" => Some(Self::Make),
-            "ini" | "cfg" | "conf" => Some(Self::Ini),
+            "ini" | "cfg" | "conf" | "env" => Some(Self::Ini),
             "ps1" | "psm1" | "psd1" => Some(Self::PowerShell),
             "dart" => Some(Self::Dart),
             "r" => Some(Self::R),
@@ -330,6 +342,7 @@ impl SyntaxLanguage {
             "ruby" => Some(Self::Ruby),
             "lua" => Some(Self::Lua),
             "pwsh" => Some(Self::PowerShell),
+            "php" => Some(Self::Php),
             _ => None,
         }
     }
@@ -468,12 +481,39 @@ fn php_highlights() -> &'static str {
             "(relative_scope) @variable.builtin",
             "(relative_scope) @keyword",
         );
+        let builtins = crate::php::builtin_function_names()
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let magic_methods = [
+            "__construct",
+            "__destruct",
+            "__call",
+            "__callStatic",
+            "__get",
+            "__set",
+            "__isset",
+            "__unset",
+            "__sleep",
+            "__wakeup",
+            "__serialize",
+            "__unserialize",
+            "__toString",
+            "__invoke",
+            "__set_state",
+            "__clone",
+            "__debugInfo",
+        ]
+        .map(|name| format!("\"{name}\""))
+        .join(" ");
         format!(
             r#"{base}
 (class_declaration name: (name) @type)
 (interface_declaration name: (name) @type)
 (trait_declaration name: (name) @type)
 (enum_declaration name: (name) @type)
+(enum_case name: (name) @constant)
 (base_clause [(name) (qualified_name (name))] @type)
 (class_interface_clause [(name) (qualified_name (name))] @type)
 (use_declaration [(name) (qualified_name (name))] @type)
@@ -481,9 +521,66 @@ fn php_highlights() -> &'static str {
 (class_constant_access_expression . [(name) (qualified_name (name))] @type)
 (class_constant_access_expression (name) @keyword (#eq? @keyword "class"))
 (scoped_property_access_expression scope: [(name) (qualified_name (name))] @type)
+(nullsafe_member_access_expression name: (name) @property)
+(binary_expression operator: "instanceof" right: [(name) (qualified_name (name))] @type)
+[(primitive_type) (bottom_type)] @type
 ((variable_name (name) @_this) @variable.builtin (#eq? @_this "this"))
-(function_call_expression function: (name) @function.builtin (#any-of? @function.builtin "empty" "isset" "unset" "eval" "die" "exit" "compact" "extract"))
+(function_definition name: (name) @function (#any-of? @function {builtins}))
+(unset_statement "unset" @function.builtin)
+(function_call_expression function: (name) @function.builtin (#any-of? @function.builtin "empty" "isset" "unset" "eval" "die" "exit" "compact" "extract" {builtins}))
+(function_call_expression function: (qualified_name (name) @function.builtin) (#any-of? @function.builtin "empty" "isset" "unset" "eval" "die" "exit" "compact" "extract" {builtins}))
+(method_declaration name: (name) @function.builtin (#any-of? @function.builtin {magic_methods}))
+(member_call_expression name: (name) @function.builtin (#any-of? @function.builtin {magic_methods}))
+(nullsafe_member_call_expression name: (name) @function.builtin (#any-of? @function.builtin {magic_methods}))
+(scoped_call_expression name: (name) @function.builtin (#any-of? @function.builtin {magic_methods}))
+ ["(" ")" "[" "]" "{{" "}}" "," ";" ":" "?" "=>" "->" "?->" "::" "++" "--"] @punctuation
+ ["=" "+" "-" "*" "/" "%" "**" "." "==" "===" "!=" "!==" "<>" ">" ">=" ">>" "<" "<=" "<<" "<=>" "&&" "||" "??" "|>" "!" "&" "|" "^" "~" "@" "+=" "-=" "*=" "/=" "%=" "**=" ".=" "&=" "|=" "^=" "<<=" ">>=" "??="] @operator
 "#
+        )
+    })
+}
+
+/// JSON's upstream query colors values but intentionally leaves structural
+/// delimiters plain. The editor uses the same punctuation scope for every
+/// bracket family, matching JavaScript and TypeScript.
+fn json_highlights() -> &'static str {
+    static QUERY: OnceLock<String> = OnceLock::new();
+    QUERY.get_or_init(|| {
+        format!(
+            "{}\n[\"[\" \"]\" \"{{\" \"}}\" \",\"] @punctuation\n\":\" @operator\n",
+            tree_sitter_json::HIGHLIGHTS_QUERY
+        )
+    })
+}
+
+/// CSS's grammar leaves bare values such as `white`, `bold`, `block` and
+/// `inherit` as plain text. They are semantic values, not document text.
+fn css_highlights() -> &'static str {
+    static QUERY: OnceLock<String> = OnceLock::new();
+    QUERY.get_or_init(|| {
+        format!(
+            "{}\n((plain_value) @constant (#not-match? @constant \"^--\"))\n",
+            tree_sitter_css::HIGHLIGHTS_QUERY
+        )
+    })
+}
+
+/// The INI grammar exposes every value as one opaque `setting_value` node and
+/// the upstream query leaves it plain. Classify it by its text so `.env` and
+/// config files tell numbers, booleans/null and strings apart. The patterns
+/// avoid backslashes because the query parser consumes them as escapes.
+fn ini_highlights() -> &'static str {
+    const NUMBER: &str =
+        "^[-+]?(0[xX][0-9a-fA-F]+|[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?)[[:space:]]*$";
+    const KEYWORD: &str = "(?i)^(true|false|yes|no|on|off|null|nil|none)[[:space:]]*$";
+    static QUERY: OnceLock<String> = OnceLock::new();
+    QUERY.get_or_init(|| {
+        format!(
+            "{base}\n\
+             ((setting_value) @number (#match? @number \"{NUMBER}\"))\n\
+             ((setting_value) @constant (#match? @constant \"{KEYWORD}\"))\n\
+             ((setting_value) @string\n  (#not-match? @string \"{NUMBER}\")\n  (#not-match? @string \"{KEYWORD}\"))\n",
+            base = tree_sitter_ini::HIGHLIGHTS_QUERY
         )
     })
 }
@@ -541,17 +638,21 @@ const TYPESCRIPT_HIGHLIGHTS: &str = r#"
 [
   (string)
   (template_string)
+  (regex)
 ] @string
 (number) @number
 (property_identifier) @property
 (private_property_identifier) @property
+(member_expression property: (property_identifier) @property)
+(optional_chain) @punctuation
 (call_expression function: (identifier) @function)
+(call_expression function: (identifier) @function.builtin (#eq? @function.builtin "require"))
+("require") @function.builtin
 (call_expression function: (member_expression property: (property_identifier) @function))
 (function_declaration name: (identifier) @function)
 (method_definition name: (property_identifier) @function)
 (method_signature name: (property_identifier) @function)
 (function_expression name: (identifier) @function)
-(arrow_function) @function
 [(this) (this_type)] @variable.builtin
 [(true) (false) (null) (undefined)] @constant
 (identifier) @variable
@@ -571,13 +672,14 @@ const TYPESCRIPT_HIGHLIGHTS: &str = r#"
 ] @keyword
 (meta_property ["meta" "target"] @keyword)
 (abstract_class_declaration "abstract" @keyword)
+("abstract") @keyword
 [
-  ";" "." "," "(" ")" "[" "]" "{" "}" ":"
-] @punctuation
-[
-  "=" "+" "-" "*" "/" "%" "==" "===" "!=" "!==" "=>" ">" ">=" "<" "<="
-  "&&" "||" "??" "!" "&" "|" "^" "~" "?"
-] @operator
+   ";" "." "," "(" ")" "[" "]" "{" "}" ":" "?" "..." "=>" "++" "--"
+ ] @punctuation
+ [
+   "=" "+" "-" "*" "/" "%" "**" "==" "===" "!=" "!==" ">" ">=" ">>" ">>>" "<" "<=" "<<"
+  "&&" "||" "??" "!" "&" "|" "^" "~" "+=" "-=" "*=" "/=" "%=" "**=" "<<=" ">>=" ">>>=" "&=" "|=" "^=" "&&=" "||=" "??="
+ ] @operator
 "#;
 
 const JAVASCRIPT_HIGHLIGHTS: &str = r#"
@@ -592,10 +694,13 @@ const JAVASCRIPT_HIGHLIGHTS: &str = r#"
 (private_property_identifier) @property
 (function_declaration name: (identifier) @function)
 (call_expression function: (identifier) @function)
+(call_expression function: (identifier) @function.builtin (#eq? @function.builtin "require"))
+((import_statement "from" @keyword))
 [("const") ("let") ("var") ("function") ("class") ("return") ("if") ("else") ("for") ("while") ("import") ("export") ("async") ("await") ("new")] @keyword
 (meta_property ["meta" "target"] @keyword)
-[("+") ("-") ("*") ("/") ("=") ("==") ("===") ("=>") ("!") ("&&") ("||")] @operator
-[("(") (")") ("[") ("]") ("{") ("}") (",") (";") (".")] @punctuation
+[("=") ("+") ("-") ("*") ("/") ("%") ("**") ("==") ("===") ("!=") ("!==") (">") (">=") (">>") (">>=") (">>>") (">>>=") ("<") ("<=") ("<<") ("<<=") ("&&") ("||") ("??") ("!") ("&") ("|") ("^") ("~") ("+=") ("-=") ("*=") ("/=") ("%=") ("**=") ("&=") ("|=") ("^=") ("&&=") ("||=") ("??=")] @operator
+[("(") (")") ("[") ("]") ("{") ("}") (",") (";") (".") (":") ("?") ("=>") ("++") ("--")] @punctuation
+(optional_chain) @punctuation
 "#;
 
 const BASH_HIGHLIGHTS: &str = r#"
@@ -646,6 +751,10 @@ pub enum HighlightScope {
     Operator,
     Property,
     Punctuation,
+    PunctuationBracket1,
+    PunctuationBracket2,
+    PunctuationBracket3,
+    PunctuationBracket4,
     String,
     Tag,
     Type,
@@ -676,7 +785,7 @@ impl HighlightScope {
             "operator" => Some(Self::Operator),
             "property" | "field" => Some(Self::Property),
             "punctuation" | "delimiter" => Some(Self::Punctuation),
-            "string" | "character" => Some(Self::String),
+            "string" | "character" | "text" => Some(Self::String),
             "tag" => Some(Self::Tag),
             "type" | "namespace" => Some(Self::Type),
             "variable" | "parameter" => Some(Self::Variable),
@@ -698,6 +807,10 @@ impl HighlightScope {
             Self::Operator => "operator",
             Self::Property => "property",
             Self::Punctuation => "punctuation",
+            Self::PunctuationBracket1 => "punctuation.bracket.1",
+            Self::PunctuationBracket2 => "punctuation.bracket.2",
+            Self::PunctuationBracket3 => "punctuation.bracket.3",
+            Self::PunctuationBracket4 => "punctuation.bracket.4",
             Self::String => "string",
             Self::Tag => "tag",
             Self::Type => "type",
@@ -788,6 +901,19 @@ pub fn style_runs_for_viewport(
                 .map(|(s, e, scope)| (s + start_byte, e + start_byte, scope)),
         );
     }
+    if language == SyntaxLanguage::Blade {
+        let mut scan = VueScan {
+            rope,
+            window: (start_byte, end_byte),
+            overlay: crate::php::framework::laravel::blade::Overlay::default(),
+            blade: true,
+        };
+        scan.walk_blocks(tree.root_node());
+        spans.extend(scan.overlay.spans.into_iter().filter_map(|(s, e, scope)| {
+            let (s, e) = (s.max(start_byte), e.min(end_byte));
+            (s < e).then_some((s, e, scope))
+        }));
+    }
     if language == SyntaxLanguage::Vue {
         let overlay = vue_overlay(rope, tree, start_byte, end_byte);
         spans = crate::php::framework::laravel::blade::subtract(spans, &overlay.claimed);
@@ -798,6 +924,7 @@ pub fn style_runs_for_viewport(
         spans = crate::php::framework::laravel::blade::subtract(spans, &overlay.claimed);
         spans.extend(overlay.spans);
     }
+    rainbow_brackets(rope, &mut spans);
     // Tree-sitter does not guarantee that a broad fallback capture precedes a
     // semantic capture of the same token. Apply the generic variable color
     // first so the renderer lets the more specific scope win.
@@ -830,11 +957,68 @@ pub fn style_runs_for_viewport(
     runs
 }
 
+/// Color matching bracket pairs by nesting level while leaving every other
+/// punctuation token on the theme's ordinary punctuation color.
+fn rainbow_brackets(rope: &Rope, spans: &mut [(usize, usize, HighlightScope)]) {
+    spans.sort_by_key(|(start, end, scope)| (*start, *end, highlight_priority(*scope)));
+    let mut stack = Vec::new();
+    let mut index = 0;
+    while index < spans.len() {
+        let (start, end, scope) = spans[index];
+        let mut next = index + 1;
+        while next < spans.len() && spans[next].0 == start && spans[next].1 == end {
+            next += 1;
+        }
+        if scope == HighlightScope::Punctuation {
+            let token = rope.byte_slice(start..end).to_string();
+            let bracket = match token.as_str() {
+                "(" => Some((b')', true)),
+                "[" => Some((b']', true)),
+                "{" => Some((b'}', true)),
+                ")" | "]" | "}" => Some((token.as_bytes()[0], false)),
+                _ => None,
+            };
+            if let Some((marker, opening)) = bracket {
+                let color = if opening {
+                    let color = rainbow_bracket_scope(stack.len());
+                    stack.push((marker, color));
+                    Some(color)
+                } else if stack
+                    .last()
+                    .is_some_and(|(expected, _)| *expected == marker)
+                {
+                    stack.pop().map(|(_, color)| color)
+                } else {
+                    None
+                };
+                if let Some(color) = color {
+                    for span in &mut spans[index..next] {
+                        if span.2 == HighlightScope::Punctuation {
+                            span.2 = color;
+                        }
+                    }
+                }
+            }
+        }
+        index = next;
+    }
+}
+
+fn rainbow_bracket_scope(depth: usize) -> HighlightScope {
+    match depth % 4 {
+        0 => HighlightScope::PunctuationBracket1,
+        1 => HighlightScope::PunctuationBracket2,
+        2 => HighlightScope::PunctuationBracket3,
+        _ => HighlightScope::PunctuationBracket4,
+    }
+}
+
 fn highlight_priority(scope: HighlightScope) -> u8 {
     match scope {
         HighlightScope::Variable => 0,
         HighlightScope::Property => 1,
-        HighlightScope::Function | HighlightScope::FunctionBuiltin | HighlightScope::Type => 2,
+        HighlightScope::Function | HighlightScope::Type => 2,
+        HighlightScope::FunctionBuiltin => 3,
         _ => 1,
     }
 }
@@ -915,6 +1099,7 @@ fn vue_overlay(
         rope,
         window: (start_byte, end_byte),
         overlay: crate::php::framework::laravel::blade::Overlay::default(),
+        blade: false,
     };
     scan.walk(tree.root_node());
     let mut overlay = scan.overlay;
@@ -966,6 +1151,8 @@ struct VueScan<'a> {
     rope: &'a Rope,
     window: (usize, usize),
     overlay: crate::php::framework::laravel::blade::Overlay,
+    /// Blade: blank out Blade constructs in a block before parsing it.
+    blade: bool,
 }
 
 impl VueScan<'_> {
@@ -1012,10 +1199,30 @@ impl VueScan<'_> {
         let Some(text) = text_between(self.rope, from, to) else {
             return;
         };
+        let text = if self.blade {
+            crate::php::framework::laravel::blade::mask(&text)
+        } else {
+            text
+        };
         let Some(sub) = cached_parse(language, &text) else {
             return;
         };
         self.captures(language, &text, &sub, from, (from, to));
+    }
+
+    /// Blade: only the `<script>` and `<style>` bodies are injected. Blade
+    /// has no Vue-style attributes or interpolations to read.
+    fn walk_blocks(&mut self, node: tree_sitter::Node) {
+        if node.end_byte() <= self.window.0 || node.start_byte() >= self.window.1 {
+            return;
+        }
+        if matches!(node.kind(), "script_element" | "style_element") {
+            return self.block(node);
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            self.walk_blocks(child);
+        }
     }
 
     fn attribute(&mut self, attribute: tree_sitter::Node) {
@@ -1833,13 +2040,26 @@ pub struct SyntaxService {
 
 impl SyntaxService {
     pub fn new(language: Language) -> Self {
+        Self::with_mask(language, None)
+    }
+
+    /// The service for `language`. Blade is parsed as HTML with its own
+    /// constructs blanked out (see `blade::mask`), because `->` or `!=` in
+    /// `@if (...)` otherwise breaks the HTML tree for the rest of the file.
+    pub fn for_syntax(language: SyntaxLanguage) -> Self {
+        let mask: Option<TextMask> = (language == SyntaxLanguage::Blade)
+            .then_some(crate::php::framework::laravel::blade::mask as TextMask);
+        Self::with_mask(language.grammar(), mask)
+    }
+
+    fn with_mask(language: Language, mask: Option<TextMask>) -> Self {
         let (request_tx, request_rx) = mpsc::channel::<Request>();
         let (result_tx, result_rx) = mpsc::channel::<SyntaxSnapshot>();
         let latest_requested = Arc::new(AtomicU64::new(0));
         let latest_for_worker = Arc::clone(&latest_requested);
         let worker = thread::Builder::new()
             .name("galaxy-syntax".into())
-            .spawn(move || run(language, request_rx, result_tx, latest_for_worker))
+            .spawn(move || run(language, mask, request_rx, result_tx, latest_for_worker))
             .expect("creating syntax worker thread");
         Self {
             requests: Some(request_tx),
@@ -1954,8 +2174,13 @@ impl Drop for SyntaxService {
     }
 }
 
+/// Rewrites document text before it is parsed. It must keep the byte length
+/// and line breaks, so tree offsets stay offsets of the document.
+type TextMask = fn(&str) -> String;
+
 fn run(
     language: Language,
+    mask: Option<TextMask>,
     requests: Receiver<Request>,
     results: Sender<SyntaxSnapshot>,
     latest: Arc<AtomicU64>,
@@ -1966,11 +2191,17 @@ fn run(
         .expect("valid Tree-sitter language");
     let mut previous = None::<(u64, Tree)>;
     while let Ok(request) = requests.recv() {
-        let text = request.text;
-        let incremental = matches!(
-            (request.base_revision, request.edit, previous.as_ref()),
-            (Some(base), Some(_), Some((revision, _))) if base == *revision
-        );
+        // A masked text differs from the document's in places the edit does
+        // not describe, so it is always parsed from scratch.
+        let text = match mask {
+            Some(mask) => Rope::from_str(&mask(&request.text.to_string())),
+            None => request.text,
+        };
+        let incremental = mask.is_none()
+            && matches!(
+                (request.base_revision, request.edit, previous.as_ref()),
+                (Some(base), Some(_), Some((revision, _))) if base == *revision
+            );
         let old_tree = if incremental {
             let (_, tree) = previous.as_mut().expect("matched above");
             tree.edit(&request.edit.expect("matched above").input_edit());
@@ -2023,6 +2254,22 @@ mod tests {
             assert!(Instant::now() < deadline, "syntax worker did not finish");
             thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    fn is_bracket_scope(scope: HighlightScope) -> bool {
+        matches!(
+            scope,
+            HighlightScope::PunctuationBracket1
+                | HighlightScope::PunctuationBracket2
+                | HighlightScope::PunctuationBracket3
+                | HighlightScope::PunctuationBracket4
+        )
+    }
+
+    fn bracket_count(runs: &[StyleRun], source: &str, token: &str) -> usize {
+        runs.iter()
+            .filter(|run| is_bracket_scope(run.scope) && &source[run.start..run.end] == token)
+            .count()
     }
 
     /// Parses `text` as `language` and reports `is_markup_text` at the first
@@ -2240,6 +2487,10 @@ mod tests {
             (SyntaxLanguage::Python, "def f():\n    return 1"),
             (SyntaxLanguage::Go, "package main\nfunc main() {}"),
             (SyntaxLanguage::Html, "<main>Galaxy</main>"),
+            (
+                SyntaxLanguage::Xml,
+                "<?xml version=\"1.0\"?><main id=\"galaxy\"/>",
+            ),
             (SyntaxLanguage::Css, "main { color: red; }"),
             (SyntaxLanguage::Bash, "#!/usr/bin/env bash\necho Galaxy"),
             (
@@ -2426,14 +2677,364 @@ mod tests {
         let tree = parser.parse(source, None).unwrap();
         let doc = Document::from_text(source);
         let runs = style_runs_for_viewport(&doc, &tree, language, 0, 1);
-        let punctuation = runs
+        assert_eq!(bracket_count(&runs, source, "("), 1);
+        assert_eq!(bracket_count(&runs, source, ")"), 1);
+        assert!(
+            runs.iter().all(|run| run.scope != HighlightScope::Function),
+            "an anonymous arrow function must not overwrite its delimiters"
+        );
+    }
+
+    #[test]
+    fn env_values_are_classified_by_type() {
+        let language = SyntaxLanguage::Ini;
+        let source = "APP_DEBUG=true\nPORT=8080\nRATIO=-1.5\nMODE=OFF\nNAME=\"galaxy app\"\nURL=http://localhost:8000\nEMPTY=\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let doc = Document::from_text(source);
+        let runs = style_runs_for_viewport(&doc, &tree, language, 0, 7);
+        let scopes = |line: usize, token: &str| {
+            let text = source.lines().nth(line).unwrap();
+            let start = text.find(token).unwrap();
+            runs.iter()
+                .filter(|run| {
+                    run.line == line && run.start == start && run.end == start + token.len()
+                })
+                .map(|run| run.scope)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(scopes(0, "true"), vec![HighlightScope::Constant]);
+        assert_eq!(scopes(1, "8080"), vec![HighlightScope::Number]);
+        assert_eq!(scopes(2, "-1.5"), vec![HighlightScope::Number]);
+        assert_eq!(scopes(3, "OFF"), vec![HighlightScope::Constant]);
+        assert_eq!(scopes(4, "\"galaxy app\""), vec![HighlightScope::String]);
+        assert_eq!(
+            scopes(5, "http://localhost:8000"),
+            vec![HighlightScope::String]
+        );
+        // Keys stay properties.
+        assert_eq!(scopes(1, "PORT"), vec![HighlightScope::Property]);
+    }
+
+    #[test]
+    fn css_bare_values_are_constants() {
+        let language = SyntaxLanguage::Css;
+        let source = ".card { display: block; position: relative; border: none; color: white; font-weight: bold; }\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let doc = Document::from_text(source);
+        let runs = style_runs_for_viewport(&doc, &tree, language, 0, 1);
+        for value in ["block", "relative", "none", "white", "bold"] {
+            let start = source.find(value).unwrap();
+            assert!(
+                runs.iter().any(|run| {
+                    run.start == start
+                        && run.end == start + value.len()
+                        && run.scope == HighlightScope::Constant
+                }),
+                "{value} is not a CSS constant"
+            );
+        }
+    }
+
+    /// Runs of a Blade `source` as the editor sees them: the worker parses the
+    /// masked text and the viewport adds the Blade overlay on top.
+    fn blade_runs(source: &str) -> Vec<StyleRun> {
+        let language = SyntaxLanguage::Blade;
+        let service = SyntaxService::for_syntax(language);
+        let doc = Document::from_text(source);
+        service.submit_document(&doc);
+        let snapshot = wait_for(&service);
+        style_runs_for_viewport(&doc, snapshot.tree(), language, 0, doc.line_count())
+    }
+
+    fn scopes_of(runs: &[StyleRun], source: &str, line: usize, token: &str) -> Vec<HighlightScope> {
+        let text = source.lines().nth(line).unwrap();
+        let start = text.find(token).unwrap();
+        runs.iter()
+            .filter(|r| r.line == line && r.start <= start && r.end >= start + token.len())
+            .map(|r| r.scope)
+            .collect()
+    }
+
+    #[test]
+    fn blade_conditions_do_not_break_html_below() {
+        let source = "<div>\n@if (session('a')->role != 'x' && $b->c != 'y')\n<div class=\"col\">\n<label>Name</label>\n</div>\n@endif\n</div>\n";
+        let runs = blade_runs(source);
+        assert!(scopes_of(&runs, source, 2, "div").contains(&HighlightScope::Tag));
+        assert!(scopes_of(&runs, source, 2, "class").contains(&HighlightScope::Attribute));
+        assert!(scopes_of(&runs, source, 3, "label").contains(&HighlightScope::Tag));
+    }
+
+    #[test]
+    fn blade_style_and_script_blocks_get_injected_styles() {
+        let source = "@push('js')\n<style>\n.card { color: #FFF; padding: 0 12px; }\n</style>\n<script>\nconst u = '{{ route(\"a.b\") }}';\nfunction go() { return 1; }\n</script>\n@endpush\n";
+        let runs = blade_runs(source);
+        assert!(scopes_of(&runs, source, 2, "padding").contains(&HighlightScope::Property));
+        assert!(scopes_of(&runs, source, 2, "12px").contains(&HighlightScope::Number));
+        assert!(scopes_of(&runs, source, 6, "function").contains(&HighlightScope::Keyword));
+        assert!(scopes_of(&runs, source, 6, "1").contains(&HighlightScope::Number));
+        // The Blade echo inside the script keeps its Blade colors.
+        assert!(scopes_of(&runs, source, 5, "route").contains(&HighlightScope::Function));
+    }
+
+    #[test]
+    fn php_function_parentheses_are_punctuation() {
+        let language = SyntaxLanguage::Php;
+        let source = "<?php function noArgs() {} function withArgs($value) {}\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let doc = Document::from_text(source);
+        let runs = style_runs_for_viewport(&doc, &tree, language, 0, 1);
+        assert_eq!(bracket_count(&runs, source, "("), 2);
+        assert_eq!(bracket_count(&runs, source, ")"), 2);
+    }
+
+    #[test]
+    fn php_brackets_and_logical_operators_are_highlighted() {
+        let language = SyntaxLanguage::Php;
+        let source = "<?php $value = $a instanceof BillingInterval ? $a->value : null; $items = [$a]; $a?->next()->value; C::make(); $i++; --$j; $mask <<= 1; $result ??= $value; if ($a && $b) {}\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let doc = Document::from_text(source);
+        let runs = style_runs_for_viewport(&doc, &tree, language, 0, 1);
+        let scope_at = |token: &str| {
+            let start = source.find(token).unwrap();
+            runs.iter()
+                .filter(|run| run.start == start && run.end == start + token.len())
+                .map(|run| run.scope)
+                .collect::<Vec<_>>()
+        };
+        let scope_at_end = |token: &str| {
+            let start = source.rfind(token).unwrap();
+            runs.iter()
+                .filter(|run| run.start == start && run.end == start + token.len())
+                .map(|run| run.scope)
+                .collect::<Vec<_>>()
+        };
+        let ternary_question = source.find(" ? ").unwrap() + 1;
+        let ternary_colon = source.find(" : ").unwrap() + 1;
+
+        assert!(scope_at("&&").contains(&HighlightScope::Operator));
+        assert!(runs.iter().any(|run| {
+            run.start == ternary_question
+                && run.end == ternary_question + 1
+                && run.scope == HighlightScope::Punctuation
+        }));
+        assert!(runs.iter().any(|run| {
+            run.start == ternary_colon
+                && run.end == ternary_colon + 1
+                && run.scope == HighlightScope::Punctuation
+        }));
+        assert!(scope_at("[").iter().any(|scope| is_bracket_scope(*scope)));
+        assert!(scope_at("]").iter().any(|scope| is_bracket_scope(*scope)));
+        assert!(scope_at("?->").contains(&HighlightScope::Punctuation));
+        assert!(scope_at_end("->").contains(&HighlightScope::Punctuation));
+        assert!(scope_at("::").contains(&HighlightScope::Punctuation));
+        assert!(scope_at("++").contains(&HighlightScope::Punctuation));
+        assert!(scope_at("--").contains(&HighlightScope::Punctuation));
+        assert!(scope_at("BillingInterval").contains(&HighlightScope::Type));
+        assert!(scope_at("<<=").contains(&HighlightScope::Operator));
+        assert!(scope_at("??=").contains(&HighlightScope::Operator));
+    }
+
+    #[test]
+    fn php_unset_statement_uses_builtin_function_scope() {
+        let language = SyntaxLanguage::Php;
+        let source = "<?php unset($items[$offset]);\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let doc = Document::from_text(source);
+        let runs = style_runs_for_viewport(&doc, &tree, language, 0, 1);
+
+        assert!(runs.iter().any(|run| {
+            &source[run.start..run.end] == "unset" && run.scope == HighlightScope::FunctionBuiltin
+        }));
+    }
+
+    #[test]
+    fn php_enum_cases_use_constant_scope() {
+        let language = SyntaxLanguage::Php;
+        let source = "<?php enum IntervalBoundary { case ClosedOpen; }\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let doc = Document::from_text(source);
+        let runs = style_runs_for_viewport(&doc, &tree, language, 0, 1);
+        let start = source.find("ClosedOpen").unwrap();
+
+        assert!(runs.iter().any(|run| {
+            run.start == start
+                && run.end == start + "ClosedOpen".len()
+                && run.scope == HighlightScope::Constant
+        }));
+    }
+
+    #[test]
+    fn javascript_optional_properties_and_chain_are_highlighted() {
+        let language = SyntaxLanguage::JavaScript;
+        let source = "const interval = bill?.subscriptionPenaltySettings; bill.subscriptionPenaltySettings;\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let doc = Document::from_text(source);
+        let runs = style_runs_for_viewport(&doc, &tree, language, 0, 1);
+        let scope_at = |token: &str| {
+            let start = source.find(token).unwrap();
+            runs.iter()
+                .filter(|run| run.start == start && run.end == start + token.len())
+                .map(|run| run.scope)
+                .collect::<Vec<_>>()
+        };
+
+        let dot_start = source.rfind('.').unwrap();
+        let dot_scopes = runs
             .iter()
-            .filter(|run| run.scope == HighlightScope::Punctuation)
-            .map(|run| &source[run.start..run.end])
+            .filter(|run| run.start == dot_start && run.end == dot_start + 1)
+            .map(|run| run.scope)
+            .collect::<Vec<_>>();
+        assert_eq!(scope_at("?."), dot_scopes);
+        assert!(scope_at("subscriptionPenaltySettings").contains(&HighlightScope::Property));
+    }
+
+    #[test]
+    fn typescript_and_javascript_operators_and_delimiters_are_scoped() {
+        for language in [SyntaxLanguage::TypeScript, SyntaxLanguage::JavaScript] {
+            let source = "const value = flag ? left : right; count <<= 1; value ??= fallback; ready &&= true; const map = (item) => item ** 2; require(\"path\");\n";
+            let mut parser = Parser::new();
+            parser.set_language(&language.grammar()).unwrap();
+            let tree = parser.parse(source, None).unwrap();
+            let doc = Document::from_text(source);
+            let runs = style_runs_for_viewport(&doc, &tree, language, 0, 1);
+            let scope_at = |token: &str| {
+                let start = source.find(token).unwrap();
+                runs.iter()
+                    .filter(|run| run.start == start && run.end == start + token.len())
+                    .map(|run| run.scope)
+                    .collect::<Vec<_>>()
+            };
+
+            for token in ["=", "<<=", "??=", "&&=", "**"] {
+                assert!(
+                    scope_at(token).contains(&HighlightScope::Operator),
+                    "{language:?} {token} must be an operator"
+                );
+            }
+            for token in ["?", ":", "=>"] {
+                assert!(
+                    scope_at(token).contains(&HighlightScope::Punctuation),
+                    "{language:?} {token} must be punctuation"
+                );
+            }
+            assert!(scope_at("require").contains(&HighlightScope::FunctionBuiltin));
+        }
+    }
+
+    #[test]
+    fn typescript_import_require_and_type_punctuation_are_scoped() {
+        let language = SyntaxLanguage::TypeScript;
+        let source = "import path = require(\"path\");\ntype Callback = (...args: any[]) => any;\ntype Value<T> = T extends string ? T : never;\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let doc = Document::from_text(source);
+        let runs = style_runs_for_viewport(&doc, &tree, language, 0, 3);
+        let scope_at = |line: usize, start: usize, token: &str| {
+            runs.iter()
+                .filter(|run| {
+                    run.line == line && run.start == start && run.end == start + token.len()
+                })
+                .map(|run| run.scope)
+                .collect::<Vec<_>>()
+        };
+
+        let require = source.lines().next().unwrap().find("require").unwrap();
+        assert!(scope_at(0, require, "require").contains(&HighlightScope::FunctionBuiltin));
+        for (line, token) in [(1, "..."), (2, "?"), (2, ":")] {
+            let start = source.lines().nth(line).unwrap().rfind(token).unwrap();
+            assert!(
+                scope_at(line, start, token).contains(&HighlightScope::Punctuation),
+                "{token} must be punctuation"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_brackets_use_matching_rainbow_scopes() {
+        let language = SyntaxLanguage::TypeScript;
+        let source = "const value = ({ items: [call(\"(plain)\")] });\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let doc = Document::from_text(source);
+        let runs = style_runs_for_viewport(&doc, &tree, language, 0, 1);
+        let brackets = runs
+            .iter()
+            .filter_map(|run| match &source[run.start..run.end] {
+                "(" | ")" | "[" | "]" | "{" | "}" => Some((&source[run.start..run.end], run.scope)),
+                _ => None,
+            })
             .collect::<Vec<_>>();
 
-        assert_eq!(punctuation.iter().filter(|&&token| token == "(").count(), 1);
-        assert_eq!(punctuation.iter().filter(|&&token| token == ")").count(), 1);
+        assert_eq!(
+            brackets,
+            vec![
+                ("(", HighlightScope::PunctuationBracket1),
+                ("{", HighlightScope::PunctuationBracket2),
+                ("[", HighlightScope::PunctuationBracket3),
+                ("(", HighlightScope::PunctuationBracket4),
+                (")", HighlightScope::PunctuationBracket4),
+                ("]", HighlightScope::PunctuationBracket3),
+                ("}", HighlightScope::PunctuationBracket2),
+                (")", HighlightScope::PunctuationBracket1),
+            ]
+        );
+        assert!(runs.iter().all(|run| {
+            &source[run.start..run.end] != "(plain)" || run.scope == HighlightScope::String
+        }));
+    }
+
+    #[test]
+    fn json_brackets_and_colons_are_highlighted() {
+        let language = SyntaxLanguage::Json;
+        let source = "{\"items\": [true]}\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let doc = Document::from_text(source);
+        let runs = style_runs_for_viewport(&doc, &tree, language, 0, 1);
+        let scope_at = |token: &str| {
+            let start = source.find(token).unwrap();
+            runs.iter()
+                .filter(|run| run.start == start && run.end == start + token.len())
+                .map(|run| run.scope)
+                .collect::<Vec<_>>()
+        };
+
+        assert!(scope_at("{").iter().any(|scope| is_bracket_scope(*scope)));
+        assert!(scope_at(":").contains(&HighlightScope::Operator));
+        assert!(scope_at("[").iter().any(|scope| is_bracket_scope(*scope)));
+        assert!(scope_at("]").iter().any(|scope| is_bracket_scope(*scope)));
+    }
+
+    #[test]
+    fn typescript_regex_is_a_string() {
+        let language = SyntaxLanguage::TypeScript;
+        let source = "const pattern = /[a-z]+/gi;\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let doc = Document::from_text(source);
+        let runs = style_runs_for_viewport(&doc, &tree, language, 0, 1);
+
+        assert!(runs.iter().any(|run| {
+            &source[run.start..run.end] == "/[a-z]+/gi" && run.scope == HighlightScope::String
+        }));
     }
 
     #[test]
@@ -2453,6 +3054,25 @@ mod tests {
                 && HighlightScope::from_capture(names[capture.index as usize])
                     == Some(HighlightScope::Keyword)
         })));
+    }
+
+    #[test]
+    fn typescript_query_highlights_abstract_constructor_type_as_keyword() {
+        let language = SyntaxLanguage::TypeScript;
+        let source =
+            "type Constructor<T> = T extends abstract new (...args: any[]) => any ? T : never;\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let doc = Document::from_text(source);
+        let runs = style_runs_for_viewport(&doc, &tree, language, 0, 1);
+        let start = source.find("abstract").unwrap();
+
+        assert!(runs.iter().any(|run| {
+            run.start == start
+                && run.end == start + "abstract".len()
+                && run.scope == HighlightScope::Keyword
+        }));
     }
 
     #[test]
@@ -2765,6 +3385,26 @@ mod tests {
             Some(SyntaxLanguage::Bash)
         );
         assert_eq!(
+            SyntaxLanguage::detect(".env", ""),
+            Some(SyntaxLanguage::Ini)
+        );
+        assert_eq!(
+            SyntaxLanguage::detect(".env.production", ""),
+            Some(SyntaxLanguage::Ini)
+        );
+        assert_eq!(
+            SyntaxLanguage::detect("phpunit.xml", ""),
+            Some(SyntaxLanguage::Xml)
+        );
+        assert_eq!(
+            SyntaxLanguage::detect("composer.lock", ""),
+            Some(SyntaxLanguage::Json)
+        );
+        assert_eq!(
+            SyntaxLanguage::detect("artisan", "#!/usr/bin/env php"),
+            Some(SyntaxLanguage::Php)
+        );
+        assert_eq!(
             SyntaxLanguage::detect(".docker/nginx-logrotate.conf", ""),
             Some(SyntaxLanguage::Ini)
         );
@@ -2915,7 +3555,9 @@ mod tests {
 
     #[test]
     fn php_language_constructs_get_builtin_function_scope() {
-        let doc = Document::from_text("<?php\nif (empty($a)) { foo(); }\n");
+        let doc = Document::from_text(
+            "<?php\nclass C { function __construct() {} }\nif (empty($a) && isset($b)) { strlen($b); \\sprintf('%s', $b); $c->__toString(); C::__debugInfo(); foo(); }\n",
+        );
         let language = SyntaxLanguage::Php;
         let mut parser = Parser::new();
         parser.set_language(&language.grammar()).unwrap();
@@ -2923,12 +3565,23 @@ mod tests {
         let runs = style_runs_for_viewport(&doc, &tree, language, 0, 2);
         let on = |from: usize, to: usize| {
             runs.iter()
-                .filter(|r| r.line == 1 && r.start == from && r.end == to)
+                .filter(|r| r.line == 2 && r.start == from && r.end == to)
                 .map(|r| r.scope)
                 .collect::<Vec<_>>()
         };
         assert!(on(4, 9).contains(&HighlightScope::FunctionBuiltin));
-        assert!(on(17, 20).contains(&HighlightScope::Function));
+        assert!(on(17, 22).contains(&HighlightScope::FunctionBuiltin));
+        assert!(on(30, 36).contains(&HighlightScope::FunctionBuiltin));
+        assert!(on(43, 50).contains(&HighlightScope::FunctionBuiltin));
+        assert!(on(66, 76).contains(&HighlightScope::FunctionBuiltin));
+        assert!(on(83, 94).contains(&HighlightScope::FunctionBuiltin));
+        assert!(on(98, 101).contains(&HighlightScope::Function));
+        assert!(runs.iter().any(|run| {
+            run.line == 1
+                && run.start == 19
+                && run.end == 30
+                && run.scope == HighlightScope::FunctionBuiltin
+        }));
     }
 
     #[test]
@@ -2975,7 +3628,8 @@ mod tests {
         assert!(at(0, "$title", HighlightScope::Variable));
         assert!(at(0, "'Good'", HighlightScope::String));
         assert!(at(1, "asset", HighlightScope::Function));
-        assert!(at(2, "@yield", HighlightScope::Keyword));
+        assert!(at(2, "@", HighlightScope::Keyword));
+        assert!(at(2, "yield", HighlightScope::Keyword));
         assert!(at(2, "'content'", HighlightScope::String));
         // The HTML attribute value is not painted over the Blade expression.
         assert!(

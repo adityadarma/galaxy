@@ -149,6 +149,47 @@ extension MainWindowController {
         }
     }
 
+    /// A large saved tab set must yield to AppKit between small batches, or the
+    /// just-shown launch window appears frozen while every editor is created.
+    func restoreTabsIncrementally(
+        _ savedTabs: [Session.Tab],
+        active: Int?,
+        workspace: Workspace
+    ) {
+        let activeIndex = active.flatMap { savedTabs.indices.contains($0) ? $0 : nil }
+        let candidates = (activeIndex.map { [$0] } ?? []) + savedTabs.indices.filter { $0 != activeIndex }
+        guard let (firstIndex, firstTab) = candidates.lazy.compactMap({ index in
+            self.openRestoredTab(savedTabs[index]).map { (index, $0) }
+        }).first else { return }
+
+        tabs.append(firstTab)
+        selectTab(0)
+
+        let pending = savedTabs.enumerated().filter { $0.offset != firstIndex }
+        let batchSize = 2
+        var next = 0
+
+        func restoreNextBatch() {
+            guard self.workspace === workspace, next < pending.count else { return }
+            let end = min(next + batchSize, pending.count)
+            for (savedIndex, saved) in pending[next..<end] {
+                guard let tab = self.openRestoredTab(saved) else { continue }
+                let insertionIndex = min(savedIndex, self.tabs.count)
+                self.tabs.insert(tab, at: insertionIndex)
+                if let activeIndex = self.activeIndex, activeIndex >= insertionIndex {
+                    self.activeIndex = activeIndex + 1
+                }
+            }
+            self.refreshTabBar()
+            next = end
+            if next < pending.count {
+                DispatchQueue.main.async(execute: restoreNextBatch)
+            }
+        }
+
+        DispatchQueue.main.async(execute: restoreNextBatch)
+    }
+
     func saveSessionForQuit(otherWindows: [Session] = []) {
         if !didCloseWindow {
             var session = currentSession()
@@ -169,15 +210,20 @@ extension MainWindowController {
     /// tabs whose files still exist, with caret and scroll. Returns
     /// `false` if nothing could be restored.
     @discardableResult
-    func restore(_ session: Session) -> Bool {
+    func restore(_ session: Session, incrementally: Bool = false) -> Bool {
         isNavigating = true
         defer { isNavigating = false }
         var restoredWorkspace = false
+        var restoresWorkspaceTabs = false
         if let root = session.workspace {
             var isDir: ObjCBool = false
             if FileManager.default.fileExists(atPath: root, isDirectory: &isDir), isDir.boolValue {
                 do {
-                    try openWorkspace(at: URL(fileURLWithPath: root))
+                    if let workspaceSession = Session.load(from: Session.workspaceURL(for: root)) {
+                        restoresWorkspaceTabs = !workspaceSession.tabs.isEmpty
+                            || !(workspaceSession.extraGroups?.isEmpty ?? true)
+                    }
+                    try openWorkspace(at: URL(fileURLWithPath: root), restoresTabsIncrementally: incrementally && restoresWorkspaceTabs)
                     restoredWorkspace = true
                 } catch {
                     Log.app.error("restoring workspace failed: \(String(describing: error), privacy: .public)")
@@ -186,7 +232,7 @@ extension MainWindowController {
         }
         // Opening the folder already restored its own saved session. Doing
         // it twice would add the extra groups a second time.
-        if allTabs.isEmpty { restoreTabs(from: session) }
+        if allTabs.isEmpty, !restoresWorkspaceTabs { restoreTabs(from: session) }
         if restoredWorkspace { setSidebarVisible(session.sidebarVisible) }
         Log.app.info("restored session: workspace \(restoredWorkspace), \(self.allTabs.count) tabs")
         return restoredWorkspace || !allTabs.isEmpty

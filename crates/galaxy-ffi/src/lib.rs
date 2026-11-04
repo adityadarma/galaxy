@@ -125,6 +125,10 @@ pub enum CoreEvent {
         total: u64,
         changed: u64,
     },
+    PhpIndexFinished {
+        root: String,
+        files: u64,
+    },
 }
 
 /// Implemented in Swift. Called from core threads, so the Swift side must
@@ -777,11 +781,19 @@ impl Core {
     /// module resolution needs a full workspace snapshot rebuild.
     pub fn apply_workspace_changes(&self, root: String, paths: Vec<String>, rescan: bool) {
         let root = PathBuf::from(root);
-        if rescan
+        // PHP's Composer index includes project classes and `vendor/`. Unlike
+        // TypeScript, it has no cheap per-file delta: rebuild it in the
+        // background, retaining the old snapshot until the replacement is
+        // ready. `vendor/` is deliberately included because Composer writes
+        // autoload metadata there after install/dump-autoload.
+        let full_reindex = rescan
             || paths
                 .iter()
-                .any(|path| workspace_index_metadata(Path::new(path)))
-        {
+                .any(|path| workspace_index_metadata(Path::new(path)));
+        if !full_reindex && paths.iter().any(|path| php_index_input_changed(path)) {
+            refresh_php_engines(&self.php, &root);
+        }
+        if full_reindex {
             self.refresh_workspace_indexes(root.to_string_lossy().into_owned());
             return;
         }
@@ -1774,6 +1786,17 @@ impl Core {
             })
             .collect()
     }
+}
+
+/// A watcher path that can affect Composer class resolution.
+fn php_index_input_changed(path: &str) -> bool {
+    let path = Path::new(path);
+    is_php_path(path)
+        || path
+            .components()
+            .next()
+            .is_some_and(|component| component.as_os_str() == "vendor")
+        || workspace_index_metadata(path)
 }
 
 fn file_uri(path: &Path) -> String {
@@ -4574,6 +4597,24 @@ fn spawn_workspace_indexing(
             }
             send_workspace_index_progress(&listener, &root, total, total);
             send_workspace_index_finished(&listener, &root, total, changed);
+            if let Some(engine) = php_engines
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&root)
+                .cloned()
+            {
+                let files = engine
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .index_stats()
+                    .files as u64;
+                if let Some(listener) = &listener {
+                    listener.on_event(CoreEvent::PhpIndexFinished {
+                        root: root.to_string_lossy().into_owned(),
+                        files,
+                    });
+                }
+            }
             tracing::debug!(
                 root = %root.display(),
                 files = total,
@@ -4997,6 +5038,28 @@ fn spawn_php_index(
             log_language_index("php", &root, stats, started.elapsed());
         })
         .ok()
+}
+
+/// Rebuild every PHP project already active under this workspace. Do not make
+/// a watcher event create engines for unrelated folders: opening a PHP file
+/// still owns initial engine creation.
+fn refresh_php_engines(engines: &EngineMap<PhpEngine>, workspace_root: &Path) {
+    let active = engines
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .filter(|(root, _)| root.starts_with(workspace_root))
+        .map(|(root, engine)| (root.clone(), Arc::clone(engine)))
+        .collect::<Vec<_>>();
+    for (root, engine) in active {
+        let rebuild = engine
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .begin_rebuild();
+        if rebuild {
+            let _ = spawn_php_index(&engine, &root);
+        }
+    }
 }
 
 fn log_language_index(language: &str, root: &Path, stats: LanguageIndexStats, elapsed: Duration) {
@@ -6029,6 +6092,27 @@ impl Workspace {
             .collect())
     }
 
+    /// Stages the region of `rel_path` that starts at `old_start` in `HEAD`
+    /// (see `git_diff_hunks`), with `text` as the working content. The other
+    /// changes stay unstaged. Does nothing when that region is gone.
+    pub fn git_stage_hunk(
+        &self,
+        rel_path: String,
+        text: String,
+        old_start: u64,
+    ) -> Result<(), CoreError> {
+        let base = galaxy_core::git::head_blob(self.inner.root(), &rel_path)?.unwrap_or_default();
+        let base = String::from_utf8_lossy(&base);
+        let Some(hunk) = galaxy_core::git::diff_hunks(&base, &text)
+            .into_iter()
+            .find(|h| h.old_start as u64 == old_start)
+        else {
+            return Ok(());
+        };
+        galaxy_core::git::stage_hunk(self.inner.root(), &rel_path, &text, hunk)?;
+        Ok(())
+    }
+
     /// Who last changed each line of `rel_path`, counting `text` as the
     /// current content. `None` for untracked files and outside a repository.
     pub fn git_blame(
@@ -6402,6 +6486,7 @@ pub struct DiagnosticSpan {
     pub start: u64,
     pub end: u64,
     pub severity: u8,
+    pub message: String,
     pub unnecessary: bool,
 }
 
@@ -6634,6 +6719,7 @@ impl From<viewport::ViewportSnapshot> for ViewportSnapshot {
                             start: span.start as u64,
                             end: span.end as u64,
                             severity: span.severity,
+                            message: String::new(),
                             unnecessary: span.unnecessary,
                         })
                         .collect(),
@@ -6697,7 +6783,7 @@ struct SyntaxState {
 
 impl SyntaxState {
     fn new(language: SyntaxLanguage, doc: &Document) -> Self {
-        let service = SyntaxService::new(language.grammar());
+        let service = SyntaxService::for_syntax(language);
         service.submit_document(doc);
         Self {
             language,
@@ -7104,6 +7190,7 @@ impl DocumentHandle {
                         start,
                         end,
                         severity: diagnostic.severity,
+                        message: diagnostic.message.clone(),
                         unnecessary: diagnostic.unnecessary,
                     });
                 }

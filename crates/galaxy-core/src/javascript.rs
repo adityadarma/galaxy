@@ -230,10 +230,13 @@ pub fn resolve_typescript_specifier(
     resolve_bare_package(project, specifier, from)
 }
 
-/// Resolves a `node:` specifier only through a locally installed `@types/node`.
-/// This deliberately never consults system type roots or the network.
+/// Resolves a Node builtin specifier only through a locally installed
+/// `@types/node`. This deliberately never consults system type roots or the network.
 pub fn resolve_node_types_specifier(specifier: &str, from: &Path) -> Option<PathBuf> {
-    let subpath = specifier.strip_prefix("node:")?;
+    let subpath = specifier.strip_prefix("node:").unwrap_or(specifier);
+    if !is_node_builtin_specifier(specifier) {
+        return None;
+    }
     if subpath.is_empty()
         || subpath.contains('\\')
         || subpath
@@ -250,6 +253,64 @@ pub fn resolve_node_types_specifier(specifier: &str, from: &Path) -> Option<Path
         }
     }
     None
+}
+
+/// Node's builtins may omit the `node:` scheme, as in `import path from "path"`.
+pub fn is_node_builtin_specifier(specifier: &str) -> bool {
+    let name = specifier.strip_prefix("node:").unwrap_or(specifier);
+    matches!(
+        name,
+        "assert"
+            | "assert/strict"
+            | "buffer"
+            | "child_process"
+            | "cluster"
+            | "console"
+            | "constants"
+            | "crypto"
+            | "dgram"
+            | "diagnostics_channel"
+            | "dns"
+            | "dns/promises"
+            | "domain"
+            | "events"
+            | "fs"
+            | "fs/promises"
+            | "http"
+            | "http2"
+            | "https"
+            | "module"
+            | "net"
+            | "os"
+            | "path"
+            | "path/posix"
+            | "path/win32"
+            | "perf_hooks"
+            | "process"
+            | "punycode"
+            | "querystring"
+            | "readline"
+            | "readline/promises"
+            | "repl"
+            | "stream"
+            | "stream/promises"
+            | "stream/web"
+            | "string_decoder"
+            | "sys"
+            | "timers"
+            | "timers/promises"
+            | "tls"
+            | "trace_events"
+            | "tty"
+            | "url"
+            | "util"
+            | "util/types"
+            | "v8"
+            | "vm"
+            | "wasi"
+            | "worker_threads"
+            | "zlib"
+    )
 }
 
 fn resolve_package_import(root: &Path, specifier: &str) -> Option<PathBuf> {
@@ -1740,6 +1801,16 @@ mod tests {
         assert_eq!(resolve_relative_import("./directory", &from), None);
         assert!(relative_import_candidates("react", &from).is_empty());
         assert!(relative_import_candidates("node:fs", &from).is_empty());
+    }
+
+    #[test]
+    fn recognizes_node_builtin_specifiers_with_or_without_scheme() {
+        for specifier in ["path", "crypto", "node:path", "node:crypto", "fs/promises"] {
+            assert!(is_node_builtin_specifier(specifier), "{specifier}");
+        }
+        for specifier in ["lodash", "@types/node", "./path", "node:not-a-module"] {
+            assert!(!is_node_builtin_specifier(specifier), "{specifier}");
+        }
     }
 
     #[test]

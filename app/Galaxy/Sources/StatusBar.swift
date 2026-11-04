@@ -22,6 +22,7 @@ final class StatusBar: NSView {
     let workspaceScan = StatusBar.label("workspace-scan")
     private var scanRoot: String?
     private var workspaceIndexText: String?
+    private var clearWorkspaceStatus: DispatchWorkItem?
     let cursor = StatusBar.label("status-cursor")
     let language = StatusBar.label("status-language")
     let indent = StatusBar.label("status-indent")
@@ -158,22 +159,23 @@ final class StatusBar: NSView {
     }
 
     func resetWorkspaceScan(root: String) {
+        clearWorkspaceStatus?.cancel()
         scanRoot = root
-        workspaceIndexText = "Indexing workspace..."
+        workspaceIndexText = "Scanning workspace..."
         updateWorkspaceScan()
     }
 
     func workspaceIndexStarted(root: String, total: UInt64) {
         guard root == scanRoot else { return }
         workspaceIndexText = total == 0
-            ? "Indexing files..."
-            : "Indexing 0 of \(total) files"
+            ? "Scanning workspace files..."
+            : "Scanning workspace 0 of \(total) files"
         updateWorkspaceScan()
     }
 
     func workspaceIndexProgress(root: String, completed: UInt64, total: UInt64) {
         guard root == scanRoot else { return }
-        workspaceIndexText = "Indexing \(completed) of \(total) files"
+        workspaceIndexText = "Scanning workspace \(completed) of \(total) files"
         updateWorkspaceScan()
     }
 
@@ -182,6 +184,21 @@ final class StatusBar: NSView {
         _ = changed
         workspaceIndexText = nil
         updateWorkspaceScan()
+    }
+
+    func phpIndexFinished(root: String, files: UInt64) {
+        guard root == scanRoot else { return }
+        clearWorkspaceStatus?.cancel()
+        let text = "PHP Composer indexed \(files.formatted(.number.grouping(.automatic))) files"
+        workspaceIndexText = text
+        updateWorkspaceScan()
+        let clear = DispatchWorkItem { [weak self] in
+            guard self?.workspaceIndexText == text else { return }
+            self?.workspaceIndexText = nil
+            self?.updateWorkspaceScan()
+        }
+        clearWorkspaceStatus = clear
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3, execute: clear)
     }
 
     private func updateWorkspaceScan() {

@@ -798,6 +798,7 @@ fn diagnostics_are_clipped_to_visible_utf16_lines() {
     let snap = doc.viewport(0, 2);
     assert_eq!(snap.lines[0].diagnostics[0].start, 1);
     assert_eq!(snap.lines[0].diagnostics[0].end, 3);
+    assert_eq!(snap.lines[0].diagnostics[0].message, "bad");
     assert_eq!(snap.lines[1].diagnostics[0].start, 0);
     assert_eq!(snap.lines[1].diagnostics[0].end, 2);
 }

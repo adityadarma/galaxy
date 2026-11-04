@@ -79,6 +79,15 @@ fn source_changes_during_indexing_do_not_request_full_rerun() {
 }
 
 #[test]
+fn php_vendor_and_composer_changes_invalidate_the_php_index() {
+    assert!(php_index_input_changed("app/Models/Order.php"));
+    assert!(php_index_input_changed("vendor/composer/autoload_psr4.php"));
+    assert!(php_index_input_changed("composer.lock"));
+    assert!(!php_index_input_changed("README.md"));
+    assert!(!php_index_input_changed("node_modules/pkg/index.js"));
+}
+
+#[test]
 fn file_finder_searches_the_workspace() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();

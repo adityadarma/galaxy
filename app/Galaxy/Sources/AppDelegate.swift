@@ -94,7 +94,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         } else if let url = pendingURL {
             pendingURL = nil
             controller.open(url: url)
-        } else if Self.shouldRestoreSession, let session, controller.restore(session) {
+        } else if Self.shouldRestoreSession, let session, controller.restore(session, incrementally: true) {
             pendingWindowSessions = session.otherWindows ?? []
             // The prior workspace and its tabs are restored only after a quit.
         } else {

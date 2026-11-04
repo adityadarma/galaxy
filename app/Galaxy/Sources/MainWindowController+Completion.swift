@@ -77,11 +77,18 @@ extension MainWindowController {
             return
         }
         localCompletionItems = nil
-        // Read snippet metadata before scheduling native completion. Both cross
-        // the same Rust document handle; running them concurrently corrupts the
-        // UniFFI return buffer while typing.
-        snippetCompletionItems = prefix.isEmpty ? [] : bridge.snippetCompletions(document: document)
-            .filter { $0.label.lowercased().hasPrefix(prefix.lowercased()) }
+        // Snippet metadata crosses the same Rust document handle as native
+        // completion. Read it serially on that queue, never on AppKit's main
+        // thread while the user is typing.
+        snippetCompletionItems = []
+        if !prefix.isEmpty {
+            let requestedPosition = completionPosition
+            bridge.readSnippetCompletions(document: document, prefix: prefix) { [weak self] items in
+                guard let self, self.completionPosition == requestedPosition else { return }
+                self.snippetCompletionItems = items
+                self.refreshCompletion()
+            }
+        }
         let requestStarted = DispatchTime.now().uptimeNanoseconds
         bridge.requestCompletion(document: document, line: position.line, character: position.colUtf16)
         let requestElapsed = Double(DispatchTime.now().uptimeNanoseconds - requestStarted) / 1_000_000
@@ -99,7 +106,23 @@ extension MainWindowController {
             suggestRetryUntil = nil
             return
         }
-        let lspItems = bridge.completions(document: document)
+        let requestedPosition = completionPosition
+        bridge.readCompletions(document: document) { [weak self] lspItems in
+            guard let self, self.completionPosition == requestedPosition else { return }
+            self.applyCompletion(lspItems, document: document)
+        }
+    }
+
+    /// Applies results already read on the completion queue.
+    private func applyCompletion(_ lspItems: [CompletionInfo], document: DocumentHandle) {
+        guard !completionDismissed else { return }
+        let position = document.primaryCursor()
+        guard position.line == completionPosition.line,
+              position.colUtf16 == completionPosition.colUtf16 else {
+            completionPopup.isHidden = true
+            suggestRetryUntil = nil
+            return
+        }
         // A name that replaces more than the word before the caret (a dotted
         // config key, a view name): the query is everything it replaces, and
         // snippets do not apply.
@@ -159,16 +182,24 @@ extension MainWindowController {
     }
 
     func refreshSignatureHelp() {
+        // The completion list owns the caret area. Signature help is useful
+        // while typing arguments, but must not cover a suggestion selection.
+        guard completionPopup.isHidden else {
+            signaturePopup.isHidden = true
+            lastSignatureRequest = nil
+            return
+        }
         guard let document = activeTab?.doc else {
             lastSignatureRequest = nil
             signaturePopup.isHidden = true
             return
         }
+        let position = document.primaryCursor()
         let request = (
             path: document.path(),
             revision: document.revision(),
-            line: completionPosition.line,
-            column: completionPosition.colUtf16
+            line: position.line,
+            column: position.colUtf16
         )
         guard lastSignatureRequest?.path != request.path
             || lastSignatureRequest?.revision != request.revision
@@ -176,12 +207,12 @@ extension MainWindowController {
             || lastSignatureRequest?.column != request.column
         else { return }
         lastSignatureRequest = request
-        bridge.requestSignatureHelp(document: document, line: completionPosition.line, character: completionPosition.colUtf16)
+        bridge.requestSignatureHelp(document: document, line: position.line, character: position.colUtf16)
         guard let signature = bridge.signatureHelp(document: document) else { signaturePopup.isHidden = true; return }
         signaturePopup.show(signature)
         signaturePopup.isHidden = false
         signaturePopup.frame = popupFrame(size: NSSize(width: 520, height: signature.documentation == nil ? 48 : 78),
-                                          line: completionPosition.line, column: completionPosition.colUtf16)
+                                           line: position.line, column: position.colUtf16)
     }
 
     func handleCompletionKey(_ event: NSEvent) -> Bool {

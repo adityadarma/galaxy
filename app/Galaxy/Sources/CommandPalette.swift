@@ -133,6 +133,8 @@ final class CommandPaletteView: NSView, NSTextFieldDelegate, NSTableViewDataSour
         "revealFileInOS": #selector(MainWindowController.revealInFinder(_:)),
         "copyFilePath": #selector(MainWindowController.copyExplorerPath(_:)),
         "copyRelativeFilePath": #selector(MainWindowController.copyExplorerRelativePath(_:)),
+        "filesExplorer.copy": #selector(MainWindowController.copyExplorerItem(_:)),
+        "filesExplorer.paste": #selector(MainWindowController.pasteExplorerItem(_:)),
         "renameFile": #selector(MainWindowController.renameExplorerItem(_:)),
         "deleteFile": #selector(MainWindowController.deleteExplorerItem(_:)),
         "workbench.files.action.refreshFilesExplorer": #selector(MainWindowController.refreshExplorer(_:)),

@@ -61,8 +61,12 @@ final class ExplorerController: NSObject {
     private(set) var renamingEntry: FileEntry?
     private weak var renameField: NSTextField?
     private weak var renameCell: ExplorerCell?
+    /// A new row stays virtual until its name is confirmed.
+    private var pendingNewItem: (entry: FileEntry, parent: String, isFolder: Bool)?
     /// Called with the new name when an in-place rename is confirmed.
     var onRename: ((FileEntry, String) -> Void)?
+    var onRenameCancelled: ((FileEntry) -> Void)?
+    var onCreateNewItem: ((String, Bool, String) -> Void)?
     /// Builds the right-click menu, after the clicked row was selected.
     var contextMenu: (() -> NSMenu?)?
 
@@ -281,9 +285,9 @@ final class ExplorerController: NSObject {
 
     /// Turns the row's name into a text field with the name selected up to
     /// the extension, as in VSCode. Return confirms, Escape cancels, and
-    /// moving focus elsewhere confirms.
+    /// moving focus elsewhere confirms a typed name.
     @discardableResult
-    func beginRename(relPath: String) -> Bool {
+    func beginRename(relPath: String, selectAll: Bool = false, initialName: String? = nil) -> Bool {
         if renamingEntry != nil { finishRename(commit: true) }
         guard let row = row(forRelPath: relPath), let node = outlineView.item(atRow: row) as? ExplorerNode else {
             return false
@@ -296,31 +300,67 @@ final class ExplorerController: NSObject {
         renameCell = cell
         renameField = cell.label
         cell.setEditing(true)
+        let displayedName = initialName ?? node.entry.name
+        cell.label.stringValue = displayedName
         cell.label.delegate = self
         outlineView.window?.makeFirstResponder(cell.label)
         if let editor = cell.label.currentEditor() {
-            let name = node.entry.name as NSString
+            let name = displayedName as NSString
             let stem = node.entry.isDir ? name : name.deletingPathExtension as NSString
             // ".gitignore" has no stem: select it all.
-            let length = stem.length == 0 ? name.length : stem.length
+            let length = selectAll || stem.length == 0 ? name.length : stem.length
             editor.selectedRange = NSRange(location: 0, length: length)
         }
         return true
     }
 
+    /// Adds a temporary outline row. No file or folder is created yet.
+    @discardableResult
+    func beginNewItem(parent: String, folder: Bool) -> Bool {
+        guard workspace != nil, pendingNewItem == nil else { return false }
+        let placeholder = ".galaxy-new-\(UUID().uuidString)"
+        let rel = parent.isEmpty ? placeholder : parent + "/" + placeholder
+        pendingNewItem = (FileEntry(name: "", relPath: rel, isDir: folder), parent, folder)
+        refresh()
+        reveal(relPath: rel)
+        return beginRename(relPath: rel, selectAll: true, initialName: "")
+    }
+
     /// Ends an in-place rename; `commit` passes the new name on.
-    func finishRename(commit: Bool) {
+    func finishRename(commit: Bool, keepEmptyName: Bool = false) {
         guard let entry = renamingEntry else { return }
-        renamingEntry = nil
         let name = renameField?.stringValue ?? entry.name
+        let trimmed = name.trimmingCharacters(in: .whitespaces)
+        let pending = pendingNewItem?.entry.relPath == entry.relPath ? pendingNewItem : nil
+        // AppKit can end editing while an outline row is refreshed. A new
+        // item's empty field is still awaiting a name, so restore its focus.
+        if commit, keepEmptyName, trimmed.isEmpty, pending != nil {
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.renamingEntry?.relPath == entry.relPath, let renameField = self.renameField else { return }
+                self.outlineView.window?.makeFirstResponder(renameField)
+            }
+            return
+        }
+        renamingEntry = nil
         renameField?.delegate = nil
         renameField?.stringValue = entry.name
         renameCell?.setEditing(false)
         renameField = nil
         renameCell = nil
         outlineView.window?.makeFirstResponder(outlineView)
-        let trimmed = name.trimmingCharacters(in: .whitespaces)
-        if commit, !trimmed.isEmpty, trimmed != entry.name { onRename?(entry, name) }
+        if let pending {
+            pendingNewItem = nil
+            if commit, !trimmed.isEmpty {
+                onCreateNewItem?(pending.parent, pending.isFolder, trimmed)
+            } else {
+                refresh()
+            }
+        } else if commit, !trimmed.isEmpty, trimmed != entry.name {
+            onRename?(entry, name)
+            onRenameCancelled = nil
+        } else if !commit || onRenameCancelled != nil {
+            onRenameCancelled?(entry)
+        }
     }
 
     /// The field while a rename is in progress (tests type into it).
@@ -366,10 +406,13 @@ final class ExplorerController: NSObject {
 
         listCalls += 1
         let rel = node?.entry.relPath ?? ""
-        let list: [ExplorerNode]
+        var list: [ExplorerNode]
         do {
             let inherited = node?.isIgnored ?? false
             list = try workspace.listDir(relPath: rel).map { ExplorerNode(entry: $0, parentIgnored: inherited) }
+            if let pending = pendingNewItem, pending.parent == rel {
+                list.append(ExplorerNode(entry: pending.entry, parentIgnored: inherited))
+            }
         } catch {
             Log.ui.error("list \(rel, privacy: .public) failed: \(String(describing: error), privacy: .public)")
             list = []
@@ -402,8 +445,10 @@ extension ExplorerController: NSTextFieldDelegate {
     }
 
     func controlTextDidEndEditing(_ notification: Notification) {
-        // Focus moved elsewhere: keep the typed name, as VSCode does.
-        finishRename(commit: true)
+        guard let field = notification.object as? NSTextField, field === renameField else { return }
+        // Focus moved elsewhere: keep a typed name, but do not discard an
+        // untouched New File/New Folder row during an AppKit refresh.
+        finishRename(commit: true, keepEmptyName: true)
     }
 }
 
@@ -427,6 +472,15 @@ extension ExplorerController: NSOutlineViewDelegate {
         let cell = outlineView.makeView(withIdentifier: ExplorerCell.reuseID, owner: self) as? ExplorerCell
             ?? ExplorerCell()
         cell.show(node.entry, expanded: outlineView.isItemExpanded(node))
+        if renamingEntry?.relPath == node.entry.relPath {
+            // Reloading recycles the cell and normally restores the on-disk
+            // placeholder name. Keep a pending New File/New Folder field blank.
+            cell.setEditing(true)
+            cell.label.stringValue = ""
+            cell.label.delegate = self
+            renameCell = cell
+            renameField = cell.label
+        }
         cell.isIgnored = node.isIgnored
         cell.isDirty = isDirty(node.entry)
         let status = gitStatus(for: node.entry)
@@ -852,11 +906,12 @@ enum FileGlyph {
             "composer.lock", "cargo.lock", "gemfile.lock", "tsconfig.json", "jsconfig.json",
             ".eslintrc", ".eslintrc.json", ".eslintrc.js", "eslint.config.js", "eslint.config.mjs",
             ".prettierrc", ".prettierrc.json", ".prettierrc.js", "prettier.config.js",
-            "readme.md", "readme", "license", "license.md", "copying",
-            ".dockerignore", ".editorconfig", ".env", ".env.example", ".npmignore", ".prettierignore",
-            ".gitignore", ".gitattributes", ".gitmodules", ".gitlab-ci.yml",
-            ".gitlab-ci_gitlab.yml", ".gitlab-ci_release.yml", "artisan", "crontab", "nginx.conf", "www.conf",
-            "firebase.json", "supabase.toml", "vercel.json", "netlify.toml", ".npmrc", "composer.json":
+             "readme.md", "readme", "license", "license.md", "copying",
+             ".dockerignore", ".editorconfig", ".env", ".env.example", ".npmignore", ".prettierignore",
+             ".gitignore", ".gitattributes", ".gitmodules", ".gitlab-ci.yml",
+             ".gitlab-ci_gitlab.yml", ".gitlab-ci_release.yml", "artisan", "crontab", "nginx.conf", "www.conf",
+             "firebase.json", "supabase.toml", "vercel.json", "netlify.toml", ".npmrc", "composer.json",
+             ".styleci.yml", ".phpunit.result.cache", "phpunit.xml", "phpunit.xml.dist", "pint.json":
             name
         default:
             nil
@@ -886,6 +941,9 @@ enum FileGlyph {
         case ".prettierignore": ("prettier", "paintbrush", .labelColor)
         case ".gitignore", ".gitattributes", ".gitmodules": ("git", "arrow.triangle.branch", .labelColor)
         case ".gitlab-ci.yml", ".gitlab-ci_gitlab.yml", ".gitlab-ci_release.yml": ("gitlab", "arrow.triangle.branch", .labelColor)
+        case ".styleci.yml": (nil, "paintbrush.pointed", .systemRed)
+        case ".phpunit.result.cache", "phpunit.xml", "phpunit.xml.dist": (nil, "checkmark.seal", .systemPurple)
+        case "pint.json": (nil, "paintbrush", .systemOrange)
         case "nginx.conf": ("nginx", "network", .labelColor)
         case "logrotate": (nil, "arrow.triangle.2.circlepath", .systemOrange)
         case "www.conf": ("php", "doc", .labelColor)

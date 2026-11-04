@@ -46,7 +46,7 @@ impl Autoload {
             read_files_php(&text, root, &mut files);
         }
         if let Ok(text) = std::fs::read_to_string(root.join("composer.json")) {
-            read_composer_json(&text, root, &mut psr4);
+            read_composer_json(&text, root, &mut psr4, &mut files);
         }
         let mut psr4: Vec<_> = psr4.into_iter().collect();
         psr4.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
@@ -126,8 +126,16 @@ impl Autoload {
     /// Every class the mapping can reach, found by walking the PSR-4
     /// directories (test folders skipped) and reading the class map.
     pub fn all_classes(&self) -> Vec<ClassName> {
+        self.indexed_classes().0
+    }
+
+    /// Class names plus the number of unique PHP source files examined while
+    /// building them. This includes non-class PHP files in autoload roots so
+    /// index telemetry represents work done rather than just declarations.
+    pub fn indexed_classes(&self) -> (Vec<ClassName>, usize) {
         let vendor_dir = self.root.join("vendor");
         let mut seen = HashSet::new();
+        let mut files = HashSet::new();
         let mut out = Vec::new();
         for (prefix, dirs) in &self.psr4 {
             for dir in dirs {
@@ -135,8 +143,9 @@ impl Autoload {
                 walk(
                     dir,
                     prefix,
-                    &mut |fqn: String| {
-                        if seen.insert(fqn.clone()) {
+                    &mut |fqn: String, path: PathBuf| {
+                        files.insert(path);
+                        if !fqn.is_empty() && seen.insert(fqn.clone()) {
                             let short = fqn.rsplit('\\').next().unwrap_or(&fqn).to_owned();
                             out.push(ClassName { short, fqn, vendor });
                         }
@@ -146,6 +155,7 @@ impl Autoload {
             }
         }
         for (fqn, path) in &self.classmap {
+            files.insert(path.clone());
             if seen.insert(fqn.clone()) {
                 let short = fqn.rsplit('\\').next().unwrap_or(fqn).to_owned();
                 out.push(ClassName {
@@ -155,17 +165,18 @@ impl Autoload {
                 });
             }
         }
+        files.extend(self.files.iter().cloned());
         out.sort_by(|a, b| {
             a.short
                 .to_lowercase()
                 .cmp(&b.short.to_lowercase())
                 .then_with(|| a.fqn.cmp(&b.fqn))
         });
-        out
+        (out, files.len())
     }
 }
 
-fn walk(dir: &Path, namespace: &str, add: &mut impl FnMut(String), depth: usize) {
+fn walk(dir: &Path, namespace: &str, add: &mut impl FnMut(String, PathBuf), depth: usize) {
     if depth > 12 {
         return;
     }
@@ -189,11 +200,15 @@ fn walk(dir: &Path, namespace: &str, add: &mut impl FnMut(String), depth: usize)
                 add,
                 depth + 1,
             );
-        } else if let Some(stem) = name.strip_suffix(".php")
-            && !stem.contains('.')
-            && stem.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-        {
-            add(format!("{namespace}{stem}"));
+        } else if let Some(stem) = name.strip_suffix(".php") {
+            let path = entry.path();
+            if !stem.contains('.') && stem.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                add(format!("{namespace}{stem}"), path);
+            } else {
+                // Report all PHP sources traversed by an autoload root even if
+                // their basename cannot represent a PSR-4 class name.
+                add(String::new(), path);
+            }
         }
     }
 }
@@ -252,25 +267,39 @@ fn read_classmap_php(text: &str, root: &Path, out: &mut HashMap<String, PathBuf>
     }
 }
 
-fn read_composer_json(text: &str, root: &Path, out: &mut HashMap<String, Vec<PathBuf>>) {
+fn read_composer_json(
+    text: &str,
+    root: &Path,
+    out: &mut HashMap<String, Vec<PathBuf>>,
+    files: &mut Vec<PathBuf>,
+) {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text) else {
         return;
     };
     for section in ["autoload", "autoload-dev"] {
-        let Some(map) = value[section]["psr-4"].as_object() else {
-            continue;
-        };
-        for (prefix, dirs) in map {
-            let list: Vec<&str> = match dirs {
-                serde_json::Value::String(one) => vec![one.as_str()],
-                serde_json::Value::Array(many) => many.iter().filter_map(|v| v.as_str()).collect(),
-                _ => continue,
-            };
-            let entry = out.entry(prefix.clone()).or_default();
-            for dir in list {
-                let dir = root.join(dir.trim_end_matches('/'));
-                if !entry.contains(&dir) {
-                    entry.push(dir);
+        if let Some(map) = value[section]["psr-4"].as_object() {
+            for (prefix, dirs) in map {
+                let list: Vec<&str> = match dirs {
+                    serde_json::Value::String(one) => vec![one.as_str()],
+                    serde_json::Value::Array(many) => {
+                        many.iter().filter_map(|v| v.as_str()).collect()
+                    }
+                    _ => continue,
+                };
+                let entry = out.entry(prefix.clone()).or_default();
+                for dir in list {
+                    let dir = root.join(dir.trim_end_matches('/'));
+                    if !entry.contains(&dir) {
+                        entry.push(dir);
+                    }
+                }
+            }
+        }
+        if let Some(helper_files) = value[section]["files"].as_array() {
+            for file in helper_files.iter().filter_map(|value| value.as_str()) {
+                let file = root.join(file);
+                if !files.contains(&file) {
+                    files.push(file);
                 }
             }
         }
@@ -338,5 +367,28 @@ mod tests {
         assert!(names.contains(&"App\\Models\\User".to_owned()));
         assert!(names.contains(&"Acme\\Lib\\Sub\\Thing".to_owned()));
         assert!(names.contains(&"Mapped\\One".to_owned()));
+    }
+
+    #[test]
+    fn counts_every_php_file_in_an_autoload_root() {
+        let dir = project();
+        std::fs::write(dir.path().join("app/helpers.php"), "<?php").unwrap();
+
+        let (_, files) = Autoload::load(dir.path()).indexed_classes();
+
+        assert_eq!(files, 3);
+    }
+
+    #[test]
+    fn reads_helper_files_from_composer_json() {
+        let dir = project();
+        std::fs::write(
+            dir.path().join("composer.json"),
+            r#"{"autoload":{"files":["app/helpers.php"]}}"#,
+        )
+        .unwrap();
+        let helper = dir.path().join("app/helpers.php");
+
+        assert_eq!(Autoload::load(dir.path()).function_files(), [helper]);
     }
 }

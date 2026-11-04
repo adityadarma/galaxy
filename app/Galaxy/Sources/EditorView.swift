@@ -23,14 +23,14 @@ final class EditorView: NSView {
         let digitWidth: CGFloat
         let spaceWidth: CGFloat
 
-        init(font: NSFont) {
+        init(font: NSFont, lineSpacing: CGFloat = Theme.editorLineSpacing) {
             let ctFont = font as CTFont
             ascent = CTFontGetAscent(ctFont)
             descent = CTFontGetDescent(ctFont)
             leading = CTFontGetLeading(ctFont)
             // Font metrics carry float noise (16.00006 for Fira Code 13), which
             // a bare `ceil` turned into a whole extra point of space per line.
-            lineHeight = ceil(ascent + descent + leading - 0.01)
+            lineHeight = ceil(ascent + descent + leading - 0.01 + lineSpacing)
             digitWidth = ("0" as NSString).size(withAttributes: [.font: font]).width
             spaceWidth = (" " as NSString).size(withAttributes: [.font: font]).width
         }
@@ -43,6 +43,9 @@ final class EditorView: NSView {
     static let gutterTrailingPadding: CGFloat = 26
     /// Space between the gutter and the first column.
     static let textInset: CGFloat = 0
+    /// Git change bar: sits just right of the line numbers.
+    static let gitBarOffset: CGFloat = 4
+    static let gitBarWidth: CGFloat = 3
     static let caretWidth: CGFloat = 2
     static let blinkInterval: TimeInterval = 0.53
     static let matchColor = Theme.findMatch
@@ -176,18 +179,60 @@ final class EditorView: NSView {
     var gitLineChanges: [UInt64: GitLineChangeKind] = [:] {
         didSet { if gitLineChanges != oldValue { needsDisplay = true } }
     }
-    /// A changed hunk expanded below one working-tree line.
+    /// A changed hunk expanded in a peek zone below `anchorLine`: a header row,
+    /// then context, removed and added rows.
     struct InlineGitHunk: Equatable {
-        let anchorLine: UInt64
-        let oldLines: [String]
-        let newLines: [String]
+        enum Kind: Equatable { case context, removed, added }
+        struct Row: Equatable {
+            var kind: Kind
+            /// 1-based line numbers in HEAD and in the working tree.
+            var oldNumber: Int?
+            var newNumber: Int?
+            var text: String
+            /// Syntax runs of `text`, from the document the row belongs to.
+            var styles: [StyleRun] = []
+        }
+        var anchorLine: UInt64
+        var rows: [Row]
+        /// First HEAD line of the hunk. It does not move while the file is
+        /// edited, so a refresh finds the same hunk again by it.
+        var oldStart: UInt64 = 0
+        var newStart: UInt64 = 0
+        var newLen: UInt64 = 0
+        var fileName = ""
+        var index = 0
+        var total = 1
+
+        static let headerVerticalPadding: CGFloat = 4
+        /// The header plus every source row. Used by tests and accessibility.
+        var rowCount: Int { rows.count + 1 }
+        func headerHeight(lineHeight: CGFloat) -> CGFloat {
+            lineHeight + Self.headerVerticalPadding * 2
+        }
+        func height(lineHeight: CGFloat) -> CGFloat {
+            headerHeight(lineHeight: lineHeight) + CGFloat(rows.count) * lineHeight
+        }
+        var oldLines: [String] { rows.filter { $0.kind == .removed }.map(\.text) }
+        var newLines: [String] { rows.filter { $0.kind == .added }.map(\.text) }
+
+        func contains(line: UInt64) -> Bool {
+            line >= newStart && line < newStart + max(newLen, 1)
+        }
     }
     var inlineGitHunk: InlineGitHunk? {
-        didSet { if inlineGitHunk != oldValue { reloadDocument() } }
+        didSet {
+            if inlineGitHunk != oldValue {
+                reloadDocument()
+                window?.invalidateCursorRects(for: self)
+            }
+        }
     }
     /// A click on a Git change marker. The controller supplies the hunk from
     /// HEAD and toggles its inline representation.
     var onGitChangeClick: ((UInt64) -> Void)?
+    /// The header buttons of the open hunk.
+    enum InlineHunkAction: Equatable { case stage, revert, next, previous, close }
+    var onInlineHunkAction: ((InlineHunkAction) -> Void)?
     /// `editor.renderWhitespace`; dots everywhere unless settings say otherwise.
     var renderWhitespace: WhitespaceRendering = .all {
         didSet { if renderWhitespace != oldValue { needsDisplay = true } }
@@ -457,8 +502,8 @@ final class EditorView: NSView {
         lineCount = Int(newCount ?? 0)
         hasFolds = !wrapSuspended && (document?.hasFolds() ?? false)
         rowCount = rowMapped ? Int(document?.totalRows() ?? 0) : lineCount
-        let inlineRows = inlineGitHunk.map { $0.oldLines.count + $0.newLines.count } ?? 0
-        let virtual = CGFloat(rowCount + inlineRows) * metrics.lineHeight
+        let inlineHeight = inlineGitHunk?.height(lineHeight: metrics.lineHeight) ?? 0
+        let virtual = CGFloat(rowCount) * metrics.lineHeight + inlineHeight
         let visible = enclosingScrollView?.contentSize.height ?? 0
         setFrameSize(NSSize(width: frame.width, height: max(virtual, visible)))
         updateDocumentWidth()
@@ -558,13 +603,13 @@ final class EditorView: NSView {
         } else {
             row = CGFloat(line)
         }
-        let insertedRows: Int
+        let insertedHeight: CGFloat
         if let hunk = inlineGitHunk, line > hunk.anchorLine {
-            insertedRows = hunk.oldLines.count + hunk.newLines.count
+            insertedHeight = hunk.height(lineHeight: metrics.lineHeight)
         } else {
-            insertedRows = 0
+            insertedHeight = 0
         }
-        return (row + CGFloat(insertedRows)) * metrics.lineHeight
+        return row * metrics.lineHeight + insertedHeight
     }
 
     /// The line (and row within it) drawn at document-space `y`.
@@ -572,8 +617,13 @@ final class EditorView: NSView {
         var row = y.isFinite ? max(0, floor(y / metrics.lineHeight)) : 0
         if let hunk = inlineGitHunk {
             let anchor = rowMapped ? CGFloat(document?.rowOfLine(line: hunk.anchorLine) ?? hunk.anchorLine) : CGFloat(hunk.anchorLine)
-            let inserted = CGFloat(hunk.oldLines.count + hunk.newLines.count)
-            if row > anchor { row = max(anchor, row - inserted) }
+            let zoneStart = (anchor + 1) * metrics.lineHeight
+            let zoneEnd = zoneStart + hunk.height(lineHeight: metrics.lineHeight)
+            if y >= zoneStart, y < zoneEnd {
+                row = anchor
+            } else if y >= zoneEnd {
+                row = max(anchor, floor((y - hunk.height(lineHeight: metrics.lineHeight)) / metrics.lineHeight))
+            }
         }
         guard rowMapped, let document else { return (UInt64(min(row, CGFloat(max(lineCount - 1, 0)))), 0) }
         let position = document.lineAtRow(row: UInt64(row))
@@ -1011,15 +1061,21 @@ final class EditorView: NSView {
                 }
             }
 
-            // Git blame of the caret line, quiet and after the text.
+            // Git blame of the caret line, quiet and after the text. A
+            // diagnostic message follows it, not the source text, so the two
+            // annotations never occupy the same pixels.
+            let sourceEnd = point(column: line.text.utf16.count, text: line.text, rows: rows,
+                                  top: top, originX: originX)
+            var trailingAnnotationEnd = sourceEnd.x
             if let blame = blameAnnotation, blame.line == line.line {
                 let note = CTLineCreateWithAttributedString(NSAttributedString(
                     string: blame.text,
                     attributes: [.font: font, .foregroundColor: Self.blameTextColor]
                 ))
-                let end = point(column: line.text.utf16.count, text: line.text, rows: rows, top: top, originX: originX)
-                context.textPosition = CGPoint(x: end.x + Self.blameGap, y: end.y + metrics.ascent)
+                let start = sourceEnd.x + Self.blameGap
+                context.textPosition = CGPoint(x: start, y: sourceEnd.y + metrics.ascent)
                 CTLineDraw(note, context)
+                trailingAnnotationEnd = start + CGFloat(CTLineGetTypographicBounds(note, nil, nil, nil))
             }
 
             // Diagnostics sit above text decorations but beneath carets.
@@ -1030,12 +1086,28 @@ final class EditorView: NSView {
                     context.fill(CGRect(x: rect.minX, y: rect.minY + metrics.ascent + 2, width: rect.width, height: 1))
                 }
             }
-            // Only errors and warnings are underlined. Information and hints
-            // stay as the gutter dot so missing type hints do not clutter text.
+            // Errors and warnings get the same wavy underline VS Code uses.
             for diagnostic in line.diagnostics where !diagnostic.unnecessary && diagnostic.severity <= 2 {
                 context.setFillColor(Theme.diagnostic(diagnostic.severity).cgColor)
                 for rect in span(diagnostic.start, diagnostic.end, 1, 0) {
-                    context.fill(CGRect(x: rect.minX, y: rect.maxY - 2, width: rect.width, height: 1))
+                    drawDiagnosticUnderline(in: rect, context: context)
+                }
+            }
+
+            // The first diagnostic message reads at the line's right edge,
+            // without obscuring the minimap or a horizontally scrolled gutter.
+            if let diagnostic = line.diagnostics.first(where: { !$0.unnecessary && !$0.message.isEmpty }) {
+                let start = trailingAnnotationEnd + 24
+                let limit = bounds.width - rightInset - 8
+                if start < limit {
+                    let note = CTLineCreateWithAttributedString(NSAttributedString(
+                        string: diagnostic.message,
+                        attributes: [.font: font, .foregroundColor: Theme.diagnostic(diagnostic.severity)]
+                    ))
+                    let available = limit - start
+                    let rendered = CTLineCreateTruncatedLine(note, Double(available), .end, nil) ?? note
+                    context.textPosition = CGPoint(x: start, y: sourceEnd.y + metrics.ascent)
+                    CTLineDraw(rendered, context)
                 }
             }
 
@@ -1086,10 +1158,6 @@ final class EditorView: NSView {
             context.setFillColor(hasBreakpoint ? NSColor.white.cgColor : (hasCaret ? Theme.accent : Theme.gutterText).cgColor)
             context.textPosition = CGPoint(x: gutterRight - width, y: top + metrics.ascent)
             CTLineDraw(number, context)
-            if let severity = line.diagnostics.filter({ !$0.unnecessary }).map(\.severity).min() {
-                context.setFillColor(Theme.diagnostic(severity).cgColor)
-                context.fill(CGRect(x: gutterRight + 3, y: top + lineHeight / 2 - 2, width: 4, height: 4))
-            }
             if line.foldable, !wrapSuspended, line.folded || pointerInGutter {
                 drawFoldChevron(in: context, folded: line.folded,
                                 center: CGPoint(x: gutterRight + 16, y: top + lineHeight / 2))
@@ -1101,8 +1169,7 @@ final class EditorView: NSView {
                 case .deleted: NSColor.systemRed
                 }
                 context.setFillColor(color.cgColor)
-                let markerHeight: CGFloat = change == .deleted ? 3 : block
-                context.fill(CGRect(x: shift, y: top, width: 4, height: markerHeight))
+                context.fill(CGRect(x: gutterRight + Self.gitBarOffset, y: top, width: Self.gitBarWidth, height: block))
             }
             if let hunk = inlineGitHunk, hunk.anchorLine == line.line {
                 drawInlineGitHunk(hunk, below: top + block, context: context)
@@ -1115,26 +1182,155 @@ final class EditorView: NSView {
         }
     }
 
+    /// A compact 1 pt zig-zag below diagnostics, rather than a flat underline.
+    private func drawDiagnosticUnderline(in rect: CGRect, context: CGContext) {
+        let y = rect.maxY - 2
+        let step: CGFloat = 2
+        context.setLineWidth(1)
+        context.move(to: CGPoint(x: rect.minX, y: y))
+        var x = rect.minX
+        var up = true
+        while x < rect.maxX {
+            let next = min(x + step, rect.maxX)
+            context.addLine(to: CGPoint(x: next, y: y + (up ? -1 : 1)))
+            x = next
+            up.toggle()
+        }
+        context.strokePath()
+    }
+
+    static let inlineHunkButtons: [(action: InlineHunkAction, symbol: String)] = [
+        (.stage, "plus"),
+        (.revert, "arrow.uturn.backward"),
+        (.next, "arrow.down"),
+        (.previous, "arrow.up"),
+        (.close, "xmark"),
+    ]
+
+    static func inlineHunkActionIsEnabled(_ action: InlineHunkAction, hunk: InlineGitHunk) -> Bool {
+        hunk.total > 1 || (action != .next && action != .previous)
+    }
+
+    /// Top of the open hunk's zone, in document space.
+    func inlineHunkTop(_ hunk: InlineGitHunk) -> CGFloat {
+        rowTop(of: hunk.anchorLine) + metrics.lineHeight * CGFloat(lineRows(hunk.anchorLine).count)
+    }
+
+    /// Header buttons, pinned to the visible right edge. The minimap covers
+    /// the last `rightInset` points of the clip, so they sit left of it.
+    func inlineHunkButtonRects(top: CGFloat) -> [(action: InlineHunkAction, rect: CGRect)] {
+        let right = (enclosingScrollView?.contentView.bounds.maxX ?? bounds.width) - rightInset - 14
+        let size: CGFloat = 30
+        let count = Self.inlineHunkButtons.count
+        let headerHeight = inlineGitHunk?.headerHeight(lineHeight: metrics.lineHeight) ?? metrics.lineHeight
+        return Self.inlineHunkButtons.enumerated().map { index, button in
+            (button.action, CGRect(x: right - CGFloat(count - index) * size, y: top, width: size,
+                                   height: headerHeight))
+        }
+    }
+
+    enum InlineHunkHit: Equatable {
+        case button(InlineHunkAction)
+        case zone
+    }
+
+    func inlineHunkHit(at point: NSPoint) -> InlineHunkHit? {
+        guard let hunk = inlineGitHunk else { return nil }
+        let top = inlineHunkTop(hunk)
+        guard point.y >= top, point.y < top + hunk.height(lineHeight: metrics.lineHeight) else { return nil }
+        if let hit = inlineHunkButtonRects(top: top).first(where: { $0.rect.contains(point) }) {
+            return Self.inlineHunkActionIsEnabled(hit.action, hunk: hunk) ? .button(hit.action) : .zone
+        }
+        return .zone
+    }
+
     private func drawInlineGitHunk(_ hunk: InlineGitHunk, below top: CGFloat, context: CGContext) {
         let lineHeight = metrics.lineHeight
-        let numberWidth = gutterRight - Self.gutterPadding
-        let lines = hunk.oldLines.map { (text: $0, color: Theme.diffRemoved, prefix: "-") }
-            + hunk.newLines.map { (text: $0, color: Theme.diffAdded, prefix: "+") }
-        for (index, line) in lines.enumerated() {
-            let y = top + CGFloat(index) * lineHeight
-            context.setFillColor(line.color.cgColor)
-            context.fill(CGRect(x: 0, y: y, width: bounds.width, height: lineHeight))
-            context.setFillColor(line.prefix == "-" ? NSColor.systemRed.cgColor : NSColor.systemGreen.cgColor)
-            context.fill(CGRect(x: gutterShift, y: y, width: 4, height: lineHeight))
-            let marker = layout(for: line.prefix)
-            context.setFillColor(Theme.gutterText.cgColor)
-            context.textPosition = CGPoint(x: gutterShift + numberWidth - 8, y: y + metrics.ascent)
-            CTLineDraw(marker, context)
-            let source = layout(for: line.text)
-            context.setFillColor(Theme.editorForeground.resolved(for: effectiveAppearance).cgColor)
-            context.textPosition = CGPoint(x: textOriginX, y: y + metrics.ascent)
-            CTLineDraw(source, context)
+        let headerHeight = hunk.headerHeight(lineHeight: lineHeight)
+        let shift = gutterShift
+        let background = Theme.editorBackground.resolved(for: effectiveAppearance)
+        let foreground = Theme.editorForeground.resolved(for: effectiveAppearance)
+        let digits = max(3, String(hunk.rows.map { max($0.oldNumber ?? 0, $0.newNumber ?? 0) }.max() ?? 0).count)
+        let column = ceil(CGFloat(digits) * metrics.digitWidth)
+        let oldRight = shift + Self.gutterPadding + column
+        let newRight = oldRight + 16 + column
+        // Code starts after both number columns, and scrolls under them.
+        let textX = max(textOriginX, newRight + 16)
+        let pinnedWidth = textX - shift
+        let border = NSColor.systemYellow.withAlphaComponent(0.55)
+        let width = bounds.width
+
+        func tint(_ kind: InlineGitHunk.Kind) -> NSColor? {
+            switch kind {
+            case .context: nil
+            case .removed: NSColor.systemRed.withAlphaComponent(0.26)
+            case .added: NSColor.systemGreen.withAlphaComponent(0.22)
+            }
         }
+        func draw(_ text: String, at x: CGFloat, y: CGFloat, color: NSColor) {
+            context.setFillColor(color.cgColor)
+            context.textPosition = CGPoint(x: x, y: y + metrics.ascent)
+            CTLineDraw(layout(for: text), context)
+        }
+        func number(_ value: Int?, right: CGFloat, y: CGFloat) {
+            guard let value else { return }
+            let line = layout(for: "\(value)")
+            let numberWidth = CGFloat(CTLineGetTypographicBounds(line, nil, nil, nil))
+            draw("\(value)", at: right - numberWidth, y: y, color: Theme.gutterText)
+        }
+
+        // Header: file name, what is shown, and the buttons.
+        context.setFillColor(NSColor.labelColor.withAlphaComponent(0.07).cgColor)
+        context.fill(CGRect(x: 0, y: top, width: width, height: headerHeight))
+        let name = hunk.fileName
+        let nameWidth = CGFloat(CTLineGetTypographicBounds(layout(for: name), nil, nil, nil))
+        let changes = hunk.total == 1 ? "1 of 1 change" : "\(hunk.index + 1) of \(hunk.total) changes"
+        let headerTextY = top + InlineGitHunk.headerVerticalPadding
+        draw(name, at: shift + Self.gutterPadding, y: headerTextY, color: foreground)
+        draw("Git Local Changes (Working Tree) - \(changes)",
+             at: shift + Self.gutterPadding + nameWidth + 12, y: headerTextY, color: Theme.gutterText)
+        for button in Self.inlineHunkButtons.enumerated() {
+            guard let rect = inlineHunkButtonRects(top: top).first(where: { $0.action == button.element.action })?.rect,
+                  let image = NSImage(systemSymbolName: button.element.symbol, accessibilityDescription: nil)?
+                    .withSymbolConfiguration(
+                        NSImage.SymbolConfiguration(paletteColors: [.secondaryLabelColor])
+                            .applying(NSImage.SymbolConfiguration(pointSize: 12, weight: .regular)))
+            else { continue }
+            let size = image.size
+            let unavailable = !Self.inlineHunkActionIsEnabled(button.element.action, hunk: hunk)
+            image.draw(
+                in: CGRect(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2, width: size.width, height: size.height),
+                from: .zero, operation: .sourceOver, fraction: unavailable ? 0.3 : 1, respectFlipped: true, hints: nil)
+        }
+
+        for (index, row) in hunk.rows.enumerated() {
+            let y = top + headerHeight + CGFloat(index) * lineHeight
+            if let color = tint(row.kind) {
+                context.setFillColor(color.cgColor)
+                context.fill(CGRect(x: 0, y: y, width: width, height: lineHeight))
+            }
+            if row.styles.isEmpty {
+                draw(row.text, at: textX, y: y, color: foreground)
+            } else {
+                // Colours come from the runs, not the context's fill.
+                context.textPosition = CGPoint(x: textX, y: y + metrics.ascent)
+                CTLineDraw(syntaxLayout(for: row.text, styles: row.styles), context)
+            }
+            // Scrolled sideways, text must not show through the number columns.
+            context.setFillColor(background.cgColor)
+            context.fill(CGRect(x: shift, y: y, width: pinnedWidth, height: lineHeight))
+            if let color = tint(row.kind) {
+                context.setFillColor(color.cgColor)
+                context.fill(CGRect(x: shift, y: y, width: pinnedWidth, height: lineHeight))
+            }
+            number(row.oldNumber, right: oldRight, y: y)
+            number(row.newNumber, right: newRight, y: y)
+        }
+
+        let height = hunk.height(lineHeight: lineHeight)
+        context.setFillColor(border.cgColor)
+        context.fill(CGRect(x: 0, y: top, width: width, height: 1))
+        context.fill(CGRect(x: 0, y: top + height - 1, width: width, height: 1))
     }
 
     /// A small chevron: points right while folded, down while open.
@@ -1392,5 +1588,16 @@ extension EditorView: NSViewToolTipOwner {
             case .folded: return "Click to expand the range."
             }
         }
+    }
+}
+
+extension EditorView.InlineGitHunk {
+    /// Removed rows followed by added rows, numbered from 1.
+    init(anchorLine: UInt64, oldLines: [String], newLines: [String]) {
+        self.init(
+            anchorLine: anchorLine,
+            rows: oldLines.enumerated().map { Row(kind: .removed, oldNumber: $0.offset + 1, newNumber: nil, text: $0.element) }
+                + newLines.enumerated().map { Row(kind: .added, oldNumber: nil, newNumber: $0.offset + 1, text: $0.element) }
+        )
     }
 }

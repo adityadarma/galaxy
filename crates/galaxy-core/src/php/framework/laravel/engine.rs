@@ -16,11 +16,64 @@ use crate::php::engine::{
 use crate::php::framework::common::complete::{
     Found, describe, found, named, pick, relative, target_of,
 };
+use crate::php::framework::common::files::walk;
 use crate::php::generics;
-use crate::php::parse::{ClassInfo, MemberKind, parse_with_tree};
+use crate::php::parse::{ClassInfo, Member, MemberKind, parse_with_tree};
 
 const MODEL: &str = "Illuminate\\Database\\Eloquent\\Model";
 const RELATIONS: &str = "Illuminate\\Database\\Eloquent\\Relations\\";
+
+/// A relation method: declared to return a relation, or, when it declares no
+/// return type, whose body returns `$this->hasMany(...)` and the like.
+fn is_relation_method(member: &Member) -> bool {
+    static CALL: OnceLock<Regex> = OnceLock::new();
+    if let Some(ty) = member.ty.as_deref() {
+        return is_relation_type(ty);
+    }
+    let call = CALL.get_or_init(|| {
+        Regex::new(r"(?i)^\s*(?:return\s+)?\$this\s*->\s*(?:hasone|hasmany|belongsto|belongstomany|hasonethrough|hasmanythrough|morphone|morphmany|morphto|morphtomany|morphedbymany)\s*\(")
+            .expect("valid")
+    });
+    member
+        .body_return
+        .as_deref()
+        .is_some_and(|body| call.is_match(body))
+}
+
+/// The method a relation body starts from: `$this->objekSewa()->where(..)`.
+fn wrapped_relation() -> &'static Regex {
+    static WRAPPED: OnceLock<Regex> = OnceLock::new();
+    WRAPPED
+        .get_or_init(|| Regex::new(r"^\s*(?:return\s+)?\$this\s*->\s*(\w+)\s*\(").expect("valid"))
+}
+
+/// `hasMany(Line::class` and the like, in the body of an untyped relation.
+fn related_model_call() -> &'static Regex {
+    static RELATED: OnceLock<Regex> = OnceLock::new();
+    RELATED.get_or_init(|| {
+        Regex::new(r"(?i)(?:hasone|hasmany|belongsto|belongstomany|morphone|morphmany|morphto|morphtomany|morphedbymany)\s*\(\s*\\?([\w\\]+)::class")
+            .expect("valid")
+    })
+}
+
+fn is_relation_type(ty: &str) -> bool {
+    let ty = generics::base(ty);
+    ty.starts_with(RELATIONS)
+        || matches!(
+            ty.rsplit('\\').next().unwrap_or(ty),
+            "BelongsTo"
+                | "BelongsToMany"
+                | "HasMany"
+                | "HasManyThrough"
+                | "HasOne"
+                | "HasOneThrough"
+                | "MorphMany"
+                | "MorphOne"
+                | "MorphTo"
+                | "MorphToMany"
+                | "MorphedByMany"
+        )
+}
 
 pub(super) fn is_blade(path: &Path) -> bool {
     crate::php::framework::is_template(path)
@@ -59,6 +112,7 @@ fn item_kind(kind: Kind) -> ItemKind {
     }
 }
 
+#[allow(dead_code)]
 fn snake(name: &str) -> String {
     let mut out = String::new();
     for (i, c) in name.chars().enumerate() {
@@ -74,6 +128,7 @@ fn snake(name: &str) -> String {
     out
 }
 
+#[allow(dead_code)]
 fn plural(word: &str) -> String {
     let vowel = |c: char| "aeiou".contains(c);
     if let Some(stem) = word.strip_suffix('y')
@@ -141,28 +196,11 @@ impl PhpEngine {
         self.lineage(class).iter().any(|c| c.fqn == MODEL)
     }
 
-    fn table_of(&mut self, class: &Arc<ClassInfo>) -> String {
-        static TABLE: OnceLock<Regex> = OnceLock::new();
-        let re =
-            TABLE.get_or_init(|| Regex::new(r#"\$table\s*=\s*['"]([\w.]+)['"]"#).expect("valid"));
-        for owner in self.lineage(class).into_iter().take(6) {
-            if owner.fqn == MODEL {
-                break;
-            }
-            if let Ok(text) = std::fs::read_to_string(&owner.path)
-                && let Some(caps) = re.captures(&text)
-            {
-                return caps[1].to_owned();
-            }
-        }
-        plural(&snake(&class.name))
-    }
-
-    /// Columns a model reads: those migrations create and the attributes it
-    /// lists itself.
-    fn model_columns(&mut self, idx: &Index, class: &Arc<ClassInfo>) -> Vec<Item> {
-        let table = self.table_of(class);
-        let mut columns = idx.columns_of(&table);
+    /// Column names explicitly declared by the model. Migrations define the
+    /// database schema, but `$fillable` and related model attributes define
+    /// the names this model exposes to application code.
+    fn model_columns(&mut self, class: &Arc<ClassInfo>) -> Vec<Item> {
+        let mut columns: Vec<Item> = Vec::new();
         for owner in self.lineage(class).into_iter().take(6) {
             if owner.fqn == MODEL {
                 break;
@@ -194,39 +232,271 @@ impl PhpEngine {
         columns
     }
 
+    /// Eloquent accessors expose `getTypeNameAttribute()` or `typeName()` as
+    /// either `$model->type_name` or `$model->typeName`.
+    fn model_accessor(&mut self, class: &Arc<ClassInfo>, name: &str) -> Option<Found> {
+        let accessor = name
+            .split('_')
+            .filter(|part| !part.is_empty())
+            .map(|part| {
+                let mut chars = part.chars();
+                chars
+                    .next()
+                    .map(|first| first.to_ascii_uppercase().to_string() + chars.as_str())
+                    .unwrap_or_default()
+            })
+            .collect::<String>();
+        let legacy = format!("get{accessor}Attribute");
+        let modern = accessor
+            .chars()
+            .next()
+            .map(|first| first.to_ascii_lowercase().to_string() + &accessor[first.len_utf8()..])
+            .unwrap_or_default();
+        for owner in self.lineage(class).into_iter().take(6) {
+            if owner.fqn == MODEL {
+                break;
+            }
+            if let Some(member) = owner.members.iter().find(|member| {
+                member.kind == MemberKind::Method
+                    && !member.is_static
+                    && (member.name.eq_ignore_ascii_case(&legacy)
+                        || (member.name == modern
+                            && member
+                                .body_return
+                                .as_deref()
+                                .is_some_and(|body| body.contains("Attribute::"))))
+            }) {
+                return Some(Found {
+                    detail: member.detail.clone(),
+                    loc: Some(Loc {
+                        path: owner.path.clone(),
+                        line: member.line,
+                        column: member.column,
+                    }),
+                    class: None,
+                });
+            }
+        }
+        None
+    }
+
     fn model_relations(&mut self, class: &Arc<ClassInfo>) -> Vec<Item> {
-        let mut out: Vec<Item> = Vec::new();
+        let mut candidates: Vec<(Arc<ClassInfo>, Member)> = Vec::new();
         for owner in self.lineage(class).into_iter().take(8) {
             if owner.fqn == MODEL {
                 break;
             }
             for member in &owner.members {
                 if member.kind == MemberKind::Method
-                    && member
-                        .ty
-                        .as_deref()
-                        .is_some_and(|t| t.starts_with(RELATIONS))
-                    && !out.iter().any(|i| i.name == member.name)
+                    && !candidates.iter().any(|(_, m)| m.name == member.name)
                 {
-                    out.push(Item {
-                        name: member.name.clone(),
-                        detail: member
-                            .ty
-                            .as_deref()
-                            .and_then(|t| t.rsplit('\\').next())
-                            .unwrap_or("")
-                            .to_owned(),
-                        loc: Some(Loc {
-                            path: owner.path.clone(),
-                            line: member.line,
-                            column: member.column,
-                        }),
-                        class: None,
-                    });
+                    candidates.push((owner.clone(), member.clone()));
                 }
             }
         }
-        out
+        // A relation can be built on another one (`$this->objekSewa()->where()`),
+        // so keep adding methods until nothing new qualifies.
+        let mut names: Vec<String> = Vec::new();
+        loop {
+            let before = names.len();
+            for (_, member) in &candidates {
+                if names.contains(&member.name) {
+                    continue;
+                }
+                let wraps = member.ty.is_none()
+                    && member
+                        .body_return
+                        .as_deref()
+                        .and_then(|body| wrapped_relation().captures(body))
+                        .is_some_and(|caps| names.iter().any(|n| n == &caps[1]));
+                if is_relation_method(member) || wraps {
+                    names.push(member.name.clone());
+                }
+            }
+            if names.len() == before {
+                break;
+            }
+        }
+        candidates
+            .into_iter()
+            .filter(|(_, member)| names.contains(&member.name))
+            .map(|(owner, member)| Item {
+                name: member.name.clone(),
+                detail: member
+                    .ty
+                    .as_deref()
+                    .and_then(|t| t.rsplit('\\').next())
+                    .unwrap_or("")
+                    .to_owned(),
+                loc: Some(Loc {
+                    path: owner.path.clone(),
+                    line: member.line,
+                    column: member.column,
+                }),
+                class: None,
+            })
+            .collect()
+    }
+
+    /// The type supplied to a Blade view variable by its PHP caller.
+    fn blade_variable_type(&mut self, idx: &Index, path: &Path, name: &str) -> Option<String> {
+        static VIEW_DATA: OnceLock<Regex> = OnceLock::new();
+        static ASSIGNMENT: OnceLock<Regex> = OnceLock::new();
+        static SERVICE: OnceLock<Regex> = OnceLock::new();
+        static CONSTRUCTOR: OnceLock<Regex> = OnceLock::new();
+        static PARAMETER: OnceLock<Regex> = OnceLock::new();
+        let view = idx
+            .views
+            .iter()
+            .find(|view| view.loc.as_ref().is_some_and(|loc| loc.path == path))?;
+        let view_data = VIEW_DATA.get_or_init(|| {
+            Regex::new(r#"(?s)(?:view|render)\s*\(\s*['\"]([^'\"]+)['\"]\s*,\s*(\$\w+|\[[^)]*\])"#)
+                .expect("valid")
+        });
+        let assignment = ASSIGNMENT.get_or_init(|| {
+            Regex::new(r#"(?m)(\$\w+)\s*\[\s*['\"](\w+)['\"]\s*\]\s*=\s*([^;]+);"#).expect("valid")
+        });
+        let service =
+            SERVICE.get_or_init(|| Regex::new(r#"^\$this->(\w+)(->.*)$"#).expect("valid"));
+        let constructor = CONSTRUCTOR.get_or_init(|| {
+            Regex::new(r#"(?s)function\s+__construct\s*\((.*?)\)"#).expect("valid")
+        });
+        for source_path in walk(&self.root().join("app")) {
+            if source_path.extension().is_none_or(|ext| ext != "php") {
+                continue;
+            }
+            let Ok(source) = std::fs::read_to_string(&source_path) else {
+                continue;
+            };
+            for call in view_data.captures_iter(&source) {
+                if call[1] != view.name {
+                    continue;
+                }
+                let data = &call[2];
+                let value = if data.starts_with('$') {
+                    assignment
+                        .captures_iter(&source[..call.get(0)?.start()])
+                        .filter(|assignment| &assignment[1] == data && &assignment[2] == name)
+                        .last()?
+                        .get(3)?
+                        .as_str()
+                } else {
+                    let pair = Regex::new(&format!(
+                        r#"['\"]{}['\"]\s*=>\s*([^,\]]+)"#,
+                        regex::escape(name)
+                    ))
+                    .expect("valid");
+                    pair.captures(data)?.get(1)?.as_str()
+                };
+                let ty = self
+                    .with_context(
+                        &source_path,
+                        &source,
+                        call.get(0)?.start(),
+                        |engine, ctx| engine.eval(ctx, value, 0),
+                    )
+                    .or_else(|| {
+                        let service = service.captures(value.trim())?;
+                        let property = &service[1];
+                        let assignment = Regex::new(&format!(
+                            r#"\$this->{}\s*=\s*\$(\w+)"#,
+                            regex::escape(property)
+                        ))
+                        .ok()?;
+                        let parameter = assignment.captures(&source)?.get(1)?.as_str();
+                        let params = constructor.captures(&source)?.get(1)?.as_str();
+                        let parameter = PARAMETER
+                            .get_or_init(|| {
+                                Regex::new(r#"(?m)([\\\w]+)\s+\$(\w+)\b"#).expect("valid")
+                            })
+                            .captures_iter(params)
+                            .find(|caps| &caps[2] == parameter)?;
+                        let expression = format!("new {}(){}", &parameter[1], &service[2]);
+                        self.with_context(
+                            &source_path,
+                            &source,
+                            call.get(0)?.start(),
+                            |engine, ctx| engine.eval(ctx, &expression, 0),
+                        )
+                    });
+                if let Some(ty) = ty {
+                    return Some(ty);
+                }
+            }
+        }
+        None
+    }
+
+    /// Definition target of a regular PHP helper called from a Blade echo.
+    fn blade_helper_target(&mut self, text: &str, byte: usize) -> Option<Target> {
+        static CALL: OnceLock<Regex> = OnceLock::new();
+        let call = CALL.get_or_init(|| Regex::new(r"\b([A-Za-z_]\w*)\s*\(").expect("valid"));
+        let name = call.captures_iter(text).find(|call| {
+            let name = call.get(1).expect("name");
+            name.start() <= byte && byte <= name.end()
+        })?;
+        let function = self.function(&name[1])?;
+        Some(Target {
+            path: function.path.clone(),
+            line: function.line,
+            column: function.column,
+        })
+    }
+
+    /// Resolve a Blade expression such as `$aset->masterKodeBarang->nama`
+    /// from the type supplied by the PHP caller of that view.
+    fn blade_model_definition(
+        &mut self,
+        idx: &Index,
+        path: &Path,
+        text: &str,
+        byte: usize,
+    ) -> Option<Found> {
+        static CHAIN: OnceLock<Regex> = OnceLock::new();
+        let re = CHAIN.get_or_init(|| Regex::new(r"\$(\w+)((?:\s*->\s*\w+)+)").expect("valid"));
+        let caps = re.captures_iter(text).find(|caps| {
+            let whole = caps.get(0).expect("whole");
+            whole.start() <= byte && byte <= whole.end()
+        })?;
+        let variable = caps.get(1).expect("variable");
+        let variable = &text[variable.start()..variable.end()];
+        let ty = self.blade_variable_type(idx, path, variable)?;
+        let mut class = self.class(ty.trim_start_matches('\\'))?;
+        let chain = caps.get(2).expect("chain");
+        let mut offset = chain.start();
+        for part in text[chain.start()..chain.end()].split("->").skip(1) {
+            let name = part.trim();
+            let start = offset + part.find(name)?;
+            let end = start + name.len();
+            offset += part.len() + 2;
+            if let Some(relation) = self
+                .model_relations(&class)
+                .into_iter()
+                .find(|relation| relation.name == name)
+            {
+                if start <= byte && byte <= end {
+                    return Some(found(&relation));
+                }
+                let member = class.members.iter().find(|member| member.name == name)?;
+                let related = member.body_return.as_deref().and_then(|body| {
+                    related_model_call()
+                        .captures(body)
+                        .and_then(|caps| self.class(&format!("App\\Models\\{}", &caps[1])))
+                })?;
+                class = related;
+            } else {
+                if start <= byte && byte <= end {
+                    return self.model_accessor(&class, name).or_else(|| {
+                        self.model_columns(&class)
+                            .into_iter()
+                            .find(|column| column.name == name)
+                            .map(|column| found(&column))
+                    });
+                }
+                return None;
+            }
+        }
+        None
     }
 
     /// Runs `run` with a context at `byte` of the PHP in `text`.
@@ -297,8 +567,104 @@ impl PhpEngine {
         let name = site.class.clone()?;
         self.with_context(path, text, site.start, |engine, ctx| {
             let fqn = engine.class_ref(ctx, &name)?;
-            engine.class(&fqn)
+            if let Some(class) = engine.class(&fqn) {
+                return Some(class);
+            }
+            // Legacy Laravel routes commonly use `Api\\UserController@show`
+            // without importing the controller into the routes file.
+            let name = name.trim_start_matches('\\');
+            if name.starts_with("App\\") || name.starts_with("Illuminate\\") {
+                return None;
+            }
+            for fqn in [
+                format!("App\\Http\\Controllers\\{name}"),
+                format!("App\\{name}"),
+            ] {
+                if let Some(class) = engine.class(&fqn) {
+                    return Some(class);
+                }
+            }
+            None
         })
+    }
+
+    /// Definition of the dotted relationship segment under the cursor. Each
+    /// preceding segment is called as a relation, then unwrapped through
+    /// `getResults()` to find the model that owns the next relation.
+    fn relation_definition(
+        &mut self,
+        path: &Path,
+        text: &str,
+        site: &Site,
+        byte: usize,
+    ) -> Option<Found> {
+        let name = &text[site.start..site.end];
+        let at = byte.checked_sub(site.start)?;
+        let selected = name
+            .split('.')
+            .scan(0, |start, part| {
+                let end = *start + part.len();
+                let range = *start..=end;
+                *start = end + 1;
+                Some((part, range))
+            })
+            .position(|(_, range)| range.contains(&at))?;
+        let mut class = self.model_of_call(path, text, site)?;
+        for (index, relation) in name.split('.').enumerate() {
+            let relations = self.model_relations(&class);
+            let item = pick(&relations, relation)?;
+            if index == selected {
+                return Some(found(item));
+            }
+            class = self.with_context(path, text, site.paren?, |engine, ctx| {
+                let relation_type = engine.member_type(ctx, &class.fqn, relation, Some(""));
+                // `HasMany<Related, Declaring>`: the first argument is the model
+                // the next segment belongs to. `getResults()` only helps for
+                // singular relations, since a `hasMany` returns a collection.
+                let inferred = relation_type.as_ref().and_then(|ty| {
+                    let (_, args) = generics::split(ty);
+                    let related = args.first().and_then(|arg| engine.class(arg));
+                    related.filter(|c| engine.is_model(c))
+                });
+                let inferred = inferred.or_else(|| {
+                    let result = engine.member_type(
+                        ctx,
+                        relation_type.as_deref()?,
+                        "getResults",
+                        Some(""),
+                    )?;
+                    engine
+                        .class(generics::base(&result))
+                        .filter(|c| engine.is_model(c))
+                });
+                if inferred.is_some() {
+                    return inferred;
+                }
+                let re = related_model_call();
+                let mut method = relation.to_owned();
+                let mut name = None;
+                for _ in 0..4 {
+                    let body = engine.lineage(&class).into_iter().find_map(|owner| {
+                        owner
+                            .members
+                            .iter()
+                            .find(|member| {
+                                member.kind == MemberKind::Method && member.name == method
+                            })
+                            .and_then(|member| member.body_return.clone())
+                    })?;
+                    if let Some(caps) = re.captures(&body) {
+                        name = Some(caps.get(1)?.as_str().to_owned());
+                        break;
+                    }
+                    method = wrapped_relation().captures(&body)?[1].to_owned();
+                }
+                let name = name?;
+                let fqn = engine.class_ref(ctx, &name)?;
+                engine.class(&fqn)
+            })?;
+        }
+        None
     }
 
     // ---- lookup --------------------------------------------------------
@@ -443,11 +809,12 @@ impl PhpEngine {
             }
             Kind::Action => {
                 let class = self.action_class(path, text, site)?;
-                if name.starts_with("__") {
+                let method = name.rsplit_once('@').map_or(name, |(_, method)| method);
+                if method.starts_with("__") {
                     return None;
                 }
                 let methods = self.action_methods(&class, true);
-                if let Some(item) = pick(&methods, name) {
+                if let Some(item) = pick(&methods, method) {
                     return Some(Some(found(item)));
                 }
                 if !self.fully_known(&class) {
@@ -462,7 +829,7 @@ impl PhpEngine {
             }
             Kind::Column => {
                 let class = self.model_of_call(path, text, site)?;
-                let columns = self.model_columns(idx, &class);
+                let columns = self.model_columns(&class);
                 pick(&columns, name).map(|item| Some(found(item)))
             }
             Kind::Relation => {
@@ -552,7 +919,7 @@ impl PhpEngine {
             }
             Kind::Column => {
                 let class = self.model_of_call(path, text, &site)?;
-                let columns = self.model_columns(&idx, &class);
+                let columns = self.model_columns(&class);
                 named(typed, &columns, kind, from)
             }
             Kind::Relation => {
@@ -591,7 +958,46 @@ impl PhpEngine {
             let item = pick(items, &text[start..end])?;
             return Some(self.targets(item.loc.as_ref(), item.class.as_deref()));
         }
+        if blade && let Some(target) = self.blade_helper_target(text, byte) {
+            return Some(vec![target]);
+        }
+        if blade && let Some(hit) = self.blade_model_definition(&idx, path, text, byte) {
+            return Some(self.targets(hit.loc.as_ref(), hit.class.as_deref()));
+        }
+        // The helper name belongs to Laravel, while its string argument names
+        // a project file below `public`. Keep those two destinations distinct.
+        if let Some(site) = sites(text, blade).into_iter().find(|site| {
+            if site.kind != Kind::Asset {
+                return false;
+            }
+            let Some(paren) = site.paren else {
+                return false;
+            };
+            let Some(call) = crate::php::framework::common::scan::callee(text, paren) else {
+                return false;
+            };
+            let name_end = paren;
+            let name_start = text[..name_end]
+                .trim_end()
+                .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '\\'))
+                .map_or(0, |at| at + 1);
+            matches!(call.name.as_str(), "asset" | "secure_asset" | "mix")
+                && name_start <= byte
+                && byte <= name_end
+        }) {
+            let paren = site.paren.expect("matched above");
+            let name = crate::php::framework::common::scan::callee(text, paren)
+                .expect("matched above")
+                .name;
+            if let Some(target) = laravel_helper_target(&idx.root, &name) {
+                return Some(vec![target]);
+            }
+        }
         let site = site_at(text, byte, blade)?;
+        if site.kind == Kind::Relation {
+            let hit = self.relation_definition(path, text, &site, byte)?;
+            return Some(self.targets(hit.loc.as_ref(), hit.class.as_deref()));
+        }
         if site.kind == Kind::Rule {
             let contents = &text[site.start..site.end];
             let at = byte - site.start;
@@ -820,6 +1226,19 @@ fn append_line(path: PathBuf, line: &str) -> FileChange {
     }
 }
 
+/// Location of a Laravel global helper in the installed framework sources.
+fn laravel_helper_target(root: &Path, name: &str) -> Option<Target> {
+    let path = root.join("vendor/laravel/framework/src/Illuminate/Foundation/helpers.php");
+    let text = std::fs::read_to_string(&path).ok()?;
+    let prefix = format!("function {name}(");
+    let line = text.lines().position(|line| line.contains(&prefix))? as u32;
+    Some(Target {
+        path,
+        line,
+        column: 0,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -850,6 +1269,7 @@ mod tests {
             "routes/web.php",
             "<?php\nRoute::get('/', fn () => 1)->name('home');\n",
         );
+        write(r, "routes/api.php", "<?php\n");
         write(r, "resources/views/welcome.blade.php", "hi");
         write(r, "resources/views/layouts/app.blade.php", "hi");
         write(
@@ -865,7 +1285,7 @@ mod tests {
         write(
             r,
             "app/Models/User.php",
-            "<?php\nnamespace App\\Models;\n\nclass User\n{\n}\n",
+            "<?php\nnamespace App\\Models;\n\nclass User\n{\n    protected $fillable = ['nickname'];\n}\n",
         );
         write(
             r,
@@ -931,18 +1351,38 @@ mod tests {
         assert_eq!(labels, vec!["index", "show"]);
 
         let (text, line, column) =
-            cursor("<?php\nnamespace App;\nuse App\\Models\\User;\n\nUser::where('em|');\n");
+            cursor("<?php\nnamespace App;\nuse App\\Models\\User;\n\nUser::where('|');\n");
         let labels: Vec<String> = engine
             .complete(&dir.path().join("app/X.php"), &text, line, column)
             .into_iter()
             .map(|i| i.label)
             .collect();
-        assert_eq!(labels, vec!["email"]);
+        assert_eq!(labels, vec!["nickname"]);
+
+        // Eloquent methods whose first string names a column all offer the
+        // model's declared attributes, not only `where`.
+        for method in ["orderBy", "select", "pluck", "whereLike"] {
+            let (text, line, column) = cursor(&format!(
+                "<?php\nnamespace App;\nuse App\\Models\\User;\n\nUser::{method}('|');\n"
+            ));
+            let labels: Vec<String> = engine
+                .complete(&dir.path().join("app/X.php"), &text, line, column)
+                .into_iter()
+                .map(|i| i.label)
+                .collect();
+            assert_eq!(labels, vec!["nickname"], "{method}");
+        }
     }
 
     #[test]
     fn jumps_to_where_a_name_is_defined() {
         let dir = project();
+        write(dir.path(), "public/css/site.css", "body {}");
+        write(
+            dir.path(),
+            "vendor/laravel/framework/src/Illuminate/Foundation/helpers.php",
+            "<?php\nfunction asset($path) {}\n",
+        );
         let mut engine = PhpEngine::new(dir.path());
         let path = dir.path().join("app/X.php");
         let (text, line, column) = cursor("<?php\nroute('ho|me');\n");
@@ -950,6 +1390,20 @@ mod tests {
         assert_eq!(targets.len(), 1);
         assert!(targets[0].path.ends_with("routes/web.php"));
         assert_eq!(targets[0].line, 1);
+
+        let (text, line, column) = cursor("<?php\nasset|('css/site.css');\n");
+        let targets = engine.definition(&path, &text, line, column);
+        assert_eq!(targets.len(), 1);
+        assert!(
+            targets[0]
+                .path
+                .ends_with("vendor/laravel/framework/src/Illuminate/Foundation/helpers.php")
+        );
+
+        let (text, line, column) = cursor("<?php\nasset('css/si|te.css');\n");
+        let targets = engine.definition(&path, &text, line, column);
+        assert_eq!(targets.len(), 1);
+        assert!(targets[0].path.ends_with("public/css/site.css"));
 
         let (text, line, column) = cursor("<?php\nview('layouts.a|pp');\n");
         let targets = engine.definition(&path, &text, line, column);
@@ -963,6 +1417,136 @@ mod tests {
         let targets = engine.definition(&path, &text, line, column);
         assert!(targets[0].path.ends_with("config/app.php"));
         assert_eq!(targets[0].line, 3);
+    }
+
+    #[test]
+    fn jumps_from_blade_model_relations_and_columns() {
+        let dir = project();
+        write(
+            dir.path(),
+            "app/Models/Aset.php",
+            "<?php\nnamespace App\\Models;\nuse Illuminate\\Database\\Eloquent\\Model;\nclass Aset extends Model {\n    public static function with(array $relations): self { return new self(); }\n    public function findOrFail(int $id): Aset { return $this; }\n    public function masterKodeBarang() { return $this->belongsTo(MasterKodeBarang::class); }\n    public function getTypeNameAttribute() { return 'Aset'; }\n    protected function label(): Attribute { return Attribute::make(get: fn () => 'Aset'); }\n}\n",
+        );
+        write(
+            dir.path(),
+            "app/Models/MasterKodeBarang.php",
+            "<?php\nnamespace App\\Models;\nuse Illuminate\\Database\\Eloquent\\Model;\nclass MasterKodeBarang extends Model {\n    protected $fillable = ['nama'];\n}\n",
+        );
+        write(
+            dir.path(),
+            "app/Http/Controllers/AsetController.php",
+            "<?php\nnamespace App\\Http\\Controllers;\nuse App\\Models\\Aset;\nclass AsetController {\n    private function aset(): Aset {}\n    public function show() {\n        $data['aset'] = $this->aset();\n        return view('aset', $data);\n    }\n}\n",
+        );
+        write(dir.path(), "resources/views/aset.blade.php", "");
+        let mut engine = PhpEngine::new(dir.path());
+        let path = dir.path().join("resources/views/aset.blade.php");
+
+        let (text, line, column) = cursor("{{ $aset->masterKodeB|arang->nama }}");
+        let targets = engine.definition(&path, &text, line, column);
+        assert_eq!(targets.len(), 1);
+        assert!(targets[0].path.ends_with("app/Models/Aset.php"));
+
+        let (text, line, column) = cursor("{{ $aset->masterKodeBarang->na|ma }}");
+        let targets = engine.definition(&path, &text, line, column);
+        assert_eq!(targets.len(), 1);
+        assert!(targets[0].path.ends_with("app/Models/MasterKodeBarang.php"));
+
+        let (text, line, column) = cursor("{{ $aset->type_na|me }}");
+        let targets = engine.definition(&path, &text, line, column);
+        assert_eq!(targets.len(), 1);
+        assert!(targets[0].path.ends_with("app/Models/Aset.php"));
+        assert_eq!(targets[0].line, 7);
+
+        let (text, line, column) = cursor("{{ $aset->la|bel }}");
+        let targets = engine.definition(&path, &text, line, column);
+        assert_eq!(targets.len(), 1);
+        assert!(targets[0].path.ends_with("app/Models/Aset.php"));
+        assert_eq!(targets[0].line, 8);
+
+        write(
+            dir.path(),
+            "app/Services/AsetService.php",
+            "<?php\nnamespace App\\Services;\nuse App\\Models\\Aset;\nclass AsetService { public function findPublic(int $id) { return Aset::with(['masterKodeBarang'])->findOrFail($id); } }\n",
+        );
+        write(
+            dir.path(),
+            "app/Http/Controllers/PublicAsetController.php",
+            "<?php\nnamespace App\\Http\\Controllers;\nuse App\\Services\\AsetService;\nclass PublicAsetController {\n    protected $asetService;\n    public function __construct(AsetService $asetService) { $this->asetService = $asetService; }\n    public function show() {\n        $data['aset'] = $this->asetService->findPublic(1);\n        return view('aset-service', $data);\n    }\n}\n",
+        );
+        write(dir.path(), "resources/views/aset-service.blade.php", "");
+        let service_path = dir.path().join("resources/views/aset-service.blade.php");
+        let mut engine = PhpEngine::new(dir.path());
+        let (text, line, column) = cursor("{{ $aset->masterKodeBarang->na|ma }}");
+        let targets = engine.definition(&service_path, &text, line, column);
+        assert_eq!(targets.len(), 1);
+        assert!(targets[0].path.ends_with("app/Models/MasterKodeBarang.php"));
+
+        write(
+            dir.path(),
+            "app/Http/Controllers/RenderController.php",
+            "<?php\nnamespace App\\Http\\Controllers;\nuse App\\Models\\Aset;\nclass RenderController {\n    private function aset(): Aset {}\n    public function show() {\n        $aset = $this->aset();\n        return view()->render('aset-render', ['aset' => $aset, 'lainnya' => null]);\n    }\n}\n",
+        );
+        write(dir.path(), "resources/views/aset-render.blade.php", "");
+        let render_path = dir.path().join("resources/views/aset-render.blade.php");
+        let mut engine = PhpEngine::new(dir.path());
+        let (text, line, column) = cursor("{{ $aset->masterKodeBarang->na|ma }}");
+        let targets = engine.definition(&render_path, &text, line, column);
+        assert_eq!(targets.len(), 1);
+        assert!(targets[0].path.ends_with("app/Models/MasterKodeBarang.php"));
+    }
+
+    #[test]
+    fn jumps_from_blade_to_composer_helper() {
+        let dir = project();
+        write(
+            dir.path(),
+            "composer.json",
+            r#"{"autoload":{"psr-4":{"App\\":"app/"},"files":["app/helpers.php"]}}"#,
+        );
+        write(
+            dir.path(),
+            "app/helpers.php",
+            "<?php\n\nfunction formatRupiah($value) { return $value; }\n",
+        );
+        write(dir.path(), "resources/views/helper.blade.php", "");
+        let mut engine = PhpEngine::new(dir.path());
+        let path = dir.path().join("resources/views/helper.blade.php");
+        let (text, line, column) = cursor("{{ formatRup|iah($payment->amount) }}");
+        let targets = engine.definition(&path, &text, line, column);
+
+        assert_eq!(targets.len(), 1);
+        assert!(targets[0].path.ends_with("app/helpers.php"));
+        assert_eq!(targets[0].line, 2);
+        assert_eq!(targets[0].column, 9);
+    }
+
+    #[test]
+    fn jumps_to_legacy_route_actions_without_an_import() {
+        let dir = project();
+        write(
+            dir.path(),
+            "app/Http/Controllers/Api/AssetController.php",
+            "<?php\nnamespace App\\Http\\Controllers\\Api;\n\nclass AssetController\n{\n    public function recommended() {}\n}\n",
+        );
+        let mut engine = PhpEngine::new(dir.path());
+        assert!(
+            engine
+                .class("App\\Http\\Controllers\\Api\\AssetController")
+                .is_some()
+        );
+        let path = dir.path().join("routes/api.php");
+        let (text, line, column) =
+            cursor("<?php\nRoute::get('/recommended', 'Api\\AssetController@recommen|ded');\n");
+
+        let targets = engine.definition(&path, &text, line, column);
+
+        assert_eq!(targets.len(), 1);
+        assert!(
+            targets[0]
+                .path
+                .ends_with("app/Http/Controllers/Api/AssetController.php")
+        );
+        assert_eq!(targets[0].line, 5);
     }
 
     #[test]

@@ -329,11 +329,29 @@ fn permits_extending_date_prototype() {
 }
 
 #[test]
+fn infers_object_shorthand_properties() {
+    let index = DocumentIndex::parse(
+        "global.ts",
+        "const data = '/data';\nconst cache = '/cache';\nconst paths = { data, cache };\nconst Path = paths;\nPath.data;\nPath.cache;\n",
+    );
+
+    assert!(
+        index
+            .type_diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "TS2339"),
+        "{:?}",
+        index.type_diagnostics
+    );
+}
+
+#[test]
 fn permits_date_now_and_class_constructor_arguments() {
     let index = DocumentIndex::parse(
         "values.ts",
         "const id = String(Date.now());\n\
-         class VineMultipartFile { constructor(options?: object, values?: unknown[], name?: string) {} }\n\
+          const utc = Date.UTC(1970, 0, 1);\n\
+          class VineMultipartFile { constructor(options?: object, values?: unknown[], name?: string) {} }\n\
          new VineMultipartFile({}, [], 'file');\n",
     );
 
@@ -617,6 +635,17 @@ fn indexes_export_assignment_ambient_namespace() {
             .map(|declaration| declaration.kind),
         Some(DeclarationKind::Namespace)
     );
+}
+
+#[test]
+fn indexes_export_assignment_declaration() {
+    let index = DocumentIndex::parse(
+        "path.d.ts",
+        "declare const path: { sep: string };\nexport = path;\n",
+    );
+    let declaration = index.export_assignment_declaration().expect("path");
+    assert_eq!(declaration.name, "path");
+    assert_eq!(declaration.range.start.line, 0);
 }
 
 #[test]

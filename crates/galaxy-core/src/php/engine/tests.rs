@@ -147,6 +147,25 @@ fn follows_chains_assignments_and_this() {
 }
 
 #[test]
+fn follows_untyped_property_injected_by_constructor() {
+    let project = Project::new();
+    let service = project.dir.path().join("app/Services/PhoneQcService.php");
+    std::fs::create_dir_all(service.parent().unwrap()).unwrap();
+    std::fs::write(
+            &service,
+            "<?php\nnamespace App\\Services;\nclass PhoneQcService { public function handleListPhoneQcOfDatatable(): array { return []; } }\n",
+        )
+        .unwrap();
+    let (text, line, column) = marker(
+        "<?php\nnamespace App\\Http;\nuse App\\Services\\PhoneQcService;\nclass PhoneQcController {\n    protected $phoneQcService;\n    public function __construct(PhoneQcService $phoneQcService) { $this->phoneQcService = $phoneQcService; }\n    public function datatable() { $this->phoneQcService->handleListPhoneQcOfDatata|ble(); }\n}\n",
+    );
+    let mut engine = PhpEngine::new(project.dir.path());
+    let targets = engine.definition(&project.file(), &text, line, column);
+    assert_eq!(targets.len(), 1);
+    assert!(targets[0].path.ends_with("app/Services/PhoneQcService.php"));
+}
+
+#[test]
 fn resolves_class_string_templates_and_new() {
     let project = Project::new();
     let items = project.complete(&format!(
@@ -278,6 +297,36 @@ fn works_without_composer() {
     let text = "<?php\n$t = new Thing();\n$t->";
     let items = engine.complete(&dir.path().join("main.php"), text, 2, 4);
     assert_eq!(labels(&items), ["run"]);
+}
+
+#[test]
+fn vendor_files_use_the_application_composer_root() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let source = root.join("vendor/acme/source/src/UsesTarget.php");
+    let target = root.join("vendor/acme/target/src/Target.php");
+    std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(root.join("vendor/composer")).unwrap();
+    std::fs::write(
+        root.join("vendor/composer/autoload_psr4.php"),
+        "<?php\nreturn array(\n    'Acme\\\\Source\\\\' => array($vendorDir . '/acme/source/src'),\n    'Acme\\\\Target\\\\' => array($vendorDir . '/acme/target/src'),\n);\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &source,
+        "<?php\nnamespace Acme\\Source;\nuse Acme\\Target\\Target;\nnew Target();\n",
+    )
+    .unwrap();
+    std::fs::write(&target, "<?php\nnamespace Acme\\Target;\nclass Target {}\n").unwrap();
+
+    assert_eq!(project_root(&source), root);
+    let mut engine = PhpEngine::new(root);
+    let text = std::fs::read_to_string(&source).unwrap();
+    let found = engine.definition(&source, &text, 3, 5);
+
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].path, target);
 }
 
 #[test]
@@ -1080,6 +1129,212 @@ fn follows_relations_through_generics() {
         found[0].path.ends_with("lib/HasOneOrMany.php"),
         "{:?}",
         found[0].path
+    );
+}
+
+#[test]
+fn laravel_dotted_relation_strings_follow_each_model() {
+    let dir = eloquent_project();
+    std::fs::write(dir.path().join("artisan"), "#!/usr/bin/env php\n").unwrap();
+    let mut engine = PhpEngine::new(dir.path());
+    let file = dir.path().join("app/Service.php");
+    let text = "<?php\nnamespace App;\nclass Service {\n    public function run() {\n        Order::with('payment.details');\n    }\n}\n";
+
+    let payment = engine.definition(&file, text, 4, 22);
+    assert_eq!(payment.len(), 1);
+    assert!(payment[0].path.ends_with("app/Order.php"), "{payment:?}");
+
+    let details = engine.definition(&file, text, 4, 30);
+    assert_eq!(details.len(), 1);
+    assert!(details[0].path.ends_with("app/Payment.php"), "{details:?}");
+}
+
+#[test]
+fn laravel_relation_arrays_resolve_on_multiline_chains() {
+    let dir = eloquent_project();
+    std::fs::write(dir.path().join("artisan"), "#!/usr/bin/env php\n").unwrap();
+    let mut engine = PhpEngine::new(dir.path());
+    let file = dir.path().join("app/Service.php");
+    let text = "<?php\nnamespace App;\nclass Service {\n    public function run() {\n        $orders = Order::select([\n            'id',\n            'name',\n        ])\n            ->with([\n                'lines',\n                'payment',\n            ])\n            ->get();\n    }\n}\n";
+
+    let payment = engine.definition(&file, text, 10, 20);
+    assert_eq!(payment.len(), 1, "{payment:?}");
+    assert!(payment[0].path.ends_with("app/Order.php"), "{payment:?}");
+
+    let lines = engine.definition(&file, text, 9, 20);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+}
+
+#[test]
+fn laravel_relation_array_on_one_line_resolves() {
+    let dir = eloquent_project();
+    std::fs::write(dir.path().join("artisan"), "#!/usr/bin/env php\n").unwrap();
+    let mut engine = PhpEngine::new(dir.path());
+    let file = dir.path().join("app/Service.php");
+    let text = "<?php\nnamespace App;\nclass Service {\n    public function run() {\n        Order::with(['payment'])->where('id', 1);\n    }\n}\n";
+    let found = engine.definition(&file, text, 4, 24);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].path.ends_with("app/Order.php"), "{found:?}");
+}
+
+#[test]
+fn laravel_relations_without_return_types_resolve() {
+    let dir = eloquent_project();
+    std::fs::write(dir.path().join("artisan"), "#!/usr/bin/env php\n").unwrap();
+    std::fs::write(
+        dir.path().join("app/Untyped.php"),
+        "<?php\nnamespace App;\nclass Untyped extends \\Lib\\Model\n{\n    public function payment()\n    {\n        return $this->hasOne(Payment::class, 'untyped_id', 'id')\n            ->withDefault(['x' => 1]);\n    }\n}\n",
+    )
+    .unwrap();
+    let mut engine = PhpEngine::new(dir.path());
+    let file = dir.path().join("app/Service.php");
+    let text = "<?php\nnamespace App;\nclass Service {\n    public function run() {\n        Untyped::with(['payment'])->get();\n        Untyped::with('payment.details');\n    }\n}\n";
+
+    let found = engine.definition(&file, text, 4, 24);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].path.ends_with("app/Untyped.php"), "{found:?}");
+
+    let details = engine.definition(&file, text, 5, 33);
+    assert_eq!(details.len(), 1, "{details:?}");
+    assert!(details[0].path.ends_with("app/Payment.php"), "{details:?}");
+}
+
+#[test]
+fn laravel_relation_strings_resolve_through_builder_chains() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    for (path, body) in [
+        (
+            "composer.json",
+            r#"{"autoload":{"psr-4":{"Illuminate\\Database\\Eloquent\\":"lib/","App\\":"app/"}}}"#,
+        ),
+        ("artisan", "#!/usr/bin/env php\n"),
+        (
+            "lib/Model.php",
+            r#"<?php
+namespace Illuminate\Database\Eloquent;
+
+abstract class Model
+{
+    /** @return \Illuminate\Database\Eloquent\Builder<static> */
+    public static function query() {}
+}
+"#,
+        ),
+        (
+            "lib/Builder.php",
+            r#"<?php
+namespace Illuminate\Database\Eloquent;
+
+/**
+ * @template TModel of \Illuminate\Database\Eloquent\Model
+ */
+class Builder
+{
+    /** @return $this */
+    public function when($value, $callback) { return $this; }
+    /** @return $this */
+    public function where($column) { return $this; }
+    /** @return $this */
+    public function select($columns) { return $this; }
+    /** @return $this */
+    public function with($relations) { return $this; }
+    /** @return $this */
+    public function whereHas($relation, $callback = null) { return $this; }
+}
+"#,
+        ),
+        (
+            "app/Product.php",
+            "<?php\nnamespace App;\n\nuse Illuminate\\Database\\Eloquent\\Model;\n\nclass Product extends Model\n{\n}\n",
+        ),
+        (
+            "app/Line.php",
+            "<?php\nnamespace App;\n\nuse Illuminate\\Database\\Eloquent\\Model;\n\nclass Line extends Model\n{\n    public function product()\n    {\n        return $this->belongsTo(Product::class, 'product_id', 'id');\n    }\n}\n",
+        ),
+        (
+            "app/Order.php",
+            "<?php\nnamespace App;\n\nuse Illuminate\\Database\\Eloquent\\Model;\n\nclass Order extends Model\n{\n    public function lines()\n    {\n        return $this->hasMany(Line::class, 'order_id', 'id');\n    }\n\n    public function activeLines()\n    {\n        return $this->lines()->where('active', 1);\n    }\n}\n",
+        ),
+    ] {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+    let file = root.join("app/Service.php");
+    let text = r#"<?php
+namespace App;
+
+use Illuminate\Database\Eloquent\Builder;
+
+class Service
+{
+    public function run($x)
+    {
+        $base = function () {
+            return Order::query()
+                ->where('id', 1);
+        };
+        $a = Order::query()
+            ->when($x, function (Builder $query) {
+                $query->whereHas('activeLines', function ($query) {
+                    $query->where('id', 1);
+                });
+            });
+        $a->select(['id'])
+            ->with([
+                'lines',
+                'lines.product',
+            ]);
+        $base()->select(['id'])
+            ->with([
+                'activeLines',
+            ]);
+    }
+}
+"#;
+    let mut engine = PhpEngine::new(root);
+    let mut at = |needle: &str, nth: usize| {
+        let (row, line) = text
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| line.contains(needle))
+            .nth(nth)
+            .unwrap();
+        let column = line.find(needle).unwrap() as u32 + 2;
+        engine.definition(&file, text, row as u32, column)
+    };
+
+    // `Builder $query` names the class; the call it is passed to names the model.
+    let in_callback = at("'activeLines'", 0);
+    assert!(
+        in_callback
+            .iter()
+            .any(|t| t.path.ends_with("app/Order.php")),
+        "{in_callback:?}"
+    );
+    // A builder kept in a variable, with the array on lines of its own.
+    let in_variable = at("'lines',", 0);
+    assert!(
+        in_variable
+            .iter()
+            .any(|t| t.path.ends_with("app/Order.php")),
+        "{in_variable:?}"
+    );
+    let next_segment = at("product'", 0);
+    assert!(
+        next_segment
+            .iter()
+            .any(|t| t.path.ends_with("app/Line.php")),
+        "{next_segment:?}"
+    );
+    // A builder returned by a closure held in a variable, and a relation
+    // that is built on another one.
+    let in_closure = at("'activeLines'", 1);
+    assert_eq!(in_closure.len(), 1, "{in_closure:?}");
+    assert!(
+        in_closure[0].path.ends_with("app/Order.php"),
+        "{in_closure:?}"
     );
 }
 

@@ -39,7 +39,7 @@ extension MainWindowController {
         }
     }
 
-    func openWorkspace(at url: URL) throws {
+    func openWorkspace(at url: URL, restoresTabsIncrementally: Bool = false) throws {
         if openExistingWorkspace?(url) == true { return }
         // A new folder is a new project session. Do not carry files from the
         // previous workspace into the new tab bar.
@@ -79,7 +79,11 @@ extension MainWindowController {
         statusLabel.stringValue = ""
         resetBottomPanelForNewWorkspace()
         if let session = Session.load(from: Session.workspaceURL(for: ws.root())) {
-            restoreTabs(from: session)
+            if restoresTabsIncrementally, session.extraGroups?.isEmpty ?? true {
+                restoreTabsIncrementally(session.tabs, active: session.active, workspace: ws)
+            } else {
+                restoreTabs(from: session)
+            }
         }
         // Git, filesystem watching, and the Go to File index are not needed
         // for the restored editor frame. Start them after AppKit presents it.

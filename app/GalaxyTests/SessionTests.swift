@@ -96,6 +96,31 @@ final class SessionTests: XCTestCase {
         XCTAssertFalse(d.restore(empty), "nothing restored: the caller opens an Untitled buffer")
     }
 
+    func testLaunchRestoreBatchesWorkspaceTabs() throws {
+        let first = makeController()
+        try first.openWorkspace(at: root.appendingPathComponent("ws"))
+        try first.openFile(at: root.appendingPathComponent("ws/src/long.rs"))
+        try first.openFile(at: root.appendingPathComponent("ws/src/main.rs"))
+        first.selectTab(2)
+        let saved = first.currentSession()
+        try saved.save(to: Session.workspaceURL(for: root.appendingPathComponent("ws").path))
+        first.window?.close()
+
+        let second = makeController()
+        defer { second.window?.orderOut(nil) }
+        XCTAssertTrue(second.restore(saved, incrementally: true))
+        XCTAssertEqual(second.tabBar.items.map(\.title), ["main.rs"], "the last active tab is ready before deferred restoration")
+        XCTAssertEqual(second.activeTab?.title, "main.rs")
+
+        let restored = expectation(description: "workspace tabs restored")
+        DispatchQueue.main.async {
+            XCTAssertEqual(second.tabBar.items.map(\.title), ["long.rs", "main.rs"])
+            XCTAssertEqual(second.activeTab?.title, "main.rs", "deferred tabs do not steal focus")
+            restored.fulfill()
+        }
+        wait(for: [restored], timeout: 1)
+    }
+
     func testABadOrNewerSessionFileIsIgnored() throws {
         try "{ not json".write(to: sessionURL, atomically: true, encoding: .utf8)
         XCTAssertNil(Session.load(from: sessionURL))

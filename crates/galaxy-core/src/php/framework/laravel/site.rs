@@ -162,7 +162,8 @@ fn eloquent_kind(name: &str) -> Option<Kind> {
         | "wherenotnull" | "ornwherenull" | "wherebetween" | "wherenotbetween" | "wheredate"
         | "wheremonth" | "whereday" | "whereyear" | "wheretime" | "wherecolumn" | "orderby"
         | "orderbydesc" | "latest" | "oldest" | "pluck" | "groupby" | "value" | "increment"
-        | "decrement" | "sum" | "avg" | "min" | "max" | "wherelike" | "wherenot" => Kind::Column,
+        | "decrement" | "sum" | "avg" | "min" | "max" | "wherelike" | "wherenot" | "select"
+        | "addselect" => Kind::Column,
         "with" | "load" | "loadmissing" | "has" | "orhas" | "doesnthave" | "ordoesnthave"
         | "wherehas" | "orwherehas" | "wheredoesnthave" | "withcount" | "withsum" | "withavg"
         | "withmin" | "withmax" | "withexists" | "loadcount" | "without" | "withwhererelation"
@@ -187,6 +188,12 @@ fn blade_regions(text: &str) -> Vec<Region> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
+        // The fallback arm steps one byte; skip the tail of multibyte
+        // characters (curly quotes, CJK) instead of slicing inside them.
+        if !text.is_char_boundary(i) {
+            i += 1;
+            continue;
+        }
         let rest = &text[i..];
         if rest.starts_with("{{--") {
             i += rest.find("--}}").map_or(rest.len(), |n| n + 4);
@@ -353,7 +360,7 @@ fn classify(
         }
         // `Route::get('/x', 'Controller@method')`
         if call.operator == Some("::")
-            && call.scope == "route"
+            && call.scope.eq_ignore_ascii_case("route")
             && found.index == 1
             && !in_array
             && let Some(caps) = action_string().captures(contents)
@@ -573,6 +580,11 @@ mod tests {
         let source = text.replacen('|', "", 1);
         let site = site_at(&source, cursor, false).expect("site");
         assert_eq!(site.class.as_deref(), Some("UserController"));
+        let text = "<?php\nRoute::get('x', 'Api\\UserController@sh|ow');\n";
+        let cursor = text.find('|').unwrap();
+        let source = text.replacen('|', "", 1);
+        let site = site_at(&source, cursor, false).expect("site");
+        assert_eq!(site.class.as_deref(), Some("Api\\UserController"));
     }
 
     #[test]
@@ -621,6 +633,20 @@ mod tests {
         assert_eq!(
             blade("@php $a = __('x.y|'); @endphp"),
             Some((Kind::Translation, "x.y".into()))
+        );
+    }
+
+    #[test]
+    fn blade_with_multibyte_text_does_not_panic() {
+        // Curly quotes and CJK are multibyte; scanning must not slice inside them.
+        let blade = |code: &str| at(code, true);
+        assert_eq!(
+            blade("<p>“quoted” 日本語</p> {{ config('app.n|ame') }}"),
+            Some((Kind::Config, "app.name".into()))
+        );
+        assert_eq!(
+            blade("<p>“x”</p>\n@extends('layouts.a|pp')"),
+            Some((Kind::View, "layouts.app".into()))
         );
     }
 

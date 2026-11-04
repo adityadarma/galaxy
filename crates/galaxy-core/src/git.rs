@@ -1034,6 +1034,20 @@ pub fn head_blob(root: &Path, rel_path: &str) -> io::Result<Option<Vec<u8>>> {
         .map(|mut blob| blob.take_data()))
 }
 
+/// Whether Git's ignore rules cover `rel_path`. Ignored files are never part
+/// of a change, so the gutter must not mark them. Any failure (no `git`, not
+/// a repository, timeout) reads as "not ignored".
+fn is_ignored(root: &Path, rel_path: &str) -> bool {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(root)
+        .args(["check-ignore", "-q", "--"])
+        .arg(rel_path);
+    output_within(cmd, Duration::from_secs(5))
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
 pub fn diff_lines(
     root: &Path,
     rel_path: &str,
@@ -1043,6 +1057,9 @@ pub fn diff_lines(
     let head = match repo.head_tree() {
         Ok(tree) => tree,
         Err(_) => {
+            if is_ignored(root, rel_path) {
+                return Ok(Vec::new());
+            }
             return Ok((1..=working_text.lines().count().max(1))
                 .map(|line| GitLineChange {
                     line,
@@ -1061,9 +1078,10 @@ pub fn diff_lines(
     // They are commonly ignored and absent from HEAD, which otherwise makes
     // every line look newly added in the gutter.
     if old.is_none()
-        && rel_path
+        && (rel_path
             .split('/')
             .any(|part| matches!(part, "node_modules" | "vendor"))
+            || is_ignored(root, rel_path))
     {
         return Ok(Vec::new());
     }
@@ -1284,6 +1302,83 @@ pub fn stage(root: &Path, path: &str) -> io::Result<()> {
     git_path_command(root, ["add", "--", path])
 }
 
+/// Stages one changed region of `rel_path`: the lines of `hunk` as they are
+/// in `new_text`, leaving every other change unstaged. A file that is not in
+/// `HEAD` is staged whole. The patch is made against `HEAD`, so it applies
+/// when the index still matches it.
+pub fn stage_hunk(root: &Path, rel_path: &str, new_text: &str, hunk: DiffHunk) -> io::Result<()> {
+    let Some(base) = head_blob(root, rel_path)? else {
+        return stage(root, rel_path);
+    };
+    let base = String::from_utf8_lossy(&base);
+    let patch = hunk_patch(rel_path, &base, new_text, hunk);
+    let file = std::env::temp_dir().join(format!(
+        "galaxy-hunk-{}-{}.patch",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    ));
+    std::fs::write(&file, patch)?;
+    let result = run_git(
+        root,
+        &[
+            "apply",
+            "--cached",
+            "--unidiff-zero",
+            "--whitespace=nowarn",
+            &file.to_string_lossy(),
+        ],
+        "stage change",
+        LOCAL_TIMEOUT,
+    );
+    let _ = std::fs::remove_file(&file);
+    result
+}
+
+/// A zero-context unified diff turning `old` into `new` for one hunk.
+fn hunk_patch(rel_path: &str, old: &str, new: &str, hunk: DiffHunk) -> String {
+    let old_lines: Vec<&str> = old.lines().collect();
+    let new_lines: Vec<&str> = new.lines().collect();
+    // A zero-length side is addressed by the line before the change.
+    let start = |first: usize, len: usize| if len == 0 { first } else { first + 1 };
+    let mut patch = format!(
+        "--- a/{rel_path}\n+++ b/{rel_path}\n@@ -{},{} +{},{} @@\n",
+        start(hunk.old_start, hunk.old_len),
+        hunk.old_len,
+        start(hunk.new_start, hunk.new_len),
+        hunk.new_len
+    );
+    let side =
+        |lines: &[&str], text: &str, first: usize, len: usize, sign: char, out: &mut String| {
+            for (i, line) in lines[first..first + len].iter().enumerate() {
+                out.push(sign);
+                out.push_str(line);
+                out.push('\n');
+                if first + i + 1 == lines.len() && !text.ends_with('\n') {
+                    out.push_str("\\ No newline at end of file\n");
+                }
+            }
+        };
+    side(
+        &old_lines,
+        old,
+        hunk.old_start,
+        hunk.old_len,
+        '-',
+        &mut patch,
+    );
+    side(
+        &new_lines,
+        new,
+        hunk.new_start,
+        hunk.new_len,
+        '+',
+        &mut patch,
+    );
+    patch
+}
+
 pub fn stage_all(root: &Path) -> io::Result<()> {
     git_path_command(root, ["add", "-A"])
 }
@@ -1359,6 +1454,90 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["new.txt", "tracked.txt"]
         );
+    }
+
+    fn commit_all(dir: &Path, message: &str) {
+        run(dir, ["add", "."]);
+        run(
+            dir,
+            [
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                message,
+            ],
+        );
+    }
+
+    fn staged_diff(dir: &Path) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["diff", "--cached", "--unified=0"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[test]
+    fn stage_hunk_stages_only_the_chosen_change() {
+        let dir = tempfile::tempdir().unwrap();
+        run(dir.path(), ["init", "-b", "main"]);
+        let old = "a\nb\nc\nd\ne\nf\ng\n";
+        fs::write(dir.path().join("f.txt"), old).unwrap();
+        commit_all(dir.path(), "initial");
+        // One replaced line, one deleted line, one inserted line.
+        let new = "a\nB\nc\nd\nf\ng\nh\n";
+        fs::write(dir.path().join("f.txt"), new).unwrap();
+        let all = diff_hunks(old, new);
+        assert_eq!(all.len(), 3, "{all:?}");
+
+        stage_hunk(dir.path(), "f.txt", new, all[1]).unwrap();
+        let staged = staged_diff(dir.path());
+        assert!(staged.contains("-e\n"), "{staged}");
+        assert!(!staged.contains("+B"), "{staged}");
+        assert!(!staged.contains("+h"), "{staged}");
+
+        stage_hunk(dir.path(), "f.txt", new, all[0]).unwrap();
+        stage_hunk(dir.path(), "f.txt", new, all[2]).unwrap();
+        let index = Command::new("git")
+            .arg("-C")
+            .arg(dir.path())
+            .args(["show", ":f.txt"])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&index.stdout), new);
+    }
+
+    #[test]
+    fn stage_hunk_handles_a_file_without_final_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        run(dir.path(), ["init", "-b", "main"]);
+        fs::write(dir.path().join("f.txt"), "one\ntwo").unwrap();
+        commit_all(dir.path(), "initial");
+        fs::write(dir.path().join("f.txt"), "one\nTWO").unwrap();
+        let hunk = diff_hunks("one\ntwo", "one\nTWO")[0];
+        stage_hunk(dir.path(), "f.txt", "one\nTWO", hunk).unwrap();
+        let staged = staged_diff(dir.path());
+        assert!(
+            staged.contains("-two") && staged.contains("+TWO"),
+            "{staged}"
+        );
+    }
+
+    #[test]
+    fn stage_hunk_stages_a_new_file_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        run(dir.path(), ["init", "-b", "main"]);
+        fs::write(dir.path().join("seed.txt"), "x\n").unwrap();
+        commit_all(dir.path(), "initial");
+        fs::write(dir.path().join("new.txt"), "a\nb\n").unwrap();
+        let hunk = diff_hunks("", "a\nb\n")[0];
+        stage_hunk(dir.path(), "new.txt", "a\nb\n", hunk).unwrap();
+        assert!(staged_diff(dir.path()).contains("+b"));
     }
 
     fn hunks(old: &str, new: &str) -> Vec<(usize, usize, usize, usize)> {
@@ -1493,6 +1672,44 @@ mod tests {
         );
         assert!(
             diff_lines(dir.path(), "vendor/pkg/src/File.php", "<?php\n")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn diff_lines_skips_gitignored_files() {
+        let dir = tempfile::tempdir().unwrap();
+        run(dir.path(), ["init", "-b", "main"]);
+        fs::write(dir.path().join(".gitignore"), "secret.txt\nbuild/\n").unwrap();
+        fs::write(dir.path().join("tracked.txt"), "one\n").unwrap();
+        run(dir.path(), ["add", ".gitignore", "tracked.txt"]);
+        run(
+            dir.path(),
+            [
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        );
+
+        assert!(
+            diff_lines(dir.path(), "secret.txt", "a\nb\n")
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            diff_lines(dir.path(), "build/out.txt", "a\nb\n")
+                .unwrap()
+                .is_empty()
+        );
+        // A plain untracked file still shows as added.
+        assert!(
+            !diff_lines(dir.path(), "new.txt", "a\nb\n")
                 .unwrap()
                 .is_empty()
         );

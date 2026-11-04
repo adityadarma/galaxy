@@ -223,6 +223,29 @@ pub fn scan(src: &str) -> Overlay {
     out
 }
 
+/// `src` with every Blade construct (`{{ }}`, `@if (...)`, `@php` blocks,
+/// `<?php ?>`) replaced by spaces. Newlines stay and the byte length is
+/// unchanged, so offsets in the result are offsets in `src`. The HTML grammar
+/// parses this text: `->` or `!=` inside `@if (...)` would otherwise read as
+/// tag brackets and leave the rest of the file without structure.
+pub fn mask(src: &str) -> String {
+    let overlay = scan(src);
+    if overlay.claimed.is_empty() {
+        return src.to_owned();
+    }
+    let mut bytes = src.as_bytes().to_vec();
+    for &(start, end) in &overlay.claimed {
+        for byte in &mut bytes[start.min(end)..end.min(src.len())] {
+            if !matches!(*byte, b'\n' | b'\r') {
+                *byte = b' ';
+            }
+        }
+    }
+    // Claims begin and end next to ASCII delimiters, so whole characters are
+    // blanked and the text stays UTF-8.
+    String::from_utf8(bytes).unwrap_or_else(|_| src.to_owned())
+}
+
 /// Drops the parts of `spans` that Blade owns. `claimed` must be sorted and
 /// non-overlapping, as [`scan`] returns it.
 pub fn subtract(spans: Vec<Span>, claimed: &[(usize, usize)]) -> Vec<Span> {
@@ -310,7 +333,9 @@ fn at(b: &[u8], i: usize, prev: Option<u8>, out: &mut Overlay) -> usize {
     if !DIRECTIVES.iter().any(|d| d.as_bytes() == name) {
         return name_end;
     }
-    out.spans.push((i, name_end, HighlightScope::Keyword));
+    // Keep the directive as a single keyword, including its marker.
+    out.spans.push((i, i + 1, HighlightScope::Keyword));
+    out.spans.push((i + 1, name_end, HighlightScope::Keyword));
 
     if name == b"verbatim" {
         // Blade leaves everything up to `@endverbatim` alone.
@@ -425,7 +450,14 @@ fn code(b: &[u8], mut i: usize, stop: Stop, out: &mut Vec<Span>) -> Option<usize
                     i += 1;
                 }
             }
+            // PHP's error-suppression operator is commonly used in Blade as
+            // `@$value`. Match directive markers so the leading `@` is clear.
+            b'@' if b.get(i + 1) == Some(&b'$') => {
+                out.push((i, i + 1, HighlightScope::Keyword));
+                i += 1;
+            }
             b'-' if b.get(i + 1) == Some(&b'>') => {
+                out.push((i, i + 2, HighlightScope::Punctuation));
                 after = After::Arrow;
                 i += 2;
                 continue;
@@ -578,6 +610,14 @@ mod tests {
     }
 
     #[test]
+    fn error_suppression_marker_matches_directive_color() {
+        let src = "{{ @$permohonan->end_date }}";
+        let o = scan(src);
+        assert_eq!(texts(src, &o, HighlightScope::Keyword), ["@"]);
+        assert_eq!(texts(src, &o, HighlightScope::Variable), ["$permohonan"]);
+    }
+
+    #[test]
     fn raw_echo_and_function_calls() {
         let src = "{!! config('app.name', 'x') !!}";
         let o = scan(src);
@@ -602,7 +642,12 @@ mod tests {
         let o = scan(src);
         assert_eq!(
             texts(src, &o, HighlightScope::Keyword),
-            ["@yield", "@foreach", "as", "@endforeach"]
+            ["@", "yield", "@", "foreach", "as", "@", "endforeach"]
+        );
+        assert!(
+            texts(src, &o, HighlightScope::Punctuation)
+                .into_iter()
+                .all(|text| text != "@")
         );
         assert_eq!(
             texts(src, &o, HighlightScope::Variable),
@@ -659,7 +704,10 @@ mod tests {
     fn php_block_is_colored_and_claimed() {
         let src = "@php\n  $n = count($list);\n@endphp";
         let o = scan(src);
-        assert_eq!(texts(src, &o, HighlightScope::Keyword), ["@php", "@endphp"]);
+        assert_eq!(
+            texts(src, &o, HighlightScope::Keyword),
+            ["@", "php", "@", "endphp"]
+        );
         assert_eq!(texts(src, &o, HighlightScope::Variable), ["$n", "$list"]);
         assert_eq!(texts(src, &o, HighlightScope::Function), ["count"]);
         assert_eq!(claimed(src, &o)[0], "@php\n  $n = count($list);\n");
@@ -671,7 +719,7 @@ mod tests {
         let o = scan(src);
         assert_eq!(
             texts(src, &o, HighlightScope::Keyword),
-            ["@verbatim", "@endverbatim"]
+            ["@", "verbatim", "@", "endverbatim"]
         );
         assert!(texts(src, &o, HighlightScope::Variable).is_empty());
     }
@@ -697,6 +745,13 @@ mod tests {
         assert_eq!(texts(src, &o, HighlightScope::Type), ["Str", "Foo"]);
         assert_eq!(texts(src, &o, HighlightScope::Constant), ["BAR", "true"]);
         assert_eq!(texts(src, &o, HighlightScope::Number), ["3"]);
+        assert_eq!(
+            texts(src, &o, HighlightScope::Punctuation)
+                .iter()
+                .filter(|text| **text == "->")
+                .count(),
+            1
+        );
     }
 
     #[test]

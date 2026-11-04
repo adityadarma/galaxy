@@ -372,12 +372,17 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         editorView.onGitChangeClick = { [weak self] line in
             self?.toggleInlineGitHunk(at: line)
         }
+        editorView.onInlineHunkAction = { [weak self] action in
+            self?.handleInlineHunkAction(action)
+        }
         editorView.onSnippetInvalidated = { [weak self] in
             self?.snippetSession = nil
             self?.snippetDocumentKey = nil
         }
         editorView.onClickMove = { [weak self] before, after in
             guard let self, let tab = self.activeTab else { return }
+            self.signaturePopup.isHidden = true
+            self.lastSignatureRequest = nil
             _ = self.navHistory.recordJump(
                 from: NavLocation(key: tab.navKey, line: before.line, col: before.col),
                 to: NavLocation(key: tab.navKey, line: after.line, col: after.col))
@@ -440,6 +445,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             case let .workspaceIndexFinished(root, total, changed):
                 if self?.workspaceIndexState?.root == root { self?.workspaceIndexState = nil }
                 self?.statusBar.workspaceIndexFinished(root: root, total: total, changed: changed)
+            case let .phpIndexFinished(root, files):
+                self?.statusBar.phpIndexFinished(root: root, files: files)
             }
         }
         statusBar.onGitClick = { [weak self] in self?.showGitBranchPicker() }
@@ -617,6 +624,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                     let markers = problems.filter { $0.uri == "file://\(document.path())" }
                         .map { ($0.line, $0.severity) }
                     self.scrollView.diagnosticScroller.update(markers: markers, lineCount: document.lineCount())
+                    self.minimap.updateDiagnosticMarkers(markers)
                     // Redraw only when diagnostics change, not every 100 ms.
                     let revision = document.diagnosticsRevision()
                     if revision != self.lastDiagnosticsRevision {
@@ -955,6 +963,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             self?.openWorkspaceFile(workspace, entry, preview: false)
         }
         explorer.onRename = { [weak self] entry, name in self?.renameEntry(entry, to: name) }
+        explorer.onCreateNewItem = { [weak self] parent, folder, name in
+            self?.createExplorerItem(parent: parent, folder: folder, name: name)
+        }
         explorer.contextMenu = { [weak self] in self?.explorerContextMenu() }
         explorer.outlineView.onKey = { [weak self] event in self?.explorerKey(event) ?? false }
         pathBar.menuForComponent = { [weak self] index in self?.pathBarMenu(for: index) }
@@ -1000,20 +1011,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     var minimapEnabled = UserDefaults.standard.object(forKey: "Minimap") as? Bool ?? true
 
     var wordWrapEnabled = UserDefaults.standard.bool(forKey: "WordWrap")
-
-    /// Asks for a new item's name; `nil` cancels. Tests replace it.
-    var askNewName: (_ title: String, _ folder: String) -> String? = { title, folder in
-        let alert = NSAlert()
-        alert.messageText = title
-        alert.informativeText = folder.isEmpty ? "In the workspace root." : "In \(folder)."
-        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))
-        field.placeholderString = "Name (use / for subfolders)"
-        alert.accessoryView = field
-        alert.addButton(withTitle: "Create")
-        alert.addButton(withTitle: "Cancel")
-        alert.window.initialFirstResponder = field
-        return alert.runModal() == .alertFirstButtonReturn ? field.stringValue : nil
-    }
 
     /// Asks before moving `name` to the Trash. Tests replace it.
     var askConfirmDelete: (_ name: String, _ isFolder: Bool) -> Bool = { name, isFolder in

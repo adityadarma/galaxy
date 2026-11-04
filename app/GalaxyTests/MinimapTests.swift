@@ -41,6 +41,11 @@ final class MinimapTests: XCTestCase {
         XCTAssertEqual(MinimapView.line(atY: 9_999, offset: 0, lineCount: 100), 100)
     }
 
+    func testDiagnosticMarkerUsesTheSameScrolledOverviewCoordinates() {
+        XCTAssertEqual(MinimapView.markerY(line: 20, offset: 0), 40)
+        XCTAssertEqual(MinimapView.markerY(line: 20, offset: 12), 28)
+    }
+
     func testRunsSkipBlanksAndCapTheWidth() {
         func pairs(_ text: String) -> [[Int]] { MinimapView.runs(in: text).map { [$0.start, $0.end] } }
         XCTAssertEqual(pairs(""), [])

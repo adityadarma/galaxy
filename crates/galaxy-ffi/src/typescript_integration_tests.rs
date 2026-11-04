@@ -997,7 +997,7 @@ fn typescript_definition_follows_migration_table_callback_parameter() {
         .unwrap();
 
     assert!(core.request_definition(document.clone(), 3, 7));
-    let definition = core.definition_locations(document);
+    let definition = core.definition_locations(document.clone());
     assert_eq!(definition.len(), 1);
     assert_eq!((definition[0].line, definition[0].column), (2, 45));
 }
@@ -3166,6 +3166,40 @@ fn typescript_navigation_does_not_resolve_node_specifiers_without_local_types() 
         .open_document(path.to_string_lossy().into_owned())
         .unwrap();
     assert!(!core.request_definition(document, 0, 9));
+}
+
+#[test]
+fn typescript_navigation_resolves_bare_node_builtin_module_strings() {
+    let dir = tempfile::tempdir().unwrap();
+    let types = dir.path().join("node_modules/@types/node");
+    std::fs::create_dir_all(&types).unwrap();
+    std::fs::write(
+        types.join("package.json"),
+        r#"{"exports":{"./path":"./path.d.ts"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        types.join("path.d.ts"),
+        "declare const path: { sep: string };\nexport = path;\n",
+    )
+    .unwrap();
+    let path = dir.path().join("main.ts");
+    std::fs::write(&path, "import path from 'path';\n").unwrap();
+    let core = Core::new();
+    let document = core
+        .open_document(path.to_string_lossy().into_owned())
+        .unwrap();
+
+    assert!(core.request_definition(document.clone(), 0, 18));
+    let definition = core.definition_locations(document.clone());
+    assert_eq!(definition.len(), 1);
+    assert!(definition[0].uri.ends_with("@types/node/path.d.ts"));
+
+    assert!(core.request_definition(document.clone(), 0, 7));
+    let definition = core.definition_locations(document);
+    assert_eq!(definition.len(), 1);
+    assert!(definition[0].uri.ends_with("@types/node/path.d.ts"));
+    assert_eq!((definition[0].line, definition[0].column), (0, 14));
 }
 
 #[test]

@@ -22,6 +22,9 @@ final class ExplorerTests: XCTestCase {
         XCTAssertEqual(FileGlyph.style(for: "nginx.conf").0, "nginx")
         XCTAssertNil(FileGlyph.style(for: "logrotate").0)
         XCTAssertEqual(FileGlyph.style(for: "www.conf").0, "php")
+        XCTAssertEqual(FileGlyph.style(for: ".styleci.yml").1, "paintbrush.pointed")
+        XCTAssertEqual(FileGlyph.style(for: "phpunit.xml").1, "checkmark.seal")
+        XCTAssertEqual(FileGlyph.style(for: "pint.json").1, "paintbrush")
         XCTAssertEqual(FileGlyph.style(for: "firebase").0, "firebase")
         XCTAssertEqual(FileGlyph.style(for: "supabase").0, "supabase")
         XCTAssertEqual(FileGlyph.style(for: "vercel").0, "vercel")
@@ -292,7 +295,13 @@ final class ExplorerTests: XCTestCase {
             GitLineChangeInfo(line: 8, kind: .modified),
             GitLineChangeInfo(line: 8, kind: .deleted),
         ])
-        XCTAssertEqual(markers, [8: .deleted])
+        XCTAssertEqual(markers, [8: .modified])
+
+        let replacement = MainWindowController.gitLineMarkers([
+            GitLineChangeInfo(line: 26, kind: .deleted),
+            GitLineChangeInfo(line: 26, kind: .added),
+        ])
+        XCTAssertEqual(replacement, [26: .modified])
     }
 
     func testDraggingTheDividerResizesTheSidebar() throws {
@@ -546,33 +555,39 @@ final class ExplorerTests: XCTestCase {
         defer { controller.window?.orderOut(nil) }
         controller.open(url: root)
         let explorer = controller.explorer
-        var asked: [String] = []
-        var answer: String? = "lib.rs"
-        controller.askNewName = { _, folder in asked.append(folder); return answer }
+        func nameNewItem(_ name: String) throws {
+            let field = try XCTUnwrap(explorer.renameFieldForTesting)
+            let editor = try XCTUnwrap(field.currentEditor() as? NSTextView)
+            editor.string = name
+            editor.doCommand(by: #selector(NSResponder.insertNewline(_:)))
+        }
 
         // Nothing selected: root.
         controller.sectionHeader.newFileButton.performClick(nil)
+        XCTAssertEqual(explorer.renameFieldForTesting?.stringValue, "")
+        try nameNewItem("lib.rs")
         XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("lib.rs").path))
-        XCTAssertEqual(controller.tabBar.items.last?.title, "lib.rs", "a new file opens")
         XCTAssertEqual(explorer.selectedEntry?.relPath, "lib.rs", "and is selected in the tree")
 
         // Folder selected: inside it. A selected file means its folder.
         explorer.reveal(relPath: "src")
-        answer = "net"
         controller.sectionHeader.newFolderButton.performClick(nil)
+        XCTAssertEqual(explorer.renameFieldForTesting?.stringValue, "")
+        try nameNewItem("net")
         var isDir: ObjCBool = false
         XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("src/net").path, isDirectory: &isDir))
         XCTAssertTrue(isDir.boolValue)
         explorer.reveal(relPath: "src/main.rs")
-        answer = "util.rs"
         controller.explorerNewFile(nil)
+        try nameNewItem("util.rs")
         XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("src/util.rs").path))
-        XCTAssertEqual(asked, ["", "src", "src"])
 
-        // Cancel creates nothing; an existing name is refused, not overwritten.
-        answer = nil
+        // Escape removes the temporary item; an existing name is refused, not overwritten.
         let before = try FileManager.default.contentsOfDirectory(atPath: root.path).sorted()
         controller.explorerNewFile(nil)
+        let field = try XCTUnwrap(explorer.renameFieldForTesting)
+        try XCTUnwrap(field.currentEditor() as? NSTextView)
+            .doCommand(by: #selector(NSResponder.cancelOperation(_:)))
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path).sorted(), before)
         XCTAssertThrowsError(try controller.workspace!.createFile(parentRelPath: "", name: "README.md"))
         XCTAssertEqual(try String(contentsOf: root.appendingPathComponent("README.md"), encoding: .utf8), "# hi\n")

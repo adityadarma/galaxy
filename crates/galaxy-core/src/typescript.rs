@@ -316,7 +316,7 @@ pub struct DocumentIndex {
     /// of a script, or the `declare global` blocks and `export as namespace`
     /// of a module.
     pub global_names: Vec<String>,
-    export_assignment: bool,
+    export_assignment: Option<String>,
     namespace_members: Vec<NamespaceMemberUse>,
     symbols: Vec<SymbolOccurrences>,
     import_symbols: Vec<SymbolOccurrences>,
@@ -353,14 +353,15 @@ impl DocumentIndex {
         let mut dynamic_imports = Vec::new();
         let mut exports = Vec::new();
         let mut namespace_members = Vec::new();
-        let mut export_assignment = false;
+        let mut export_assignment = None;
 
         let mut cursor = root.walk();
         for node in root.named_children(&mut cursor) {
             match node.kind() {
                 "import_statement" => imports.push(import_from_node(text, node, &locations)),
                 "export_statement" => {
-                    export_assignment |= is_export_assignment(text, node);
+                    export_assignment =
+                        export_assignment.or_else(|| export_assignment_name(text, node));
                     index_export(text, node, &locations, &mut declarations, &mut exports);
                 }
                 _ => declarations
@@ -466,7 +467,7 @@ impl DocumentIndex {
     /// Whether the file has a top-level import or export, which keeps its
     /// declarations out of the global scope.
     pub fn is_module(&self) -> bool {
-        !self.imports.is_empty() || !self.exports.is_empty() || self.export_assignment
+        !self.imports.is_empty() || !self.exports.is_empty() || self.export_assignment.is_some()
     }
 
     /// Returns a literal dynamic import whose module string contains the cursor.
@@ -774,13 +775,27 @@ impl DocumentIndex {
     /// This covers declaration-merging packages such as `knex`, whose public
     /// `Knex` type is not represented by a named `export` statement.
     pub fn export_assignment_namespace(&self, name: &str) -> Option<&Declaration> {
-        if !self.diagnostics.is_empty() || !self.export_assignment {
+        if !self.diagnostics.is_empty() || self.export_assignment.is_none() {
             return None;
         }
         let declarations = self
             .declarations
             .iter()
             .filter(|item| item.name == name && item.kind == DeclarationKind::Namespace)
+            .collect::<Vec<_>>();
+        (declarations.len() == 1).then(|| declarations[0])
+    }
+
+    /// Resolves the local declaration assigned by CommonJS `export = name`.
+    pub fn export_assignment_declaration(&self) -> Option<&Declaration> {
+        if !self.diagnostics.is_empty() {
+            return None;
+        }
+        let name = self.export_assignment.as_deref()?;
+        let declarations = self
+            .declarations
+            .iter()
+            .filter(|item| item.name == name)
             .collect::<Vec<_>>();
         (declarations.len() == 1).then(|| declarations[0])
     }

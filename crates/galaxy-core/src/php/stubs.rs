@@ -123,6 +123,25 @@ impl Stubs {
     }
 }
 
+/// Names of global functions declared by the newest bundled PHP baseline.
+/// Syntax highlighting cannot depend on the open project's Composer version,
+/// so use the broadest supported built-in set.
+pub fn builtin_function_names() -> &'static [String] {
+    static NAMES: OnceLock<Vec<String>> = OnceLock::new();
+    NAMES.get_or_init(|| {
+        let mut names = Stubs::for_version(PhpVersion::V85)
+            .functions()
+            // Global PHP functions have a leading namespace separator, e.g.
+            // `\\strlen`; namespaced extension APIs have another separator.
+            .filter(|function| !function.fqn.trim_start_matches('\\').contains('\\'))
+            .map(|function| function.name.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        names
+    })
+}
+
 /// `true` for paths of stub declarations.
 pub fn is_stub_path(path: &Path) -> bool {
     path.to_str().is_some_and(|path| path.starts_with(SCHEME))
@@ -143,4 +162,17 @@ pub fn materialize(path: &Path) -> Option<PathBuf> {
         std::fs::write(&target, text).ok()?;
     }
     Some(target)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builtin_names_include_global_core_and_extension_functions() {
+        let names = builtin_function_names();
+        assert!(names.binary_search(&"strlen".to_string()).is_ok());
+        assert!(names.binary_search(&"sprintf".to_string()).is_ok());
+        assert!(names.binary_search(&"preg_quote".to_string()).is_ok());
+    }
 }

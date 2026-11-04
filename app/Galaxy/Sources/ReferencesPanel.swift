@@ -26,6 +26,8 @@ final class ReferencesPanel: CardView, NSTableViewDataSource, NSTableViewDelegat
     private var snippets: [String: String] = [:]
     private var shownLocations: [DefinitionLocation] = []
     private var shownTitle = ""
+    private var shownItemName = "reference"
+    private var workspaceRoot: String?
     private var previewedLocation: DefinitionLocation?
     private let title = NSTextField(labelWithString: "References")
     private let count = NSTextField(labelWithString: "0 references")
@@ -53,10 +55,10 @@ final class ReferencesPanel: CardView, NSTableViewDataSource, NSTableViewDelegat
         setAccessibilityLabel("References Peek")
         setAccessibilityIdentifier("references-peek")
 
-        title.font = .systemFont(ofSize: 13, weight: .semibold)
-        count.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        title.font = .systemFont(ofSize: 14, weight: .semibold)
+        count.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
         count.textColor = .secondaryLabelColor
-        previewTitle.font = .systemFont(ofSize: 11, weight: .medium)
+        previewTitle.font = .systemFont(ofSize: 12, weight: .medium)
         previewTitle.textColor = .secondaryLabelColor
         previewTitle.lineBreakMode = .byTruncatingMiddle
 
@@ -102,7 +104,7 @@ final class ReferencesPanel: CardView, NSTableViewDataSource, NSTableViewDelegat
         column.resizingMask = .autoresizingMask
         table.addTableColumn(column)
         table.headerView = nil
-        table.rowHeight = 28
+        table.rowHeight = 26
         table.intercellSpacing = .zero
         table.backgroundColor = .clear
         table.dataSource = self
@@ -134,7 +136,7 @@ final class ReferencesPanel: CardView, NSTableViewDataSource, NSTableViewDelegat
             header.topAnchor.constraint(equalTo: topAnchor, constant: 6),
             header.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
             header.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
-            header.heightAnchor.constraint(equalToConstant: 24),
+            header.heightAnchor.constraint(equalToConstant: 22),
             split.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 4),
             split.leadingAnchor.constraint(equalTo: leadingAnchor),
             split.trailingAnchor.constraint(equalTo: trailingAnchor),
@@ -183,6 +185,8 @@ final class ReferencesPanel: CardView, NSTableViewDataSource, NSTableViewDelegat
         guard locations != shownLocations || panelTitle != shownTitle else { return }
         shownLocations = locations
         shownTitle = panelTitle
+        shownItemName = itemName
+        self.workspaceRoot = workspaceRoot
         previewedLocation = nil
         title.stringValue = panelTitle
         snippets = [:]
@@ -210,6 +214,8 @@ final class ReferencesPanel: CardView, NSTableViewDataSource, NSTableViewDelegat
         guard count.stringValue != status || preview.plainText != detail else { return }
         shownLocations = []
         shownTitle = "References"
+        shownItemName = "reference"
+        workspaceRoot = nil
         title.stringValue = "References"
         groups = []
         rows = []
@@ -231,7 +237,12 @@ final class ReferencesPanel: CardView, NSTableViewDataSource, NSTableViewDelegat
         gutterWidth: CGFloat? = nil,
         stickyScopes: ((Int) -> [Int])? = nil
     ) {
-        previewTitle.stringValue = "\((path as NSString).lastPathComponent):\(location.line + 1):\(location.column + 1)"
+        let name = (path as NSString).lastPathComponent
+        let directory = ProblemsPanel.displayDirectory(for: path, workspaceRoot: workspaceRoot)
+        title.stringValue = "\(name)  \(directory) - \(shownTitle)"
+        count.stringValue = "(\(shownLocations.count))"
+        count.toolTip = "\(shownLocations.count) \(shownItemName)\(shownLocations.count == 1 ? "" : "s")"
+        previewTitle.stringValue = "\(location.line + 1):\(location.column + 1)"
         let (attributed, lineRanges) = attributedPreview(text: text, styles: styles)
         previewRuler.update(
             lineRanges: lineRanges,
@@ -247,9 +258,11 @@ final class ReferencesPanel: CardView, NSTableViewDataSource, NSTableViewDelegat
             attributed.addAttribute(.backgroundColor, value: NSColor.selectedTextBackgroundColor.withAlphaComponent(0.22), range: range)
         }
         preview.update(attributed: attributed, lineRanges: lineRanges, selectedLine: Int(location.line))
+        previewScroll.layoutSubtreeIfNeeded()
         let clipView = previewScroll.contentView
         let centeredY = max(0, preview.y(forLine: Int(location.line)) - clipView.bounds.height / 2)
-        clipView.scroll(to: NSPoint(x: 0, y: centeredY))
+        let target = NSRect(origin: NSPoint(x: 0, y: centeredY), size: clipView.bounds.size)
+        clipView.scroll(to: clipView.constrainBoundsRect(target).origin)
         previewScroll.reflectScrolledClipView(clipView)
         preview.updateVisibleLines()
         if let group = groups.first(where: { URL(string: $0.uri)?.path == path }) {
@@ -283,7 +296,7 @@ final class ReferencesPanel: CardView, NSTableViewDataSource, NSTableViewDelegat
     private func scrollPreview(toLine line: Int, above pinned: Int) {
         let clip = previewScroll.contentView
         let y = preview.y(forLine: line) - CGFloat(pinned) * preview.rowHeight
-        let target = NSRect(origin: NSPoint(x: clip.bounds.origin.x, y: y), size: clip.bounds.size)
+        let target = NSRect(origin: NSPoint(x: 0, y: y), size: clip.bounds.size)
         clip.scroll(to: clip.constrainBoundsRect(target).origin)
         previewScroll.reflectScrolledClipView(clip)
     }
@@ -339,9 +352,9 @@ final class ReferencesPanel: CardView, NSTableViewDataSource, NSTableViewDelegat
     func numberOfRows(in tableView: NSTableView) -> Int { rows.count }
 
     func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
-        guard rows.indices.contains(row) else { return 28 }
-        if case .file = rows[row] { return 30 }
-        return 28
+        guard rows.indices.contains(row) else { return 26 }
+        if case .file = rows[row] { return 28 }
+        return 26
     }
 
     func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
@@ -464,7 +477,7 @@ final class ReferencesResultCell: NSTableCellView {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         for label in [locationLabel, sourceLabel] {
-            label.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
+            label.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
             label.lineBreakMode = .byTruncatingTail
             label.maximumNumberOfLines = 1
             addSubview(label)
@@ -487,10 +500,10 @@ final class ReferencesResultCell: NSTableCellView {
 
     override func layout() {
         super.layout()
-        let locationWidth: CGFloat = 58
-        let sourceX: CGFloat = 84
-        locationLabel.frame = NSRect(x: 12, y: 5, width: locationWidth, height: 18)
-        sourceLabel.frame = NSRect(x: sourceX, y: 5, width: max(0, bounds.width - sourceX - 10), height: 18)
+        let locationWidth: CGFloat = 52
+        let sourceX: CGFloat = 70
+        locationLabel.frame = NSRect(x: 8, y: 3, width: locationWidth, height: 20)
+        sourceLabel.frame = NSRect(x: sourceX, y: 3, width: max(0, bounds.width - sourceX - 8), height: 20)
     }
 }
 
@@ -515,7 +528,7 @@ final class ReferencesFileCell: NSTableCellView {
         directoryLabel.font = .systemFont(ofSize: 12, weight: .medium)
         directoryLabel.textColor = .secondaryLabelColor
         directoryLabel.lineBreakMode = .byTruncatingMiddle
-        countLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
+        countLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .semibold)
         countLabel.alignment = .right
     }
 
@@ -535,21 +548,21 @@ final class ReferencesFileCell: NSTableCellView {
     override func layout() {
         super.layout()
         let countWidth: CGFloat = 24
-        let contentWidth = max(0, bounds.width - 12 - 16 - countWidth - 10)
+        let contentWidth = max(0, bounds.width - 8 - 16 - countWidth - 8)
         let measuredName = ceil(nameLabel.intrinsicContentSize.width)
         let nameWidth = min(measuredName, max(72, contentWidth * 0.55))
         let nameX: CGFloat = 30
-        let directoryX = nameX + nameWidth + 10
-        let countX = max(directoryX, bounds.width - countWidth - 10)
-        disclosureLabel.frame = NSRect(x: 12, y: 5, width: 14, height: 20)
-        nameLabel.frame = NSRect(x: nameX, y: 5, width: nameWidth, height: 20)
+        let directoryX = nameX + nameWidth + 6
+        let countX = max(directoryX, bounds.width - countWidth - 8)
+        disclosureLabel.frame = NSRect(x: 8, y: 3, width: 14, height: 22)
+        nameLabel.frame = NSRect(x: nameX, y: 3, width: nameWidth, height: 22)
         directoryLabel.frame = NSRect(
             x: directoryX,
-            y: 5,
+            y: 3,
             width: max(0, countX - directoryX - 8),
-            height: 20
+            height: 22
         )
-        countLabel.frame = NSRect(x: countX, y: 5, width: countWidth, height: 20)
+        countLabel.frame = NSRect(x: countX, y: 3, width: countWidth, height: 22)
     }
 }
 
@@ -589,7 +602,7 @@ private final class ReferencesPreviewView: NSView {
     var onViewportChange: (() -> Void)?
     private static let stickyLimit = 3
     var rowHeight: CGFloat { lineHeight }
-    private var lineHeight: CGFloat { ceil(NSLayoutManager().defaultLineHeight(for: Theme.editorFont)) }
+    private var lineHeight: CGFloat { ceil(NSLayoutManager().defaultLineHeight(for: Theme.editorFont) + Theme.editorLineSpacing) }
     var hasSyntaxHighlighting: Bool {
         let base = Theme.editorForeground.resolved(for: effectiveAppearance)
         var highlighted = false
@@ -899,8 +912,6 @@ private final class ReferencesStickyView: NSView {
             row.text.draw(at: NSPoint(x: gutterWidth, y: top))
             NSGraphicsContext.restoreGraphicsState()
         }
-        NSColor.separatorColor.setFill()
-        NSRect(x: gutterWidth - 1, y: 0, width: 1, height: bounds.height).fill()
     }
 }
 
@@ -997,7 +1008,5 @@ private final class ReferencesLineNumberRuler: NSRulerView {
                 withAttributes: attributes
             )
         }
-        NSColor.separatorColor.setFill()
-        NSRect(x: ruleThickness - 1, y: rect.minY, width: 1, height: rect.height).fill()
     }
 }

@@ -249,6 +249,19 @@ pub(super) fn typescript_import_target(
                 })
         })
         .or_else(|| ambient_module_location(cache, &target_path, &import.specifier, imported_name))
+        .or_else(|| {
+            (binding.kind == ImportKind::Default).then(|| {
+                cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .index(&target_path)
+                    .and_then(|index| index.export_assignment_declaration().cloned())
+                    .map(|declaration| LspDefinitionLocation {
+                        uri: file_uri(&target_path),
+                        range: typescript_range(declaration.range),
+                    })
+            })?
+        })
         .unwrap_or_else(|| module_root_location(&target_path));
     Some((location, occurrences.occurrences))
 }
@@ -1293,7 +1306,7 @@ pub(super) fn resolve_typescript_import_uncached(
     if javascript::is_relative_typescript_specifier(specifier) {
         return javascript::resolve_relative_import(specifier, importer);
     }
-    if specifier.starts_with("node:") {
+    if javascript::is_node_builtin_specifier(specifier) {
         return javascript::resolve_node_types_specifier(specifier, importer);
     }
     let project = javascript::TypeScriptProject::detect(importer)?;

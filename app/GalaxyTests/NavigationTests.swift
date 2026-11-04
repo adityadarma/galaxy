@@ -664,6 +664,43 @@ final class NavigationTests: XCTestCase {
         XCTAssertNotNil(range("\\Illuminate\\Support\\Facades\\Log::channel('queue')", "'queue'"))
         XCTAssertNotNil(range("$path = storage_path('logs/x.log');", "'logs/x.log'"))
         XCTAssertNotNil(range("$this->lang->get('auth.failed')", "'auth.failed'"))
+        XCTAssertNotNil(range("Route::middleware('auth:sanctum')->group(fn () => null);", "'auth:sanctum'"))
+        XCTAssertNotNil(range("Route::get('/')->middleware('auth');", "'auth'"))
+        XCTAssertNotNil(range("Route::get('/')->withoutMiddleware('auth');", "'auth'"))
+        XCTAssertNotNil(range("Route::post('/register', 'Api\\AuthController@register');", "'Api\\AuthController@register'"))
+        XCTAssertNotNil(range("Asset::with(['detailPemanfaatanAsetActive.pemanfaatan', 'unitPengelolaBarang'])", "'detailPemanfaatanAsetActive.pemanfaatan'"))
+    }
+
+    func testEloquentRelationHoverUnderlinesOnlyThePointedSegment() {
+        let text = "Asset::with('asetDisewa.pemanfaatan.permohonan.objekSewaAsetPublik')"
+        let literal = (text as NSString).range(of: "'asetDisewa.pemanfaatan.permohonan.objekSewaAsetPublik'")
+        let start = literal.location
+        let end = literal.location + literal.length
+        let segment = EditorView.eloquentRelationSegmentRange(
+            in: text, stringStart: start, stringEnd: end,
+            at: (text as NSString).range(of: "permohonan").location + 2
+        )
+        XCTAssertEqual((text as NSString).substring(with: NSRange(segment ?? 0..<0)), "permohonan")
+    }
+
+    func testEloquentRelationOnItsOwnLineOfAMultilineArrayIsALink() {
+        let text = "$a = Aset::select([\n    'id',\n])\n    ->with([\n        'detailKibD',\n        'objekSewaActive.hargaObjek',\n    ])"
+        let ns = text as NSString
+        let literal = ns.range(of: "'objekSewaActive.hargaObjek'")
+        let range = EditorView.frameworkStringRange(
+            in: text, stringStart: literal.location, stringEnd: literal.location + literal.length
+        )
+        XCTAssertNotNil(range)
+        let segment = EditorView.eloquentRelationSegmentRange(
+            in: text, stringStart: literal.location, stringEnd: literal.location + literal.length,
+            at: ns.range(of: "hargaObjek").location + 2
+        )
+        XCTAssertEqual(ns.substring(with: NSRange(segment ?? 0..<0)), "hargaObjek")
+        // A column list before it is not a relation list.
+        let column = ns.range(of: "'id'")
+        XCTAssertNil(EditorView.frameworkStringRange(
+            in: text, stringStart: column.location, stringEnd: column.location + column.length
+        ))
     }
 
     func testCodeIgniterAndSymfonyStringsAreLinks() {

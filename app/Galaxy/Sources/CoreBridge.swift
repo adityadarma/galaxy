@@ -125,9 +125,36 @@ final class CoreBridge {
         }
     }
 
+    /// Reads completion results after the engine work already queued for this
+    /// document. Never synchronously wait for that queue on AppKit's thread.
+    func readCompletions(
+        document: DocumentHandle,
+        completion: @escaping @MainActor @Sendable ([CompletionInfo]) -> Void
+    ) {
+        let core = core
+        completionQueue.async {
+            let items = core.completions(document: document)
+            Task { @MainActor in completion(items) }
+        }
+    }
+
     func snippetCompletions(document: DocumentHandle) -> [CompletionInfo] {
         completionQueue.sync {
             document.snippetCompletions()
+        }
+    }
+
+    /// Snippet metadata shares the Rust document handle with completion, so
+    /// keep it serialized but never make a keystroke wait for it.
+    func readSnippetCompletions(
+        document: DocumentHandle,
+        prefix: String,
+        completion: @escaping @MainActor @Sendable ([CompletionInfo]) -> Void
+    ) {
+        completionQueue.async {
+            let items = document.snippetCompletions()
+                .filter { $0.label.lowercased().hasPrefix(prefix.lowercased()) }
+            Task { @MainActor in completion(items) }
         }
     }
 

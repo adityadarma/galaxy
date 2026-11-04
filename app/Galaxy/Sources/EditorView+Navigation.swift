@@ -106,13 +106,19 @@ extension EditorView {
         window?.makeFirstResponder(self)
         if document.hasMarkedText() { inputContext?.discardMarkedText() }
         let local = convert(event.locationInWindow, from: nil)
+        // The peek zone swallows clicks; its header buttons act.
+        if let hit = inlineHunkHit(at: local) {
+            if case .button(let action) = hit { onInlineHunkAction?(action) }
+            return
+        }
         let pos = textPosition(at: local)
         // The "..." after a folded line opens it again.
         if event.clickCount == 1, let hit = foldPillRects.first(where: { $0.value.contains(local) }) {
             toggleFold(line: UInt64(hit.key))
             return
         }
-        if local.x >= gutterShift, local.x < gutterShift + 4,
+        let barMinX = gutterShift + gutterRight + Self.gitBarOffset - 2
+        if local.x >= barMinX, local.x < barMinX + Self.gitBarWidth + 4,
            gitLineChanges[pos.line + 1] != nil, event.clickCount == 1 {
             onGitChangeClick?(pos.line)
             return
@@ -208,15 +214,33 @@ extension EditorView {
         return pos
     }
 
-    /// Arrow over the line numbers, I-beam (or link hand) over the text.
+    /// Arrow over line numbers, I-beam (or link hand) over text, and a hand
+    /// over active peek-header actions.
     override func resetCursorRects() {
+        func addCursorRectIfValid(_ rect: NSRect, cursor: NSCursor) {
+            // AppKit asks for cursor rects while restoring layout after sleep
+            // and can briefly expose an empty or non-finite visible rect.
+            // Passing either through addCursorRect raises an Objective-C
+            // exception inside NSTrackingArea on macOS 26.
+            guard rect.width > 0, rect.height > 0,
+                  rect.minX.isFinite, rect.minY.isFinite,
+                  rect.maxX.isFinite, rect.maxY.isFinite else { return }
+            addCursorRect(rect, cursor: cursor)
+        }
         let edge = gutterWidth + gutterShift
         let gutter = NSRect(x: gutterShift, y: visibleRect.minY, width: gutterWidth, height: visibleRect.height)
             .intersection(visibleRect)
         let text = NSRect(x: edge, y: visibleRect.minY,
-                          width: max(0, visibleRect.maxX - edge), height: visibleRect.height)
-        addCursorRect(gutter, cursor: .arrow)
-        addCursorRect(text, cursor: definitionLink == nil ? .iBeam : .pointingHand)
+                           width: max(0, visibleRect.maxX - edge), height: visibleRect.height)
+        addCursorRectIfValid(gutter, cursor: .arrow)
+        addCursorRectIfValid(text, cursor: definitionLink == nil ? .iBeam : .pointingHand)
+        if let hunk = inlineGitHunk {
+            let top = inlineHunkTop(hunk)
+            for button in inlineHunkButtonRects(top: top)
+            where Self.inlineHunkActionIsEnabled(button.action, hunk: hunk) {
+                addCursorRectIfValid(button.rect.intersection(visibleRect), cursor: .pointingHand)
+            }
+        }
     }
 
     /// Shows or clears the Cmd-hover link for the word under the mouse.
@@ -414,7 +438,26 @@ extension EditorView {
             // Tree-sitter styles a template literal as one string run, including
             // its `${...}` expression. That expression is code, not string text.
             if Self.isTemplateInterpolation(in: text, at: range.lowerBound) { return qualified(range, in: text, document: document) }
-            return Self.frameworkStringRange(in: text, stringStart: Int(run.start), stringEnd: Int(run.end))
+            let stringStart = Int(run.start), stringEnd = Int(run.end)
+            // An array element on its own line (`'detailKibD',`) belongs to a
+            // call opened on an earlier line, so look at the lines above too.
+            var source = text, offset = 0
+            if Self.frameworkStringRange(in: text, stringStart: stringStart, stringEnd: stringEnd) == nil,
+               Self.isPHP(document), pos.line > 0,
+               text.utf16.prefix(stringStart).allSatisfy({ $0 == 0x20 || $0 == 0x09 }) {
+                let first = pos.line > 400 ? pos.line - 400 : 0
+                let prefix = (first..<pos.line).map { document.displayLine(line: $0) }.joined(separator: "\n") + "\n"
+                source = prefix + text
+                offset = prefix.utf16.count
+            }
+            guard let range = Self.frameworkStringRange(
+                in: source, stringStart: offset + stringStart, stringEnd: offset + stringEnd
+            ) else { return nil }
+            let segment = Self.eloquentRelationSegmentRange(
+                in: source, stringStart: offset + stringStart, stringEnd: offset + stringEnd,
+                at: offset + Int(pos.colUtf16)
+            ) ?? range
+            return (segment.lowerBound - offset)..<(segment.upperBound - offset)
         }
         return qualified(range, in: text, document: document)
     }
@@ -520,9 +563,18 @@ extension EditorView {
     static let frameworkStringMethods: Set<String> = [
         "get", "getMany", "string", "integer", "boolean", "float", "array", "prepend", "push", "has",
         "hasForLocale", "choice", "disk", "fake", "persistentFake", "forgetDisk", "make", "view", "render",
-        "modal", "inertia", "asset", "route", "channel",
+        "modal", "inertia", "asset", "route", "channel", "middleware", "withoutMiddleware", "withoutmiddleware",
+        "with", "load", "loadMissing", "has", "orHas", "doesntHave", "orDoesntHave", "whereHas", "orWhereHas",
+        "whereDoesntHave", "withCount", "withSum", "withAvg", "withMin", "withMax", "withExists", "loadCount",
+        "without", "withWhereRelation", "whereHasMorph", "whereRelation",
         "generateUrl", "redirectToRoute", "generate", "renderView", "renderForm", "renderBlock",
         "getParameter", "trans", "htmlTemplate", "textTemplate",
+    ]
+
+    static let eloquentRelationMethods: Set<String> = [
+        "with", "load", "loadMissing", "has", "orHas", "doesntHave", "orDoesntHave", "whereHas", "orWhereHas",
+        "whereDoesntHave", "withCount", "withSum", "withAvg", "withMin", "withMax", "withExists", "loadCount",
+        "without", "withWhereRelation", "whereHasMorph", "whereRelation",
     ]
 
     /// The call a string literal is the first argument of: the function or
@@ -601,7 +653,11 @@ extension EditorView {
     static func frameworkStringRange(in text: String, stringStart: Int, stringEnd: Int) -> Range<Int>? {
         let units = Array(text.utf16)
         guard stringStart >= 0, stringEnd <= units.count, stringEnd - stringStart >= 2,
-              let call = stringCall(in: text, stringStart: stringStart) else { return nil }
+              let call = stringCall(in: text, stringStart: stringStart) else {
+            guard isRouteActionString(in: text, stringStart: stringStart)
+                    || isEloquentRelationArrayString(in: text, stringStart: stringStart) else { return nil }
+            return stringContentsRange(in: units, start: stringStart, end: stringEnd)
+        }
         if call.isMethod {
             guard frameworkStringMethods.contains(call.name) else { return nil }
             // `channel` is only resolvable on the Log facade.
@@ -609,10 +665,83 @@ extension EditorView {
         } else {
             guard frameworkStringHelpers.contains(call.name) else { return nil }
         }
-        let first = units[stringStart], last = units[stringEnd - 1]
+        return stringContentsRange(in: units, start: stringStart, end: stringEnd)
+    }
+
+    private static func stringContentsRange(in units: [UInt16], start: Int, end: Int) -> Range<Int>? {
+        let first = units[start], last = units[end - 1]
         let quotes: Set<UInt16> = [UInt16(UInt8(ascii: "'")), UInt16(UInt8(ascii: "\""))]
-        let inner = quotes.contains(first) && first == last ? (stringStart + 1)..<(stringEnd - 1) : stringStart..<stringEnd
+        let inner = quotes.contains(first) && first == last ? (start + 1)..<(end - 1) : start..<end
         return inner.isEmpty ? nil : inner
+    }
+
+    /// Legacy Laravel route actions are the second argument to `Route::get`,
+    /// unlike framework helper strings which are always the first argument.
+    private static func isRouteActionString(in text: String, stringStart: Int) -> Bool {
+        let units = Array(text.utf16)
+        var i = stringStart - 1
+        while i >= 0, units[i] == 0x20 { i -= 1 }
+        guard i >= 0, units[i] == UInt16(UInt8(ascii: ",")) else { return false }
+        i -= 1
+        var depth = 0
+        while i >= 0 {
+            if units[i] == UInt16(UInt8(ascii: ")")) {
+                depth += 1
+            } else if units[i] == UInt16(UInt8(ascii: "(")) {
+                if depth == 0 {
+                    let call = stringCall(in: text, stringStart: i + 1)
+                    return call?.receiver?.caseInsensitiveCompare("Route") == .orderedSame
+                        && ["get", "post", "put", "patch", "delete", "match", "any"].contains(call?.name.lowercased() ?? "")
+                }
+                depth -= 1
+            }
+            i -= 1
+        }
+        return false
+    }
+
+    /// Eloquent accepts relation names in an array, e.g. `with(['author.posts'])`.
+    private static func isEloquentRelationArrayString(in text: String, stringStart: Int) -> Bool {
+        let units = Array(text.utf16)
+        var i = stringStart - 1
+        var brackets = 0
+        while i >= 0 {
+            if units[i] == UInt16(UInt8(ascii: "]")) {
+                brackets += 1
+            } else if units[i] == UInt16(UInt8(ascii: "[")) {
+                if brackets == 0 { break }
+                brackets -= 1
+            }
+            i -= 1
+        }
+        guard i >= 0 else { return false }
+        i -= 1
+        while i >= 0 {
+            if units[i] == UInt16(UInt8(ascii: "(")) {
+                guard let call = stringCall(in: text, stringStart: i + 1) else { return false }
+                return call.isMethod && eloquentRelationMethods.contains(call.name)
+            }
+            i -= 1
+        }
+        return false
+    }
+
+    /// The dotted Eloquent relation segment under the pointer. The backend
+    /// follows preceding segments to resolve the owner of this method.
+    static func eloquentRelationSegmentRange(
+        in text: String, stringStart: Int, stringEnd: Int, at column: Int
+    ) -> Range<Int>? {
+        let call = stringCall(in: text, stringStart: stringStart)
+        guard (call?.isMethod == true && eloquentRelationMethods.contains(call!.name))
+                || isEloquentRelationArrayString(in: text, stringStart: stringStart),
+              let contents = stringContentsRange(in: Array(text.utf16), start: stringStart, end: stringEnd),
+              contents.contains(column) else { return nil }
+        let units = Array(text.utf16)
+        var start = column
+        while start > contents.lowerBound, units[start - 1] != UInt16(UInt8(ascii: ".")) { start -= 1 }
+        var end = column
+        while end < contents.upperBound, units[end] != UInt16(UInt8(ascii: ".")) { end += 1 }
+        return start < end ? start..<end : nil
     }
 
     /// UTF-16 range of the identifier touching `column` (letters, digits,
