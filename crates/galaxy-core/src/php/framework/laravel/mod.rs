@@ -80,6 +80,14 @@ impl Framework for LaravelFramework {
         "laravel"
     }
 
+    fn owns_template(&self, path: &Path) -> bool {
+        self.index.is_some()
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(blade::is_blade_name)
+    }
+
     fn owns_string(&self, text: &str, byte: usize) -> bool {
         self.index.is_some() && in_string(text, byte, false)
     }
@@ -184,9 +192,15 @@ mod tests {
 
     #[test]
     fn artisan_makes_an_application_with_an_index() {
-        let dir = project(&[("artisan", "<?php")]);
+        let dir = project(&[("artisan", "<?php"), ("bootstrap/app.php", "<?php")]);
         let found = LaravelFramework::detect(dir.path()).expect("detected");
         assert!(found.index().is_some());
+    }
+
+    #[test]
+    fn artisan_without_laravel_bootstrap_is_not_an_application() {
+        let dir = project(&[("artisan", "<?php")]);
+        assert!(LaravelFramework::detect(dir.path()).is_none());
     }
 
     #[test]

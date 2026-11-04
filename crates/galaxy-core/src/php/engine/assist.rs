@@ -8,7 +8,6 @@ use super::{
 };
 use crate::lang::{Action, Edit, OutlineSymbol, Signature};
 use crate::parameter_hints::{self, Argument, Parameter, ParameterHint};
-use crate::php::framework;
 use crate::php::parse::{ClassKind, FileSymbols, MemberKind, parse_file, parse_with_tree};
 
 const MAX_IMPORT_CHOICES: usize = 8;
@@ -350,7 +349,7 @@ impl PhpEngine {
     pub fn actions(&mut self, path: &Path, text: &str, line: u32, column: u32) -> Vec<Action> {
         let previous = self.register_current(path, text);
         let mut out = Vec::new();
-        let template = framework::is_template(path);
+        let template = self.is_template(path);
         if let Some(byte) = byte_offset(text, line, column) {
             if !template {
                 self.import_actions(path, text, byte, &mut out);

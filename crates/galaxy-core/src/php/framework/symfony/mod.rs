@@ -280,10 +280,10 @@ localized:
     }
 
     #[test]
-    fn detects_by_console_and_bundles_or_lock() {
+    fn detects_by_console_and_bundles_or_lock_with_framework_dependency() {
         let dir = project(&[("bin/console", "<?php"), ("config/bundles.php", "<?php")]);
         assert!(Index::detect(dir.path()).is_some());
-        let dir = project(&[("symfony.lock", "{}")]);
+        let dir = project(&[("symfony.lock", "{}"), ("composer.json", COMPOSER)]);
         assert!(Index::detect(dir.path()).is_some());
     }
 
@@ -295,6 +295,7 @@ localized:
             vec![("bin/console", "<?php")],
             vec![("config/bundles.php", "<?php")],
             vec![("artisan", "<?php")],
+            vec![("symfony.lock", "{}")],
             vec![("composer.json", "not json")],
             vec![],
         ] {
@@ -635,7 +636,7 @@ class A {
 
     #[test]
     fn walks_are_capped() {
-        let dir = project(&[("symfony.lock", "{}")]);
+        let dir = project(&[("symfony.lock", "{}"), ("composer.json", COMPOSER)]);
         let templates = dir.path().join("templates");
         std::fs::create_dir_all(&templates).unwrap();
         for i in 0..20_050 {

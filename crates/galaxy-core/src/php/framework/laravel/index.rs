@@ -75,9 +75,10 @@ fn kebab(name: &str) -> String {
 
 impl Index {
     /// The index of the Laravel application at `root`; `None` for any other
-    /// project (no `artisan` script).
+    /// project (without Laravel's application structure).
     pub fn detect(root: &Path) -> Option<Self> {
-        root.join("artisan").is_file().then(|| Self::build(root))
+        (root.join("artisan").is_file() && root.join("bootstrap/app.php").is_file())
+            .then(|| Self::build(root))
     }
 
     pub fn build(root: &Path) -> Self {

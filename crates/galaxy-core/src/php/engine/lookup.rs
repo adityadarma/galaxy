@@ -36,7 +36,7 @@ impl PhpEngine {
                 return EMPTY.get_or_init(HashMap::new);
             }
             self.scanned = Some(if self.autoload.is_empty() {
-                scan_sources(&self.root)
+                scan_sources(&self.root, self.is_framework("laravel"))
                     .into_iter()
                     .map(|(fqn, path)| (fqn.to_lowercase(), path))
                     .collect()

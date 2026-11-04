@@ -271,7 +271,7 @@ impl Index {
 // Detection
 
 fn is_symfony(root: &Path) -> bool {
-    root.join("symfony.lock").is_file()
+    (root.join("symfony.lock").is_file() && composer_requires_symfony(root))
         || (root.join("bin/console").is_file() && root.join("config/bundles.php").is_file())
         || composer_requires_symfony(root)
 }

@@ -475,7 +475,7 @@ pub(super) fn name_start(bytes: &[u8], mut i: usize) -> usize {
 }
 
 /// Class declarations of a project that has no Composer autoload data.
-pub(super) fn scan_sources(root: &Path) -> Vec<(String, PathBuf)> {
+pub(super) fn scan_sources(root: &Path, skip_blade_templates: bool) -> Vec<(String, PathBuf)> {
     static NAMESPACE: OnceLock<Regex> = OnceLock::new();
     static CLASS: OnceLock<Regex> = OnceLock::new();
     let namespace = NAMESPACE
@@ -506,7 +506,10 @@ pub(super) fn scan_sources(root: &Path) -> Vec<(String, PathBuf)> {
                 {
                     stack.push((entry.path(), depth + 1));
                 }
-            } else if name.ends_with(".php") && !framework::is_template_name(name) {
+            } else if name.ends_with(".php")
+                && !(skip_blade_templates
+                    && crate::php::framework::laravel::blade::is_blade_name(name))
+            {
                 budget = budget.saturating_sub(1);
                 if budget == 0 {
                     return out;

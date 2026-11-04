@@ -101,13 +101,14 @@ pub fn build(root: &Path) -> Built {
 
 fn build_inner(root: &Path) -> Built {
     let autoload = Autoload::load(root);
+    let frameworks = framework::detect_all(root);
     let (mut names, mut files) = autoload.indexed_classes();
     if let VersionSelection::Supported(version) = for_project(root) {
         names.extend(Stubs::for_version(version).class_names().iter().cloned());
     }
     let mut scanned = HashMap::new();
     if autoload.is_empty() {
-        for (fqn, path) in scan_sources(root) {
+        for (fqn, path) in scan_sources(root, frameworks.iter().any(|fw| fw.name() == "laravel")) {
             let short = fqn.rsplit('\\').next().unwrap_or(&fqn).to_owned();
             names.push(ClassName {
                 short,
@@ -123,7 +124,7 @@ fn build_inner(root: &Path) -> Built {
         names,
         files,
         scanned,
-        frameworks: framework::detect_all(root),
+        frameworks,
     }
 }
 
@@ -210,6 +211,13 @@ impl PhpEngine {
     /// `true` when the project uses the framework called `name`.
     pub fn is_framework(&self, name: &str) -> bool {
         self.frameworks.iter().any(|fw| fw.name() == name)
+    }
+
+    /// Whether an active framework owns `path` as a non-PHP template.
+    pub(super) fn is_template(&self, path: &Path) -> bool {
+        self.frameworks
+            .iter()
+            .any(|framework| framework.owns_template(path))
     }
 
     /// An engine that reads nothing yet: Composer data and class names

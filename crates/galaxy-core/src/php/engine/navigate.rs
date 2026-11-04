@@ -17,7 +17,7 @@ impl PhpEngine {
         if let Some(targets) = named {
             return targets;
         }
-        if framework::is_template(path) {
+        if self.is_template(path) {
             return Vec::new();
         }
         self.with_symbol(path, text, line, column, |engine, _ctx, symbol, _range| {
@@ -57,7 +57,7 @@ impl PhpEngine {
         if named.is_some() {
             return named;
         }
-        if framework::is_template(path) {
+        if self.is_template(path) {
             return None;
         }
         self.with_symbol(path, text, line, column, |engine, ctx, symbol, range| {

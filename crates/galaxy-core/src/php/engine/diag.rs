@@ -12,7 +12,6 @@ use tree_sitter::Node;
 
 use super::{PhpEngine, position_of};
 use crate::lang::{Problem, Severity};
-use crate::php::framework;
 use crate::php::parse::{parse_with_tree, resolve_name};
 
 const MAX_PROBLEMS: usize = 200;
@@ -27,7 +26,7 @@ impl PhpEngine {
     /// Problems in `text`, the content of `path`.
     pub fn diagnostics(&mut self, path: &Path, text: &str) -> Vec<Problem> {
         let previous = self.register_current(path, text);
-        let mut out = if framework::is_template(path) {
+        let mut out = if self.is_template(path) {
             Vec::new()
         } else {
             self.diagnostics_inner(path, text)

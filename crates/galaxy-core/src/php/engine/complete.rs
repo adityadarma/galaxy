@@ -33,7 +33,7 @@ impl PhpEngine {
         let out = match answer {
             Some(items) => items,
             // Templates are not PHP: only a framework has anything to say.
-            None if framework::is_template(path) => Vec::new(),
+            None if self.is_template(path) => Vec::new(),
             // A string a framework handles but has no suggestion for.
             None if byte_offset(text, line, column)
                 .is_some_and(|byte| frameworks.iter().any(|fw| fw.owns_string(text, byte))) =>

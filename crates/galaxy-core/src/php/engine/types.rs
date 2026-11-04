@@ -390,13 +390,53 @@ impl PhpEngine {
                 args = Some(&s[pos + 1..close - 1]);
                 pos = close;
             }
-            let class = current.take()?;
+            if s[..start].trim() == "$this->"
+                && let Some(narrowed) = self.this_property_instanceof_type(ctx, name)
+            {
+                current = Some(narrowed);
+                continue;
+            }
+            let class = if s[..start].trim() == "$this->" {
+                current.take()?
+            } else {
+                current.take()?
+            };
             current = self.member_type(ctx, &class, name, args);
         }
         if !s[pos..].trim().is_empty() {
             return None;
         }
         current
+    }
+
+    /// Narrows `$this->property` inside an `if` or `elseif` body whose
+    /// condition proves that property is an instance of a specific class.
+    fn this_property_instanceof_type(&mut self, ctx: &Ctx<'_>, property: &str) -> Option<String> {
+        let cursor = ctx
+            .tree
+            .root_node()
+            .descendant_for_byte_range(ctx.byte, ctx.byte)?;
+        let mut node = Some(cursor);
+        while let Some(current) = node {
+            if matches!(current.kind(), "if_statement" | "else_if_clause") {
+                let condition = current.child_by_field_name("condition");
+                let body = current.child_by_field_name("body");
+                if let (Some(condition), Some(body)) = (condition, body)
+                    && ctx.byte >= body.start_byte()
+                    && ctx.byte <= body.end_byte()
+                {
+                    let property = regex::escape(property);
+                    let pattern = format!(r"\$this\s*->\s*{property}\s+instanceof\s+([\w\\]+)");
+                    if let Ok(re) = Regex::new(&pattern)
+                        && let Some(caps) = re.captures(&ctx.src[condition.byte_range()])
+                    {
+                        return self.class_ref(ctx, &caps[1]);
+                    }
+                }
+            }
+            node = current.parent();
+        }
+        None
     }
 
     /// What `$name()` returns when `$name` was assigned a closure: the type

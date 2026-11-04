@@ -41,6 +41,11 @@ pub trait Framework: Send + Sync + std::fmt::Debug {
     /// Stable lowercase name, e.g. `"laravel"`.
     fn name(&self) -> &'static str;
 
+    /// `true` when this framework owns `path` as a non-PHP template.
+    fn owns_template(&self, _path: &Path) -> bool {
+        false
+    }
+
     /// `true` when `byte` is inside a string literal the framework handles,
     /// so plain PHP completion stays quiet there.
     fn owns_string(&self, _text: &str, _byte: usize) -> bool {
@@ -151,18 +156,4 @@ pub fn detect_all(root: &Path) -> Vec<Arc<dyn Framework>> {
         found.push(Arc::new(framework));
     }
     found
-}
-
-/// `true` for a file name of a template syntax some framework owns
-/// (`*.blade.php`). Those are not PHP: the analysis skips them and only
-/// the framework answers.
-pub fn is_template_name(name: &str) -> bool {
-    laravel::blade::is_blade_name(name)
-}
-
-/// [`is_template_name`] for the file at `path`.
-pub fn is_template(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(is_template_name)
 }

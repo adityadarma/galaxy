@@ -44,6 +44,23 @@ impl Project {
             "<?php\nreturn array(\n    'abc' => $baseDir . '/app/Support/Container.php',\n);\n",
         )
         .unwrap();
+        std::fs::write(
+            root.join("vendor/composer/autoload_psr4.php"),
+            "<?php\nreturn array(\n    'Illuminate\\\\Pagination\\\\' => array($vendorDir . '/laravel/framework/src/Illuminate/Pagination'),\n);\n",
+        )
+        .unwrap();
+        let pagination = root.join("vendor/laravel/framework/src/Illuminate/Pagination");
+        std::fs::create_dir_all(&pagination).unwrap();
+        std::fs::write(
+            pagination.join("AbstractPaginator.php"),
+            "<?php\nnamespace Illuminate\\Pagination;\nclass AbstractPaginator\n{\n    public function perPage(): int { return 15; }\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            pagination.join("LengthAwarePaginator.php"),
+            "<?php\nnamespace Illuminate\\Pagination;\nclass LengthAwarePaginator extends AbstractPaginator\n{\n    public function total(): int { return 0; }\n}\n",
+        )
+        .unwrap();
         Self { dir }
     }
 
@@ -103,6 +120,55 @@ fn filters_by_typed_prefix() {
     let project = Project::new();
     let items = project.complete(&format!("{HEAD}        $user->na|\n    }}\n}}\n"));
     assert_eq!(labels(&items), ["name"]);
+}
+
+#[test]
+fn treats_blade_named_files_as_php_without_laravel() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("app")).unwrap();
+    std::fs::write(
+        dir.path().join("composer.json"),
+        r#"{"autoload":{"psr-4":{"App\\":"app/"}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("app/User.php"),
+        "<?php\nnamespace App;\nclass User { public function name(): string { return ''; } }\n",
+    )
+    .unwrap();
+    let path = dir.path().join("views/example.blade.php");
+    let source = "<?php\nnamespace App;\nclass Page {\n    public function show(User $user) {\n        $user->na|\n    }\n}\n";
+    let (text, line, column) = marker(&source);
+    let mut engine = PhpEngine::new(dir.path());
+
+    let items = engine.complete(&path, &text, line, column);
+    assert_eq!(labels(&items), ["name"]);
+}
+
+#[test]
+fn treats_blade_named_files_as_php_with_eloquent_only() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("app")).unwrap();
+    std::fs::write(
+        dir.path().join("composer.json"),
+        r#"{"autoload":{"psr-4":{"App\\":"app/"}},"require":{"illuminate/database":"^12"}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("app/User.php"),
+        "<?php\nnamespace App;\nclass User { public function name(): string { return ''; } }\n",
+    )
+    .unwrap();
+    let path = dir.path().join("views/example.blade.php");
+    let source = "<?php\nnamespace App;\nclass Page {\n    public function show(User $user) {\n        $user->na|\n    }\n}\n";
+    let (text, line, column) = marker(source);
+    let mut engine = PhpEngine::new(dir.path());
+
+    assert!(engine.is_framework("laravel"));
+    assert_eq!(
+        labels(&engine.complete(&path, &text, line, column)),
+        ["name"]
+    );
 }
 
 #[test]
@@ -188,6 +254,74 @@ fn resolves_class_string_templates_and_new() {
             "{HEAD}        if ($thing instanceof User) {{\n            $thing->|\n        }}\n    }}\n}}\n"
         ));
     assert!(labels(&items).contains(&"name"), "instanceof narrowing");
+}
+
+#[test]
+fn narrows_this_property_from_instanceof() {
+    let project = Project::new();
+    let items = project.complete(
+        "<?php\nnamespace App\\Http;\nuse App\\Models\\User;\nclass Page {\n    private $result;\n    public function show() {\n        if ($this->result instanceof User) {\n            $this->result->na|\n        }\n    }\n}\n",
+    );
+    assert!(
+        labels(&items).contains(&"name"),
+        "property instanceof narrowing"
+    );
+}
+
+#[test]
+fn finds_vendor_method_on_this_property_narrowed_by_instanceof() {
+    let project = Project::new();
+    let (source, line, column) = marker(
+        "<?php\nnamespace App\\Http;\nuse Illuminate\\Pagination\\LengthAwarePaginator;\nclass Page {\n    private $result;\n    public function show() {\n        if ($this->result instanceof LengthAwarePaginator) {\n            $this->result->to|tal();\n        }\n    }\n}\n",
+    );
+    let mut engine = PhpEngine::new(project.dir.path());
+    let target = engine.definition(&project.file(), &source, line, column);
+
+    assert_eq!(target.len(), 1);
+    assert!(
+        target[0].path.ends_with(
+            "vendor/laravel/framework/src/Illuminate/Pagination/LengthAwarePaginator.php"
+        ),
+        "{target:?}"
+    );
+    assert_eq!(target[0].line, 4);
+}
+
+#[test]
+fn finds_inherited_vendor_method_on_this_property_narrowed_by_instanceof() {
+    let project = Project::new();
+    let (source, line, column) = marker(
+        "<?php\nnamespace App\\Http;\nuse Illuminate\\Pagination\\LengthAwarePaginator;\nclass Page {\n    private $result;\n    public function show() {\n        if ($this->result instanceof LengthAwarePaginator) {\n            $this->result->per|Page();\n        }\n    }\n}\n",
+    );
+    let mut engine = PhpEngine::new(project.dir.path());
+    let target = engine.definition(&project.file(), &source, line, column);
+
+    assert_eq!(target.len(), 1);
+    assert!(
+        target[0]
+            .path
+            .ends_with("vendor/laravel/framework/src/Illuminate/Pagination/AbstractPaginator.php"),
+        "{target:?}"
+    );
+    assert_eq!(target[0].line, 4);
+}
+
+#[test]
+fn finds_vendor_method_in_elseif_narrowed_by_instanceof() {
+    let project = Project::new();
+    let (source, line, column) = marker(
+        "<?php\nnamespace App\\Http;\nuse Illuminate\\Pagination\\LengthAwarePaginator;\nclass Page {\n    private $result;\n    public function show() {\n        if ($this->result instanceof \\stdClass) {\n        } elseif ($this->result instanceof LengthAwarePaginator) {\n            $this->result->to|tal();\n        }\n    }\n}\n",
+    );
+    let mut engine = PhpEngine::new(project.dir.path());
+    let target = engine.definition(&project.file(), &source, line, column);
+
+    assert_eq!(target.len(), 1, "{target:?}");
+    assert!(
+        target[0].path.ends_with(
+            "vendor/laravel/framework/src/Illuminate/Pagination/LengthAwarePaginator.php"
+        ),
+        "{target:?}"
+    );
 }
 
 #[test]
@@ -1136,6 +1270,8 @@ fn follows_relations_through_generics() {
 fn laravel_dotted_relation_strings_follow_each_model() {
     let dir = eloquent_project();
     std::fs::write(dir.path().join("artisan"), "#!/usr/bin/env php\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("bootstrap")).unwrap();
+    std::fs::write(dir.path().join("bootstrap/app.php"), "<?php").unwrap();
     let mut engine = PhpEngine::new(dir.path());
     let file = dir.path().join("app/Service.php");
     let text = "<?php\nnamespace App;\nclass Service {\n    public function run() {\n        Order::with('payment.details');\n    }\n}\n";
@@ -1153,6 +1289,8 @@ fn laravel_dotted_relation_strings_follow_each_model() {
 fn laravel_relation_arrays_resolve_on_multiline_chains() {
     let dir = eloquent_project();
     std::fs::write(dir.path().join("artisan"), "#!/usr/bin/env php\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("bootstrap")).unwrap();
+    std::fs::write(dir.path().join("bootstrap/app.php"), "<?php").unwrap();
     let mut engine = PhpEngine::new(dir.path());
     let file = dir.path().join("app/Service.php");
     let text = "<?php\nnamespace App;\nclass Service {\n    public function run() {\n        $orders = Order::select([\n            'id',\n            'name',\n        ])\n            ->with([\n                'lines',\n                'payment',\n            ])\n            ->get();\n    }\n}\n";
@@ -1169,6 +1307,8 @@ fn laravel_relation_arrays_resolve_on_multiline_chains() {
 fn laravel_relation_array_on_one_line_resolves() {
     let dir = eloquent_project();
     std::fs::write(dir.path().join("artisan"), "#!/usr/bin/env php\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("bootstrap")).unwrap();
+    std::fs::write(dir.path().join("bootstrap/app.php"), "<?php").unwrap();
     let mut engine = PhpEngine::new(dir.path());
     let file = dir.path().join("app/Service.php");
     let text = "<?php\nnamespace App;\nclass Service {\n    public function run() {\n        Order::with(['payment'])->where('id', 1);\n    }\n}\n";
@@ -1181,6 +1321,8 @@ fn laravel_relation_array_on_one_line_resolves() {
 fn laravel_relations_without_return_types_resolve() {
     let dir = eloquent_project();
     std::fs::write(dir.path().join("artisan"), "#!/usr/bin/env php\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("bootstrap")).unwrap();
+    std::fs::write(dir.path().join("bootstrap/app.php"), "<?php").unwrap();
     std::fs::write(
         dir.path().join("app/Untyped.php"),
         "<?php\nnamespace App;\nclass Untyped extends \\Lib\\Model\n{\n    public function payment()\n    {\n        return $this->hasOne(Payment::class, 'untyped_id', 'id')\n            ->withDefault(['x' => 1]);\n    }\n}\n",
@@ -1209,6 +1351,7 @@ fn laravel_relation_strings_resolve_through_builder_chains() {
             r#"{"autoload":{"psr-4":{"Illuminate\\Database\\Eloquent\\":"lib/","App\\":"app/"}}}"#,
         ),
         ("artisan", "#!/usr/bin/env php\n"),
+        ("bootstrap/app.php", "<?php"),
         (
             "lib/Model.php",
             r#"<?php

@@ -76,7 +76,9 @@ fn is_relation_type(ty: &str) -> bool {
 }
 
 pub(super) fn is_blade(path: &Path) -> bool {
-    crate::php::framework::is_template(path)
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(crate::php::framework::laravel::blade::is_blade_name)
 }
 
 fn label(kind: Kind) -> &'static str {
@@ -1253,6 +1255,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let r = dir.path();
         write(r, "artisan", "<?php");
+        write(r, "bootstrap/app.php", "<?php");
         write(
             r,
             "composer.json",
