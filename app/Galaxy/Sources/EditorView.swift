@@ -38,12 +38,11 @@ final class EditorView: NSView {
 
     /// Padding on each side of the line numbers.
     static let gutterPadding: CGFloat = 10
-    /// Space between the line numbers and the gutter divider: the diagnostic
-    /// dot first, then the fold chevron.
+    /// Space after the line numbers: Git lane first, then the fold chevron.
     static let gutterTrailingPadding: CGFloat = 26
     /// Space between the gutter and the first column.
     static let textInset: CGFloat = 0
-    /// Git change bar: sits just right of the line numbers.
+    /// Git change bar: fixed lane left of the line numbers.
     static let gitBarOffset: CGFloat = 4
     static let gitBarWidth: CGFloat = 3
     static let caretWidth: CGFloat = 2
@@ -182,7 +181,7 @@ final class EditorView: NSView {
     /// A changed hunk expanded in a peek zone below `anchorLine`: a header row,
     /// then context, removed and added rows.
     struct InlineGitHunk: Equatable {
-        enum Kind: Equatable { case context, removed, added }
+        enum Kind: Equatable { case context, removed, added, modified }
         struct Row: Equatable {
             var kind: Kind
             /// 1-based line numbers in HEAD and in the working tree.
@@ -212,8 +211,8 @@ final class EditorView: NSView {
         func height(lineHeight: CGFloat) -> CGFloat {
             headerHeight(lineHeight: lineHeight) + CGFloat(rows.count) * lineHeight
         }
-        var oldLines: [String] { rows.filter { $0.kind == .removed }.map(\.text) }
-        var newLines: [String] { rows.filter { $0.kind == .added }.map(\.text) }
+        var oldLines: [String] { rows.filter { $0.oldNumber != nil && $0.kind != .context }.map(\.text) }
+        var newLines: [String] { rows.filter { $0.newNumber != nil && $0.kind != .context }.map(\.text) }
 
         func contains(line: UInt64) -> Bool {
             line >= newStart && line < newStart + max(newLen, 1)
@@ -444,6 +443,10 @@ final class EditorView: NSView {
 
     /// Right edge of the line numbers.
     var gutterRight: CGFloat { gutterWidth - Self.gutterTrailingPadding }
+
+    /// Dedicated Git-diff lane, separated from the variable-width line number.
+    /// It stays fixed as the line-number column grows from 999 to 1000.
+    var gitBarX: CGFloat { Self.gitBarOffset }
 
     /// Left edge of the fold chevron's column; clicks right of it fold.
     var foldZoneMinX: CGFloat { gutterRight + 9 }
@@ -1169,7 +1172,7 @@ final class EditorView: NSView {
                 case .deleted: NSColor.systemRed
                 }
                 context.setFillColor(color.cgColor)
-                context.fill(CGRect(x: gutterRight + Self.gitBarOffset, y: top, width: Self.gitBarWidth, height: block))
+                context.fill(CGRect(x: shift + gitBarX, y: top, width: Self.gitBarWidth, height: block))
             }
             if let hunk = inlineGitHunk, hunk.anchorLine == line.line {
                 drawInlineGitHunk(hunk, below: top + block, context: context)
@@ -1265,6 +1268,7 @@ final class EditorView: NSView {
             case .context: nil
             case .removed: NSColor.systemRed.withAlphaComponent(0.26)
             case .added: NSColor.systemGreen.withAlphaComponent(0.22)
+            case .modified: NSColor.systemYellow.withAlphaComponent(0.22)
             }
         }
         func draw(_ text: String, at x: CGFloat, y: CGFloat, color: NSColor) {

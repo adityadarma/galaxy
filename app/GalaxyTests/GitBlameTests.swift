@@ -234,6 +234,28 @@ final class GitBlameTests: XCTestCase {
         }
     }
 
+    func testInlineHunkSeparatesModifiedLinesFromNewLines() throws {
+        let url = root.appendingPathComponent("methods.php")
+        try "<?php\nclass Photos {\n    public function photos(): array { return []; }\n}\n".write(to: url, atomically: true, encoding: .utf8)
+        try git("add", ".")
+        try commit(as: "Alice", "add methods")
+        try "<?php\nclass Photos {\n    public function assetPhotos(): array { return []; }\n    public function uploadPhotos(): array { return []; }\n}\n".write(to: url, atomically: true, encoding: .utf8)
+
+        let c = try makeController()
+        try open(c, "methods.php")
+        c.toggleInlineGitHunk(at: 2)
+        waitFor { c.editorView.inlineGitHunk != nil }
+        let hunk = try XCTUnwrap(c.editorView.inlineGitHunk)
+
+        XCTAssertEqual(hunk.rows.filter { $0.kind == .removed }.map(\.text), [
+            "    public function photos(): array { return []; }",
+        ])
+        XCTAssertEqual(hunk.rows.filter { $0.kind == .added }.map(\.text), [
+            "    public function assetPhotos(): array { return []; }",
+            "    public function uploadPhotos(): array { return []; }",
+        ])
+    }
+
     func testHeaderButtonHitReachesTheActionCallback() throws {
         let c = try makeController()
         try open(c, "f.txt")

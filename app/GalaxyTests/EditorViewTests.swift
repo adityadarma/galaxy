@@ -570,9 +570,19 @@ final class EditorViewTests: XCTestCase {
         view.gitLineChanges = [1: .added]
         let rep = try bitmap(view)
         let y = view.metrics.lineHeight / 2
-        let barX = view.gutterRight + EditorView.gitBarOffset + EditorView.gitBarWidth / 2
+        let barX = view.gitBarX + EditorView.gitBarWidth / 2
 
         XCTAssertNotEqual(try luminance(rep, view, x: barX, y: y), try luminance(rep, view, x: 1, y: y))
+    }
+
+    func testGitBarDrawsPastOneThousandLines() throws {
+        let text = Array(repeating: "unchanged", count: 1_001).joined(separator: "\n")
+        let (view, _, url) = try makeView(text: text)
+        defer { try? FileManager.default.removeItem(at: url) }
+        view.reloadDocument()
+
+        XCTAssertEqual(view.gitBarX, EditorView.gitBarOffset)
+        XCTAssertLessThan(view.gitBarX + EditorView.gitBarWidth, view.gutterRight - 4)
     }
 
     /// Regression: Core Text draws black unless told to use the context

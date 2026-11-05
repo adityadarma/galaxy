@@ -117,7 +117,7 @@ extension EditorView {
             toggleFold(line: UInt64(hit.key))
             return
         }
-        let barMinX = gutterShift + gutterRight + Self.gitBarOffset - 2
+        let barMinX = gutterShift + gitBarX - 2
         if local.x >= barMinX, local.x < barMinX + Self.gitBarWidth + 4,
            gitLineChanges[pos.line + 1] != nil, event.clickCount == 1 {
             onGitChangeClick?(pos.line)

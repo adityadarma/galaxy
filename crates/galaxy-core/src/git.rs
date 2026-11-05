@@ -1104,10 +1104,20 @@ pub fn diff_lines(
     }
     let mut changes = Vec::new();
     let (mut old, mut new) = (0, 0);
+    // Where the current run of changes began, in `changes` and in each text.
+    let (mut run_start, mut run_old, mut run_new) = (0, 0, 0);
     while old < old_lines.len() || new < new_lines.len() {
         if old < old_lines.len() && new < new_lines.len() && old_lines[old] == new_lines[new] {
+            settle_run(
+                &mut changes,
+                run_start,
+                &old_lines[run_old..old],
+                &new_lines[run_new..new],
+            );
+            run_start = changes.len();
             old += 1;
             new += 1;
+            (run_old, run_new) = (old, new);
         } else if new < new_lines.len()
             && (old == old_lines.len() || lcs[old][new + 1] >= lcs[old + 1][new])
         {
@@ -1124,20 +1134,124 @@ pub fn diff_lines(
             old += 1;
         }
     }
-    // A replacement is rendered as one modified marker instead of adjacent
-    // added/deleted stripes. The LCS tie-breaker emits the added working-tree
-    // line before the deleted HEAD line, whose anchor is the following line.
-    for index in 0..changes.len().saturating_sub(1) {
-        if changes[index].kind == GitLineChangeKind::Added
-            && changes[index + 1].kind == GitLineChangeKind::Deleted
-            && changes[index + 1].line <= changes[index].line + 1
-        {
-            changes[index].kind = GitLineChangeKind::Modified;
-            changes.remove(index + 1);
-            break;
+    settle_run(
+        &mut changes,
+        run_start,
+        &old_lines[run_old..old],
+        &new_lines[run_new..new],
+    );
+    Ok(changes)
+}
+
+/// Relabels the changes since `start`, which no unchanged line separates.
+/// `old_run` and `new_run` are the HEAD and working-tree lines they cover.
+///
+/// Equal counts are a plain replacement: every new line is modified. When the
+/// counts differ, a new line is modified only if it is an edit of an old line
+/// (similar text, in order), so an edited line keeps its modified marker while
+/// the lines typed after it stay added, and the old lines nothing edited stay
+/// deleted.
+fn settle_run(changes: &mut Vec<GitLineChange>, start: usize, old_run: &[&str], new_run: &[&str]) {
+    if old_run.is_empty() || new_run.is_empty() {
+        return;
+    }
+    let lines_of = |kind: GitLineChangeKind| -> Vec<usize> {
+        changes[start..]
+            .iter()
+            .filter(|change| change.kind == kind)
+            .map(|change| change.line)
+            .collect()
+    };
+    let added = lines_of(GitLineChangeKind::Added);
+    let deleted = lines_of(GitLineChangeKind::Deleted);
+    if added.len() != new_run.len() || deleted.len() != old_run.len() {
+        return;
+    }
+    let (old_paired, new_paired) = if old_run.len() == new_run.len() {
+        (vec![true; old_run.len()], vec![true; new_run.len()])
+    } else {
+        similar_pairs(old_run, new_run)
+    };
+    changes.truncate(start);
+    for (line, paired) in added.into_iter().zip(new_paired) {
+        changes.push(GitLineChange {
+            line,
+            kind: if paired {
+                GitLineChangeKind::Modified
+            } else {
+                GitLineChangeKind::Added
+            },
+        });
+    }
+    for (line, paired) in deleted.into_iter().zip(old_paired) {
+        if !paired {
+            changes.push(GitLineChange {
+                line,
+                kind: GitLineChangeKind::Deleted,
+            });
         }
     }
-    Ok(changes)
+}
+
+/// Which old and new lines are edits of each other: the longest in-order
+/// matching of lines with similar text. Runs too large to compare cheaply
+/// pair nothing.
+fn similar_pairs(old: &[&str], new: &[&str]) -> (Vec<bool>, Vec<bool>) {
+    let mut old_paired = vec![false; old.len()];
+    let mut new_paired = vec![false; new.len()];
+    if old.len() * new.len() > 400 {
+        return (old_paired, new_paired);
+    }
+    let width = new.len() + 1;
+    let mut score = vec![0usize; (old.len() + 1) * width];
+    for i in (0..old.len()).rev() {
+        for j in (0..new.len()).rev() {
+            score[i * width + j] = if lines_are_similar(old[i], new[j]) {
+                score[(i + 1) * width + j + 1] + 1
+            } else {
+                score[(i + 1) * width + j].max(score[i * width + j + 1])
+            };
+        }
+    }
+    let (mut i, mut j) = (0, 0);
+    while i < old.len() && j < new.len() {
+        if lines_are_similar(old[i], new[j])
+            && score[i * width + j] == score[(i + 1) * width + j + 1] + 1
+        {
+            old_paired[i] = true;
+            new_paired[j] = true;
+            i += 1;
+            j += 1;
+        } else if score[(i + 1) * width + j] >= score[i * width + j + 1] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    (old_paired, new_paired)
+}
+
+/// Two lines are versions of one another when at least half of the longer
+/// one's characters survive in order. Very short lines never match.
+fn lines_are_similar(old: &str, new: &str) -> bool {
+    let old: Vec<char> = old.trim().chars().collect();
+    let new: Vec<char> = new.trim().chars().collect();
+    if old.len().max(new.len()) < 3 {
+        return false;
+    }
+    let mut previous = vec![0usize; new.len() + 1];
+    for old_char in &old {
+        let mut current = vec![0usize; new.len() + 1];
+        for (index, new_char) in new.iter().enumerate() {
+            current[index + 1] = if old_char == new_char {
+                previous[index] + 1
+            } else {
+                previous[index + 1].max(current[index])
+            };
+        }
+        previous = current;
+    }
+    previous[new.len()] * 2 >= old.len().max(new.len())
 }
 
 /// The commit that last touched some lines of a file.
@@ -1623,13 +1737,92 @@ mod tests {
                 "initial",
             ],
         );
-        let changes = diff_lines(dir.path(), "tracked.txt", "one\nchanged\ntwo\n").unwrap();
+        let changes = diff_lines(dir.path(), "tracked.txt", "one\nchanged\nthree\n").unwrap();
         assert_eq!(
             changes,
             vec![GitLineChange {
                 line: 2,
                 kind: GitLineChangeKind::Modified,
             }]
+        );
+
+        // An insert beside an unrelated delete is not a replacement.
+        let separate = diff_lines(dir.path(), "tracked.txt", "one\nchanged\ntwo\n").unwrap();
+        assert_eq!(
+            separate,
+            vec![
+                GitLineChange {
+                    line: 2,
+                    kind: GitLineChangeKind::Added
+                },
+                GitLineChange {
+                    line: 3,
+                    kind: GitLineChangeKind::Deleted
+                },
+            ]
+        );
+
+        // An edited line followed by typed lines: only the edited one is
+        // modified, the rest are additions.
+        fs::write(
+            dir.path().join("member.txt"),
+            "head\n    protected $value;\ntail\n",
+        )
+        .unwrap();
+        run(dir.path(), ["add", "member.txt"]);
+        run(
+            dir.path(),
+            [
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "member",
+            ],
+        );
+        let edited = diff_lines(
+            dir.path(),
+            "member.txt",
+            "head\n    protected $value;dsd\nDesadinas\nAwsSource\ntail\n",
+        )
+        .unwrap();
+        assert_eq!(
+            edited,
+            vec![
+                GitLineChange {
+                    line: 2,
+                    kind: GitLineChangeKind::Modified
+                },
+                GitLineChange {
+                    line: 3,
+                    kind: GitLineChangeKind::Added
+                },
+                GitLineChange {
+                    line: 4,
+                    kind: GitLineChangeKind::Added
+                },
+            ]
+        );
+
+        let expanded = diff_lines(dir.path(), "tracked.txt", "one\nchanged\nextra\ntwo\n").unwrap();
+        assert_eq!(
+            expanded,
+            vec![
+                GitLineChange {
+                    line: 2,
+                    kind: GitLineChangeKind::Added
+                },
+                GitLineChange {
+                    line: 3,
+                    kind: GitLineChangeKind::Added
+                },
+                GitLineChange {
+                    line: 4,
+                    kind: GitLineChangeKind::Deleted
+                }
+            ]
         );
 
         let inserted = diff_lines(dir.path(), "tracked.txt", "one\ntwo\nthree\nfour\n").unwrap();

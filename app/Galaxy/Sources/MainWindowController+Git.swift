@@ -288,7 +288,14 @@ extension MainWindowController {
             return
         }
         showInlineGitHunk { hunks in
-            hunks.firstIndex { line >= $0.newStart && line < $0.newStart + max($0.newLen, 1) }
+            hunks.firstIndex {
+                if $0.newLen == 0 {
+                    // A deletion has no working-tree row. Its red marker is
+                    // anchored to the following row, which opens this hunk.
+                    return line == $0.newStart
+                }
+                return line >= $0.newStart && line < $0.newStart + $0.newLen
+            }
         }
     }
 
@@ -407,12 +414,14 @@ extension MainWindowController {
             rows.append(Row(kind: .context, oldNumber: oldStart - k + 1, newNumber: newStart - k + 1, text: newAll[newStart - k],
                             styles: newStyles[newStart - k] ?? []))
         }
-        for i in 0..<oldLen where oldStart + i < oldAll.count {
-            rows.append(Row(kind: .removed, oldNumber: oldStart + i + 1, newNumber: nil, text: oldAll[oldStart + i],
+        let oldChanged = Array(oldAll.dropFirst(oldStart).prefix(oldLen))
+        let newChanged = Array(newAll.dropFirst(newStart).prefix(newLen))
+        for i in 0..<oldChanged.count {
+            rows.append(Row(kind: .removed, oldNumber: oldStart + i + 1, newNumber: nil, text: oldChanged[i],
                             styles: oldStyles[oldStart + i] ?? []))
         }
-        for i in 0..<newLen where newStart + i < newAll.count {
-            rows.append(Row(kind: .added, oldNumber: nil, newNumber: newStart + i + 1, text: newAll[newStart + i],
+        for i in 0..<newChanged.count {
+            rows.append(Row(kind: .added, oldNumber: nil, newNumber: newStart + i + 1, text: newChanged[i],
                             styles: newStyles[newStart + i] ?? []))
         }
         for j in 0..<context {
