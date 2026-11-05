@@ -352,7 +352,10 @@ final class EditorView: NSView {
             if appliedWrapColumns != nil { oldValue?.setWrapColumns(columns: nil) }
             appliedWrapColumns = nil
             contentTextWidth = 0
-            if document !== oldValue { setInlineHints([:]) }
+            if document !== oldValue {
+                oldValue?.setWrapHints(lines: [])
+                setInlineHints([:])
+            }
             applyWrapColumns()
             syntaxAwaiting = document?.syntaxLanguage() != nil
             startSyntaxPollingIfNeeded()
@@ -474,6 +477,7 @@ final class EditorView: NSView {
         syntaxLayouts.removeAll()
         hintLabels.removeAll()
         contentTextWidth = 0
+        syncWrapHints()
         reloadDocument()
     }
 
@@ -560,6 +564,7 @@ final class EditorView: NSView {
         guard columns != appliedWrapColumns else { return false }
         appliedWrapColumns = columns
         document?.setWrapColumns(columns: columns.map { UInt32($0) })
+        syncWrapHints()
         return true
     }
 
@@ -656,7 +661,7 @@ final class EditorView: NSView {
     /// y is the top of the row holding it.
     func point(column: Int, text: String, rows: LineRows, top: CGFloat, originX: CGFloat) -> CGPoint {
         let row = rows.row(containing: column)
-        let shift = row == 0 ? 0 : xOffset(in: text, column: UInt64(rows.start(of: row)))
+        let shift = rowShift(in: text, rows: rows, row: row)
         return CGPoint(x: originX + xOffset(in: text, column: UInt64(column)) - shift,
                        y: top + CGFloat(row) * metrics.lineHeight)
     }
@@ -671,10 +676,16 @@ final class EditorView: NSView {
             let a = max(start, rowStart), b = min(end, rows.end(of: row))
             // A single-row line keeps empty spans (empty-line selection).
             guard a < b || (rows.count == 1 && a <= b) else { continue }
-            let shift = rowStart == 0 ? 0 : xOffset(in: text, column: UInt64(rowStart))
+            let shift = rowShift(in: text, rows: rows, row: row)
             let x0 = originX + xOffset(in: text, column: UInt64(a)) - shift
             var x1 = originX + xOffset(in: text, column: UInt64(b)) - shift
-            if row == rows.count - 1 { x1 += trailing }
+            if row == rows.count - 1 {
+                x1 += trailing
+            } else if b == rows.end(of: row), let hint = inlineHints[text]?.first(where: { $0.column == b }) {
+                // The next row starts at a labelled argument: the label's room
+                // belongs to that row, not to the end of this one.
+                x1 -= hintAdvance(hint.label)
+            }
             out.append(CGRect(x: x0, y: top + CGFloat(row) * metrics.lineHeight,
                               width: max(minWidth, x1 - x0), height: metrics.lineHeight))
         }
@@ -1037,7 +1048,7 @@ final class EditorView: NSView {
                 drawnWidth = max(drawnWidth, CGFloat(CTLineGetTypographicBounds(ctLine, nil, nil, nil)))
                 for row in 0..<rows.count {
                     let rowTopY = top + CGFloat(row) * lineHeight
-                    let shift = row == 0 ? 0 : xOffset(in: line.text, column: UInt64(rows.start(of: row)))
+                    let shift = rowShift(in: line.text, rows: rows, row: row)
                     if rows.count > 1 {
                         // The whole line is laid out once; clip to this row.
                         context.saveGState()
@@ -1518,8 +1529,43 @@ extension EditorView {
         // Layouts carry the space reserved for the labels.
         layouts.removeAll()
         syntaxLayouts.removeAll()
+        if wrapActive {
+            // Labels take room in their rows, so lines may wrap differently.
+            syncWrapHints()
+            applyDocumentMetadata(lineCount: UInt64(lineCount))
+        }
         needsDisplay = true
         onLayoutChange?()
+    }
+
+    /// Tells the core how much room each label takes, so wrapped rows leave
+    /// it free. Empty while wrap is off.
+    func syncWrapHints() {
+        guard let document else { return }
+        var lines: [WrapHintLine] = []
+        if wrapActive, metrics.spaceWidth > 0 {
+            for (text, hints) in inlineHints {
+                let length = text.utf16.count
+                let slots = hints.filter { $0.column > 0 && $0.column <= length }.map {
+                    WrapHintSlot(column: UInt64($0.column),
+                                 columns: UInt64(ceil(hintAdvance($0.label) / metrics.spaceWidth)))
+                }
+                if !slots.isEmpty { lines.append(WrapHintLine(text: text, slots: slots)) }
+            }
+        }
+        document.setWrapHints(lines: lines)
+    }
+
+    /// X, within the whole line, where wrapped `row` starts. A row that starts
+    /// at a labelled argument starts at its label.
+    func rowShift(in text: String, rows: LineRows, row: Int) -> CGFloat {
+        guard row > 0 else { return 0 }
+        let column = rows.start(of: row)
+        var x = xOffset(in: text, column: UInt64(column))
+        if let hint = inlineHints[text]?.first(where: { $0.column == column }) {
+            x -= hintAdvance(hint.label) - Self.hintGap
+        }
+        return x
     }
 
     /// Room a label takes in the line: the label, its padding and a gap on
@@ -1548,9 +1594,8 @@ extension EditorView {
         let pillHeight = max(0, metrics.lineHeight - 4)
         let textHeight = hintFont.ascender - hintFont.descender
         for hint in hints {
-            let row = rows.row(containing: hint.column)
-            // A soft wrap between the space and its argument: skip the label.
-            guard hint.column > 0, rows.row(containing: hint.column - 1) == row else { continue }
+            // A label whose argument starts a wrapped row is drawn at that row's start.
+            guard hint.column > 0 else { continue }
             let at = point(column: hint.column, text: text, rows: rows, top: top, originX: originX)
             let label = hintLabel(hint.label)
             let pill = CGRect(x: at.x - Self.hintGap - label.width - 2 * Self.hintPadding,

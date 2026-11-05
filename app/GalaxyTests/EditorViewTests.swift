@@ -555,8 +555,8 @@ final class EditorViewTests: XCTestCase {
         XCTAssertEqual(markers[38], .modified)
     }
 
-    func testScrollerSplitsGitAndProblemLanes() {
-        let lanes = DiagnosticScroller.lanes(in: NSRect(x: 0, y: 0, width: 14, height: 100))
+    func testRulerSplitsGitAndProblemLanes() {
+        let lanes = OverviewRulerView.lanes(in: NSRect(x: 0, y: 0, width: 14, height: 100))
 
         XCTAssertEqual(lanes.git.minX, 0)
         XCTAssertEqual(lanes.git.maxX, lanes.problems.minX)

@@ -89,9 +89,17 @@ extension EditorView {
         guard !text.isEmpty else { return TextPos(line: line, colUtf16: 0) }
         let rows = lineRows(line)
         // Later rows are drawn shifted left by where they start.
-        let shift = row == 0 ? 0 : xOffset(in: text, column: UInt64(rows.start(of: row)))
-        var index = max(0, CTLineGetStringIndexForPosition(
-            layout(for: text), CGPoint(x: point.x - textOriginX + shift, y: 0)))
+        let shift = rowShift(in: text, rows: rows, row: row)
+        let localX = point.x - textOriginX + shift
+        var index = max(0, CTLineGetStringIndexForPosition(layout(for: text), CGPoint(x: localX, y: 0)))
+        // Core Text puts the caret of a hinted argument halfway through its
+        // label's room, so the left half of the argument's first glyph would
+        // hit the next slot. Split that glyph at its own middle instead.
+        if index > 0, inlineHints[text]?.contains(where: { $0.column == index - 1 }) == true {
+            let glyphStart = xOffset(in: text, column: UInt64(index - 1))
+            let glyphEnd = xOffset(in: text, column: UInt64(index))
+            if localX < (glyphStart + glyphEnd) / 2 { index -= 1 }
+        }
         if rows.count > 1 {
             // A point past a wrapped row's end is the row's last slot, not
             // the first column of the next row.
@@ -268,7 +276,7 @@ extension EditorView {
         let rows = lineRows(pos.line)
         let lineRow = rows.row(containing: Int(pos.colUtf16))
         let rowEnd = min(rows.end(of: lineRow), text.utf16.count)
-        let shift = lineRow == 0 ? 0 : xOffset(in: text, column: UInt64(rows.start(of: lineRow)))
+        let shift = rowShift(in: text, rows: rows, row: lineRow)
         guard point.x - textOriginX + shift <= xOffset(in: text, column: UInt64(rowEnd)) else {
             definitionLink = nil
             return

@@ -109,6 +109,56 @@ final class WordWrapTests: XCTestCase {
         XCTAssertEqual(view.fractionalLine(atY: view.rowTop(of: 1)), 1.0, accuracy: 0.001)
     }
 
+    /// A call that fits one row until the parameter labels take room: the
+    /// core wraps with them, an argument that starts a row starts at its
+    /// label, and clicks, carets and arrow keys all agree.
+    func testInlineHintsWrapWithTheirArguments() throws {
+        let (probe, _) = try makeView(text: "x")
+        probe.wrapEnabled = true
+        let columns = try XCTUnwrap(probe.appliedWrapColumns)
+
+        var args = ["a0"]
+        func source() -> String { "f(" + args.joined(separator: ", ") + ")" }
+        while source().count < columns - 4 { args.append("a\(args.count)") }
+        let text = source()
+        var column = 2
+        var hints: [EditorView.InlineHint] = []
+        for arg in args {
+            hints.append(EditorView.InlineHint(column: column, label: "value:"))
+            column += arg.count + 2
+        }
+
+        let (view, doc) = try makeView(text: text)
+        view.wrapEnabled = true
+        XCTAssertEqual(view.rowCount, 1, "fits without labels")
+
+        view.setInlineHints([text: hints])
+        XCTAssertGreaterThan(view.rowCount, 1, "labels take room, so the line wraps")
+        XCTAssertEqual(view.lineRows(0).count, view.rowCount)
+        XCTAssertGreaterThanOrEqual(view.frame.height, CGFloat(view.rowCount) * view.metrics.lineHeight)
+
+        // The break falls before a labelled argument, which starts its row at the label.
+        let second = try XCTUnwrap(view.lineRows(0).breaks.first)
+        XCTAssertTrue(hints.contains { $0.column == second })
+        let h = view.metrics.lineHeight
+        let rect = view.rect(forLine: 0, column: UInt64(second), width: 2)
+        XCTAssertEqual(rect.minY, h, accuracy: 0.5)
+        XCTAssertEqual(rect.minX, view.textOriginX + view.hintAdvance("value:") - EditorView.hintGap, accuracy: 1.5)
+        let back = view.textPosition(at: NSPoint(x: rect.minX + 1, y: rect.midY))
+        XCTAssertEqual(Int(back.colUtf16), second)
+
+        // The core moves by the same rows.
+        doc.setCaret(pos: TextPos(line: 0, colUtf16: 0))
+        doc.moveCursors(motion: .down, extend: false)
+        XCTAssertEqual(Int(doc.primaryCursor().colUtf16), second)
+
+        // Drawing the labels on wrapped rows works, and clearing them unwraps.
+        let rep = try XCTUnwrap(view.bitmapImageRepForCachingDisplay(in: view.bounds))
+        view.cacheDisplay(in: view.bounds, to: rep)
+        view.setInlineHints([:])
+        XCTAssertEqual(view.rowCount, 1)
+    }
+
     func testWordWrapMenuItemTogglesAndPersists() throws {
         let defaults = UserDefaults.standard
         let saved = defaults.object(forKey: "WordWrap")

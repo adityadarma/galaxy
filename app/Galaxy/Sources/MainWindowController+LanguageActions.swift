@@ -321,8 +321,7 @@ extension MainWindowController {
             to: groupChrome
         )
         let inset: CGFloat = 0
-        let minimapInset: CGFloat = minimapEnabled && !isDiffPaneShown ? MinimapView.width : 0
-        let width = max(0, groupChrome.bounds.width - minimapInset)
+        let width = max(0, groupChrome.bounds.width - editorRightInset)
         let height = min(320, max(210, groupChrome.bounds.height * 0.42))
         let x: CGFloat = 0
         // `groupChrome` is not flipped: smaller Y values are visually below.

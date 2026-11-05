@@ -7,10 +7,12 @@
 //! for a tab. Only displayed text is wrapped, so a line cut at
 //! `MAX_LINE_DISPLAY_CHARS` is wrapped up to that cut.
 
+use std::collections::{HashMap, HashSet};
+
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::document::Document;
-use crate::viewport::display_text;
+use crate::viewport::{MAX_LINE_DISPLAY_CHARS, display_text};
 
 /// Narrowest usable wrap width. Anything smaller is raised to it so every
 /// row holds at least one wide grapheme.
@@ -42,10 +44,80 @@ fn grapheme_width(g: &str) -> usize {
     g.chars().next().map_or(0, char_width)
 }
 
+/// Room that inline labels (parameter names) take in some lines, in columns.
+/// A label belongs to the argument it names: it wraps with that argument and
+/// is counted in the width of its row. Lines are matched by their displayed
+/// text, so an edited line never wraps by labels made for its old text.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Extras {
+    by_text: HashMap<String, Vec<(usize, usize)>>,
+    /// Char counts of the keys, to skip the text lookup for other lines.
+    lens: HashSet<usize>,
+}
+
+impl Extras {
+    /// `entries`: displayed line text with `(UTF-16 column, columns)` pairs;
+    /// the room is added before the grapheme at that column.
+    pub fn new(entries: impl IntoIterator<Item = (String, Vec<(usize, usize)>)>) -> Self {
+        let mut by_text = HashMap::new();
+        let mut lens = HashSet::new();
+        for (text, mut at) in entries {
+            at.retain(|&(_, columns)| columns > 0);
+            if at.is_empty() {
+                continue;
+            }
+            at.sort_unstable();
+            lens.insert(text.chars().count());
+            by_text.insert(text, at);
+        }
+        Self { by_text, lens }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_text.is_empty()
+    }
+
+    /// `(char offset, extra columns)` for the displayed text of `line`.
+    fn for_line(&self, doc: &Document, line: usize) -> Vec<(usize, usize)> {
+        if self.lens.is_empty() {
+            return Vec::new();
+        }
+        let start = doc.line_to_char(line);
+        let end = doc.line_end_char(line).min(start + MAX_LINE_DISPLAY_CHARS);
+        if !self.lens.contains(&(end - start)) {
+            return Vec::new();
+        }
+        let text = display_text(doc, line);
+        let Some(at) = self.by_text.get(&text) else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(at.len());
+        let mut targets = at.iter().copied().peekable();
+        let mut utf16 = 0;
+        for (index, c) in text.chars().enumerate() {
+            while let Some(&(column, columns)) = targets.peek() {
+                if column > utf16 {
+                    break;
+                }
+                out.push((index, columns));
+                targets.next();
+            }
+            utf16 += c.len_utf16();
+        }
+        out
+    }
+}
+
 /// Char offsets (within `text`) where every row after the first starts.
 /// Rows break after the last blank that fits, or inside a word that is
 /// wider than a row.
 pub fn line_breaks(text: &str, columns: usize) -> Vec<usize> {
+    line_breaks_with(text, columns, &[])
+}
+
+/// Like `line_breaks`, with `extras` (`(char offset, columns)`, sorted)
+/// widening the grapheme at each offset.
+pub fn line_breaks_with(text: &str, columns: usize, extras: &[(usize, usize)]) -> Vec<usize> {
     let cols = columns.max(MIN_COLUMNS);
     let mut breaks = Vec::new();
     let mut pos = 0; // char offset of the next grapheme
@@ -54,9 +126,15 @@ pub fn line_breaks(text: &str, columns: usize) -> Vec<usize> {
     // of what follows it; that is what moves down if we break there.
     let mut last_blank: Option<usize> = None;
     let mut width_after_blank = 0;
+    let mut next_extra = 0;
 
     for g in text.graphemes(true) {
-        let w = grapheme_width(g);
+        let chars = g.chars().count();
+        let mut w = grapheme_width(g);
+        while next_extra < extras.len() && extras[next_extra].0 < pos + chars {
+            w += extras[next_extra].1;
+            next_extra += 1;
+        }
         while row_width + w > cols && row_width > 0 {
             if let Some(at) = last_blank.take() {
                 breaks.push(at);
@@ -68,7 +146,7 @@ pub fn line_breaks(text: &str, columns: usize) -> Vec<usize> {
             width_after_blank = 0;
         }
         row_width += w;
-        pos += g.chars().count();
+        pos += chars;
         if g == " " || g == "\t" {
             last_blank = Some(pos);
             width_after_blank = 0;
@@ -82,16 +160,19 @@ pub fn line_breaks(text: &str, columns: usize) -> Vec<usize> {
 /// Rows `line` takes at `columns`. Lines that fit are decided from a
 /// width sum alone, with no grapheme segmentation.
 pub fn rows_in_line(doc: &Document, line: usize, columns: usize) -> usize {
+    rows_in_line_with(doc, line, columns, &Extras::default())
+}
+
+pub fn rows_in_line_with(doc: &Document, line: usize, columns: usize, extras: &Extras) -> usize {
     let cols = columns.max(MIN_COLUMNS);
+    let hinted = extras.for_line(doc, line);
     let start = doc.line_to_char(line);
-    let end = doc
-        .line_end_char(line)
-        .min(start + crate::viewport::MAX_LINE_DISPLAY_CHARS);
-    let mut width = 0;
+    let end = doc.line_end_char(line).min(start + MAX_LINE_DISPLAY_CHARS);
+    let mut width: usize = hinted.iter().map(|&(_, columns)| columns).sum();
     for c in doc.rope().slice(start..end).chars() {
         width += char_width(c);
         if width > cols {
-            return line_breaks(&display_text(doc, line), cols).len() + 1;
+            return line_breaks_with(&display_text(doc, line), cols, &hinted).len() + 1;
         }
     }
     1
@@ -99,10 +180,23 @@ pub fn rows_in_line(doc: &Document, line: usize, columns: usize) -> usize {
 
 /// Char offsets, within the line, where rows after the first start.
 pub fn breaks_for_line(doc: &Document, line: usize, columns: usize) -> Vec<usize> {
-    if rows_in_line(doc, line, columns) == 1 {
+    breaks_for_line_with(doc, line, columns, &Extras::default())
+}
+
+pub fn breaks_for_line_with(
+    doc: &Document,
+    line: usize,
+    columns: usize,
+    extras: &Extras,
+) -> Vec<usize> {
+    if rows_in_line_with(doc, line, columns, extras) == 1 {
         return Vec::new();
     }
-    line_breaks(&display_text(doc, line), columns)
+    line_breaks_with(
+        &display_text(doc, line),
+        columns,
+        &extras.for_line(doc, line),
+    )
 }
 
 /// First visual row of every line, for one document revision, width and set
@@ -124,6 +218,16 @@ impl WrapMap {
 
     /// `hidden` holds sorted, disjoint `(first, last)` folded line ranges.
     pub fn build_with(doc: &Document, columns: Option<usize>, hidden: Vec<(usize, usize)>) -> Self {
+        Self::build_with_extras(doc, columns, hidden, &Extras::default())
+    }
+
+    /// `build_with`, where lines matching `extras` take room for their labels.
+    pub fn build_with_extras(
+        doc: &Document,
+        columns: Option<usize>,
+        hidden: Vec<(usize, usize)>,
+        extras: &Extras,
+    ) -> Self {
         let lines = doc.line_count();
         let mut first_row = Vec::with_capacity(lines + 1);
         let mut total = 0u64;
@@ -140,7 +244,7 @@ impl WrapMap {
                 continue;
             }
             total += match columns {
-                Some(columns) => rows_in_line(doc, line, columns) as u64,
+                Some(columns) => rows_in_line_with(doc, line, columns, extras) as u64,
                 None => 1,
             };
         }
@@ -336,5 +440,48 @@ mod tests {
             assert_eq!(breaks.len() + 1, rows_in_line(&d, 0, cols), "cols {cols}");
             assert!(breaks.windows(2).all(|w| w[0] < w[1]), "ascending");
         }
+    }
+
+    fn labels(text: &str, at: &[(usize, usize)]) -> Extras {
+        Extras::new([(text.to_string(), at.to_vec())])
+    }
+
+    #[test]
+    fn label_room_wraps_with_its_argument() {
+        // Nine columns of text fit 14; two 7-column labels do not.
+        let text = "add(1, 2)";
+        let d = doc(text);
+        assert_eq!(rows_in_line(&d, 0, 14), 1);
+        let extras = labels(text, &[(4, 7), (7, 7)]);
+        assert_eq!(rows_in_line_with(&d, 0, 14, &extras), 2);
+        // The second argument and its label move down together: the break is
+        // after the blank, at the argument.
+        assert_eq!(breaks_for_line_with(&d, 0, 14, &extras), vec![7]);
+        // No blank before the comma on a 12-column row: break inside the word.
+        assert_eq!(breaks_for_line_with(&d, 0, 12, &extras), vec![5]);
+        // Other text is not affected.
+        let other = doc("add(9, 2)");
+        assert_eq!(rows_in_line_with(&other, 0, 14, &extras), 1);
+    }
+
+    #[test]
+    fn label_columns_are_utf16_and_follow_wide_chars() {
+        // "😀" is two UTF-16 units: the argument `a` starts at column 3.
+        let text = "😀(a)";
+        let extras = labels(text, &[(3, 5)]);
+        let d = doc(text);
+        assert_eq!(extras.for_line(&d, 0), vec![(2, 5)]);
+    }
+
+    #[test]
+    fn labels_change_the_row_table() {
+        let text = "f(1, 2, 3)";
+        let d = doc(&format!("{text}\nx"));
+        let extras = labels(text, &[(2, 4), (5, 4), (8, 4)]);
+        let plain = WrapMap::build(&d, 12);
+        let hinted = WrapMap::build_with_extras(&d, Some(12), Vec::new(), &extras);
+        assert_eq!(plain.total_rows(), 2);
+        assert!(hinted.total_rows() > plain.total_rows());
+        assert_eq!(hinted.row_of_line(1), hinted.rows_of_line(0));
     }
 }

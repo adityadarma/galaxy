@@ -1921,6 +1921,21 @@ pub struct ParameterHintLine {
     pub hints: Vec<ParameterHintInfo>,
 }
 
+/// A labelled argument at UTF-16 `column` that needs `columns` monospace
+/// columns of room for its label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct WrapHintSlot {
+    pub column: u64,
+    pub columns: u64,
+}
+
+/// The label room of one line, keyed by its displayed text.
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct WrapHintLine {
+    pub text: String,
+    pub slots: Vec<WrapHintSlot>,
+}
+
 /// Parameter hints for a range of lines at document `revision`.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct ParameterHints {
@@ -6773,6 +6788,8 @@ struct State {
     wrap_columns: Option<usize>,
     /// Row table for `wrap_columns`, rebuilt when the text or width changes.
     wrap_map: Option<galaxy_core::wrap::WrapMap>,
+    /// Room the inline parameter labels take in some lines; rows leave it free.
+    wrap_extras: galaxy_core::wrap::Extras,
     /// Folded line ranges; their lines take no rows.
     folds: FoldSet,
 }
@@ -6870,10 +6887,11 @@ impl State {
             .as_ref()
             .is_none_or(|m| !m.is_current(&self.editor.doc, columns, self.folds.hidden_ranges()));
         if stale {
-            let map = galaxy_core::wrap::WrapMap::build_with(
+            let map = galaxy_core::wrap::WrapMap::build_with_extras(
                 &self.editor.doc,
                 columns,
                 self.folds.hidden_ranges().to_vec(),
+                &self.wrap_extras,
             );
             self.wrap_map = Some(map);
         }
@@ -7454,9 +7472,14 @@ impl DocumentHandle {
         let st = &mut *st;
         let ed = &mut st.editor;
         let mut next = match columns {
-            Some(columns) => {
-                movement::move_selections_wrapped(&ed.doc, &ed.sel, motion.into(), extend, columns)
-            }
+            Some(columns) => movement::move_selections_wrapped_with(
+                &ed.doc,
+                &ed.sel,
+                motion.into(),
+                extend,
+                columns,
+                &st.wrap_extras,
+            ),
             None => movement::move_selections(&ed.doc, &ed.sel, motion.into(), extend),
         };
         if !st.folds.is_empty() {
@@ -7495,6 +7518,25 @@ impl DocumentHandle {
         let columns = columns.map(|c| (c as usize).max(galaxy_core::wrap::MIN_COLUMNS));
         if st.wrap_columns != columns {
             st.wrap_columns = columns;
+            st.wrap_map = None;
+        }
+    }
+
+    /// Room the inline labels take, so rows wrap with them: for each line
+    /// (by displayed text) the UTF-16 columns of the labelled arguments and
+    /// the monospace columns each label needs. Replaces the previous set.
+    pub fn set_wrap_hints(&self, lines: Vec<WrapHintLine>) {
+        let extras = galaxy_core::wrap::Extras::new(lines.into_iter().map(|line| {
+            let at = line
+                .slots
+                .iter()
+                .map(|slot| (clamp_usize(slot.column), clamp_usize(slot.columns)))
+                .collect();
+            (line.text, at)
+        }));
+        let mut st = self.lock();
+        if st.wrap_extras != extras {
+            st.wrap_extras = extras;
             st.wrap_map = None;
         }
     }
@@ -7550,7 +7592,7 @@ impl DocumentHandle {
         let line = clamp_usize(line).min(doc.line_count().saturating_sub(1));
         let start = doc.line_to_char(line);
         let base = doc.char_to_utf16_offset(start);
-        galaxy_core::wrap::breaks_for_line(doc, line, columns)
+        galaxy_core::wrap::breaks_for_line_with(doc, line, columns, &st.wrap_extras)
             .into_iter()
             .map(|at| (doc.char_to_utf16_offset(start + at) - base) as u64)
             .collect()
@@ -8116,6 +8158,7 @@ impl DocumentHandle {
                 diagnostics_revision: 0,
                 wrap_columns: None,
                 wrap_map: None,
+                wrap_extras: galaxy_core::wrap::Extras::default(),
                 folds: FoldSet::default(),
             }),
         }

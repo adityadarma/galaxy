@@ -10,16 +10,28 @@ extension MainWindowController {
         updateMinimap()
     }
 
-    /// The minimap sits over the right edge of the primary editor, under
-    /// the scroller; the diff pane has its own layout and goes without.
+    /// Whether the overview ruler (Git and problem ticks) is shown; the diff
+    /// pane has its own layout and goes without.
+    var rulerVisible: Bool { !isDiffPaneShown }
+
+    /// Width at the editor's right edge kept clear for the ruler and minimap.
+    var editorRightInset: CGFloat {
+        guard rulerVisible else { return 0 }
+        return OverviewRulerView.width + (minimapEnabled ? MinimapView.width : 0)
+    }
+
+    /// The ruler runs down the right edge of the primary editor, in the scroll
+    /// track, and the minimap sits left of it. Both lie under the scroller.
     func updateMinimap() {
-        let show = minimapEnabled && !isDiffPaneShown
+        let show = minimapEnabled && rulerVisible
         if minimap.superview == nil {
             minimap.editor = editorView
             minimap.scrollView = scrollView
             minimap.autoresizingMask = []
             // Below the overlay scroller, so it keeps drawing over the map.
             scrollView.addSubview(minimap, positioned: .below, relativeTo: scrollView.verticalScroller)
+            scrollView.ruler.autoresizingMask = []
+            scrollView.addSubview(scrollView.ruler, positioned: .below, relativeTo: scrollView.verticalScroller)
             editorView.onLayoutChange = { [weak self] in self?.minimap.needsDisplay = true }
             scrollView.contentView.postsBoundsChangedNotifications = true
             scrollView.postsFrameChangedNotifications = true
@@ -36,18 +48,23 @@ extension MainWindowController {
             }
         }
         minimap.isHidden = !show
-        editorView.rightInset = show ? MinimapView.width : 0
+        scrollView.ruler.isHidden = !rulerVisible
+        editorView.rightInset = editorRightInset
         editorView.applyRightInset()
-        stickyTrailing?.constant = show ? -MinimapView.width : 0
+        stickyTrailing?.constant = -editorRightInset
         layoutMinimap()
     }
 
     private func layoutMinimap() {
         // Autoresizing alone loses the inset when the scroll view started
-        // out narrower than the minimap; set the width from the scroll view.
+        // out narrower than the strips; set the widths from the scroll view.
         editorView.applyRightInset()
+        let rulerWidth = OverviewRulerView.width
         let width = MinimapView.width
-        minimap.frame = NSRect(x: scrollView.bounds.width - width, y: 0, width: width, height: scrollView.bounds.height)
+        let height = scrollView.bounds.height
+        scrollView.ruler.frame = NSRect(x: scrollView.bounds.width - rulerWidth, y: 0, width: rulerWidth, height: height)
+        minimap.frame = NSRect(x: scrollView.bounds.width - rulerWidth - width, y: 0, width: width, height: height)
+        scrollView.ruler.needsDisplay = true
         minimap.needsDisplay = true
     }
 

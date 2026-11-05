@@ -41,11 +41,6 @@ final class MinimapTests: XCTestCase {
         XCTAssertEqual(MinimapView.line(atY: 9_999, offset: 0, lineCount: 100), 100)
     }
 
-    func testDiagnosticMarkerUsesTheSameScrolledOverviewCoordinates() {
-        XCTAssertEqual(MinimapView.markerY(line: 20, offset: 0), 40)
-        XCTAssertEqual(MinimapView.markerY(line: 20, offset: 12), 28)
-    }
-
     func testRunsSkipBlanksAndCapTheWidth() {
         func pairs(_ text: String) -> [[Int]] { MinimapView.runs(in: text).map { [$0.start, $0.end] } }
         XCTAssertEqual(pairs(""), [])
@@ -78,16 +73,45 @@ final class MinimapTests: XCTestCase {
         let item = NSMenuItem(title: "", action: #selector(MainWindowController.toggleMinimap(_:)), keyEquivalent: "")
         _ = c.validateMenuItem(item)
         XCTAssertEqual(item.state, .on)
-        XCTAssertEqual(c.editorView.rightInset, MinimapView.width)
+        XCTAssertEqual(c.editorView.rightInset, MinimapView.width + OverviewRulerView.width)
         let scroll = try XCTUnwrap(c.editorView.enclosingScrollView)
-        XCTAssertEqual(c.editorView.frame.width, scroll.contentSize.width - MinimapView.width, accuracy: 1)
+        XCTAssertEqual(c.editorView.frame.width, scroll.contentSize.width - MinimapView.width - OverviewRulerView.width, accuracy: 1)
 
         c.toggleMinimap(nil)
         _ = c.validateMenuItem(item)
         XCTAssertEqual(item.state, .off)
-        XCTAssertEqual(c.editorView.rightInset, 0)
-        XCTAssertEqual(c.editorView.frame.width, scroll.contentSize.width, accuracy: 1)
+        XCTAssertEqual(c.editorView.rightInset, OverviewRulerView.width, "the ruler stays without the minimap")
+        XCTAssertEqual(c.editorView.frame.width, scroll.contentSize.width - OverviewRulerView.width, accuracy: 1)
         XCTAssertFalse(defaults.bool(forKey: "Minimap"))
+    }
+
+    func testRulerSitsAtTheRightEdgeAndTheMinimapLeftOfIt() throws {
+        let defaults = UserDefaults.standard
+        let saved = defaults.object(forKey: "Minimap")
+        defer { defaults.set(saved, forKey: "Minimap") }
+        defaults.set(true, forKey: "Minimap")
+
+        let c = try makeWindow(lines: 50)
+        defer { c.window?.orderOut(nil) }
+        let scroll = c.scrollView
+        let ruler = scroll.ruler
+
+        XCTAssertFalse(ruler.isHidden)
+        XCTAssertEqual(ruler.frame.maxX, scroll.bounds.width, accuracy: 0.5)
+        XCTAssertEqual(ruler.frame.width, OverviewRulerView.width)
+        XCTAssertEqual(c.minimap.frame.maxX, ruler.frame.minX, accuracy: 0.5, "no overlap between the two")
+
+        c.toggleMinimap(nil)
+        XCTAssertTrue(c.minimap.isHidden)
+        XCTAssertFalse(ruler.isHidden, "Git and problem ticks do not depend on the minimap")
+        XCTAssertEqual(ruler.frame.maxX, scroll.bounds.width, accuracy: 0.5)
+    }
+
+    func testRulerTicksStayInsideTheStrip() {
+        XCTAssertEqual(OverviewRulerView.tickY(line: 0, lineCount: 100, height: 200), 0)
+        XCTAssertEqual(OverviewRulerView.tickY(line: 99, lineCount: 100, height: 200), 198, "last tick ends at the bottom")
+        XCTAssertEqual(OverviewRulerView.tickY(line: 5_000, lineCount: 100, height: 200), 198)
+        XCTAssertEqual(OverviewRulerView.tickY(line: 0, lineCount: 1, height: 200), 0)
     }
 
     func testClickingTheMinimapScrollsTheEditor() throws {

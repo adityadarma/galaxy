@@ -66,9 +66,6 @@ final class MinimapView: NSView {
 
     weak var editor: EditorView?
     weak var scrollView: NSScrollView?
-    /// Problems in the active document, shown as VS Code-style overview-ruler
-    /// marks at the minimap's right edge.
-    private var diagnosticMarkers: [(line: UInt64, severity: UInt8)] = []
     private var isDragging = false
     private var isHovering = false
     private var cache: (document: ObjectIdentifier, revision: UInt64, first: Int, count: Int, lines: [String], styles: [StyleRun])?
@@ -134,18 +131,6 @@ final class MinimapView: NSView {
         return (lines, snapshot.styles)
     }
 
-    func updateDiagnosticMarkers(_ markers: [(line: UInt64, severity: UInt8)]) {
-        guard diagnosticMarkers.map(\ .line) != markers.map(\ .line)
-            || diagnosticMarkers.map(\ .severity) != markers.map(\ .severity) else { return }
-        diagnosticMarkers = markers
-        needsDisplay = true
-    }
-
-    /// Y of a document line in the currently scrolled minimap overview.
-    static func markerY(line: UInt64, offset: CGFloat) -> CGFloat {
-        CGFloat(line) * rowHeight - offset
-    }
-
     // MARK: Drawing
 
     override func draw(_ dirtyRect: NSRect) {
@@ -187,15 +172,6 @@ final class MinimapView: NSView {
         for (color, rects) in bars {
             context.setFillColor(color.withAlphaComponent(0.55).cgColor)
             context.fill(rects)
-        }
-
-        // Error, warning, and info stay visible on the overview ruler even
-        // when the corresponding editor line is outside the text viewport.
-        for marker in diagnosticMarkers {
-            let y = Self.markerY(line: marker.line, offset: geometry.offset)
-            guard y + Self.rowHeight >= 0, y <= bounds.height else { continue }
-            Theme.diagnostic(marker.severity).setFill()
-            NSRect(x: bounds.maxX - 5, y: y, width: 5, height: max(Self.rowHeight, 3)).fill()
         }
 
         let alpha: CGFloat = isDragging ? 0.2 : (isHovering ? 0.14 : 0.09)

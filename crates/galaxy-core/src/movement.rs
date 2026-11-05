@@ -9,6 +9,7 @@
 
 use crate::document::Document;
 use crate::selection::{Selection, SelectionSet};
+use crate::wrap::Extras;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Motion {
@@ -86,10 +87,24 @@ pub fn move_selections_wrapped(
     extend: bool,
     columns: usize,
 ) -> SelectionSet {
+    move_selections_wrapped_with(doc, sel, motion, extend, columns, &Extras::default())
+}
+
+/// `move_selections_wrapped`, where rows leave room for inline labels.
+pub fn move_selections_wrapped_with(
+    doc: &Document,
+    sel: &SelectionSet,
+    motion: Motion,
+    extend: bool,
+    columns: usize,
+    extras: &Extras,
+) -> SelectionSet {
     match motion {
         Motion::Up | Motion::Down | Motion::PageUp(_) | Motion::PageDown(_) | Motion::LineEnd => {
             let mut out = sel.clone();
-            out.transform(doc, |s| move_wrapped(doc, s, motion, extend, columns));
+            out.transform(doc, |s| {
+                move_wrapped(doc, s, motion, extend, columns, extras)
+            });
             out
         }
         // Home keeps its smart toggle on the first row only.
@@ -97,11 +112,11 @@ pub fn move_selections_wrapped(
             let mut out = sel.clone();
             out.transform(doc, |s| {
                 let head = s.head.min(doc.len_chars());
-                let (line, row) = row_of(doc, head, columns);
+                let (line, row) = row_of(doc, head, columns, extras);
                 if row == 0 {
                     return move_one(doc, s, motion, extend);
                 }
-                let target = row_start_char(doc, line, row, columns);
+                let target = row_start_char(doc, line, row, columns, extras);
                 let moved = if extend {
                     Selection::new(s.anchor.min(doc.len_chars()), target)
                 } else {
@@ -116,25 +131,31 @@ pub fn move_selections_wrapped(
 }
 
 /// `(line, row within the line)` of the char offset `head`.
-fn row_of(doc: &Document, head: usize, columns: usize) -> (usize, usize) {
+fn row_of(doc: &Document, head: usize, columns: usize, extras: &Extras) -> (usize, usize) {
     let line = doc.char_to_line(head);
     let col = head - doc.line_to_char(line);
-    let breaks = crate::wrap::breaks_for_line(doc, line, columns);
+    let breaks = crate::wrap::breaks_for_line_with(doc, line, columns, extras);
     (line, breaks.partition_point(|b| *b <= col))
 }
 
-fn row_start_char(doc: &Document, line: usize, row: usize, columns: usize) -> usize {
+fn row_start_char(
+    doc: &Document,
+    line: usize,
+    row: usize,
+    columns: usize,
+    extras: &Extras,
+) -> usize {
     let start = doc.line_to_char(line);
     if row == 0 {
         return start;
     }
-    start + crate::wrap::breaks_for_line(doc, line, columns)[row - 1]
+    start + crate::wrap::breaks_for_line_with(doc, line, columns, extras)[row - 1]
 }
 
 /// Last caret slot of a row: the line end for the last row, else just
 /// before the first grapheme of the next row.
-fn row_end_char(doc: &Document, line: usize, row: usize, columns: usize) -> usize {
-    let breaks = crate::wrap::breaks_for_line(doc, line, columns);
+fn row_end_char(doc: &Document, line: usize, row: usize, columns: usize, extras: &Extras) -> usize {
+    let breaks = crate::wrap::breaks_for_line_with(doc, line, columns, extras);
     match breaks.get(row) {
         Some(next) => doc.prev_grapheme_boundary(doc.line_to_char(line) + next),
         None => doc.line_end_char(line),
@@ -148,9 +169,10 @@ fn step_row(
     row: usize,
     down: bool,
     columns: usize,
+    extras: &Extras,
 ) -> Option<(usize, usize)> {
     if down {
-        if row + 1 < crate::wrap::rows_in_line(doc, line, columns) {
+        if row + 1 < crate::wrap::rows_in_line_with(doc, line, columns, extras) {
             Some((line, row + 1))
         } else if line + 1 < doc.line_count() {
             Some((line + 1, 0))
@@ -160,7 +182,7 @@ fn step_row(
     } else if row > 0 {
         Some((line, row - 1))
     } else if line > 0 {
-        let rows = crate::wrap::rows_in_line(doc, line - 1, columns);
+        let rows = crate::wrap::rows_in_line_with(doc, line - 1, columns, extras);
         Some((line - 1, rows - 1))
     } else {
         None
@@ -173,11 +195,15 @@ fn move_wrapped(
     motion: Motion,
     extend: bool,
     columns: usize,
+    extras: &Extras,
 ) -> Selection {
     let head = s.head.min(doc.len_chars());
-    let (line, row) = row_of(doc, head, columns);
+    let (line, row) = row_of(doc, head, columns, extras);
     let (target, goal) = if motion == Motion::LineEnd {
-        (snap(doc, row_end_char(doc, line, row, columns)), None)
+        (
+            snap(doc, row_end_char(doc, line, row, columns, extras)),
+            None,
+        )
     } else {
         let (down, count) = match motion {
             Motion::Up => (false, 1),
@@ -188,11 +214,11 @@ fn move_wrapped(
         };
         let col = s
             .goal_col
-            .unwrap_or(head - row_start_char(doc, line, row, columns));
+            .unwrap_or(head - row_start_char(doc, line, row, columns, extras));
         let (mut l, mut r) = (line, row);
         let mut hit_edge = false;
         for _ in 0..count {
-            match step_row(doc, l, r, down, columns) {
+            match step_row(doc, l, r, down, columns, extras) {
                 Some(next) => (l, r) = next,
                 None => {
                     hit_edge = true;
@@ -204,8 +230,8 @@ fn move_wrapped(
             // Already on the first or last row: jump to the document edge.
             (if down { doc.len_chars() } else { 0 }, Some(col))
         } else {
-            let start = row_start_char(doc, l, r, columns);
-            let end = row_end_char(doc, l, r, columns);
+            let start = row_start_char(doc, l, r, columns, extras);
+            let end = row_end_char(doc, l, r, columns, extras);
             (snap(doc, (start + col).min(end)), Some(col))
         }
     };

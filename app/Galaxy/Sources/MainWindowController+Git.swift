@@ -255,7 +255,7 @@ extension MainWindowController {
     func refreshGitDiff() {
         guard let workspace, let tab = activeTab, let path = tab.relPath else {
             editorView.gitLineChanges = [:]
-            scrollView.diagnosticScroller.updateGit(changes: [:], lineCount: 1)
+            scrollView.ruler.updateGit(changes: [:], lineCount: 1)
             return
         }
         let text = tab.doc.text()
@@ -273,7 +273,7 @@ extension MainWindowController {
             Task { @MainActor [weak self] in
                 guard let self, self.activeTab?.relPath == path else { return }
                 self.editorView.gitLineChanges = mapped
-                self.scrollView.diagnosticScroller.updateGit(changes: mapped, lineCount: document.lineCount())
+                self.scrollView.ruler.updateGit(changes: mapped, lineCount: document.lineCount())
                 if let refreshed, self.editorView.inlineGitHunk == open { self.editorView.inlineGitHunk = refreshed }
                 if let map, self.isDiffPaneShown { self.applyDiff(map) }
             }

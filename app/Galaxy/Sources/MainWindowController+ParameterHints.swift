@@ -38,9 +38,9 @@ extension MainWindowController {
     }
 
     func refreshParameterHints() {
-        // Soft wrap counts columns, so widened lines would overflow their rows.
+        // With soft wrap on, the core reserves room for the labels in its rows.
         guard inlineParameterHintsEnabled, let tab = activeTab, tab.isDocument, !isDiffPaneShown,
-              !editorView.wrapActive, !tab.doc.path().isEmpty else {
+              !tab.doc.path().isEmpty else {
             editorView.setInlineHints([:])
             return
         }

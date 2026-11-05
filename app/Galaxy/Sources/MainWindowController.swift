@@ -627,8 +627,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 if let document = self.activeTab?.doc {
                     let markers = problems.filter { $0.uri == "file://\(document.path())" }
                         .map { ($0.line, $0.severity) }
-                    self.scrollView.diagnosticScroller.update(markers: markers, lineCount: document.lineCount())
-                    self.minimap.updateDiagnosticMarkers(markers)
+                    self.scrollView.ruler.update(markers: markers, lineCount: document.lineCount())
                     // Redraw only when diagnostics change, not every 100 ms.
                     let revision = document.diagnosticsRevision()
                     if revision != self.lastDiagnosticsRevision {
@@ -713,7 +712,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         detailView.addSubview(signaturePopup)
         stickyTrailing = stickyScopeView.trailingAnchor.constraint(equalTo: editorSplitView.trailingAnchor)
         // `updateMinimap` ran before this constraint existed.
-        stickyTrailing.constant = minimapEnabled && !isDiffPaneShown ? -MinimapView.width : 0
+        stickyTrailing.constant = -editorRightInset
         NSLayoutConstraint.activate([
             groupsSplitView.topAnchor.constraint(equalTo: detailView.topAnchor),
             groupsSplitView.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
