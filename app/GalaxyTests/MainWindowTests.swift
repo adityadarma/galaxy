@@ -45,6 +45,7 @@ final class MainWindowTests: XCTestCase {
             defaults.set(savedSticky, forKey: "StickyScroll")
         }
         defaults.set(13.0, forKey: "EditorFontSize")
+        defaults.set(true, forKey: "ShowBreadcrumbs")
         let c = MainWindowController(bridge: CoreBridge())
         c.showWindow(nil)
         defer { c.window?.orderOut(nil) }
@@ -71,6 +72,7 @@ final class MainWindowTests: XCTestCase {
         XCTAssertTrue(c.validateMenuItem(crumbs))
         XCTAssertEqual(crumbs.state, .on)
         c.toggleBreadcrumbs(nil)
+        XCTAssertTrue(c.pathBar.isHidden)
         _ = c.validateMenuItem(crumbs)
         XCTAssertEqual(crumbs.state, .off)
         XCTAssertEqual(defaults.bool(forKey: "ShowBreadcrumbs"), false)

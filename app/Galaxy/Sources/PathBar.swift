@@ -17,10 +17,21 @@ final class PathBar: NSView {
     let editedDot = NSTextField(labelWithString: "●")
     private(set) var components: [String] = []
     var isEdited: Bool { !editedDot.isHidden }
+    var onSelectSymbol: ((OutlineSymbol) -> Void)?
     /// Supplies the menu for a clicked folder component. The final file name
     /// deliberately has no menu because it is not a directory.
     var menuForComponent: ((Int) -> NSMenu?)?
     private let pathRow = NSStackView()
+    private var visibleSymbols: [OutlineSymbol] = []
+    private var symbolButtons: [NSButton] = []
+    private var heightConstraint: NSLayoutConstraint!
+    /// Off: hide the entire breadcrumb row, including the file path.
+    var isEnabled = true {
+        didSet {
+            isHidden = !isEnabled
+            heightConstraint.constant = isEnabled ? Self.height : 0
+        }
+    }
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -52,8 +63,9 @@ final class PathBar: NSView {
         row.translatesAutoresizingMaskIntoConstraints = false
         addSubview(row)
 
+        heightConstraint = heightAnchor.constraint(equalToConstant: Self.height)
         NSLayoutConstraint.activate([
-            heightAnchor.constraint(equalToConstant: Self.height),
+            heightConstraint,
             row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: Self.inset),
             row.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -12),
             row.centerYAnchor.constraint(equalTo: centerYAnchor),
@@ -132,9 +144,45 @@ final class PathBar: NSView {
         label.setAccessibilityLabel(components.joined(separator: " / "))
     }
 
+    /// Appends the active symbol scope after the file name, matching editor
+    /// breadcrumbs: path, file, namespace/class, then the current member.
+    func show(symbols: [OutlineSymbol], atLine line: UInt64) {
+        symbolButtons.forEach { button in
+            pathRow.removeArrangedSubview(button)
+            button.removeFromSuperview()
+        }
+        visibleSymbols = symbols
+            .filter { $0.line <= line }
+            .sorted { $0.line == $1.line ? $0.column < $1.column : $0.line < $1.line }
+        symbolButtons = []
+        for (index, symbol) in visibleSymbols.enumerated() {
+            let separator = NSTextField(labelWithString: "›")
+            separator.font = .systemFont(ofSize: 13)
+            separator.textColor = Self.separatorColor
+            separator.alignment = .center
+            separator.widthAnchor.constraint(equalToConstant: 10).isActive = true
+            pathRow.addArrangedSubview(separator)
+
+            let button = NSButton(title: symbol.name, target: self, action: #selector(selectSymbol(_:)))
+            button.tag = index
+            button.bezelStyle = .inline
+            button.isBordered = false
+            button.font = .systemFont(ofSize: 13)
+            button.contentTintColor = index == visibleSymbols.count - 1 ? .labelColor : Self.folderColor
+            button.setAccessibilityIdentifier("breadcrumb-symbol-\(index)")
+            pathRow.addArrangedSubview(button)
+            symbolButtons.append(button)
+        }
+    }
+
     @objc private func selectComponent(_ sender: NSButton) {
         guard sender.tag < components.count - 1, let menu = menuForComponent?(sender.tag) else { return }
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.height), in: sender)
+    }
+
+    @objc private func selectSymbol(_ sender: NSButton) {
+        guard visibleSymbols.indices.contains(sender.tag) else { return }
+        onSelectSymbol?(visibleSymbols[sender.tag])
     }
 
     private static func symbol(_ name: String, size: CGFloat, weight: NSFont.Weight,

@@ -67,9 +67,9 @@ extension MainWindowController {
             updateWrapState()
         }
         let breadcrumbs = defaults.object(forKey: "ShowBreadcrumbs") as? Bool ?? true
-        if breadcrumbs != breadcrumbBar.isEnabled {
-            breadcrumbBar.isEnabled = breadcrumbs
-            breadcrumbBar.show(symbols: documentSymbols, atLine: editorView.document?.primaryCursor().line ?? 0)
+        if breadcrumbs != pathBar.isEnabled {
+            pathBar.isEnabled = breadcrumbs
+            pathBar.show(symbols: documentSymbols, atLine: editorView.document?.primaryCursor().line ?? 0)
         }
         let sticky = defaults.object(forKey: "StickyScroll") as? Bool ?? true
         if sticky != stickyScopeView.isEnabled {

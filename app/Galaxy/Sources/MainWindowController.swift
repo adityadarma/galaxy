@@ -407,10 +407,14 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 }
             }
             self?.statusBar.showCursor(primary: primary, count: count)
-            self?.breadcrumbBar.show(symbols: self?.documentSymbols ?? [], atLine: primary.line)
+            self?.pathBar.show(symbols: self?.documentSymbols ?? [], atLine: primary.line)
             self?.updateBlameAnnotation()
         }
         breadcrumbBar.onSelect = { [weak self] symbol in
+            guard let self, let tab = self.activeTab else { return }
+            self.move(tab, toLine: symbol.line, col: symbol.column)
+        }
+        pathBar.onSelectSymbol = { [weak self] symbol in
             guard let self, let tab = self.activeTab else { return }
             self.move(tab, toLine: symbol.line, col: symbol.column)
         }
@@ -637,6 +641,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         tabBar.titleBar = titleBar
         pathBar.translatesAutoresizingMaskIntoConstraints = false
         pathBar.show([])
+        pathBar.isEnabled = UserDefaults.standard.object(forKey: "ShowBreadcrumbs") as? Bool ?? true
         breadcrumbBar.translatesAutoresizingMaskIntoConstraints = false
         breadcrumbBar.isEnabled = UserDefaults.standard.object(forKey: "ShowBreadcrumbs") as? Bool ?? true
         stickyScopeView.isEnabled = UserDefaults.standard.object(forKey: "StickyScroll") as? Bool ?? true

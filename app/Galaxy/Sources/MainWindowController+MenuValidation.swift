@@ -86,7 +86,7 @@ extension MainWindowController: NSMenuItemValidation {
             item.state = wordWrapEnabled ? .on : .off
             return true
         case #selector(toggleBreadcrumbs(_:)):
-            item.state = breadcrumbBar.isEnabled ? .on : .off
+            item.state = pathBar.isEnabled ? .on : .off
             return true
         case #selector(toggleStickyScroll(_:)):
             item.state = stickyScopeView.isEnabled ? .on : .off

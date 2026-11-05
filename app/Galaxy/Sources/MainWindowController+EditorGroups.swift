@@ -117,7 +117,7 @@ extension MainWindowController {
         let pane = pane(for: group)
         pane.isHidden = false
         pane.show(items: tabItems(for: group.tabs), selected: group.activeIndex, tab: group.activeTab,
-                  breadcrumbHeight: breadcrumbBar.isHidden ? 0 : 24)
+                  breadcrumbHeight: pathBar.isHidden ? 0 : 24)
     }
 
     func refreshGroupPanes() {

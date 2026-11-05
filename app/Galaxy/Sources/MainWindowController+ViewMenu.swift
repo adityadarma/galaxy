@@ -121,10 +121,10 @@ extension MainWindowController {
     @objc func zoomEditorReset(_ sender: Any?) { zoomEditor(by: nil) }
 
     @objc func toggleBreadcrumbs(_ sender: Any?) {
-        let on = !breadcrumbBar.isEnabled
-        breadcrumbBar.isEnabled = on
+        let on = !pathBar.isEnabled
+        pathBar.isEnabled = on
         UserDefaults.standard.set(on, forKey: "ShowBreadcrumbs")
-        breadcrumbBar.show(symbols: documentSymbols, atLine: editorView.document?.primaryCursor().line ?? 0)
+        pathBar.show(symbols: documentSymbols, atLine: editorView.document?.primaryCursor().line ?? 0)
     }
 
     @objc func toggleStickyScroll(_ sender: Any?) {

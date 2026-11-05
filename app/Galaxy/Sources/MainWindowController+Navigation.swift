@@ -149,10 +149,11 @@ extension MainWindowController {
             let symbols = bridge.documentSymbols(document: document)
             documentSymbols = symbols.map { OutlineSymbol(uri: $0.uri, name: $0.name, kind: $0.kind, line: $0.line, column: $0.column) }
             let line = editorView.document?.primaryCursor().line ?? 0
-            breadcrumbBar.show(symbols: documentSymbols, atLine: line)
+            pathBar.show(symbols: documentSymbols, atLine: line)
         } else {
             documentSymbols = []
             breadcrumbBar.clear()
+            pathBar.show(symbols: [], atLine: 0)
         }
         guard let document = outlineRequest else { return }
         let symbols = bridge.documentSymbols(document: document)
