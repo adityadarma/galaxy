@@ -541,8 +541,18 @@ mod tests {
                 "Other.php",
                 "<?php\nnamespace App;\n\nclass Other\n{\n    public function total(): int\n    {\n        return 2;\n    }\n\n    public function again(Other $o)\n    {\n        return $o->total();\n    }\n}\n",
             ),
+            (
+                "Traits/Response.php",
+                "<?php\nnamespace App\\Traits;\n\ntrait Response\n{\n    public function responseJson(array $data = []): array\n    {\n        return $data;\n    }\n}\n",
+            ),
+            (
+                "Controller.php",
+                "<?php\nnamespace App;\n\nuse App\\Traits\\Response;\n\nclass Controller\n{\n    use Response;\n\n    public function first(): array\n    {\n        return $this->responseJson();\n    }\n\n    public function second(): array\n    {\n        return $this->responseJson(['ok' => true]);\n    }\n}\n",
+            ),
         ] {
-            std::fs::write(root.join("app").join(name), body).unwrap();
+            let path = root.join("app").join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, body).unwrap();
         }
         dir
     }
@@ -629,6 +639,21 @@ mod tests {
             found,
             vec![("Report.php".into(), 7, 8), ("Report.php".into(), 8, 44),],
             "`$x` of `again` is another variable"
+        );
+    }
+
+    #[test]
+    fn trait_methods_include_calls_on_classes_that_use_them() {
+        let dir = project();
+        let mut engine = PhpEngine::new(dir.path());
+        let found = at(&mut engine, dir.path(), "Traits/Response.php", 5, 20);
+        assert_eq!(
+            found,
+            vec![
+                ("Controller.php".into(), 11, 22),
+                ("Controller.php".into(), 16, 22),
+                ("Response.php".into(), 5, 20),
+            ]
         );
     }
 

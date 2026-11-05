@@ -20,8 +20,8 @@ impl PhpEngine {
         if self.is_template(path) {
             return Vec::new();
         }
-        self.with_symbol(path, text, line, column, |engine, _ctx, symbol, _range| {
-            engine.symbol_target(symbol)
+        self.with_symbol(path, text, line, column, |engine, ctx, symbol, _range| {
+            engine.symbol_target(path, ctx, symbol)
         })
         .flatten()
         .unwrap_or_default()
@@ -163,6 +163,19 @@ impl PhpEngine {
         }
         let mut target = node;
         let mut parent = node.parent()?;
+        // A method declaration is its class member, not a class reference.
+        // Resolving it back to its own declaration lets the UI open References.
+        if node.kind() == "name"
+            && matches!(parent.kind(), "method_declaration" | "function_definition")
+            && parent.child_by_field_name("name").map(|n| n.id()) == Some(node.id())
+            && let Some(class) = ctx.class.as_ref()
+        {
+            return Some(Symbol::Member {
+                class: class.fqn.clone(),
+                name: text(node),
+                call: true,
+            });
+        }
         if parent.kind() == "qualified_name" || parent.kind() == "namespace_name" {
             target = parent;
             parent = parent.parent()?;
@@ -222,7 +235,12 @@ impl PhpEngine {
         }
     }
 
-    pub(super) fn symbol_target(&mut self, symbol: Symbol) -> Option<Vec<Target>> {
+    pub(super) fn symbol_target(
+        &mut self,
+        path: &Path,
+        ctx: &Ctx<'_>,
+        symbol: Symbol,
+    ) -> Option<Vec<Target>> {
         match symbol {
             Symbol::Class(fqn) => {
                 let class = self.class(&fqn)?;
@@ -249,7 +267,33 @@ impl PhpEngine {
                     column: function.column,
                 }])
             }
-            Symbol::Variable(_) => None,
+            Symbol::Variable(name) => {
+                let mut node = ctx
+                    .tree
+                    .root_node()
+                    .descendant_for_byte_range(ctx.byte, ctx.byte)?;
+                while let Some(parent) = node.parent() {
+                    node = parent;
+                    let Some(params) = node.child_by_field_name("parameters") else {
+                        continue;
+                    };
+                    let mut cursor = params.walk();
+                    let parameter = params.named_children(&mut cursor).find(|parameter| {
+                        parameter
+                            .child_by_field_name("name")
+                            .is_some_and(|parameter_name| {
+                                ctx.src[parameter_name.byte_range()] == name
+                            })
+                    })?;
+                    let parameter_name = parameter.child_by_field_name("name")?;
+                    return Some(vec![Target {
+                        path: path.to_path_buf(),
+                        line: parameter_name.start_position().row as u32,
+                        column: parameter_name.start_position().column as u32,
+                    }]);
+                }
+                None
+            }
         }
     }
 

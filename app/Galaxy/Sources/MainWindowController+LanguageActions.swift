@@ -20,7 +20,7 @@ extension MainWindowController {
             jump(to: target)
             return true
         }
-        definitionRequest = (document, position)
+        definitionRequest = (document, position, Date().addingTimeInterval(10))
         bridge.requestDefinition(document: document, line: position.line, character: position.colUtf16)
         return true
     }
@@ -28,6 +28,14 @@ extension MainWindowController {
     func refreshDefinition() {
         guard let request = definitionRequest else { return }
         let locations = bridge.definitionLocations(document: request.document)
+        guard !locations.isEmpty || Date() >= request.deadline else {
+            bridge.requestDefinition(
+                document: request.document,
+                line: request.position.line,
+                character: request.position.colUtf16
+            )
+            return
+        }
         definitionRequest = nil
         showDefinitionLocations(locations, at: request.position)
     }
@@ -35,12 +43,12 @@ extension MainWindowController {
     func showDefinitionLocations(_ locations: [DefinitionLocation], at position: TextPos) {
         guard locations.count > 1 else {
             guard let location = locations.first else { return }
-            // Like VS Code: going to the definition from the definition itself
-            // shows its references instead of a no-op jump.
             if let document = activeTab?.doc, isDefinition(location, at: position, in: document) {
-                // The request is cancelled when the caret moves, so pin it to the click.
+                // A definition cannot jump anywhere. Show its usages instead,
+                // matching the context-menu Go to Definition behavior.
                 document.goToLine(line: position.line, col: position.colUtf16)
                 startReferences(document: document, position: position)
+                return
             } else {
                 jump(to: location)
             }

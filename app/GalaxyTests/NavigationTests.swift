@@ -570,6 +570,88 @@ final class NavigationTests: XCTestCase {
         XCTAssertEqual(configLink?.1, UInt64(app + "app.name".utf16.count))
     }
 
+    func testCommandClickOnPHPMethodOpensItsDeclaration() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-php-command-click-\(UUID().uuidString)")
+        let file = dir.appendingPathComponent("Asset.php")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let source = """
+        <?php
+        class Asset {
+            public function assetPhotos() { return []; }
+            public function render() { return $this->assetPhotos(); }
+        }
+        """
+        try source.write(to: file, atomically: true, encoding: .utf8)
+
+        let controller = MainWindowController(bridge: CoreBridge())
+        controller.showWindow(nil)
+        defer { controller.window?.orderOut(nil) }
+        try controller.openFile(at: file)
+        let view = controller.editorView
+        let use = "    public function render() { return $this->assetPhotos(); }"
+        let method = (use as NSString).range(of: "assetPhotos")
+        click(view, line: 3, utf16Col: method.location + 2, flags: .command)
+
+        let declaration = ("    public function assetPhotos() { return []; }" as NSString).range(of: "assetPhotos")
+        let deadline = Date().addingTimeInterval(10)
+        while (view.document?.primaryCursor().line, view.document?.primaryCursor().colUtf16) != (2, UInt64(declaration.location)),
+              Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
+        XCTAssertEqual(view.document?.primaryCursor().line, 2)
+        XCTAssertEqual(view.document?.primaryCursor().colUtf16, UInt64(declaration.location))
+    }
+
+    func testCommandClickOnPHPMethodDeclarationShowsReferences() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-php-command-click-references-\(UUID().uuidString)")
+        let file = dir.appendingPathComponent("Aset.php")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let source = """
+        <?php
+        class Aset {
+            public function asetPhotos() { return []; }
+            public function render() { return $this->asetPhotos(); }
+        }
+        """
+        try source.write(to: file, atomically: true, encoding: .utf8)
+
+        let controller = MainWindowController(bridge: CoreBridge())
+        controller.window?.setContentSize(NSSize(width: 900, height: 600))
+        controller.showWindow(nil)
+        defer { controller.window?.orderOut(nil) }
+        try controller.openFile(at: file)
+        let view = controller.editorView
+        let declaration = ("    public function asetPhotos() { return []; }" as NSString).range(of: "asetPhotos")
+        click(view, line: 2, utf16Col: declaration.location + 2, flags: .command)
+
+        let deadline = Date().addingTimeInterval(10)
+        while controller.loadedReferencesPanel?.titleText != "References", Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
+        XCTAssertEqual(controller.loadedReferencesPanel?.titleText, "References")
+    }
+
+    func testCommandClickMovesCaretBeforeStartingDefinitionLookup() throws {
+        let controller = try makeController(text: "<?php\nuse App\\Models\\Product;\n")
+        let view = controller.editorView
+        view.document?.setPath(path: "/tmp/Navigation.php")
+        let clickedPosition = TextPos(line: 1, colUtf16: 9)
+        let lookupPosition = TextPos(line: 1, colUtf16: 15)
+        var requested: TextPos?
+        view.onDefinitionClick = { lookup in
+            requested = lookup
+            return true
+        }
+
+        click(view, line: Int(clickedPosition.line), utf16Col: Int(clickedPosition.colUtf16), flags: .command)
+
+        XCTAssertEqual(requested, lookupPosition)
+        XCTAssertEqual(controller.activeTab?.doc.primaryCursor().line, lookupPosition.line)
+        XCTAssertEqual(controller.activeTab?.doc.primaryCursor().colUtf16, lookupPosition.colUtf16)
+    }
+
     func testCommandHoverSkipsWordsBetweenJSXTagsButKeepsCode() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-jsx-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

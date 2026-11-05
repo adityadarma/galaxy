@@ -242,7 +242,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// Set while back/forward shows a location, so that move is not
     /// itself recorded as a jump.
     var isNavigating = false
-    var definitionRequest: (document: DocumentHandle, position: TextPos)?
+    var definitionRequest: (document: DocumentHandle, position: TextPos, deadline: Date)?
     var referencesRequest: (
         document: DocumentHandle,
         position: TextPos,

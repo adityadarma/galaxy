@@ -226,6 +226,24 @@ fn php_references_and_rename_come_from_the_engine() {
 }
 
 #[test]
+fn php_definition_comes_from_the_engine() {
+    let (_dir, order_path, report_path) = php_project();
+    let core = Core::new();
+    let report = core.open_document(report_path).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !core.request_definition(report.clone(), 7, 24) {
+        assert!(Instant::now() < deadline, "engine never became ready");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let locations = core.definition_locations(report);
+    assert_eq!(locations.len(), 1);
+    assert!(locations[0].uri.ends_with("app/Order.php"));
+    assert_eq!(locations[0].line, 5);
+    assert_eq!(locations[0].column, 20);
+    let _ = order_path;
+}
+
+#[test]
 fn php_signature_outline_and_actions_come_from_the_engine() {
     let (dir, _order_path, report_path) = php_project();
     let extra_path = dir.path().join("app/Extra.php");

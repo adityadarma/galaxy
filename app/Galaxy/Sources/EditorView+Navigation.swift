@@ -136,8 +136,17 @@ extension EditorView {
         }
         let flags = event.modifierFlags
         // ⌘+click on a keyword or comment is a plain click, not a lookup.
-        if flags.contains(.command), event.clickCount == 1, let range = navigableRange(at: pos),
-           onDefinitionClick?(definitionPosition(at: pos, range: range)) == true { return }
+        if flags.contains(.command), event.clickCount == 1, let range = navigableRange(at: pos) {
+            // References requests require the caret to remain on their symbol
+            // while the asynchronous definition lookup completes. Context-menu
+            // navigation already does this; Cmd-click must do the same.
+            let lookupPosition = definitionPosition(at: pos, range: range)
+            document.setCaret(pos: lookupPosition)
+            if onDefinitionClick?(lookupPosition) == true {
+                reloadDocument()
+                return
+            }
+        }
         columnAnchor = nil
         if flags.contains(.option), flags.contains(.shift) {
             // Opt+Shift+drag: column (box) selection.

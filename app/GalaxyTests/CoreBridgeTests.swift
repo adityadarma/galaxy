@@ -70,6 +70,36 @@ final class CoreBridgeTests: XCTestCase {
     }
 
     @MainActor
+    func testDefinitionRequestRetriesWhilePHPIndexBuilds() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("galaxy-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        try "{\"autoload\":{\"psr-4\":{\"App\\\\\":\"app/\"}}}"
+            .write(to: directory.appendingPathComponent("composer.json"), atomically: true, encoding: .utf8)
+        let app = directory.appendingPathComponent("app")
+        try FileManager.default.createDirectory(at: app, withIntermediateDirectories: true)
+        try "<?php\nnamespace App;\nclass Order { public function total(): int { return 1; } }\n"
+            .write(to: app.appendingPathComponent("Order.php"), atomically: true, encoding: .utf8)
+        let report = app.appendingPathComponent("Report.php")
+        try "<?php\nnamespace App;\nclass Report { public function run(Order $order): int { return $order->total(); } }\n"
+            .write(to: report, atomically: true, encoding: .utf8)
+
+        let bridge = CoreBridge()
+        let document = try bridge.openDocument(path: report.path)
+        let deadline = Date().addingTimeInterval(10)
+        repeat {
+            bridge.requestDefinition(document: document, line: 2, character: 70)
+            if !bridge.definitionLocations(document: document).isEmpty { break }
+            RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+        } while Date() < deadline
+        let locations = bridge.definitionLocations(document: document)
+        XCTAssertEqual(locations.count, 1)
+        XCTAssertTrue(locations[0].uri.hasSuffix("/Order.php"))
+    }
+
+    @MainActor
     func testDefinitionFollowsTypeImportAndPropertyAnnotation() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("galaxy-\(UUID().uuidString)")

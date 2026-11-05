@@ -123,6 +123,44 @@ fn filters_by_typed_prefix() {
 }
 
 #[test]
+fn definition_of_trait_method_call_points_to_trait() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("app/Traits")).unwrap();
+    std::fs::write(
+        dir.path().join("composer.json"),
+        r#"{"autoload":{"psr-4":{"App\\":"app/"}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("app/Traits/Response.php"),
+        "<?php\nnamespace App\\Traits;\ntrait Response { public function responseJson(): array { return []; } }\n",
+    )
+    .unwrap();
+    let path = dir.path().join("app/Controller.php");
+    let source = "<?php\nnamespace App;\nuse App\\Traits\\Response;\nclass Controller { use Response; public function show(): array { return $this->responseJson|(); } }\n";
+    let (text, line, column) = marker(source);
+    let mut engine = PhpEngine::new(dir.path());
+
+    let target = engine.definition(&path, &text, line, column);
+    assert_eq!(target.len(), 1);
+    assert!(target[0].path.ends_with("app/Traits/Response.php"));
+    assert_eq!(target[0].line, 2);
+}
+
+#[test]
+fn definition_of_parameter_use_points_to_parameter() {
+    let project = Project::new();
+    let source = format!("{HEAD}        return $user|->name();\n    }}\n}}\n");
+    let (text, line, column) = marker(&source);
+    let mut engine = PhpEngine::new(project.dir.path());
+
+    let target = engine.definition(&project.file(), &text, line, column);
+    assert_eq!(target.len(), 1);
+    assert_eq!(target[0].line, 8);
+    assert_eq!(target[0].column, 30);
+}
+
+#[test]
 fn treats_blade_named_files_as_php_without_laravel() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("app")).unwrap();

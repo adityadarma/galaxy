@@ -3620,6 +3620,10 @@ impl Core {
             self.php_engine_any(Path::new(&path)).map(Engine::Php)
         };
         let Some(engine) = engine else {
+            self.analysis
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_definitions(uri, Vec::new());
             return false;
         };
         let text = document.lock().editor.doc.text();
