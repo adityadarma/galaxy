@@ -521,6 +521,10 @@ extension MainWindowController {
     func applyDiffPane(for tab: EditorTab) {
         editorView.lineTints = [:]
         secondaryEditorView.lineTints = [:]
+        editorView.diffSpacers = []
+        secondaryEditorView.diffSpacers = []
+        editorView.diffSide = nil
+        secondaryEditorView.diffSide = nil
         guard let base = tab.diffBase else {
             if isDiffPaneShown { leaveDiffPane() }
             secondaryEditorView.document = nil
@@ -536,6 +540,8 @@ extension MainWindowController {
             editorSplitView.addSubview(secondaryScrollView, positioned: .below, relativeTo: scrollView)
         }
         secondaryEditorView.isReadOnly = true
+        secondaryEditorView.diffSide = .removed
+        editorView.diffSide = .added
         secondaryEditorView.document = base
         editorSplitView.layoutSubtreeIfNeeded()
         // A pane added to a split view starts with no width; give each side half.
@@ -552,6 +558,10 @@ extension MainWindowController {
         updateMinimap()
         diffMap = DiffLineMap()
         secondaryEditorView.isReadOnly = false
+        secondaryEditorView.diffSide = nil
+        editorView.diffSide = nil
+        secondaryEditorView.diffSpacers = []
+        editorView.diffSpacers = []
         secondaryEditorView.lineTints = [:]
         editorView.lineTints = [:]
         secondaryScrollView.removeFromSuperview()
@@ -563,13 +573,16 @@ extension MainWindowController {
     /// the first change.
     private func applyDiff(_ map: DiffLineMap) {
         diffMap = map
+        secondaryEditorView.diffSpacers = map.oldSpacers
+        editorView.diffSpacers = map.newSpacers
         editorView.lineTints = Dictionary(map.newChangedLines.map { ($0, Theme.diffAdded) }, uniquingKeysWith: { a, _ in a })
         secondaryEditorView.lineTints = Dictionary(map.oldChangedLines.map { ($0, Theme.diffRemoved) }, uniquingKeysWith: { a, _ in a })
         guard diffRevealPending else { return }
         diffRevealPending = false
         let lineHeight = editorView.metrics.lineHeight
         let first = max(0, (map.hunks.first?.newStart ?? 0) - 3)
-        scrollView.contentView.scroll(to: NSPoint(x: 0, y: CGFloat(first) * lineHeight - scrollView.contentInsets.top))
+        let visual = map.visualRow(forNew: first)
+        scrollView.contentView.scroll(to: NSPoint(x: 0, y: CGFloat(visual) * lineHeight - scrollView.contentInsets.top))
         scrollView.reflectScrolledClipView(scrollView.contentView)
         syncDiffScroll(fromPrimary: true)
     }
@@ -597,32 +610,22 @@ extension MainWindowController {
         guard lineHeight > 0 else { return }
         let inset = scrollView.contentInsets.top
         let y = max(0, source.contentView.bounds.origin.y + inset)
-        let line = Int(y / lineHeight)
-        let fraction = y - CGFloat(line) * lineHeight
-        let mapped = fromPrimary ? diffMap.oldLine(forNew: line) : diffMap.newLine(forOld: line)
         isSyncingDiffScroll = true
         defer { isSyncingDiffScroll = false }
-        target.contentView.scroll(to: NSPoint(x: 0, y: CGFloat(mapped) * lineHeight + fraction - inset))
+        target.contentView.scroll(to: NSPoint(x: 0, y: y - inset))
         target.reflectScrolledClipView(target.contentView)
     }
 
     /// Pure helper called from the utility queue in `refreshGitDiff()`, so it
     /// must not inherit the controller's main-actor isolation.
     nonisolated static func gitLineMarkers(_ changes: [GitLineChangeInfo]) -> [UInt64: GitLineChangeKind] {
-        changes.reduce(into: [:]) { markers, change in
-            guard let current = markers[change.line] else {
-                markers[change.line] = change.kind
-                return
-            }
-            if (current == .added && change.kind == .deleted)
-                || (current == .deleted && change.kind == .added) {
-                markers[change.line] = .modified
-                return
-            }
-            let priority: [GitLineChangeKind: Int] = [.added: 0, .deleted: 1, .modified: 2]
-            if priority[change.kind, default: 0] > priority[current, default: 0] {
-                markers[change.line] = change.kind
-            }
+        // A deletion marks the line above it. If that line carries an edit
+        // too, the edit shows: it is the change on the line itself.
+        let priority: [GitLineChangeKind: Int] = [.deleted: 0, .added: 1, .modified: 2]
+        return changes.reduce(into: [:]) { markers, change in
+            if let current = markers[change.line],
+               priority[current, default: 0] >= priority[change.kind, default: 0] { return }
+            markers[change.line] = change.kind
         }
     }
 }

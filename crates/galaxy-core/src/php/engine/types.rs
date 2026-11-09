@@ -28,6 +28,13 @@ impl PhpEngine {
         name: &str,
         args: &str,
     ) -> Option<String> {
+        let frameworks = self.frameworks.clone();
+        if let Some(ty) = frameworks
+            .iter()
+            .find_map(|framework| framework.function_return_type(name, args))
+        {
+            return Some(ty);
+        }
         let mut candidates = Vec::new();
         if !name.starts_with('\\') && !ctx.file.namespace.is_empty() && !name.contains('\\') {
             candidates.push(format!("{}\\{}", ctx.file.namespace, name));

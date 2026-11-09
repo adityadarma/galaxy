@@ -126,7 +126,7 @@ extension EditorView {
             return
         }
         let barMinX = gutterShift + gitBarX - 2
-        if local.x >= barMinX, local.x < barMinX + Self.gitBarWidth + 4,
+        if diffSide == nil, local.x >= barMinX, local.x < barMinX + Self.gitBarWidth + 4,
            gitLineChanges[pos.line + 1] != nil, event.clickCount == 1 {
             onGitChangeClick?(pos.line)
             return
@@ -566,7 +566,7 @@ extension EditorView {
     /// file: Laravel (`config`, `route`, `view`, ...) and CodeIgniter 4
     /// (`route_to`, `url_to`, `lang`, `helper`, `model`, `service`) names.
     static let frameworkStringHelpers: Set<String> = [
-        "config", "route", "to_route", "view", "env", "trans", "trans_choice", "__", "asset", "mix", "vite",
+        "config", "auth", "route", "to_route", "view", "env", "trans", "trans_choice", "__", "asset", "mix", "vite",
         "inertia", "base_path", "resource_path", "config_path", "app_path", "database_path", "lang_path",
         "public_path", "storage_path",
         "route_to", "url_to", "lang", "helper", "model", "service", "t",

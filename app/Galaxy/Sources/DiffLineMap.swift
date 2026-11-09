@@ -4,6 +4,12 @@ import Foundation
 /// (right) of a diff tab. Lines are 0-based. Built from the changed regions, so
 /// both panes can scroll together and tint exactly the lines that differ.
 struct DiffLineMap: Equatable {
+    struct Spacer: Equatable {
+        /// Insert virtual rows immediately before this document line.
+        var beforeLine: Int
+        var rows: Int
+    }
+
     struct Hunk: Equatable {
         var oldStart: Int, oldLen: Int, newStart: Int, newLen: Int
     }
@@ -49,5 +55,28 @@ struct DiffLineMap: Equatable {
     /// Working lines that were added or replaced.
     var newChangedLines: [UInt64] {
         hunks.flatMap { hunk in (hunk.newStart..<hunk.newStart + hunk.newLen).map(UInt64.init) }
+    }
+
+    /// Virtual rows that align each changed region with the longer side.
+    var oldSpacers: [Spacer] {
+        hunks.compactMap { hunk in
+            let rows = hunk.newLen - hunk.oldLen
+            return rows > 0 ? Spacer(beforeLine: hunk.oldStart + hunk.oldLen, rows: rows) : nil
+        }
+    }
+
+    var newSpacers: [Spacer] {
+        hunks.compactMap { hunk in
+            let rows = hunk.oldLen - hunk.newLen
+            return rows > 0 ? Spacer(beforeLine: hunk.newStart + hunk.newLen, rows: rows) : nil
+        }
+    }
+
+    func visualRow(forOld line: Int) -> Int {
+        line + oldSpacers.filter { $0.beforeLine <= line }.reduce(0) { $0 + $1.rows }
+    }
+
+    func visualRow(forNew line: Int) -> Int {
+        line + newSpacers.filter { $0.beforeLine <= line }.reduce(0) { $0 + $1.rows }
     }
 }

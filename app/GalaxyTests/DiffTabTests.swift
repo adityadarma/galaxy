@@ -66,7 +66,27 @@ final class DiffTabTests: XCTestCase {
         XCTAssertEqual(map.newLine(forOld: 8), 9)
         XCTAssertEqual(map.oldChangedLines, [2, 3])
         XCTAssertEqual(map.newChangedLines, [2, 6, 7])
+        XCTAssertEqual(map.oldSpacers, [.init(beforeLine: 7, rows: 2)])
+        XCTAssertEqual(map.newSpacers, [.init(beforeLine: 3, rows: 1)])
+        XCTAssertEqual(map.visualRow(forOld: 7), 9)
+        XCTAssertEqual(map.visualRow(forNew: 3), 4)
         XCTAssertEqual(DiffLineMap().oldLine(forNew: 5), 5)
+    }
+
+    func testSpacerRowsGiveBothSidesTheSameVisualHeight() {
+        let map = DiffLineMap(hunks: [
+            .init(oldStart: 1, oldLen: 4, newStart: 1, newLen: 1),
+            .init(oldStart: 8, oldLen: 0, newStart: 5, newLen: 2),
+        ])
+        let oldLines = 10
+        let newLines = 9
+        let oldRows = oldLines + map.oldSpacers.reduce(0) { $0 + $1.rows }
+        let newRows = newLines + map.newSpacers.reduce(0) { $0 + $1.rows }
+        XCTAssertEqual(oldRows, newRows)
+        XCTAssertEqual(map.visualRow(forOld: 5), map.visualRow(forNew: 2),
+                       "the unchanged line after a 4-for-1 hunk aligns")
+        XCTAssertEqual(map.visualRow(forOld: 8), map.visualRow(forNew: 7),
+                       "the unchanged line after a pure insertion aligns")
     }
 
     // MARK: Opening
@@ -88,6 +108,13 @@ final class DiffTabTests: XCTestCase {
         XCTAssertEqual(c.diffMap.newChangedLines, [1, 4])
         XCTAssertEqual(c.secondaryEditorView.lineTints.keys.sorted(), [1])
         XCTAssertEqual(c.editorView.lineTints.keys.sorted(), [1, 4])
+        XCTAssertEqual(c.secondaryEditorView.diffSpacers, [.init(beforeLine: 4, rows: 1)])
+        XCTAssertTrue(c.editorView.diffSpacers.isEmpty)
+        XCTAssertEqual(c.secondaryEditorView.diffSide, .removed)
+        XCTAssertEqual(c.editorView.diffSide, .added)
+        XCTAssertEqual(c.secondaryEditorView.diffMarker(for: 1), "-")
+        XCTAssertEqual(c.editorView.diffMarker(for: 1), "+")
+        XCTAssertNil(c.editorView.diffMarker(for: 0), "unchanged lines have no marker")
     }
 
     func testCommittedSideIsReadOnlyAndTheWorkingSideStaysEditable() throws {
@@ -124,6 +151,8 @@ final class DiffTabTests: XCTestCase {
         c.openWorkspaceFile(ws, FileEntry(name: "other.txt", relPath: "other.txt", isDir: false), preview: false)
         XCTAssertFalse(c.isDiffPaneShown, "a normal file shows a single pane")
         XCTAssertTrue(c.editorView.lineTints.isEmpty)
+        XCTAssertNil(c.editorView.diffSide)
+        XCTAssertNil(c.secondaryEditorView.diffSide)
         XCTAssertNil(c.secondaryEditorView.document)
 
         c.selectTab(0)

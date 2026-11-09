@@ -8,6 +8,7 @@ use std::sync::{Arc, OnceLock};
 
 use regex::Regex;
 
+use super::site::mass_assignment_site_at;
 use super::{Index, Item, Kind, Loc, Site, site_at, sites};
 use crate::php::engine::{
     Action, Completion, Ctx, FileChange, HoverResult, ItemKind, PhpEngine, Problem, Severity,
@@ -232,6 +233,93 @@ impl PhpEngine {
             }
         }
         columns
+    }
+
+    /// Model columns qualified by the main table and every table joined
+    /// before this call. Without a join, preserve the existing short names.
+    fn query_columns(
+        &mut self,
+        idx: &Index,
+        class: &Arc<ClassInfo>,
+        text: &str,
+        site: &Site,
+    ) -> Vec<Item> {
+        static JOIN: OnceLock<Regex> = OnceLock::new();
+        let paren = site.paren.unwrap_or(text.len()).min(text.len());
+        let re = JOIN.get_or_init(|| {
+            Regex::new(
+                r#"(?i)(?:::|->)\s*(?:left|right|cross|full|leftouter|rightouter)?join\s*\(\s*['"]([^'"]+)['"]"#,
+            )
+            .expect("valid")
+        });
+        let before = &text[..paren];
+        let statement_start = before.rfind([';', '{', '}']).map_or(0, |index| index + 1);
+        let receiver = &before[statement_start..];
+        let joins: Vec<(&str, &str)> = re
+            .captures_iter(receiver)
+            .filter_map(|capture| {
+                let spec = capture.get(1)?.as_str().trim();
+                let mut words = spec.split_whitespace();
+                let table = words.next()?;
+                let second = words.next();
+                let alias = match second {
+                    Some(word) if word.eq_ignore_ascii_case("as") => words.next().unwrap_or(table),
+                    Some(word) => word,
+                    None => table,
+                };
+                Some((table, alias))
+            })
+            .collect();
+        if joins.is_empty() {
+            return self.model_columns(class);
+        }
+
+        let main = self.model_table(class);
+        let mut main_columns = self.model_columns(class);
+        for column in idx.columns_of(&main) {
+            if !main_columns.iter().any(|item| item.name == column.name) {
+                main_columns.push(column);
+            }
+        }
+        let mut columns: Vec<Item> = main_columns
+            .into_iter()
+            .map(|mut item| {
+                item.name = format!("{main}.{}", item.name);
+                item
+            })
+            .collect();
+        for (table, alias) in joins {
+            columns.extend(idx.columns_of(table).into_iter().map(|mut item| {
+                item.name = format!("{alias}.{}", item.name);
+                item
+            }));
+        }
+        columns
+    }
+
+    /// Explicit `$table` value, then Eloquent's conventional pluralized name.
+    fn model_table(&mut self, class: &Arc<ClassInfo>) -> String {
+        static TABLE: OnceLock<Regex> = OnceLock::new();
+        let re = TABLE.get_or_init(|| {
+            Regex::new(
+                r#"(?i)(?:public|protected)\s+(?:readonly\s+)?(?:string\s+)?\$table\s*=\s*['"]([^'"]+)['"]"#,
+            )
+            .expect("valid")
+        });
+        for owner in self.lineage(class).into_iter().take(6) {
+            if owner.fqn == MODEL {
+                break;
+            }
+            if let Ok(source) = std::fs::read_to_string(&owner.path)
+                && let Some(table) = re
+                    .captures(&source)
+                    .and_then(|capture| capture.get(1))
+                    .map(|table| table.as_str())
+            {
+                return table.to_owned();
+            }
+        }
+        plural(&snake(&class.name))
     }
 
     /// Eloquent accessors expose `getTypeNameAttribute()` or `typeName()` as
@@ -831,7 +919,7 @@ impl PhpEngine {
             }
             Kind::Column => {
                 let class = self.model_of_call(path, text, site)?;
-                let columns = self.model_columns(&class);
+                let columns = self.query_columns(idx, &class, text, site);
                 pick(&columns, name).map(|item| Some(found(item)))
             }
             Kind::Relation => {
@@ -866,7 +954,22 @@ impl PhpEngine {
             };
             return Some(named(typed, items, ItemKind::Class, from));
         }
-        let site = site_at(text, byte, blade)?;
+        if !blade && let Some(site) = mass_assignment_site_at(text, byte) {
+            let typed = &text[site.start..byte.min(site.end)];
+            let from = position_of(text, site.start).1;
+            let class = self.model_of_call(path, text, &site)?;
+            return Some(named(
+                typed,
+                &self.model_columns(&class),
+                ItemKind::Property,
+                from,
+            ));
+        }
+        let site = if blade {
+            site_at(text, byte, true)
+        } else {
+            mass_assignment_site_at(text, byte).or_else(|| site_at(text, byte, false))
+        }?;
         let typed = &text[site.start..byte.min(site.end)];
         let from = position_of(text, site.start).1;
         let kind = item_kind(site.kind);
@@ -921,7 +1024,7 @@ impl PhpEngine {
             }
             Kind::Column => {
                 let class = self.model_of_call(path, text, &site)?;
-                let columns = self.model_columns(&class);
+                let columns = self.query_columns(&idx, &class, text, &site);
                 named(typed, &columns, kind, from)
             }
             Kind::Relation => {
@@ -995,7 +1098,11 @@ impl PhpEngine {
                 return Some(vec![target]);
             }
         }
-        let site = site_at(text, byte, blade)?;
+        let site = if blade {
+            site_at(text, byte, true)
+        } else {
+            mass_assignment_site_at(text, byte).or_else(|| site_at(text, byte, false))
+        }?;
         if site.kind == Kind::Relation {
             let hit = self.relation_definition(path, text, &site, byte)?;
             return Some(self.targets(hit.loc.as_ref(), hit.class.as_deref()));
@@ -1057,7 +1164,11 @@ impl PhpEngine {
             let markdown = describe(what, name, &hit, false, &idx.root);
             return Some(result(start, end, markdown));
         }
-        let site = site_at(text, byte, blade)?;
+        let site = if blade {
+            site_at(text, byte, true)
+        } else {
+            mass_assignment_site_at(text, byte).or_else(|| site_at(text, byte, false))
+        }?;
         if site.kind == Kind::Rule {
             let contents = &text[site.start..site.end];
             let at = byte - site.start;
@@ -1266,6 +1377,41 @@ mod tests {
             "config/app.php",
             "<?php\nreturn [\n    'name' => 'Galaxy',\n    'debug' => true,\n];\n",
         );
+        write(
+            r,
+            "config/auth.php",
+            "<?php\nreturn [\n    'guards' => [\n        'web' => ['driver' => 'session'],\n    ],\n];\n",
+        );
+        write(
+            r,
+            "vendor/laravel/sanctum/src/SanctumServiceProvider.php",
+            "<?php\nclass SanctumServiceProvider {\n    function register() {\n        config(['auth.guards.sanctum' => ['driver' => 'sanctum']]);\n    }\n}\n",
+        );
+        write(
+            r,
+            "vendor/composer/autoload_psr4.php",
+            "<?php\nreturn array(\n    'Illuminate\\\\Contracts\\\\' => array($vendorDir . '/laravel/framework/src/Illuminate/Contracts'),\n    'Illuminate\\\\Database\\\\Eloquent\\\\' => array($vendorDir . '/laravel/framework/src/Illuminate/Database/Eloquent'),\n);\n",
+        );
+        write(
+            r,
+            "vendor/laravel/framework/src/Illuminate/Contracts/Auth/Guard.php",
+            "<?php\nnamespace Illuminate\\Contracts\\Auth;\ninterface Guard {\n    public function check();\n    public function user();\n}\n",
+        );
+        write(
+            r,
+            "vendor/laravel/framework/src/Illuminate/Database/Eloquent/Model.php",
+            "<?php\nnamespace Illuminate\\Database\\Eloquent;\nabstract class Model {\n    public function __call($method, $parameters) {}\n    public static function __callStatic($method, $parameters) {}\n}\n",
+        );
+        write(
+            r,
+            "vendor/acme/token/src/TokenServiceProvider.php",
+            "<?php\nclass TokenServiceProvider {\n    function boot($auth) {\n        $auth->extend('partner', fn () => null);\n    }\n}\n",
+        );
+        write(
+            r,
+            "app/Providers/AuthServiceProvider.php",
+            "<?php\nclass AuthServiceProvider {\n    function boot() {\n        Auth::viaRequest('internal', fn () => null);\n    }\n}\n",
+        );
         write(r, ".env", "APP_NAME=Galaxy\nAPP_KEY=secret");
         write(
             r,
@@ -1288,12 +1434,17 @@ mod tests {
         write(
             r,
             "app/Models/User.php",
-            "<?php\nnamespace App\\Models;\n\nclass User\n{\n    protected $fillable = ['nickname'];\n}\n",
+            "<?php\nnamespace App\\Models;\n\nuse Illuminate\\Database\\Eloquent\\Model;\n\nclass User extends Model\n{\n    protected $fillable = ['nickname'];\n}\n",
         );
         write(
             r,
             "database/migrations/2024_01_01_000000_create_users_table.php",
             "<?php\nSchema::create('users', function (Blueprint $table) {\n    $table->id();\n    $table->string('email');\n    $table->timestamps();\n});\n",
+        );
+        write(
+            r,
+            "database/migrations/2024_01_02_000000_create_profiles_table.php",
+            "<?php\nSchema::create('profiles', function (Blueprint $table) {\n    $table->id();\n    $table->foreignId('user_id');\n    $table->string('display_name');\n});\n",
         );
         dir
     }
@@ -1375,6 +1526,99 @@ mod tests {
                 .collect();
             assert_eq!(labels, vec!["nickname"], "{method}");
         }
+
+        for source in [
+            "User::create(['nick|' => 'Ada']);",
+            "$user->update(['nick|' => 'Ada']);",
+            "User::updateOrCreate(['nickname' => 'Ada'], ['nick|' => 'Lovelace']);",
+            "User::forceFill(['nick|' => 'Ada']);",
+        ] {
+            let (text, line, column) = cursor(&format!(
+                "<?php\nnamespace App;\nuse App\\Models\\User;\nfunction save(User $user) {{\n    {source}\n}}\n"
+            ));
+            let labels: Vec<String> = engine
+                .complete(&dir.path().join("app/X.php"), &text, line, column)
+                .into_iter()
+                .map(|item| item.label)
+                .collect();
+            assert_eq!(labels, vec!["nickname"], "{source}");
+        }
+
+        let (text, line, column) = cursor(
+            "<?php\nnamespace App;\nuse App\\Models\\User;\nUser::join('ignored', 'x', '=', 'y');\nUser::leftJoin('profiles as p', 'p.user_id', '=', 'users.id')->where('|');\n",
+        );
+        let labels: Vec<String> = engine
+            .complete(&dir.path().join("app/X.php"), &text, line, column)
+            .into_iter()
+            .map(|item| item.label)
+            .collect();
+        assert!(labels.contains(&"users.nickname".to_owned()), "{labels:?}");
+        assert!(labels.contains(&"users.id".to_owned()), "{labels:?}");
+        assert!(labels.contains(&"users.email".to_owned()), "{labels:?}");
+        assert!(labels.contains(&"p.id".to_owned()), "{labels:?}");
+        assert!(labels.contains(&"p.user_id".to_owned()), "{labels:?}");
+        assert!(labels.contains(&"p.display_name".to_owned()), "{labels:?}");
+        assert!(
+            !labels.iter().any(|label| label.starts_with("ignored.")),
+            "{labels:?}"
+        );
+
+        let (text, line, column) = cursor(
+            "<?php\nnamespace App;\nuse App\\Models\\User;\nUser::leftJoin('profiles as p', 'p.user_id', '=', 'users.id')->where('p.user_|id', 1);\n",
+        );
+        let hover = engine
+            .hover(&dir.path().join("app/X.php"), &text, line, column)
+            .expect("qualified joined column hover");
+        assert!(
+            hover.markdown.contains("**Column** `p.user_id`"),
+            "{}",
+            hover.markdown
+        );
+        let targets = engine.definition(&dir.path().join("app/X.php"), &text, line, column);
+        assert_eq!(targets.len(), 1);
+        assert!(
+            targets[0]
+                .path
+                .ends_with("2024_01_02_000000_create_profiles_table.php"),
+            "{:?}",
+            targets[0].path
+        );
+
+        let (text, line, column) = cursor(
+            "<?php\nnamespace App;\nuse App\\Models\\User;\nUser::create(['nick|name' => 'Ada']);\n",
+        );
+        let hover = engine
+            .hover(&dir.path().join("app/X.php"), &text, line, column)
+            .expect("mass-assignment column hover");
+        assert!(
+            hover.markdown.contains("**Column** `nickname`"),
+            "{}",
+            hover.markdown
+        );
+        assert!(
+            hover.markdown.contains("app/Models/User.php"),
+            "{}",
+            hover.markdown
+        );
+        let targets = engine.definition(&dir.path().join("app/X.php"), &text, line, column);
+        assert_eq!(targets.len(), 1);
+        assert!(targets[0].path.ends_with("app/Models/User.php"));
+
+        for source in [
+            "User::create(['nickname' => 'Ad|a']);",
+            "User::create(['meta' => ['nick|' => 'Ada']]);",
+        ] {
+            let (text, line, column) = cursor(&format!(
+                "<?php\nnamespace App;\nuse App\\Models\\User;\n{source}\n"
+            ));
+            assert!(
+                engine
+                    .complete(&dir.path().join("app/X.php"), &text, line, column)
+                    .iter()
+                    .all(|item| item.label != "nickname"),
+                "{source}"
+            );
+        }
     }
 
     #[test]
@@ -1419,6 +1663,61 @@ mod tests {
         let (text, line, column) = cursor("<?php\nconfig('app.de|bug');\n");
         let targets = engine.definition(&path, &text, line, column);
         assert!(targets[0].path.ends_with("config/app.php"));
+        assert_eq!(targets[0].line, 3);
+
+        let (text, line, column) = cursor("<?php\nauth('sanc|tum')->check();\n");
+        let targets = engine.definition(&path, &text, line, column);
+        assert_eq!(targets.len(), 1);
+        assert!(
+            targets[0]
+                .path
+                .ends_with("vendor/laravel/sanctum/src/SanctumServiceProvider.php")
+        );
+        assert_eq!(targets[0].line, 3);
+
+        for (method, line) in [("check", 3), ("user", 4)] {
+            let source = format!("<?php\nauth('sanctum')->{method}|();\n");
+            let (text, source_line, column) = cursor(&source);
+            let targets = engine.definition(&path, &text, source_line, column);
+            assert_eq!(targets.len(), 1, "{method}");
+            assert!(
+                targets[0]
+                    .path
+                    .ends_with("vendor/laravel/framework/src/Illuminate/Contracts/Auth/Guard.php"),
+                "{method}"
+            );
+            assert_eq!(targets[0].line, line, "{method}");
+        }
+
+        for (guard, suffix) in [
+            ("partner", "vendor/acme/token/src/TokenServiceProvider.php"),
+            ("internal", "app/Providers/AuthServiceProvider.php"),
+        ] {
+            let source = format!("<?php\nauth('{guard}')->check();\n");
+            let column = source.find(guard).expect("guard") as u32 + 1;
+            let targets = engine.definition(&path, &source, 1, column);
+            assert_eq!(targets.len(), 1, "{guard}");
+            assert!(targets[0].path.ends_with(suffix), "{guard}");
+            assert!(engine.diagnostics(&path, &source).is_empty(), "{guard}");
+        }
+        let missing = "<?php\nauth('missing')->check();\n";
+        assert!(
+            engine
+                .diagnostics(&path, missing)
+                .iter()
+                .any(|problem| problem.message.contains("not defined in the config"))
+        );
+
+        write(
+            dir.path(),
+            "config/auth.php",
+            "<?php\nreturn [\n    'guards' => [\n        'sanctum' => ['driver' => 'token'],\n    ],\n];\n",
+        );
+        let mut engine = PhpEngine::new(dir.path());
+        let (text, line, column) = cursor("<?php\nauth('sanc|tum')->check();\n");
+        let targets = engine.definition(&path, &text, line, column);
+        assert_eq!(targets.len(), 1);
+        assert!(targets[0].path.ends_with("config/auth.php"));
         assert_eq!(targets[0].line, 3);
     }
 

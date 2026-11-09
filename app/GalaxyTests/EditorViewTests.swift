@@ -489,6 +489,16 @@ final class EditorViewTests: XCTestCase {
         XCTAssertTrue(inked, "line number glyphs should appear in the gutter")
     }
 
+    func testDiagnosticUnderlinesUseSeverityColors() {
+        for severity: UInt8 in 1...3 {
+            XCTAssertEqual(
+                EditorView.diagnosticUnderlineColor(severity),
+                Theme.diagnostic(severity),
+                "severity \(severity)"
+            )
+        }
+    }
+
     func testInlineGitHunkPushesFollowingLinesDown() throws {
         let (view, _, url) = try makeView(text: "zero\none\ntwo\nthree")
         defer { try? FileManager.default.removeItem(at: url) }
@@ -572,7 +582,57 @@ final class EditorViewTests: XCTestCase {
         let y = view.metrics.lineHeight / 2
         let barX = view.gitBarX + EditorView.gitBarWidth / 2
 
+        XCTAssertGreaterThan(view.gitBarX, view.gutterRight)
         XCTAssertNotEqual(try luminance(rep, view, x: barX, y: y), try luminance(rep, view, x: 1, y: y))
+    }
+
+    func testModifiedGitBarIsHatchedAndWidensUnderThePointer() throws {
+        let (view, _, url) = try makeView(text: "zero\none\ntwo")
+        defer { try? FileManager.default.removeItem(at: url) }
+        view.forcedCaretVisible = false
+        view.gitLineChanges = [1: .modified, 2: .added]
+        let right = view.gitBarX + EditorView.gitBarWidth
+
+        func samples(_ rep: NSBitmapImageRep, row: Int, x: ClosedRange<CGFloat>) throws -> Set<Int> {
+            let top = CGFloat(row) * view.metrics.lineHeight
+            var seen = Set<Int>()
+            for dy in stride(from: CGFloat(1), to: view.metrics.lineHeight - 1, by: 1) {
+                for px in stride(from: x.lowerBound, through: x.upperBound, by: 1) {
+                    seen.insert(Int((try luminance(rep, view, x: px, y: top + dy)) * 1000))
+                }
+            }
+            return seen
+        }
+
+        var rep = try bitmap(view)
+        XCTAssertGreaterThan(try samples(rep, row: 0, x: view.gitBarX...(right - 1)).count, 1, "stripes, not a solid fill")
+        XCTAssertEqual(try samples(rep, row: 1, x: view.gitBarX...(right - 1)).count, 1, "added stays solid")
+        let widenedX = right - EditorView.gitBarHoverWidth
+        let before = try samples(rep, row: 0, x: widenedX...(view.gitBarX - 1))
+        XCTAssertEqual(before.count, 1, "nothing left of the narrow bar")
+
+        view.hoveredGitLine = 0
+        rep = try bitmap(view)
+        XCTAssertGreaterThan(try samples(rep, row: 0, x: widenedX...(view.gitBarX - 1)).count, 1, "the hovered bar widens")
+        XCTAssertEqual(try samples(rep, row: 1, x: widenedX...(view.gitBarX - 1)).count, 1, "other bars stay narrow")
+    }
+
+    func testPointerOverAGitBarMarksOnlyThatLine() throws {
+        let (view, _, url) = try makeView(text: "zero\none\ntwo")
+        defer { try? FileManager.default.removeItem(at: url) }
+        view.gitLineChanges = [2: .added]
+        let x = view.gitBarX + EditorView.gitBarWidth / 2
+        let lineHeight = view.metrics.lineHeight
+
+        view.updateHoveredGitLine(at: NSPoint(x: x, y: lineHeight * 1.5))
+        XCTAssertEqual(view.hoveredGitLine, 1)
+        view.updateHoveredGitLine(at: NSPoint(x: x, y: lineHeight * 0.5))
+        XCTAssertNil(view.hoveredGitLine, "line 0 has no change")
+        view.updateHoveredGitLine(at: NSPoint(x: x + 60, y: lineHeight * 1.5))
+        XCTAssertNil(view.hoveredGitLine, "away from the bar")
+        view.updateHoveredGitLine(at: NSPoint(x: x, y: lineHeight * 1.5))
+        view.updateHoveredGitLine(at: nil)
+        XCTAssertNil(view.hoveredGitLine)
     }
 
     func testGitBarDrawsPastOneThousandLines() throws {
@@ -581,8 +641,8 @@ final class EditorViewTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: url) }
         view.reloadDocument()
 
-        XCTAssertEqual(view.gitBarX, EditorView.gitBarOffset)
-        XCTAssertLessThan(view.gitBarX + EditorView.gitBarWidth, view.gutterRight - 4)
+        XCTAssertEqual(view.gitBarX, view.gutterRight + EditorView.gitBarOffset)
+        XCTAssertLessThan(view.gitBarX + EditorView.gitBarWidth, view.foldZoneMinX)
     }
 
     /// Regression: Core Text draws black unless told to use the context

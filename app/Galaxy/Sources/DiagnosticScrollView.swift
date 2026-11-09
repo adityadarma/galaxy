@@ -57,11 +57,7 @@ final class OverviewRulerView: NSView {
     }
 
     static func color(for kind: GitLineChangeKind) -> NSColor {
-        switch kind {
-        case .added: .systemGreen
-        case .modified: .systemYellow
-        case .deleted: .systemRed
-        }
+        Theme.gitChange(kind)
     }
 
     /// Top of a 0-based line's tick, kept inside the strip.

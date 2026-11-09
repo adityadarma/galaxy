@@ -297,11 +297,12 @@ final class ExplorerTests: XCTestCase {
         ])
         XCTAssertEqual(markers, [8: .modified])
 
+        // No Added + Deleted -> Modified rule: the edit on the line shows.
         let replacement = MainWindowController.gitLineMarkers([
             GitLineChangeInfo(line: 26, kind: .deleted),
             GitLineChangeInfo(line: 26, kind: .added),
         ])
-        XCTAssertEqual(replacement, [26: .modified])
+        XCTAssertEqual(replacement, [26: .added])
     }
 
     func testDraggingTheDividerResizesTheSidebar() throws {

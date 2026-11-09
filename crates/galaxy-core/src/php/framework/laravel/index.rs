@@ -353,6 +353,8 @@ impl Index {
     fn read_providers(&mut self) {
         static BIND: OnceLock<Regex> = OnceLock::new();
         static GATE: OnceLock<Regex> = OnceLock::new();
+        static GUARD: OnceLock<Regex> = OnceLock::new();
+        static GUARD_CONFIG: OnceLock<Regex> = OnceLock::new();
         let bind = BIND.get_or_init(|| {
             Regex::new(
                 r#"->(?:bind|singleton|scoped|instance|alias|bindIf|singletonIf)\(\s*(?:['"]([^'"]+)['"]|\\?([\w\\]+)::class)"#,
@@ -361,6 +363,14 @@ impl Index {
         });
         let gate =
             GATE.get_or_init(|| Regex::new(r#"Gate::define\(\s*['"]([^'"]+)['"]"#).expect("valid"));
+        let guard = GUARD.get_or_init(|| {
+            Regex::new(
+                r#"(?i)(?:Auth\s*::|\$\w+\s*->)\s*(?:extend|viaRequest)\s*\(\s*['"]([^'"]+)['"]"#,
+            )
+            .expect("valid")
+        });
+        let guard_config = GUARD_CONFIG
+            .get_or_init(|| Regex::new(r#"['"]auth\.guards\.([^'"]+)['"]\s*=>"#).expect("valid"));
         for (name, detail) in BUILTIN_BINDINGS {
             self.bindings.push(Item {
                 name: (*name).into(),
@@ -383,7 +393,24 @@ impl Index {
                 ..Item::default()
             });
         }
-        for path in walk(&self.root.join("app/Providers")) {
+        let mut providers = walk(&self.root.join("app/Providers"));
+        // Scan each Composer package independently. `walk(vendor)` has a
+        // global file cap and can stop before a late package such as Sanctum.
+        if let Ok(vendors) = fs::read_dir(self.root.join("vendor")) {
+            for vendor in vendors.flatten().filter(|entry| entry.path().is_dir()) {
+                let Ok(packages) = fs::read_dir(vendor.path()) else {
+                    continue;
+                };
+                for package in packages.flatten().filter(|entry| entry.path().is_dir()) {
+                    providers.extend(walk(&package.path()).into_iter().filter(|path| {
+                        path.file_name()
+                            .and_then(|file| file.to_str())
+                            .is_some_and(|file| file.to_ascii_lowercase().contains("provider"))
+                    }));
+                }
+            }
+        }
+        for path in providers {
             let Some(text) = read(&path) else { continue };
             let used = uses(&text);
             for caps in bind.captures_iter(&text) {
@@ -404,6 +431,22 @@ impl Index {
                 self.abilities.push(Item {
                     name: name.as_str().to_owned(),
                     detail: "Gate".into(),
+                    loc: at(&path, &text, name.start()),
+                    class: None,
+                });
+            }
+            for caps in guard_config
+                .captures_iter(&text)
+                .chain(guard.captures_iter(&text))
+            {
+                let name = caps.get(1).expect("guard");
+                let full = format!("auth.guards.{}", name.as_str());
+                if self.config.iter().any(|item| item.name == full) {
+                    continue;
+                }
+                self.config.push(Item {
+                    name: full,
+                    detail: "Runtime auth guard".into(),
                     loc: at(&path, &text, name.start()),
                     class: None,
                 });

@@ -265,7 +265,8 @@ extension MainWindowController {
                                                    selectedText: selectedText, currentYear: year)
             text = expansion.text
             firstStopIndex = expansion.stops.first(where: { $0.index != 0 })?.index
-        if let firstStopIndex {
+                ?? expansion.stops.first?.index
+            if let firstStopIndex {
                 firstStops = expansion.stops.filter { $0.index == firstStopIndex }
             }
             snippetSession = makeSnippetSession(expansion.stops, insertionOffset: offset,

@@ -34,6 +34,26 @@ final class MainWindowTests: XCTestCase {
         XCTAssertEqual(view.document?.lines(first: 0, count: 1), ["hello"])
     }
 
+    func testMethodCompletionPlacesCaretInsideParentheses() throws {
+        let controller = MainWindowController(bridge: CoreBridge())
+        controller.showWindow(nil)
+        defer { controller.window?.orderOut(nil) }
+        controller.newDocument(nil)
+        let document = try XCTUnwrap(controller.editorView.document)
+        document.edit(command: .insertText(text: "Aset::wher"))
+        controller.editorView.didChangeDocument()
+        controller.completionQuery = "wher"
+        controller.completionPosition = TextPos(line: 0, colUtf16: 10)
+
+        controller.acceptCompletion(CompletionInfo(
+            label: "whereHas", detail: "Builder", insertText: "whereHas($0)",
+            isSnippet: true, kind: nil
+        ))
+
+        XCTAssertEqual(document.displayLine(line: 0), "Aset::whereHas()")
+        XCTAssertEqual(document.primaryCursor().colUtf16, 15, "caret is before the closing parenthesis")
+    }
+
     func testViewMenuZoomPanelsAndToggles() throws {
         let defaults = UserDefaults.standard
         let savedSize = defaults.object(forKey: "EditorFontSize")

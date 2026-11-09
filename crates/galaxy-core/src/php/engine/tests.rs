@@ -111,7 +111,7 @@ fn completes_members_of_a_typed_parameter() {
     assert!(
         items
             .iter()
-            .any(|c| c.label == "name" && c.insert_text == "name()")
+            .any(|c| c.label == "name" && c.insert_text == "name($0)" && c.is_snippet)
     );
 }
 
@@ -728,7 +728,7 @@ fn model_static_calls_resolve_to_the_query_builder() {
         ),
         (
             "lib/Builder.php",
-            "<?php\nnamespace Illuminate\\Database\\Eloquent;\n\nclass Builder\n{\n    public function create(array $attributes = []) {}\n}\n",
+            "<?php\nnamespace Illuminate\\Database\\Eloquent;\n\nclass Builder\n{\n    public function create(array $attributes = []) {}\n    public function join($table, $first, $operator = null, $second = null) {}\n}\n",
         ),
         (
             "app/Log.php",
@@ -753,6 +753,14 @@ fn model_static_calls_resolve_to_the_query_builder() {
         hover.markdown
     );
     assert!(engine.definition(&main, text, 4, 8).is_empty());
+
+    let items = engine.complete(&main, "<?php\nnamespace App;\nLog::joi", 2, 8);
+    let join = items
+        .iter()
+        .find(|item| item.label == "join")
+        .expect("forwarded join completion");
+    assert_eq!(join.kind, ItemKind::Method);
+    assert!(join.is_snippet);
 }
 
 #[test]

@@ -38,19 +38,12 @@ pub(super) fn member_completion(
     typed_dollar: bool,
 ) -> Completion {
     let (kind, label, insert, snippet) = match member.kind {
-        MemberKind::Method => {
-            let empty = member.detail.starts_with("()");
-            (
-                ItemKind::Method,
-                member.name.clone(),
-                if empty {
-                    format!("{}()", member.name)
-                } else {
-                    format!("{}($0)", member.name)
-                },
-                !empty,
-            )
-        }
+        MemberKind::Method => (
+            ItemKind::Method,
+            member.name.clone(),
+            format!("{}($0)", member.name),
+            true,
+        ),
         MemberKind::Property => (
             ItemKind::Property,
             if member.is_static {

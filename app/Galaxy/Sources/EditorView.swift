@@ -42,9 +42,14 @@ final class EditorView: NSView {
     static let gutterTrailingPadding: CGFloat = 26
     /// Space between the gutter and the first column.
     static let textInset: CGFloat = 0
-    /// Git change bar: fixed lane left of the line numbers.
+    /// Git change bar: gap between the line numbers and the bar.
     static let gitBarOffset: CGFloat = 4
     static let gitBarWidth: CGFloat = 3
+    /// Width of the bar under the pointer. It grows leftwards, keeping its right edge.
+    static let gitBarHoverWidth: CGFloat = 6
+    /// Deleted lines: a triangle this wide and tall, like VS Code's.
+    static let gitDeleteWidth: CGFloat = 4
+    static let gitDeleteHeight: CGFloat = 8
     static let caretWidth: CGFloat = 2
     static let blinkInterval: TimeInterval = 0.53
     static let matchColor = Theme.findMatch
@@ -78,6 +83,13 @@ final class EditorView: NSView {
     var rowMapped: Bool { wrapActive || hasFolds }
     /// The mouse is over the line numbers; fold chevrons show then.
     private var pointerInGutter = false
+    /// 0-based line whose Git bar the pointer is over; that bar widens.
+    var hoveredGitLine: UInt64? {
+        didSet {
+            guard hoveredGitLine != oldValue else { return }
+            setNeedsDisplay(NSRect(x: gutterShift, y: visibleRect.minY, width: gutterWidth, height: visibleRect.height))
+        }
+    }
     /// Where the "..." after each folded line was drawn, by line.
     var foldPillRects: [Int: NSRect] = [:]
     private var foldToolTipRect: NSRect = .zero
@@ -171,9 +183,21 @@ final class EditorView: NSView {
     private(set) var lastDrawnLines: Range<Int> = 0..<0
     /// The committed side of a diff: it shows and navigates, but never edits.
     var isReadOnly = false
+    enum DiffSide: Equatable { case removed, added }
+    /// Side-by-side diff role. `nil` in a normal editor.
+    var diffSide: DiffSide? {
+        didSet { if diffSide != oldValue { needsDisplay = true } }
+    }
     /// Background per 0-based line, for the changed lines of a diff.
     var lineTints: [UInt64: NSColor] = [:] {
         didSet { if lineTints != oldValue { needsDisplay = true } }
+    }
+    /// Empty visual rows used only by side-by-side diffs to align hunks.
+    var diffSpacers: [DiffLineMap.Spacer] = [] {
+        didSet {
+            guard diffSpacers != oldValue else { return }
+            reloadDocument()
+        }
     }
     var gitLineChanges: [UInt64: GitLineChangeKind] = [:] {
         didSet { if gitLineChanges != oldValue { needsDisplay = true } }
@@ -393,6 +417,7 @@ final class EditorView: NSView {
         let point = convert(event.locationInWindow, from: nil)
         lastMousePoint = point
         setPointerInGutter(point.x < gutterWidth + gutterShift)
+        updateHoveredGitLine(at: point)
         updateDefinitionLink(commandHeld: event.modifierFlags.contains(.command))
         onHover?(textPosition(at: point), point)
     }
@@ -404,7 +429,20 @@ final class EditorView: NSView {
         lastMousePoint = nil
         definitionLink = nil
         setPointerInGutter(false)
+        updateHoveredGitLine(at: nil)
         onMouseExit?()
+    }
+
+    /// Only the line under the pointer widens, as each bar does in VS Code.
+    func updateHoveredGitLine(at point: NSPoint?) {
+        var hovered: UInt64?
+        if let point,
+           point.x >= gutterShift + gitBarX - 2,
+           point.x < gutterShift + gitBarX + Self.gitBarWidth + 2 {
+            let line = textPosition(at: point).line
+            if gitLineChanges[line + 1] != nil { hovered = line }
+        }
+        hoveredGitLine = hovered
     }
 
     private func setPointerInGutter(_ inside: Bool) {
@@ -447,9 +485,9 @@ final class EditorView: NSView {
     /// Right edge of the line numbers.
     var gutterRight: CGFloat { gutterWidth - Self.gutterTrailingPadding }
 
-    /// Dedicated Git-diff lane, separated from the variable-width line number.
-    /// It stays fixed as the line-number column grows from 999 to 1000.
-    var gitBarX: CGFloat { Self.gitBarOffset }
+    /// Git-diff bar, just right of the line numbers. It follows `gutterRight`,
+    /// so it moves with the column when it grows from 999 to 1000.
+    var gitBarX: CGFloat { gutterRight + Self.gitBarOffset }
 
     /// Left edge of the fold chevron's column; clicks right of it fold.
     var foldZoneMinX: CGFloat { gutterRight + 9 }
@@ -508,7 +546,8 @@ final class EditorView: NSView {
     private func applyDocumentMetadata(lineCount newCount: UInt64?) {
         lineCount = Int(newCount ?? 0)
         hasFolds = !wrapSuspended && (document?.hasFolds() ?? false)
-        rowCount = rowMapped ? Int(document?.totalRows() ?? 0) : lineCount
+        rowCount = (rowMapped ? Int(document?.totalRows() ?? 0) : lineCount)
+            + diffSpacers.reduce(0) { $0 + $1.rows }
         let inlineHeight = inlineGitHunk?.height(lineHeight: metrics.lineHeight) ?? 0
         let virtual = CGFloat(rowCount) * metrics.lineHeight + inlineHeight
         let visible = enclosingScrollView?.contentSize.height ?? 0
@@ -617,7 +656,10 @@ final class EditorView: NSView {
         } else {
             insertedHeight = 0
         }
-        return row * metrics.lineHeight + insertedHeight
+        let spacerRows = diffSpacers
+            .filter { $0.beforeLine <= Int(line) }
+            .reduce(0) { $0 + $1.rows }
+        return (row + CGFloat(spacerRows)) * metrics.lineHeight + insertedHeight
     }
 
     /// The line (and row within it) drawn at document-space `y`.
@@ -632,6 +674,18 @@ final class EditorView: NSView {
             } else if y >= zoneEnd {
                 row = max(anchor, floor((y - hunk.height(lineHeight: metrics.lineHeight)) / metrics.lineHeight))
             }
+        }
+        if !diffSpacers.isEmpty {
+            var removed = 0
+            for spacer in diffSpacers {
+                let start = spacer.beforeLine + removed
+                if Int(row) < start { break }
+                if Int(row) < start + spacer.rows {
+                    return (UInt64(min(spacer.beforeLine, max(lineCount - 1, 0))), 0)
+                }
+                removed += spacer.rows
+            }
+            row = max(0, row - CGFloat(removed))
         }
         guard rowMapped, let document else { return (UInt64(min(row, CGFloat(max(lineCount - 1, 0)))), 0) }
         let position = document.lineAtRow(row: UInt64(row))
@@ -916,6 +970,8 @@ final class EditorView: NSView {
         // The view is flipped (y grows downward); flip glyphs back upright.
         context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)
 
+        drawDiffSpacers(context: context, lineHeight: lineHeight)
+
         let stylesByLine = Dictionary(grouping: snapshot.styles, by: { $0.line })
         // Blank lines inside an indented block keep the divider and guides.
         // Their indent is the smaller of the nearest non-blank lines around
@@ -1100,9 +1156,9 @@ final class EditorView: NSView {
                     context.fill(CGRect(x: rect.minX, y: rect.minY + metrics.ascent + 2, width: rect.width, height: 1))
                 }
             }
-            // Errors and warnings get the same wavy underline VS Code uses.
-            for diagnostic in line.diagnostics where !diagnostic.unnecessary && diagnostic.severity <= 2 {
-                context.setFillColor(Theme.diagnostic(diagnostic.severity).cgColor)
+            // Errors, warnings and information use their severity color.
+            for diagnostic in line.diagnostics where !diagnostic.unnecessary && diagnostic.severity <= 3 {
+                context.setStrokeColor(Self.diagnosticUnderlineColor(diagnostic.severity).cgColor)
                 for rect in span(diagnostic.start, diagnostic.end, 1, 0) {
                     drawDiagnosticUnderline(in: rect, context: context)
                 }
@@ -1172,18 +1228,37 @@ final class EditorView: NSView {
             context.setFillColor(hasBreakpoint ? NSColor.white.cgColor : (hasCaret ? Theme.accent : Theme.gutterText).cgColor)
             context.textPosition = CGPoint(x: gutterRight - width, y: top + metrics.ascent)
             CTLineDraw(number, context)
+            if let marker = diffMarker(for: line.line) {
+                let glyph = layout(for: marker)
+                context.setFillColor(Theme.gutterText.cgColor)
+                context.textPosition = CGPoint(x: gutterRight + 10, y: top + metrics.ascent)
+                CTLineDraw(glyph, context)
+            }
             if line.foldable, !wrapSuspended, line.folded || pointerInGutter {
                 drawFoldChevron(in: context, folded: line.folded,
                                 center: CGPoint(x: gutterRight + 16, y: top + lineHeight / 2))
             }
             if let change = gitLineChanges[line.line + 1] {
-                let color: NSColor = switch change {
-                case .added: NSColor.systemGreen
-                case .modified: NSColor.systemYellow
-                case .deleted: NSColor.systemRed
+                context.setFillColor(Theme.gitChange(change).resolved(for: effectiveAppearance).cgColor)
+                if change == .deleted {
+                    // As in VS Code: a small triangle on the edge where lines went
+                    // missing, not a bar. It stays inside the row so the next
+                    // row's background cannot paint over it.
+                    let x = shift + gitBarX
+                    context.move(to: CGPoint(x: x, y: top + block - Self.gitDeleteHeight))
+                    context.addLine(to: CGPoint(x: x + Self.gitDeleteWidth, y: top + block - Self.gitDeleteHeight / 2))
+                    context.addLine(to: CGPoint(x: x, y: top + block))
+                    context.closePath()
+                    context.fillPath()
+                } else {
+                    let width = hoveredGitLine == line.line ? Self.gitBarHoverWidth : Self.gitBarWidth
+                    let bar = CGRect(x: shift + gitBarX + Self.gitBarWidth - width, y: top, width: width, height: block)
+                    if change == .modified {
+                        drawGitHatch(in: bar, color: Theme.gitChange(change).resolved(for: effectiveAppearance), context: context)
+                    } else {
+                        context.fill(bar)
+                    }
                 }
-                context.setFillColor(color.cgColor)
-                context.fill(CGRect(x: shift + gitBarX, y: top, width: Self.gitBarWidth, height: block))
             }
             if let hunk = inlineGitHunk, hunk.anchorLine == line.line {
                 drawInlineGitHunk(hunk, below: top + block, context: context)
@@ -1196,7 +1271,67 @@ final class EditorView: NSView {
         }
     }
 
+    /// Diagonal stripes for modified lines, VS Code's default pattern for them.
+    /// The stripes lie on `x + y = k * step` in view coordinates, so they carry
+    /// on from one row to the next.
+    private func drawGitHatch(in rect: CGRect, color: NSColor, context: CGContext) {
+        context.saveGState()
+        defer { context.restoreGState() }
+        context.clip(to: rect)
+        context.setStrokeColor(color.cgColor)
+        context.setLineWidth(1)
+        let step = Self.gitBarWidth
+        var k = ((rect.minX + rect.minY) / step).rounded(.down)
+        while k * step <= rect.maxX + rect.maxY {
+            let c = k * step
+            context.move(to: CGPoint(x: c - rect.maxY, y: rect.maxY))
+            context.addLine(to: CGPoint(x: c - rect.minY, y: rect.minY))
+            k += 1
+        }
+        context.strokePath()
+    }
+
+    func diffMarker(for line: UInt64) -> String? {
+        guard lineTints[line] != nil else { return nil }
+        return switch diffSide {
+        case .removed: "-"
+        case .added: "+"
+        case nil: nil
+        }
+    }
+
+    private func drawDiffSpacers(context: CGContext, lineHeight: CGFloat) {
+        guard !diffSpacers.isEmpty else { return }
+        var preceding = 0
+        for spacer in diffSpacers {
+            let top = CGFloat(spacer.beforeLine + preceding) * lineHeight
+            let rect = CGRect(x: gutterShift + gutterWidth, y: top,
+                              width: max(0, bounds.width - gutterWidth),
+                              height: CGFloat(spacer.rows) * lineHeight)
+            preceding += spacer.rows
+            guard rect.intersects(visibleRect) else { continue }
+            context.setFillColor(Theme.editorBackground.resolved(for: effectiveAppearance).cgColor)
+            context.fill(rect)
+            context.saveGState()
+            context.clip(to: rect)
+            context.setStrokeColor(NSColor.separatorColor.withAlphaComponent(0.28).cgColor)
+            context.setLineWidth(1)
+            var x = rect.minX - rect.height
+            while x < rect.maxX {
+                context.move(to: CGPoint(x: x, y: rect.maxY))
+                context.addLine(to: CGPoint(x: x + rect.height, y: rect.minY))
+                x += 9
+            }
+            context.strokePath()
+            context.restoreGState()
+        }
+    }
+
     /// A compact 1 pt zig-zag below diagnostics, rather than a flat underline.
+    static func diagnosticUnderlineColor(_ severity: UInt8) -> NSColor {
+        Theme.diagnostic(severity)
+    }
+
     private func drawDiagnosticUnderline(in rect: CGRect, context: CGContext) {
         let y = rect.maxY - 2
         let step: CGFloat = 2
@@ -1271,15 +1406,15 @@ final class EditorView: NSView {
         // Code starts after both number columns, and scrolls under them.
         let textX = max(textOriginX, newRight + 16)
         let pinnedWidth = textX - shift
-        let border = NSColor.systemYellow.withAlphaComponent(0.55)
+        let border = Theme.gitChange(.modified).withAlphaComponent(0.55)
         let width = bounds.width
 
         func tint(_ kind: InlineGitHunk.Kind) -> NSColor? {
             switch kind {
             case .context: nil
-            case .removed: NSColor.systemRed.withAlphaComponent(0.26)
-            case .added: NSColor.systemGreen.withAlphaComponent(0.22)
-            case .modified: NSColor.systemYellow.withAlphaComponent(0.22)
+            case .removed: Theme.gitChange(.deleted).withAlphaComponent(0.26)
+            case .added: Theme.gitChange(.added).withAlphaComponent(0.22)
+            case .modified: Theme.gitChange(.modified).withAlphaComponent(0.22)
             }
         }
         func draw(_ text: String, at x: CGFloat, y: CGFloat, color: NSColor) {

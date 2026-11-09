@@ -135,6 +135,11 @@ impl Framework for LaravelFramework {
         }
     }
 
+    fn function_return_type(&self, name: &str, args: &str) -> Option<String> {
+        (name.trim_start_matches('\\').eq_ignore_ascii_case("auth") && !args.trim().is_empty())
+            .then(|| "Illuminate\\Contracts\\Auth\\Guard".to_owned())
+    }
+
     fn actions(
         &self,
         engine: &mut PhpEngine,
@@ -155,6 +160,14 @@ impl Framework for LaravelFramework {
         name: &str,
     ) -> Option<(Arc<ClassInfo>, Member)> {
         eloquent::forwarded_method(engine, class, name)
+    }
+
+    fn forwarded_completion_owners(
+        &self,
+        engine: &mut PhpEngine,
+        class: &Arc<ClassInfo>,
+    ) -> Vec<Arc<ClassInfo>> {
+        eloquent::forwarded_completion_owners(engine, class)
     }
 
     fn callback_parameter_type(

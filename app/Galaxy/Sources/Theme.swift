@@ -174,6 +174,23 @@ enum Theme {
     /// Diff tab: lines added or changed (right), removed or replaced (left).
     static let diffAdded = NSColor.systemGreen.withAlphaComponent(0.16)
     static let diffRemoved = NSColor.systemRed.withAlphaComponent(0.16)
+    /// Git gutter colors. Dark follows One Dark Pro's `editorGutter.*Background`
+    /// (the palette of the Galaxy Dark theme); light keeps VS Code's defaults.
+    static func gitChange(_ kind: GitLineChangeKind) -> NSColor {
+        func rgb(_ hex: UInt32) -> NSColor {
+            NSColor(srgbRed: CGFloat((hex >> 16) & 0xFF) / 255,
+                    green: CGFloat((hex >> 8) & 0xFF) / 255,
+                    blue: CGFloat(hex & 0xFF) / 255, alpha: 1)
+        }
+        return NSColor(name: nil) { appearance in
+            let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            switch kind {
+            case .added: return rgb(dark ? 0x109868 : 0x48985D)
+            case .modified: return rgb(dark ? 0x948B60 : 0x2090D3)
+            case .deleted: return rgb(dark ? 0x9A353D : 0xE51400)
+            }
+        }
+    }
     /// Line numbers: quieter than body text; the caret line uses `accent`.
     static let gutterText = NSColor.secondaryLabelColor
     static let indentGuide = NSColor.separatorColor.withAlphaComponent(0.55)

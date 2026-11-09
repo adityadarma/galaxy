@@ -94,6 +94,13 @@ pub trait Framework: Send + Sync + std::fmt::Debug {
         Vec::new()
     }
 
+    /// Framework-specific return type of a global function call. This runs
+    /// before the declaration's return type, for helpers whose arguments
+    /// select the returned service.
+    fn function_return_type(&self, _name: &str, _args: &str) -> Option<String> {
+        None
+    }
+
     /// Quick fixes at `byte`, appended to `out`.
     fn actions(
         &self,
@@ -114,6 +121,16 @@ pub trait Framework: Send + Sync + std::fmt::Debug {
         _name: &str,
     ) -> Option<(Arc<ClassInfo>, Member)> {
         None
+    }
+
+    /// Classes whose methods are offered after `class::` when the framework
+    /// forwards missing static calls at run time.
+    fn forwarded_completion_owners(
+        &self,
+        _engine: &mut PhpEngine,
+        _class: &Arc<ClassInfo>,
+    ) -> Vec<Arc<ClassInfo>> {
+        Vec::new()
     }
 
     /// The type of the sole untyped parameter of a closure passed to

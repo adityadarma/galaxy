@@ -40,6 +40,21 @@ pub(super) fn forwarded_method(
     engine.find_member(&builder, name, true)
 }
 
+/// Builder classes whose instance methods Eloquent exposes as static model
+/// calls through `__callStatic`.
+pub(super) fn forwarded_completion_owners(
+    engine: &mut PhpEngine,
+    class: &Arc<ClassInfo>,
+) -> Vec<Arc<ClassInfo>> {
+    if !engine.lineage(class).iter().any(|owner| owner.fqn == MODEL) {
+        return Vec::new();
+    }
+    let Some(builder) = engine.class(BUILDER) else {
+        return Vec::new();
+    };
+    engine.lineage(&builder)
+}
+
 /// The `Builder<Model>` type that calls a model or relation does not
 /// declare are forwarded to, when `chain` is one of those.
 pub(super) fn forwarding_builder(

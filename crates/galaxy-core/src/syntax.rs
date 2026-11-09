@@ -924,6 +924,9 @@ pub fn style_runs_for_viewport(
         spans = crate::php::framework::laravel::blade::subtract(spans, &overlay.claimed);
         spans.extend(overlay.spans);
     }
+    if language == SyntaxLanguage::Php && tree.root_node().has_error() {
+        recover_php_errors(rope, tree, start_byte, end_byte, &mut spans);
+    }
     rainbow_brackets(rope, &mut spans);
     // Tree-sitter does not guarantee that a broad fallback capture precedes a
     // semantic capture of the same token. Apply the generic variable color
@@ -955,6 +958,187 @@ pub fn style_runs_for_viewport(
     }
     runs.sort_by_key(|run| (run.line, run.start, run.end));
     runs
+}
+
+/// Tree-sitter can put a long valid tail inside `ERROR` after one missing
+/// semicolon. Fill the basic lexical scopes in those ranges so strings,
+/// variables, calls and control flow do not become plain text.
+fn recover_php_errors(
+    rope: &Rope,
+    tree: &Tree,
+    window_start: usize,
+    window_end: usize,
+    spans: &mut Vec<(usize, usize, HighlightScope)>,
+) {
+    const KEYWORDS: &[&str] = &[
+        "break", "case", "catch", "continue", "default", "do", "else", "elseif", "finally", "for",
+        "foreach", "if", "match", "return", "switch", "throw", "try", "while", "yield",
+    ];
+    // Correct captures that recovery classified as calls first.
+    for (start, end, scope) in spans.iter_mut() {
+        if !matches!(
+            *scope,
+            HighlightScope::Function | HighlightScope::FunctionBuiltin
+        ) {
+            continue;
+        }
+        let token = rope.byte_slice(*start..*end).to_string();
+        if KEYWORDS.contains(&token.as_str()) {
+            *scope = HighlightScope::Keyword;
+        }
+    }
+
+    let mut errors = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.is_error() {
+            let start = node.start_byte();
+            let end = node.end_byte();
+            if start < window_end && end > window_start {
+                errors.push((start, end));
+            }
+            continue;
+        }
+        if node.has_error() {
+            let mut cursor = node.walk();
+            stack.extend(node.children(&mut cursor));
+        }
+    }
+    for (start, end) in errors {
+        let text = rope.byte_slice(start..end).to_string();
+        let mut recovered = Vec::new();
+        recover_php_range(&text, start, KEYWORDS, &mut recovered);
+        // Pair brackets before clipping to the viewport. Otherwise a closing
+        // bracket whose opener scrolled above the window loses its rainbow
+        // scope and appears as plain punctuation.
+        rainbow_brackets(rope, &mut recovered);
+        spans.extend(
+            recovered
+                .into_iter()
+                .filter(|(start, end, _)| *start < window_end && *end > window_start),
+        );
+    }
+}
+
+fn recover_php_range(
+    text: &str,
+    offset: usize,
+    keywords: &[&str],
+    spans: &mut Vec<(usize, usize, HighlightScope)>,
+) {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                i += text[i..].find('\n').unwrap_or(text.len() - i);
+            }
+            b'#' => i += text[i..].find('\n').unwrap_or(text.len() - i),
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += text[i + 2..]
+                    .find("*/")
+                    .map_or(text.len() - i, |end| end + 4);
+            }
+            quote @ (b'\'' | b'"') => {
+                let start = i;
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i = (i + 2).min(bytes.len());
+                    } else if bytes[i] == quote {
+                        i += 1;
+                        break;
+                    } else {
+                        i += 1;
+                    }
+                }
+                spans.push((offset + start, offset + i, HighlightScope::String));
+            }
+            b'$' if bytes
+                .get(i + 1)
+                .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_') =>
+            {
+                let start = i;
+                i += 2;
+                while bytes
+                    .get(i)
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                {
+                    i += 1;
+                }
+                spans.push((offset + start, offset + i, HighlightScope::Variable));
+            }
+            byte if byte.is_ascii_alphabetic() || byte == b'_' => {
+                let start = i;
+                i += 1;
+                while bytes
+                    .get(i)
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                {
+                    i += 1;
+                }
+                let word = &text[start..i];
+                let before = text[..start].trim_end();
+                let after = text[i..].trim_start();
+                let scope = if keywords.contains(&word.to_ascii_lowercase().as_str()) {
+                    Some(HighlightScope::Keyword)
+                } else if before.ends_with("::") {
+                    Some(if after.starts_with('(') {
+                        HighlightScope::Function
+                    } else {
+                        HighlightScope::Constant
+                    })
+                } else if before.ends_with("->") || before.ends_with("?->") {
+                    Some(if after.starts_with('(') {
+                        HighlightScope::Function
+                    } else {
+                        HighlightScope::Property
+                    })
+                } else if after.starts_with("::") {
+                    Some(HighlightScope::Type)
+                } else if after.starts_with('(') {
+                    Some(HighlightScope::Function)
+                } else {
+                    None
+                };
+                if let Some(scope) = scope {
+                    spans.push((offset + start, offset + i, scope));
+                }
+            }
+            byte if byte.is_ascii_digit() => {
+                let start = i;
+                i += 1;
+                while bytes
+                    .get(i)
+                    .is_some_and(|byte| byte.is_ascii_digit() || *byte == b'.')
+                {
+                    i += 1;
+                }
+                spans.push((offset + start, offset + i, HighlightScope::Number));
+            }
+            b'?' if bytes.get(i + 2) == Some(&b'>') && bytes.get(i + 1) == Some(&b'-') => {
+                spans.push((offset + i, offset + i + 3, HighlightScope::Punctuation));
+                i += 3;
+            }
+            b'=' if bytes.get(i + 1) == Some(&b'>') => {
+                spans.push((offset + i, offset + i + 2, HighlightScope::Punctuation));
+                i += 2;
+            }
+            b'-' if bytes.get(i + 1) == Some(&b'>') => {
+                spans.push((offset + i, offset + i + 2, HighlightScope::Punctuation));
+                i += 2;
+            }
+            b':' if bytes.get(i + 1) == Some(&b':') => {
+                spans.push((offset + i, offset + i + 2, HighlightScope::Punctuation));
+                i += 2;
+            }
+            b'(' | b')' | b'[' | b']' | b'{' | b'}' | b',' | b';' | b':' | b'?' => {
+                spans.push((offset + i, offset + i + 1, HighlightScope::Punctuation));
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
 }
 
 /// Color matching bracket pairs by nesting level while leaving every other
@@ -3551,6 +3735,77 @@ mod tests {
         let runs = style_runs_for_viewport(&doc, &tree, language, 0, 2);
         assert!(runs.iter().any(|run| run.scope == HighlightScope::Keyword));
         assert!(runs.iter().any(|run| run.scope == HighlightScope::String));
+    }
+
+    #[test]
+    fn php_highlighting_recovers_after_a_missing_semicolon() {
+        let source = "<?php\nfunction run($request) {\n    try {\n        Aset::whereHas()\n        for ($i = 0; $i < 2; $i++) {\n            $data = [\n                'available' => $request->available_flag,\n            ];\n            if ($request->desa_id) {\n                $data['provinsi_id'] = $request->provinsi_id;\n            }\n            $aset = Aset::create($data);\n        }\n        DB::commit();\n        return Service::success(\"ok\");\n    } catch (Exception $e) {\n        DB::rollBack();\n    }\n}\n";
+        let doc = Document::from_text(source);
+        let language = SyntaxLanguage::Php;
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(doc.text(), None).unwrap();
+        assert!(tree.root_node().has_error());
+        let runs = style_runs_for_viewport(&doc, &tree, language, 0, doc.line_count());
+        for (line, token, scope) in [
+            (4, "for", HighlightScope::Keyword),
+            (6, "'available'", HighlightScope::String),
+            (6, "$request", HighlightScope::Variable),
+            (6, "available_flag", HighlightScope::Property),
+            (8, "if", HighlightScope::Keyword),
+            (9, "'provinsi_id'", HighlightScope::String),
+            (11, "Aset", HighlightScope::Type),
+            (11, "create", HighlightScope::Function),
+            (13, "commit", HighlightScope::Function),
+            (14, "return", HighlightScope::Keyword),
+            (15, "catch", HighlightScope::Keyword),
+            (16, "rollBack", HighlightScope::Function),
+        ] {
+            assert!(
+                scopes_of(&runs, source, line, token).contains(&scope),
+                "{line}:{token} {runs:?}"
+            );
+        }
+        for (line, token) in [(4, "("), (5, "["), (7, "]"), (8, "{"), (11, "(")] {
+            assert!(
+                scopes_of(&runs, source, line, token)
+                    .iter()
+                    .any(|scope| is_bracket_scope(*scope)),
+                "{line}:{token} {runs:?}"
+            );
+        }
+        for (line, token) in [(6, "=>"), (7, ";"), (11, ";")] {
+            assert!(
+                scopes_of(&runs, source, line, token).contains(&HighlightScope::Punctuation),
+                "{line}:{token} {runs:?}"
+            );
+        }
+
+        // Scrolling changes the queried byte window. Recovery must preserve
+        // lexer state from the start of the ERROR node, so colors stay stable.
+        let scrolled = style_runs_for_viewport(&doc, &tree, language, 16, 2);
+        for (line, token, scope) in [
+            (6, "'available'", HighlightScope::String),
+            (6, "available_flag", HighlightScope::Property),
+            (9, "'provinsi_id'", HighlightScope::String),
+            (11, "create", HighlightScope::Function),
+            (13, "commit", HighlightScope::Function),
+            (15, "catch", HighlightScope::Keyword),
+            (16, "rollBack", HighlightScope::Function),
+        ] {
+            assert!(
+                scopes_of(&scrolled, source, line, token).contains(&scope),
+                "scrolled {line}:{token} {scrolled:?}"
+            );
+        }
+        for (line, token) in [(7, "]"), (8, "{"), (11, "("), (16, "(")] {
+            assert!(
+                scopes_of(&scrolled, source, line, token)
+                    .iter()
+                    .any(|scope| is_bracket_scope(*scope)),
+                "scrolled {line}:{token} {scrolled:?}"
+            );
+        }
     }
 
     #[test]

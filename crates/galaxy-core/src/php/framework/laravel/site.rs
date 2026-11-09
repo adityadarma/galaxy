@@ -93,6 +93,7 @@ fn function_kind(name: &str) -> Option<Kind> {
         "trans" | "__" | "trans_choice" | "lang" => Kind::Translation,
         "asset" | "secure_asset" | "mix" => Kind::Asset,
         "app" | "resolve" => Kind::Binding,
+        "auth" => Kind::Section("auth.guards"),
         "inertia" => Kind::Page,
         "base_path" => Kind::Path(""),
         "app_path" => Kind::Path("app"),
@@ -431,6 +432,86 @@ pub fn site_at(text: &str, byte: usize, blade: bool) -> Option<Site> {
     classify(text, &string, floor, &closers, &openers)
 }
 
+/// A string key in an array passed to an Eloquent mass-assignment method.
+/// Kept separate from `site_at`: ordinary array keys deliberately name
+/// nothing, while these keys name attributes of the call's model.
+pub(in crate::php) fn mass_assignment_site_at(text: &str, byte: usize) -> Option<Site> {
+    let regions = php_regions(text);
+    let strs = strings(text, &regions, false);
+    let string = strs
+        .iter()
+        .find(|string| string.start <= byte && byte <= string.end)
+        .copied()?;
+    let before = text[..string.open].trim_end();
+    if before.ends_with("=>") {
+        return None;
+    }
+    let after = text[string.end..]
+        .trim_start_matches(['\'', '"'])
+        .trim_start();
+    if !after.is_empty() && !after.starts_with("=>") && !after.starts_with([',', ']', ')']) {
+        return None;
+    }
+    let region = regions.iter().find(|region| {
+        region.start <= string.open && string.open < region.end.max(region.start + 1)
+    })?;
+    let (closers, openers) = closers_of(&strs);
+    let found = around(text, &string, region.start, &closers);
+    let paren = found.paren?;
+    let array = found.array?;
+    let call = callee(text, paren)?;
+    if call.operator.is_none() {
+        return None;
+    }
+    let (arguments, max_array_depth): (&[usize], i32) = match call.name.as_str() {
+        "insert" | "insertorignore" => (&[0], 1),
+        "create" | "forcecreate" | "update" | "fill" | "forcefill" => (&[0], 0),
+        "firstorcreate" | "firstornew" | "updateorcreate" | "updateorinsert" => (&[0, 1], 0),
+        "upsert" => (&[0], 1),
+        _ => return None,
+    };
+    let (index, depth) = array_argument(text, paren, array, &openers)?;
+    (arguments.contains(&index) && depth <= max_array_depth).then_some(Site {
+        kind: Kind::Column,
+        start: string.start,
+        end: string.end,
+        class: None,
+        has_default: false,
+        paren: Some(paren),
+    })
+}
+
+/// Argument index when `array` is the array literal directly passed to the
+/// call at `paren`. Nested arrays return `None`.
+fn array_argument(
+    text: &str,
+    paren: usize,
+    array: usize,
+    openers: &HashMap<usize, usize>,
+) -> Option<(usize, i32)> {
+    let bytes = text.as_bytes();
+    let mut index = 0;
+    let mut depth = 0;
+    let mut i = paren + 1;
+    while i <= array && i < bytes.len() {
+        if i == array {
+            return Some((index, depth));
+        }
+        if let Some(close) = openers.get(&i) {
+            i = close + 1;
+            continue;
+        }
+        match bytes[i] {
+            b'(' | b'[' | b'{' => depth += 1,
+            b')' | b']' | b'}' => depth -= 1,
+            b',' if depth == 0 => index += 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
 /// The cursor is inside a string literal of the PHP in `text`.
 pub fn in_string(text: &str, byte: usize, blade: bool) -> bool {
     let regions = regions_of(text, blade);
@@ -545,6 +626,35 @@ mod tests {
         );
         // A key of an array names nothing.
         assert_eq!(php("config(['a.b|' => 1])"), None);
+    }
+
+    #[test]
+    fn mass_assignment_array_keys_name_model_columns() {
+        let site = |code: &str| {
+            let text = format!("<?php\n{code}\n");
+            let cursor = text.find('|').expect("cursor");
+            let source = text.replacen('|', "", 1);
+            mass_assignment_site_at(&source, cursor).map(|site| {
+                (
+                    site.kind,
+                    source[site.start..site.end].to_owned(),
+                    site.paren,
+                )
+            })
+        };
+        assert!(matches!(
+            site("$asset->update(['na|' => 1]);"),
+            Some((Kind::Column, _, Some(_)))
+        ));
+        assert!(site("Asset::create(['na|' => 1]);").is_some());
+        assert!(site("Asset::updateOrCreate(['id|' => 1], ['na' => 2]);").is_some());
+        assert!(site("Asset::updateOrCreate(['id' => 1], ['na|' => 2]);").is_some());
+        assert!(site("Asset::create(['na|']);").is_some());
+        assert!(site("Asset::insert([['na|' => 1]]);").is_some());
+        assert!(site("Asset::upsert([['na|' => 1]], ['id']);").is_some());
+        assert!(site("Asset::create(['meta' => ['na|' => 1]]);").is_none());
+        assert!(site("foo(['na|' => 1]);").is_none());
+        assert!(site("Asset::create(['name' => 'va|']);").is_none());
     }
 
     #[test]

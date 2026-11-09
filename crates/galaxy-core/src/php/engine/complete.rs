@@ -158,11 +158,27 @@ impl PhpEngine {
         let prefix = word.trim_start_matches('$');
         let mut seen = HashSet::new();
         let mut out = Vec::new();
-        for owner in self.lineage(class) {
+        let mut owners: Vec<(Arc<ClassInfo>, bool)> = self
+            .lineage(class)
+            .into_iter()
+            .map(|owner| (owner, false))
+            .collect();
+        if is_static {
+            let frameworks = self.frameworks.clone();
+            for owner in frameworks
+                .iter()
+                .flat_map(|framework| framework.forwarded_completion_owners(self, class))
+            {
+                owners.push((owner, true));
+            }
+        }
+        for (owner, forwarded) in owners {
             for member in &owner.members {
                 let wanted = match member.kind {
                     MemberKind::Method => {
-                        if is_static {
+                        if forwarded {
+                            true
+                        } else if is_static {
                             member.is_static || via_scope
                         } else {
                             true
@@ -190,7 +206,13 @@ impl PhpEngine {
                 if !self.accessible(ctx, &owner, member.visibility) {
                     continue;
                 }
-                let own = if owner.fqn == class.fqn { '0' } else { '1' };
+                let own = if owner.fqn == class.fqn {
+                    '0'
+                } else if forwarded {
+                    '2'
+                } else {
+                    '1'
+                };
                 out.push(member_completion(member, &owner, own, typed_dollar));
             }
         }

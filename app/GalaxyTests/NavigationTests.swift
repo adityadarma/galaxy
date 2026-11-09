@@ -217,24 +217,26 @@ final class NavigationTests: XCTestCase {
     }
 
     func testCommandHoverUnderlinesWordAndClearsOnRelease() throws {
-        let c = try makeController(text: "use Foo\\BarService;\nsecond")
+        let c = try makeController(text: "<?php\nuse Foo\\BarService;\nsecond")
         let v = c.editorView
+        v.document?.setPath(path: "/tmp/Foo.php")
         v.onDefinitionClick = { _ in true }
         let text = "use Foo\\BarService;"
         let column = (text as NSString).range(of: "BarService").location + 2
         let x = v.textOriginX + v.xOffset(in: text, column: UInt64(column)) + 0.5
-        v.lastMousePoint = NSPoint(x: x, y: v.metrics.lineHeight / 2)
+        v.lastMousePoint = NSPoint(x: x, y: v.metrics.lineHeight * 1.5)
 
+        // A PHP name is one link across its namespace: `Foo\BarService`.
         v.updateDefinitionLink(commandHeld: true)
-        XCTAssertEqual(v.definitionLink?.line, 0)
-        XCTAssertEqual(v.definitionLink?.start, 8)
+        XCTAssertEqual(v.definitionLink?.line, 1)
+        XCTAssertEqual(v.definitionLink?.start, 4)
         XCTAssertEqual(v.definitionLink?.end, 18)
 
         v.updateDefinitionLink(commandHeld: false)
         XCTAssertNil(v.definitionLink, "releasing Cmd removes the underline")
 
         // Past the end of the line there is nothing to open.
-        v.lastMousePoint = NSPoint(x: 10_000, y: v.metrics.lineHeight / 2)
+        v.lastMousePoint = NSPoint(x: 10_000, y: v.metrics.lineHeight * 1.5)
         v.updateDefinitionLink(commandHeld: true)
         XCTAssertNil(v.definitionLink)
     }
@@ -294,14 +296,19 @@ final class NavigationTests: XCTestCase {
     }
 
     func testCommandHoverUnderlinesVueImportSpecifier() throws {
+        // Outside `<script>` a Vue file is template text, so the import needs its block.
         let text = "import { usePage } from '@inertiajs/vue3'"
-        let c = try makeController(text: text)
+        let c = try makeController(text: "<script setup lang=\"ts\">\n" + text + "\n</script>\n")
         let v = c.editorView
         v.document?.setPath(path: "/tmp/Page.vue")
         v.onDefinitionClick = { _ in true }
+        let deadline = Date().addingTimeInterval(5)
+        while v.document?.viewport(firstLine: 1, count: 1).styles.isEmpty ?? true, Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
         let specifier = (text as NSString).range(of: "@inertiajs/vue3")
         let x = v.textOriginX + v.xOffset(in: text, column: UInt64(specifier.location + 2)) + 0.5
-        v.lastMousePoint = NSPoint(x: x, y: v.metrics.lineHeight / 2)
+        v.lastMousePoint = NSPoint(x: x, y: v.metrics.lineHeight * 1.5)
 
         v.updateDefinitionLink(commandHeld: true)
 
@@ -627,10 +634,13 @@ final class NavigationTests: XCTestCase {
         click(view, line: 2, utf16Col: declaration.location + 2, flags: .command)
 
         let deadline = Date().addingTimeInterval(10)
-        while controller.loadedReferencesPanel?.titleText != "References", Date() < deadline {
+        // The panel previews the first hit, so its title reads "<file>  <dir> - References".
+        while controller.loadedReferencesPanel?.titleText.hasSuffix("- References") != true, Date() < deadline {
             RunLoop.main.run(until: Date().addingTimeInterval(0.05))
         }
-        XCTAssertEqual(controller.loadedReferencesPanel?.titleText, "References")
+        let title = try XCTUnwrap(controller.loadedReferencesPanel?.titleText)
+        XCTAssertTrue(title.hasPrefix("Aset.php"), title)
+        XCTAssertTrue(title.hasSuffix("- References"), title)
     }
 
     func testCommandClickMovesCaretBeforeStartingDefinitionLookup() throws {
@@ -721,6 +731,62 @@ final class NavigationTests: XCTestCase {
         XCTAssertEqual(caret?.colUtf16, 8)
     }
 
+    func testCommandClickOnAuthGuardOpensPackageRegistration() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-auth-\(UUID().uuidString)")
+        let app = root.appendingPathComponent("app")
+        let provider = root.appendingPathComponent("vendor/laravel/sanctum/src/SanctumServiceProvider.php")
+        try FileManager.default.createDirectory(at: app, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: provider.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("bootstrap"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: root.appendingPathComponent("config"), withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try "#!/usr/bin/env php\n".write(to: root.appendingPathComponent("artisan"), atomically: true, encoding: .utf8)
+        try "<?php\n".write(to: root.appendingPathComponent("bootstrap/app.php"), atomically: true, encoding: .utf8)
+        try #"{"require":{"laravel/framework":"*","laravel/sanctum":"*"}}"#
+            .write(to: root.appendingPathComponent("composer.json"), atomically: true, encoding: .utf8)
+        try "<?php\nreturn ['guards' => ['web' => ['driver' => 'session']]];\n"
+            .write(to: root.appendingPathComponent("config/auth.php"), atomically: true, encoding: .utf8)
+        try "<?php\nclass SanctumServiceProvider {\n    function register() {\n        config(['auth.guards.sanctum' => ['driver' => 'sanctum']]);\n    }\n}\n"
+            .write(to: provider, atomically: true, encoding: .utf8)
+        let source = app.appendingPathComponent("Check.php")
+        let line = "if (! auth('sanctum')->check()) {}"
+        try "<?php\n\(line)\n".write(to: source, atomically: true, encoding: .utf8)
+
+        let c = MainWindowController(bridge: CoreBridge())
+        c.showWindow(nil)
+        defer { c.window?.orderOut(nil) }
+        try c.openFile(at: source)
+        let syntaxDeadline = Date().addingTimeInterval(5)
+        while c.editorView.document?.viewport(firstLine: 1, count: 1).styles.isEmpty ?? true,
+              Date() < syntaxDeadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
+        let column = (line as NSString).range(of: "sanctum").location + 2
+        let position = TextPos(line: 1, colUtf16: UInt64(column))
+        XCTAssertNotNil(c.editorView.navigableRange(at: position), "the literal must be a Cmd-click link")
+        let x = c.editorView.textOriginX + c.editorView.xOffset(in: line, column: UInt64(column)) + 0.5
+        let y = c.editorView.metrics.lineHeight + c.editorView.metrics.lineHeight / 2
+        let hit = c.editorView.textPosition(at: NSPoint(x: x, y: y))
+        XCTAssertEqual(hit.line, position.line)
+        XCTAssertEqual(hit.colUtf16, position.colUtf16)
+        var clicked: TextPos?
+        let definition = c.editorView.onDefinitionClick
+        c.editorView.onDefinitionClick = { clicked = $0; return definition?($0) ?? false }
+        click(c.editorView, line: 1, utf16Col: column, flags: .command)
+        XCTAssertEqual(clicked?.line, position.line)
+        XCTAssertEqual(clicked?.colUtf16, position.colUtf16)
+
+        let navigationDeadline = Date().addingTimeInterval(8)
+        while c.activeTab?.doc.path() == source.path, Date() < navigationDeadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+            c.refreshDefinition()
+        }
+
+        let opened = c.activeTab.map { URL(fileURLWithPath: $0.doc.path()).resolvingSymlinksInPath().path }
+        XCTAssertEqual(opened, provider.resolvingSymlinksInPath().path)
+        XCTAssertEqual(c.activeTab?.doc.primaryCursor().line, 3)
+    }
+
     func testOnlyFrameworkHelperStringsAreLinks() {
         func range(_ text: String, _ literal: String) -> Range<Int>? {
             let r = (text as NSString).range(of: literal)
@@ -729,6 +795,7 @@ final class NavigationTests: XCTestCase {
         let config = "$url = config('services.sipay.url');"
         let start = (config as NSString).range(of: "services").location
         XCTAssertEqual(range(config, "'services.sipay.url'"), start..<(start + "services.sipay.url".utf16.count))
+        XCTAssertNotNil(range("auth('sanctum')->check();", "'sanctum'"))
         XCTAssertNotNil(range("return view( \"home\" );", "\"home\""))
         XCTAssertNil(range("Log::channel('queue')->info('Queue job processing', [", "'Queue job processing'"))
         XCTAssertNil(range("'connection' => $event->connectionName,", "'connection'"))

@@ -15,6 +15,8 @@ use crate::lang::{Problem, Severity};
 use crate::php::parse::{parse_with_tree, resolve_name};
 
 const MAX_PROBLEMS: usize = 200;
+/// How many unterminated statements are repaired before giving up.
+const MAX_REPAIRS: usize = 8;
 
 /// Names that look like classes to the grammar but are not.
 const NOT_CLASSES: &[&str] = &[
@@ -48,8 +50,7 @@ impl PhpEngine {
         let root = tree.root_node();
         let mut out = Vec::new();
         if root.has_error() {
-            syntax_errors(root, text, &mut out);
-            return out;
+            return syntax_problems(root, text);
         }
         let known = !self.autoload.is_empty();
         let mut verdicts: HashMap<String, bool> = HashMap::new();
@@ -205,13 +206,25 @@ fn syntax_errors(root: Node<'_>, text: &str, out: &mut Vec<Problem>) {
             return;
         }
         if node.is_missing() {
-            out.push(problem(
-                text,
-                node,
-                Severity::Error,
-                format!("Syntax error: expected `{}`", node.kind()),
-                false,
-            ));
+            // A missing token has no width. Mark the character before it so
+            // the editor has something to underline.
+            let at = node.start_byte().min(text.len());
+            let start = text[..at]
+                .char_indices()
+                .next_back()
+                .filter(|&(_, c)| c != '\n')
+                .map_or(at, |(i, _)| i);
+            let (start_line, start_column, _) = position_of(text, start);
+            let (end_line, end_column, _) = position_of(text, at.max(start));
+            out.push(Problem {
+                start_line,
+                start_column,
+                end_line,
+                end_column,
+                severity: Severity::Error,
+                message: format!("Syntax error: expected `{}`", node.kind()),
+                unnecessary: false,
+            });
             continue;
         }
         if node.is_error() {
@@ -245,6 +258,93 @@ fn syntax_errors(root: Node<'_>, text: &str, out: &mut Vec<Problem>) {
         }
     }
     out.sort_by_key(|p| (p.start_line, p.start_column));
+}
+
+/// Syntax problems of a tree that has errors. A statement missing its `;`
+/// makes the parser cascade into bogus errors further down. Such a line is
+/// reported as the real cause, then fixed in a scratch copy and parsed again,
+/// so unrelated errors after it still show.
+fn syntax_problems(root: Node<'_>, text: &str) -> Vec<Problem> {
+    let mut causes = Vec::new();
+    let mut source = text.to_string();
+    let mut found = Vec::new();
+    syntax_errors(root, &source, &mut found);
+    for _ in 0..MAX_REPAIRS {
+        let Some(first) = found.first() else { break };
+        let Some(line) = unterminated_line(&source, first.start_line, first.start_column) else {
+            break;
+        };
+        let Some((next, at)) = with_semicolon(&source, line) else {
+            break;
+        };
+        let (start_line, start_column, _) = position_of(&source, at - 1);
+        let (end_line, end_column, _) = position_of(&source, at);
+        causes.push(Problem {
+            start_line,
+            start_column,
+            end_line,
+            end_column,
+            severity: Severity::Error,
+            message: "Syntax error: expected `;`".into(),
+            unnecessary: false,
+        });
+        found.clear();
+        source = next;
+        let mut parser = tree_sitter::Parser::new();
+        let reparsed = parser
+            .set_language(&tree_sitter_php::LANGUAGE_PHP.into())
+            .ok()
+            .and_then(|()| parser.parse(&source, None));
+        match reparsed {
+            Some(tree) if tree.root_node().has_error() => {
+                syntax_errors(tree.root_node(), &source, &mut found);
+            }
+            _ => break,
+        }
+    }
+    causes.extend(found);
+    causes.sort_by_key(|p| (p.start_line, p.start_column));
+    causes.truncate(MAX_PROBLEMS);
+    causes
+}
+
+/// The 0-based line whose missing `;` explains an error at `line`/`column`.
+///
+/// Tree-sitter puts the `ERROR` either at the newline after an unterminated
+/// call, or at the first token of the statement that follows it. In that
+/// second case the culprit is the previous non-blank line.
+fn unterminated_line(text: &str, line: u32, column: u32) -> Option<u32> {
+    let lines: Vec<&str> = text.lines().collect();
+    let here = lines.get(line as usize)?;
+    let indent = here.len() - here.trim_start().len();
+    let candidate = if (column as usize) <= indent {
+        (0..line as usize)
+            .rev()
+            .find(|&i| !lines[i].trim().is_empty())?
+    } else {
+        line as usize
+    };
+    let before = lines[candidate].trim_end();
+    let ends_call = before.ends_with(')') || before.ends_with(']');
+    let is_comment = before.trim_start().starts_with("//") || before.trim_start().starts_with('#');
+    (ends_call && !is_comment).then_some(candidate as u32)
+}
+
+/// `text` with a `;` appended to the end of 0-based `line`, and the byte
+/// offset just after it. Only that line changes, so positions on every other
+/// line stay valid.
+fn with_semicolon(text: &str, line: u32) -> Option<(String, usize)> {
+    let mut start = 0;
+    for _ in 0..line {
+        start += text[start..].find('\n')? + 1;
+    }
+    let end = text[start..].find('\n').map_or(text.len(), |i| start + i);
+    let at = start + text[start..end].trim_end().len();
+    let mut out = String::with_capacity(text.len() + 1);
+    out.push_str(&text[..at]);
+    out.push(';');
+    out.push_str(&text[at..]);
+    Some((out, at + 1))
 }
 
 /// Whether `node`, a `name` or `qualified_name`, stands where a class is
@@ -319,6 +419,43 @@ mod tests {
             "{found:?}"
         );
         assert_eq!(found[0].0, 7);
+    }
+
+    #[test]
+    fn missing_semicolon_is_reported_at_the_unterminated_statement() {
+        let dir = project();
+        let text = "<?php\nfunction run() {\n    try {\n        Aset::whereHas()\n        for ($i = 0; $i < 2; $i++) {}\n        DB::commit();\n        return Service::success(\"ok\");\n    } catch (Exception $e) {\n        DB::rollBack();\n    }\n}\n";
+        let found = run(dir.path(), text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found[0].0, 3, "{found:?}");
+        assert!(found[0].3.contains("`;`"), "{found:?}");
+    }
+
+    #[test]
+    fn a_missing_token_is_marked_over_the_character_before_it() {
+        let dir = project();
+        let text = "<?php\n$x = $a ? 1 : 2;\n$y = $a ? foo()\n";
+        let found = run(dir.path(), text);
+        assert!(!found.is_empty(), "{found:?}");
+        let mut engine = PhpEngine::new(dir.path());
+        let problems = engine.diagnostics(&dir.path().join("app/Service.php"), text);
+        let wide = problems
+            .iter()
+            .filter(|p| p.message.contains("expected"))
+            .all(|p| p.end_line > p.start_line || p.end_column > p.start_column);
+        assert!(wide, "{problems:?}");
+    }
+
+    #[test]
+    fn errors_after_a_missing_semicolon_are_kept() {
+        let dir = project();
+        let text = "<?php\nfunction run() {\n    Aset::whereHas()\n    DB::commit();\n}\ndsdsdsd\n";
+        let found = run(dir.path(), text);
+        assert!(
+            found.iter().any(|f| f.0 == 2 && f.3.contains("`;`")),
+            "{found:?}"
+        );
+        assert!(found.iter().any(|f| f.0 == 5), "{found:?}");
     }
 
     #[test]
