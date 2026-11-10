@@ -137,6 +137,11 @@ extension EditorView {
             return
         }
         if local.x < gutterWidth + gutterShift, event.clickCount == 1 {
+            // A test's run icon, in the left padding of the gutter.
+            if local.x - gutterShift < Self.runMarkerWidth + 2, runMarkers[pos.line] != nil, let onRunTest {
+                onRunTest(pos.line)
+                return
+            }
             // The chevron column folds; the line numbers set or clear a breakpoint.
             if local.x - gutterShift >= foldZoneMinX, !wrapSuspended, document.foldState(line: pos.line) != .plain {
                 toggleFold(line: pos.line)

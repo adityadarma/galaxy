@@ -50,6 +50,7 @@ extension MainWindowController {
         scheduleParameterHints(after: 0)
         refreshDebugMarkers()
         applyDiffPane(for: tab)
+        refreshTestMarkers()
         updateMarkdownPreview()
         let root = workspace?.root() ?? (tab.doc.path() as NSString).deletingLastPathComponent
         if tab.isDocument {

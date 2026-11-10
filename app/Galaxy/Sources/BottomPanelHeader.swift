@@ -9,6 +9,7 @@ final class BottomPanelHeader: NSView {
         case problems
         case output
         case debugConsole
+        case testResults
         case terminal
         case ports
 
@@ -17,6 +18,7 @@ final class BottomPanelHeader: NSView {
             case .problems: "PROBLEMS"
             case .output: "OUTPUT"
             case .debugConsole: "DEBUG CONSOLE"
+            case .testResults: "TEST RESULTS"
             case .terminal: "TERMINAL"
             case .ports: "PORTS"
             }

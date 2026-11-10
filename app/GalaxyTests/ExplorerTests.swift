@@ -3,6 +3,27 @@ import XCTest
 
 @MainActor
 final class ExplorerTests: XCTestCase {
+    /// Everyday developer file types get a glyph of their own, not the blank page.
+    func testCommonDeveloperFilesHaveTheirOwnGlyph() {
+        let generic = FileGlyph.style(for: "unknown-extension")
+        XCTAssertEqual(generic.1, "doc")
+        for key in ["sql", "sqlite", "csv", "graphql", "proto", "java", "kt", "rb", "cs", "lua", "ex", "zig",
+                    "ps1", "bat", "pem", "key", "lock", "env", "diff", "pdf", "zip", "jsonc", "conf", "ipynb",
+                    "pyi", "hcl", "mdx", "ejs", "ico", "heic", "woff2", "cc", "makefile", "gemfile", "go.mod",
+                    "requirements.txt", "pyproject.toml", "cmakelists.txt", "dockerfile"] {
+            let style = FileGlyph.style(for: key)
+            XCTAssertTrue(style.0 != nil || style.1 != "doc", "\(key) still has the generic glyph")
+        }
+        XCTAssertEqual(FileGlyph.style(for: "sql").1, "cylinder")
+        XCTAssertEqual(FileGlyph.namedFileKey("makefile"), "makefile")
+        XCTAssertEqual(FileGlyph.namedFileKey("go.mod"), "go.mod")
+        XCTAssertEqual(FileGlyph.style(for: "go.mod").0, "go")
+        XCTAssertEqual(FileGlyph.style(for: "jsonc").0, "json")
+        let sql = FileGlyph.for(name: "db_sdsd.sql")
+        XCTAssertNotNil(sql.image)
+        XCTAssertNotEqual(sql.color, FileGlyph.for(name: "notes.unknown").color)
+    }
+
     func testMaterialIconMappingsCoverCommonFilesAndFolders() {
         XCTAssertEqual(FileGlyph.style(for: "package.json").0, "npm")
         XCTAssertEqual(FileGlyph.style(for: "dockerfile").0, "docker")
@@ -466,6 +487,14 @@ final class ExplorerTests: XCTestCase {
     func testExplorerLooksLikeVSCode() throws {
         let root = try makeTree()
         defer { try? FileManager.default.removeItem(at: root) }
+        // The "Folder icons" switch is a user preference; the test runs with it on.
+        let defaults = UserDefaults.standard
+        let savedPreference = defaults.object(forKey: ExplorerIcon.showFolderIconsKey)
+        defaults.set(true, forKey: ExplorerIcon.showFolderIconsKey)
+        defer {
+            if let savedPreference { defaults.set(savedPreference, forKey: ExplorerIcon.showFolderIconsKey) }
+            else { defaults.removeObject(forKey: ExplorerIcon.showFolderIconsKey) }
+        }
         let ws = try CoreBridge().core.openWorkspace(path: root.path)
         let explorer = ExplorerController()
         explorer.scrollView.frame = NSRect(x: 0, y: 0, width: 240, height: 400)
@@ -524,7 +553,19 @@ final class ExplorerTests: XCTestCase {
         XCTAssertEqual(header.label.stringValue, "EXPLORER", "the folder name is in the title bar")
         XCTAssertEqual(header.tools.map(\.toolTip), ["New File…", "New Folder…", "Refresh Explorer",
                                                       "Collapse Folders in Explorer", "More Actions…"])
-        XCTAssertTrue(header.tools.allSatisfy { !$0.isHidden && $0.image != nil }, "always visible")
+        XCTAssertTrue(header.tools.allSatisfy { $0.image != nil })
+
+        // Only "…" shows at rest; the rest appear while the pointer is over the header.
+        func crossing(_ type: NSEvent.EventType) throws -> NSEvent {
+            try XCTUnwrap(NSEvent.enterExitEvent(
+                with: type, location: .zero, modifierFlags: [], timestamp: 0,
+                windowNumber: controller.window?.windowNumber ?? 0, context: nil,
+                eventNumber: 0, trackingNumber: 0, userData: nil))
+        }
+        header.mouseExited(with: try crossing(.mouseExited))
+        XCTAssertEqual(header.tools.filter { !$0.isHidden }.map(\.toolTip), ["More Actions…"])
+        header.mouseEntered(with: try crossing(.mouseEntered))
+        XCTAssertTrue(header.tools.allSatisfy { !$0.isHidden }, "all actions while hovered")
 
         // One row at the top of the sidebar, as tall as the tab strip; the tree below it.
         let content = try XCTUnwrap(controller.window?.contentView)

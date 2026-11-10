@@ -296,6 +296,7 @@ extension MainWindowController {
         lspTimer?.invalidate()
         lspTimer = nil
         debugger.stop()
+        testRunner.stopAll()
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
         keyMonitor = nil
         workspaceWatch?.stop()

@@ -36,8 +36,9 @@ final class EditorView: NSView {
         }
     }
 
-    /// Padding on each side of the line numbers.
-    static let gutterPadding: CGFloat = 10
+    /// Space before the line numbers. A test's run icon sits in it, with
+    /// room on both sides.
+    static let gutterPadding: CGFloat = 20
     /// Space after the line numbers: Git lane first, then the fold chevron.
     static let gutterTrailingPadding: CGFloat = 26
     /// Space between the gutter and the first column.
@@ -103,6 +104,13 @@ final class EditorView: NSView {
     }
     /// A click on the line numbers; the window turns it into a breakpoint.
     var onToggleBreakpoint: ((UInt64) -> Void)?
+    /// 0-based lines that declare a test, with the state of their run icon.
+    /// The icon sits in the left padding of the gutter.
+    var runMarkers: [UInt64: TestRunState] = [:] {
+        didSet { if runMarkers != oldValue { needsDisplay = true } }
+    }
+    /// A click on a run icon, with its 0-based line.
+    var onRunTest: ((UInt64) -> Void)?
 
     /// Width at the right edge kept clear for another view (the minimap).
     /// The document view is that much narrower than its scroll view.
@@ -1255,6 +1263,9 @@ final class EditorView: NSView {
             context.setFillColor(hasBreakpoint ? NSColor.white.cgColor : (hasCaret ? Theme.accent : Theme.gutterText).cgColor)
             context.textPosition = CGPoint(x: gutterRight - width, y: top + metrics.ascent)
             CTLineDraw(number, context)
+            if let state = runMarkers[line.line] {
+                drawRunMarker(state, in: context, centerY: top + lineHeight / 2, shift: shift)
+            }
             if let marker = diffMarker(for: line.line) {
                 let glyph = layout(for: marker)
                 context.setFillColor(Theme.gutterText.cgColor)
@@ -1508,6 +1519,51 @@ final class EditorView: NSView {
         context.setFillColor(border.cgColor)
         context.fill(CGRect(x: 0, y: top, width: width, height: 1))
         context.fill(CGRect(x: 0, y: top + height - 1, width: width, height: 1))
+    }
+
+    /// Width of the run icon's click target, from the gutter's left edge.
+    static let runMarkerWidth: CGFloat = gutterPadding
+
+    /// The icon of a test's run state in the left padding of the gutter:
+    /// a green outlined triangle to run, a check or a cross once done.
+    private func drawRunMarker(_ state: TestRunState, in context: CGContext, centerY y: CGFloat, shift: CGFloat) {
+        let size: CGFloat = 10
+        let x = shift + (Self.runMarkerWidth - size) / 2
+        let rect = CGRect(x: x, y: y - size / 2, width: size, height: size)
+        let green = NSColor.systemGreen.cgColor
+        context.saveGState()
+        context.setLineWidth(1.2)
+        context.setLineJoin(.round)
+        context.setLineCap(.round)
+        switch state {
+        case .ready:
+            context.setStrokeColor(green)
+            context.move(to: CGPoint(x: rect.minX + 1.5, y: rect.minY))
+            context.addLine(to: CGPoint(x: rect.maxX, y: rect.midY))
+            context.addLine(to: CGPoint(x: rect.minX + 1.5, y: rect.maxY))
+            context.closePath()
+            context.strokePath()
+        case .running:
+            context.setFillColor(Theme.accent.cgColor)
+            context.fillEllipse(in: rect.insetBy(dx: 1.5, dy: 1.5))
+        case .passed:
+            context.setStrokeColor(green)
+            context.strokeEllipse(in: rect.insetBy(dx: 0.5, dy: 0.5))
+            context.move(to: CGPoint(x: rect.minX + 2.4, y: rect.midY))
+            context.addLine(to: CGPoint(x: rect.midX - 0.4, y: rect.maxY - 2.6))
+            context.addLine(to: CGPoint(x: rect.maxX - 2, y: rect.minY + 2.6))
+            context.strokePath()
+        case .failed:
+            let red = NSColor.systemRed.cgColor
+            context.setStrokeColor(red)
+            context.strokeEllipse(in: rect.insetBy(dx: 0.5, dy: 0.5))
+            context.move(to: CGPoint(x: rect.minX + 2.8, y: rect.minY + 2.8))
+            context.addLine(to: CGPoint(x: rect.maxX - 2.8, y: rect.maxY - 2.8))
+            context.move(to: CGPoint(x: rect.maxX - 2.8, y: rect.minY + 2.8))
+            context.addLine(to: CGPoint(x: rect.minX + 2.8, y: rect.maxY - 2.8))
+            context.strokePath()
+        }
+        context.restoreGState()
     }
 
     /// A small chevron: points right while folded, down while open.

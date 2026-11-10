@@ -396,7 +396,7 @@ final class ReferencesPanelTests: XCTestCase {
         controller.findReferences(nil)
         let panel = try XCTUnwrap(controller.loadedReferencesPanel)
         XCTAssertEqual(panel.statusText, "Finding references...")
-        XCTAssertTrue(panel.statusDetail.contains("Indexing 12 of 80 files"))
+        XCTAssertTrue(panel.statusDetail.contains("Scanning workspace 12 of 80 files"))
     }
 
     func testInFlightReferencesDoNotTimeOutWhileLazyIndexBuilds() throws {

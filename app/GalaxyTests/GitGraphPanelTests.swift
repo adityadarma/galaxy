@@ -85,7 +85,7 @@ final class GitGraphPanelTests: XCTestCase {
 
     func testBottomPanelHasNoGitGraphTab() {
         XCTAssertEqual(BottomPanelHeader.Tab.allCases.map(\.title),
-                       ["PROBLEMS", "OUTPUT", "DEBUG CONSOLE", "TERMINAL", "PORTS"])
+                       ["PROBLEMS", "OUTPUT", "DEBUG CONSOLE", "TEST RESULTS", "TERMINAL", "PORTS"])
     }
 
     func testContextMenuOffersCommitActionsAndBranchCheckout() {

@@ -77,6 +77,7 @@ extension MainWindowController {
         problemsPanel.isHidden = tab != .problems
         outputPanel.isHidden = tab != .output
         portsPanel.isHidden = tab != .ports
+        testResultsPanel.isHidden = tab != .testResults
         debugConsole.isHidden = tab != .debugConsole
         if tab == .terminal {
             ensureTerminal()

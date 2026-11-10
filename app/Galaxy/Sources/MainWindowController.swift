@@ -127,6 +127,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// `editor.inlineParameterHints`.
     var inlineParameterHintsEnabled = true
     var parameterHintsItem: DispatchWorkItem?
+    /// Tests found in the shown file, and the runs started from their gutter icons.
+    var detectedTests: [TestCase] = []
+    var testScanItem: DispatchWorkItem?
+    let testRunner = TestRunner()
+    let testResultsPanel = TestResultsPanel()
     /// Last request: document, revision and lines asked for, and when.
     var parameterHintsRequest: (doc: ObjectIdentifier, revision: UInt64, lines: Range<Int>, at: Date, empty: Bool)?
     var parameterHintsGeneration = 0
@@ -381,6 +386,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             self?.updateBlameAnnotation()
             self?.scheduleBlameRefresh()
             self?.scheduleParameterHints()
+            self?.scheduleTestMarkers()
         }
         editorView.onGitChangeClick = { [weak self] line in
             self?.toggleInlineGitHunk(at: line)
@@ -670,7 +676,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         // `BottomPanelContentView.layout()` sizes these (never below its
         // minimum). No autoresizing mask: one tied to the collapsed,
         // zero-height container conflicts with the panels' own constraints.
-        for panel in [terminalPanel, outputPanel, portsPanel, problemsPanel, debugConsole] as [NSView] {
+        for panel in [terminalPanel, outputPanel, portsPanel, problemsPanel, debugConsole, testResultsPanel] as [NSView] {
             panel.translatesAutoresizingMaskIntoConstraints = true
             panel.autoresizingMask = []
             // A zero frame would become a `height == 0` constraint before
@@ -726,7 +732,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         // Every panel is added once and switched with `isHidden`; see
         // `setBottomPanelOpen`.
         debugConsole.isHidden = true
-        for panel in [terminalPanel, problemsPanel, outputPanel, portsPanel, debugConsole] as [NSView] {
+        for panel in [terminalPanel, problemsPanel, outputPanel, portsPanel, debugConsole, testResultsPanel] as [NSView] {
             bottomPanelContent.addSubview(panel)
         }
         bottomPanelContent.isHidden = true
@@ -810,6 +816,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
         debugConsole.onEvaluate = { [weak self] expression in self?.debugger.evaluate(expression) }
         editorView.onToggleBreakpoint = { [weak self] line in self?.toggleBreakpoint(line: line) }
+        editorView.onRunTest = { [weak self] line in self?.runTest(atLine: line) }
+        wireTestResults()
+        testResultsPanel.isHidden = true
         problemsPanel.isHidden = true
         outputPanel.isHidden = true
         portsPanel.isHidden = true
