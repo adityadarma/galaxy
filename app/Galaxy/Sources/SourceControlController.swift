@@ -894,18 +894,7 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
             return
         }
 
-        // Retrieve git diff (prefer staged changes; fallback to unstaged)
-        var (_, diff) = runGit(args: ["diff", "--cached"])
-        if diff.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            (_, diff) = runGit(args: ["diff"])
-        }
-
-        guard !diff.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            messageContainer.text = fallback
-            updateCommitButtonState()
-            focusMessageInput()
-            return
-        }
+        guard let root = workspace?.root() else { return }
 
         // Show generating feedback
         messageContainer.text = ""
@@ -915,23 +904,29 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
 
         generateTask?.cancel()
         generateTask = Task { [weak self] in
-            let generated = await AICommitService.shared.generateCommitMessage(diff: diff)
-            await MainActor.run {
-                guard let self else { return }
-                guard !Task.isCancelled else { return }
-                self.messageContainer.generateButton.isGenerating = false
-                self.generateTask = nil
-                self.updatePlaceholderString()
-
-                if let generated, !generated.isEmpty {
-                    self.messageContainer.text = generated
-                } else {
-                    // Graceful fallback to Option 1
-                    self.messageContainer.text = fallback
+            // Git runs off the main thread: a big diff must not freeze the UI.
+            let diff = await Task.detached {
+                // Prefer staged changes; fall back to unstaged.
+                var (_, diff) = Self.runGit(root: root, args: ["diff", "--cached"])
+                if diff.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    (_, diff) = Self.runGit(root: root, args: ["diff"])
                 }
-                self.updateCommitButtonState()
-                self.focusMessageInput()
+                return diff
+            }.value
+            let hasDiff = !diff.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            let generated = hasDiff ? await AICommitService.shared.generateCommitMessage(diff: diff) : nil
+            guard !Task.isCancelled, let self else { return }
+            self.messageContainer.generateButton.isGenerating = false
+            self.generateTask = nil
+            self.updatePlaceholderString()
+            if let generated, !generated.isEmpty {
+                self.messageContainer.text = generated
+            } else {
+                // Graceful fallback to the heuristic message.
+                self.messageContainer.text = fallback
             }
+            self.updateCommitButtonState()
+            self.focusMessageInput()
         }
     }
 
@@ -1029,8 +1024,10 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         process.standardError = pipe
         do {
             try process.run()
-            process.waitUntilExit()
+            // Drain the pipe before waiting: a child that fills the pipe
+            // buffer (a large diff) blocks on write and never exits.
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
             let output = String(data: data, encoding: .utf8) ?? ""
             return (process.terminationStatus, output)
         } catch {

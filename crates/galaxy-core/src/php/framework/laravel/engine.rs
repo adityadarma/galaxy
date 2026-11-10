@@ -192,6 +192,30 @@ fn blade_tag(text: &str, at: usize) -> Option<(Tag, usize, usize)> {
     None
 }
 
+/// The table a query-builder call is made on, without a model:
+/// `DB::table('posts')`, `DB::connection('x')->table('posts')` or
+/// `->from('posts')` earlier in the chain. An alias (`posts as p`) is
+/// dropped.
+fn table_of_call(text: &str, site: &Site) -> Option<String> {
+    static TABLE: OnceLock<Regex> = OnceLock::new();
+    let paren = site.paren?.min(text.len());
+    let before = text[..paren].trim_end();
+    let name_start = before
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !(c.is_ascii_alphanumeric() || *c == '_'))
+        .map_or(0, |(i, c)| i + c.len_utf8());
+    let head = &before[..name_start];
+    let (receiver_end, _) = member_operator(head)?;
+    let receiver = &head[receiver_start(head, receiver_end)..receiver_end];
+    let re = TABLE.get_or_init(|| {
+        Regex::new(r#"(?:\bDB::(?:connection\([^)]*\)->)?table|->\s*from)\s*\(\s*['"]([^'"]+)['"]"#)
+            .expect("valid")
+    });
+    let spec = re.captures(receiver)?.get(1)?.as_str();
+    spec.split_whitespace().next().map(str::to_owned)
+}
+
 impl PhpEngine {
     // ---- model helpers -------------------------------------------------
 
@@ -235,12 +259,47 @@ impl PhpEngine {
         columns
     }
 
+    /// Columns for a `where('…')` style call: those of the table it names
+    /// (`DB::table('posts')`, `->from('posts')`) when migrations know it, else
+    /// those of the model it is made on.
+    fn call_columns(
+        &mut self,
+        idx: &Index,
+        path: &Path,
+        text: &str,
+        site: &Site,
+    ) -> Option<Vec<Item>> {
+        if let Some(table) = table_of_call(text, site) {
+            let columns = idx.columns_of(&table);
+            if !columns.is_empty() {
+                return Some(Self::with_joins(idx, &table, columns, text, site));
+            }
+        }
+        let class = self.model_of_call(path, text, site)?;
+        Some(self.query_columns(idx, &class, text, site))
+    }
+
     /// Model columns qualified by the main table and every table joined
     /// before this call. Without a join, preserve the existing short names.
     fn query_columns(
         &mut self,
         idx: &Index,
         class: &Arc<ClassInfo>,
+        text: &str,
+        site: &Site,
+    ) -> Vec<Item> {
+        let main = self.model_table(class);
+        let columns = self.model_columns(class);
+        Self::with_joins(idx, &main, columns, text, site)
+    }
+
+    /// `main_columns` of `main`, or, when the statement joins other tables,
+    /// the qualified columns (`table.column`) of `main` and every joined
+    /// table.
+    fn with_joins(
+        idx: &Index,
+        main: &str,
+        main_columns: Vec<Item>,
         text: &str,
         site: &Site,
     ) -> Vec<Item> {
@@ -271,12 +330,11 @@ impl PhpEngine {
             })
             .collect();
         if joins.is_empty() {
-            return self.model_columns(class);
+            return main_columns;
         }
 
-        let main = self.model_table(class);
-        let mut main_columns = self.model_columns(class);
-        for column in idx.columns_of(&main) {
+        let mut main_columns = main_columns;
+        for column in idx.columns_of(main) {
             if !main_columns.iter().any(|item| item.name == column.name) {
                 main_columns.push(column);
             }
@@ -918,8 +976,7 @@ impl PhpEngine {
                 (!has_call).then_some(None)
             }
             Kind::Column => {
-                let class = self.model_of_call(path, text, site)?;
-                let columns = self.query_columns(idx, &class, text, site);
+                let columns = self.call_columns(idx, path, text, site)?;
                 pick(&columns, name).map(|item| Some(found(item)))
             }
             Kind::Relation => {
@@ -1023,8 +1080,7 @@ impl PhpEngine {
                 named(typed, &methods, kind, from)
             }
             Kind::Column => {
-                let class = self.model_of_call(path, text, &site)?;
-                let columns = self.query_columns(&idx, &class, text, &site);
+                let columns = self.call_columns(&idx, path, text, &site)?;
                 named(typed, &columns, kind, from)
             }
             Kind::Relation => {
@@ -1487,6 +1543,70 @@ mod tests {
             .map(|i| i.label)
             .collect();
         assert_eq!(labels, vec!["APP_KEY", "APP_NAME"]);
+    }
+
+    #[test]
+    fn completes_columns_of_a_table_without_a_model() {
+        let dir = project();
+        let mut engine = PhpEngine::new(dir.path());
+        let path = dir.path().join("app/X.php");
+        let labels = |engine: &mut PhpEngine, source: &str| -> Vec<String> {
+            let (text, line, column) = cursor(&format!("<?php\nnamespace App;\n{source}\n"));
+            engine
+                .complete(&path, &text, line, column)
+                .into_iter()
+                .map(|item| item.label)
+                .collect()
+        };
+
+        // The table named by the query builder gives the columns; no model
+        // is involved, so `$fillable` (`nickname`) never shows up.
+        for source in [
+            "DB::table('profiles')->where('|');",
+            "DB::table('profiles')->orderBy('|');",
+            "DB::connection('replica')->table('profiles')->where('|');",
+            "DB::table('profiles as p')->where('|');",
+            "$query->from('profiles')->where('|');",
+        ] {
+            let mut found = labels(&mut engine, source);
+            found.sort();
+            assert_eq!(found, vec!["display_name", "id", "user_id"], "{source}");
+        }
+
+        // A join qualifies every column with its table or alias.
+        let found = labels(
+            &mut engine,
+            "DB::table('profiles')->join('users as u', 'u.id', '=', 'profiles.user_id')->where('|');",
+        );
+        for expected in [
+            "profiles.display_name",
+            "profiles.user_id",
+            "u.email",
+            "u.id",
+        ] {
+            assert!(
+                found.contains(&expected.to_owned()),
+                "{expected}: {found:?}"
+            );
+        }
+        assert!(!found.contains(&"display_name".to_owned()), "{found:?}");
+
+        // A table no migration creates offers nothing instead of guessing.
+        let found = labels(&mut engine, "DB::table('legacy_rows')->where('|');");
+        assert!(!found.contains(&"id".to_owned()), "{found:?}");
+
+        // The column links to the migration that declares it.
+        let (text, line, column) =
+            cursor("<?php\nnamespace App;\nDB::table('profiles')->where('display_|name', 1);\n");
+        let targets = engine.definition(&path, &text, line, column);
+        assert_eq!(targets.len(), 1);
+        assert!(
+            targets[0]
+                .path
+                .ends_with("2024_01_02_000000_create_profiles_table.php"),
+            "{:?}",
+            targets[0].path
+        );
     }
 
     #[test]

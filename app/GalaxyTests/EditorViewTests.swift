@@ -70,7 +70,7 @@ final class EditorViewTests: XCTestCase {
         while view.frame.width <= visibleWidth, Date() < deadline {
             RunLoop.current.run(until: Date().addingTimeInterval(0.05))
         }
-        XCTAssertGreaterThan(view.contentTextWidth, visibleWidth, "the long line was measured")
+        XCTAssertGreaterThan(view.scrollTextWidth, visibleWidth, "the long line was measured")
         XCTAssertGreaterThan(view.frame.width, visibleWidth, "the document is wider than the window")
         XCTAssertEqual(view.gutterShift, 0)
 
@@ -260,6 +260,155 @@ final class EditorViewTests: XCTestCase {
         XCTAssertEqual(view.xOffset(in: "add(9, 2)", column: 4), before, accuracy: 0.01)
         view.setInlineHints([:])
         XCTAssertEqual(view.xOffset(in: text, column: 4), before, accuracy: 0.01)
+    }
+
+    /// An inferred return type is a button: only a double-click on its pill
+    /// reports it, a plain parameter label never does.
+    func testDoubleClickOnReturnTypeHintReportsItsPosition() throws {
+        let text = "function make() {}"
+        let (view, _, url) = try makeView(text: text)
+        defer { try? FileManager.default.removeItem(at: url) }
+        view.reloadDocument()
+        view.setInlineHints([text: [EditorView.InlineHint(column: 15, label: ": Customer", returnType: true)]])
+
+        var reported: [(UInt64, Int)] = []
+        view.onReturnTypeHintDoubleClick = { reported.append(($0, $1)) }
+        let at = CGPoint(x: view.textOriginX + view.xOffset(in: text, column: 15), y: view.rowTop(of: 0))
+        let pill = view.hintPill(view.inlineHints[text]![0], at: at, lineLength: text.utf16.count)
+        let inside = NSPoint(x: pill.midX, y: pill.midY)
+
+        XCTAssertNotNil(view.returnTypeHint(at: inside))
+        XCTAssertNil(view.returnTypeHint(at: NSPoint(x: pill.minX - 30, y: pill.midY)))
+
+        func click(_ point: NSPoint, count: Int) throws {
+            let event = try XCTUnwrap(NSEvent.mouseEvent(
+                with: .leftMouseDown, location: view.convert(point, to: nil), modifierFlags: [], timestamp: 0,
+                windowNumber: 0, context: nil, eventNumber: 0, clickCount: count, pressure: 1))
+            view.mouseDown(with: event)
+        }
+        try click(inside, count: 1)
+        XCTAssertTrue(reported.isEmpty, "a single click does nothing")
+        try click(inside, count: 2)
+        XCTAssertEqual(reported.count, 1)
+        XCTAssertEqual(reported.first?.0, 0)
+        XCTAssertEqual(reported.first?.1, 15)
+
+        // A parameter name label is not a button.
+        view.setInlineHints([text: [EditorView.InlineHint(column: 15, label: "a:")]])
+        XCTAssertNil(view.returnTypeHint(at: inside))
+    }
+
+    /// At the end of a line there is no room reserved after the last
+    /// character, so the return type is drawn after the text, not over it.
+    func testReturnTypeHintAtLineEndSitsAfterTheText() throws {
+        let text = "public function login(LoginRequest $request)"
+        let (view, _, url) = try makeView(text: text)
+        defer { try? FileManager.default.removeItem(at: url) }
+        view.reloadDocument()
+        let length = text.utf16.count
+        let hint = EditorView.InlineHint(column: length, label: ": RedirectResponse", returnType: true)
+        view.setInlineHints([text: [hint]])
+
+        let at = CGPoint(x: view.textOriginX + view.xOffset(in: text, column: UInt64(length)), y: view.rowTop(of: 0))
+        let pill = view.hintPill(hint, at: at, lineLength: length)
+        XCTAssertGreaterThanOrEqual(pill.minX, at.x, "the pill starts where the text ends")
+        XCTAssertNotNil(view.returnTypeHint(at: NSPoint(x: pill.midX, y: pill.midY)))
+
+        // The text keeps its own width: no room was taken before the last character.
+        view.setInlineHints([:])
+        let plain = view.xOffset(in: text, column: UInt64(length))
+        view.setInlineHints([text: [hint]])
+        XCTAssertEqual(view.xOffset(in: text, column: UInt64(length)), plain, accuracy: 0.01)
+    }
+
+    /// Blame text starts after the return type pill, never under it.
+    func testBlameStartsAfterTrailingReturnTypeHint() throws {
+        let text = "public function index()"
+        let (view, _, url) = try makeView(text: text)
+        defer { try? FileManager.default.removeItem(at: url) }
+        view.reloadDocument()
+        view.blameAnnotation = EditorView.BlameAnnotation(line: 0, text: "You, Uncommitted changes")
+        let plain = try XCTUnwrap(view.blameAnnotationRect()).minX
+
+        let length = text.utf16.count
+        let hint = EditorView.InlineHint(column: length, label: ": Response", returnType: true)
+        view.setInlineHints([text: [hint]])
+        let rect = try XCTUnwrap(view.blameAnnotationRect())
+        let at = CGPoint(x: view.textOriginX + view.xOffset(in: text, column: UInt64(length)), y: view.rowTop(of: 0))
+        let pill = view.hintPill(hint, at: at, lineLength: length)
+        XCTAssertGreaterThan(rect.minX, pill.maxX, "blame starts right of the pill")
+        XCTAssertGreaterThan(rect.minX, plain)
+    }
+
+    /// The line beside the numbers is the left edge of the text: it scrolls
+    /// away with the text, and nothing is left at the pinned gutter's edge.
+    func testGutterDividerScrollsAwayWithTheText() throws {
+        let text = (0..<6).map { _ in "    " + String(repeating: "wide ", count: 120) }.joined(separator: "\n")
+        let (view, _, url) = try makeView(text: text)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 600, height: 200))
+        scroll.documentView = view
+        view.reloadDocument()
+        view.updateDocumentWidth()
+
+        /// Luminance of the pixel columns around the gutter's right edge.
+        func edge() throws -> [CGFloat] {
+            let rep = try bitmap(view)
+            let scale = CGFloat(rep.pixelsWide) / view.bounds.width
+            let y = view.metrics.lineHeight * 1.5
+            let center = view.gutterShift + view.gutterWidth - 1
+            return try (-3...3).map { offset in
+                let x = Int((center + CGFloat(offset) * 0.5) * scale)
+                return try luminance(rep, view, x: CGFloat(x) / scale, y: y)
+            }
+        }
+        let still = try edge()
+        XCTAssertGreaterThan(Set(still).count, 1, "the line is drawn before scrolling: \(still)")
+        scroll.contentView.scroll(to: NSPoint(x: view.gutterWidth + 10, y: 0))
+        scroll.reflectScrolledClipView(scroll.contentView)
+        let scrolled = try edge()
+        XCTAssertEqual(Set(scrolled).count, 1, "no line is left at the gutter's edge: \(scrolled)")
+    }
+
+    /// The scroll range covers the widest line from the start, so it does
+    /// not grow as farther lines get drawn.
+    func testScrollRangeIsWholeBeforeLongLinesAreDrawn() throws {
+        let lines = (0..<400).map { $0 == 399 ? String(repeating: "x", count: 900) : "short" }
+        let (view, _, url) = try makeView(text: lines.joined(separator: "\n"))
+        defer { try? FileManager.default.removeItem(at: url) }
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 600, height: 200))
+        scroll.documentView = view
+        view.reloadDocument()
+        view.updateDocumentWidth()
+
+        XCTAssertEqual(view.contentTextWidth, 0, "no line has been drawn yet")
+        let needed = view.textOriginX + 900 * view.metrics.spaceWidth
+        XCTAssertGreaterThanOrEqual(view.frame.width, needed, "the range already reaches the end of line 399")
+    }
+
+    /// The horizontal scroller belongs to the text: it starts after the
+    /// gutter, so it never draws over the line numbers.
+    func testHorizontalScrollerStartsAfterTheGutter() throws {
+        let (view, _, url) = try makeView(text: String(repeating: "wide ", count: 400))
+        defer { try? FileManager.default.removeItem(at: url) }
+        let scroll = DiagnosticScrollView(frame: NSRect(x: 0, y: 0, width: 600, height: 200))
+        scroll.hasHorizontalScroller = true
+        scroll.scrollerStyle = .overlay
+        scroll.documentView = view
+        view.reloadDocument()
+        view.updateDocumentWidth()
+        scroll.layoutSubtreeIfNeeded()
+        scroll.tile()
+        let scroller = try XCTUnwrap(scroll.horizontalScroller)
+        XCTAssertEqual(scroller.frame.minX, view.gutterWidth, accuracy: 0.01)
+        XCTAssertEqual(scroller.frame.maxX, scroll.bounds.width, accuracy: 0.01)
+    }
+
+    /// Pulling past either end must not bounce sideways: the clip would
+    /// leave the document and drag the pinned gutter with it.
+    func testEditorScrollViewDoesNotBounceSideways() {
+        let scroll = DiagnosticScrollView(frame: NSRect(x: 0, y: 0, width: 600, height: 200))
+        XCTAssertEqual(scroll.horizontalScrollElasticity, .none)
     }
 
     func testGutterGrowsWithDigitCount() throws {

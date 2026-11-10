@@ -194,6 +194,32 @@ final class TerminalPanelTests: XCTestCase {
         XCTAssertEqual(UserDefaults.standard.double(forKey: "BottomPanelHeight"), Double(c.bottomPanelContentHeight), accuracy: 0.5)
     }
 
+    /// The panel is a card of its own, apart from the editor card by the
+    /// card gap; closed, the editor card fills the area and the gap is gone.
+    func testBottomPanelIsACardApartFromTheEditorCard() throws {
+        let c = MainWindowController(bridge: CoreBridge())
+        c.window?.setContentSize(NSSize(width: 1000, height: 800))
+        c.showWindow(nil)
+        defer { c.window?.orderOut(nil); UserDefaults.standard.removeObject(forKey: "BottomPanelHeight") }
+        c.window?.layoutIfNeeded()
+        XCTAssertTrue(c.bottomPanelCard.isHidden)
+        XCTAssertEqual(c.editorCard.frame.height, c.detailView.bounds.height, accuracy: 0.5)
+
+        c.toggleTerminal(nil)
+        c.window?.layoutIfNeeded()
+        XCTAssertFalse(c.bottomPanelCard.isHidden)
+        let gap = c.editorCard.frame.minY - c.bottomPanelCard.frame.maxY
+        let flipped = c.detailView.isFlipped
+        let between = flipped ? c.bottomPanelCard.frame.minY - c.editorCard.frame.maxY : gap
+        XCTAssertEqual(between, Theme.cardGap, accuracy: 0.5, "the cards are a card gap apart")
+        XCTAssertEqual(c.bottomPanelCard.layer?.cornerRadius, Theme.cardRadius)
+
+        c.toggleTerminal(nil)
+        c.window?.layoutIfNeeded()
+        XCTAssertTrue(c.bottomPanelCard.isHidden)
+        XCTAssertEqual(c.editorCard.frame.height, c.detailView.bounds.height, accuracy: 0.5)
+    }
+
     func testTerminalMovesIntoEditorAreaAndBack() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-term-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

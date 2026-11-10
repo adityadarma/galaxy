@@ -72,6 +72,38 @@ final class StickyScopeTests: XCTestCase {
         XCTAssertTrue(hasInk(Int(editor.textOriginX)..<Int(editor.textOriginX) + 60), "code")
     }
 
+    /// The pinned rows follow the text sideways: past the numbers, the code
+    /// and the divider are gone, and the numbers stay at the left edge.
+    func testRowsScrollSidewaysWithTheEditorAndKeepTheirNumbers() throws {
+        let (sticky, editor, url) = try makeView()
+        defer { try? FileManager.default.removeItem(at: url) }
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 600, height: 200))
+        scroll.documentView = editor
+        editor.frame = NSRect(x: 0, y: 0, width: 3000, height: 200)
+        sticky.show([.init(line: 39, text: "class A {", styles: [])])
+        sticky.frame = NSRect(x: 0, y: 0, width: 600, height: editor.metrics.lineHeight)
+
+        func ink(in xs: Range<Int>) throws -> Bool {
+            let rep = try XCTUnwrap(sticky.bitmapImageRepForCachingDisplay(in: sticky.bounds))
+            sticky.cacheDisplay(in: sticky.bounds, to: rep)
+            let scale = CGFloat(rep.pixelsWide) / sticky.bounds.width
+            let background = try XCTUnwrap(rep.colorAt(x: 0, y: 2)?.usingColorSpace(.sRGB))
+            for x in xs { for y in 0..<rep.pixelsHigh - 2 {
+                guard let c = rep.colorAt(x: Int(CGFloat(x) * scale), y: y)?.usingColorSpace(.sRGB) else { continue }
+                if abs(c.redComponent - background.redComponent) > 0.2 { return true }
+            } }
+            return false
+        }
+        let textStart = Int(editor.textOriginX)
+        XCTAssertTrue(try ink(in: textStart..<textStart + 60), "code before scrolling")
+
+        scroll.contentView.scroll(to: NSPoint(x: 400, y: 0))
+        scroll.reflectScrolledClipView(scroll.contentView)
+        sticky.horizontalScrollChanged()
+        XCTAssertTrue(try ink(in: 0..<Int(editor.gutterRight)), "the number stays at the edge")
+        XCTAssertFalse(try ink(in: Int(editor.gutterWidth)..<600), "the code and the divider scrolled away")
+    }
+
     /// A header pins the moment it reaches the top, with its copy on the
     /// original, and leaves when its block ends under the bar.
     func testHeadersPinAsTheyReachTheTopAndLeaveWithTheirBlock() throws {

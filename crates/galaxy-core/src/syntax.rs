@@ -162,6 +162,15 @@ impl SyntaxLanguage {
         }
     }
 
+    /// The comment marker for the file at `path`. Dotenv files share the INI
+    /// grammar but comment with `#`; real INI files keep `;`.
+    pub fn comment_marker_for(self, path: &str) -> Option<&'static str> {
+        if self == Self::Ini && is_dotenv(path) {
+            return Some("#");
+        }
+        self.comment_marker()
+    }
+
     pub fn grammar(self) -> Language {
         match self {
             Self::Rust => tree_sitter_rust::LANGUAGE.into(),
@@ -474,6 +483,16 @@ pub fn outline_symbols(
 /// as keywords rather than variables, and the class names it leaves out:
 /// declarations, `extends`/`implements`, trait uses, attributes, `X::class`
 /// and `X::$property`.
+/// `.env` and `.env.*` (`.env.local`, `.env.production`), by file name.
+fn is_dotenv(path: &str) -> bool {
+    let name = path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(path)
+        .to_ascii_lowercase();
+    name == ".env" || name.starts_with(".env.")
+}
+
 fn php_highlights() -> &'static str {
     static QUERY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     QUERY.get_or_init(|| {
@@ -3618,6 +3637,23 @@ mod tests {
         ] {
             assert_eq!(SyntaxLanguage::detect(path, ""), Some(expected), "{path}");
         }
+    }
+
+    #[test]
+    fn dotenv_files_comment_with_a_hash_and_ini_files_with_a_semicolon() {
+        let ini = SyntaxLanguage::Ini;
+        for path in [
+            ".env",
+            "/app/.env",
+            ".env.local",
+            "C:\\app\\.env.production",
+        ] {
+            assert_eq!(ini.comment_marker_for(path), Some("#"), "{path}");
+        }
+        for path in ["php.ini", "/etc/php/www.conf", "environment.ini"] {
+            assert_eq!(ini.comment_marker_for(path), Some(";"), "{path}");
+        }
+        assert_eq!(SyntaxLanguage::Rust.comment_marker_for(".env"), Some("//"));
     }
 
     #[test]

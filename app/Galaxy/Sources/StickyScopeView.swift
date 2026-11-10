@@ -105,6 +105,16 @@ final class StickyScopeView: NSView {
         }
     }
 
+    /// Sideways scroll position the rows were last drawn at.
+    private var lastShift: CGFloat = 0
+
+    /// The editor scrolled: redraw if it moved sideways. Called for every
+    /// scroll step, so the rows stay in step with the text beneath them.
+    func horizontalScrollChanged() {
+        guard !rows.isEmpty, let editor, editor.gutterShift != lastShift else { return }
+        needsDisplay = true
+    }
+
     /// The row under `point` (view coordinates), if any.
     func row(at point: NSPoint) -> Int? {
         guard rowHeight > 0, point.y >= 0 else { return nil }
@@ -126,7 +136,10 @@ final class StickyScopeView: NSView {
         dirtyRect.intersection(bounds).fill()
         guard let editor, let context = NSGraphicsContext.current?.cgContext else { return }
         let metrics = editor.metrics
-        let textX = editor.textOriginX
+        // The rows scroll sideways with the editor; the numbers stay put.
+        let shift = editor.gutterShift
+        lastShift = shift
+        let textX = editor.textOriginX - shift
         let gutterRight = editor.gutterRight
         context.saveGState()
         defer { context.restoreGState() }
@@ -150,7 +163,9 @@ final class StickyScopeView: NSView {
                 ? editor.layout(for: row.text)
                 : editor.syntaxLayout(for: row.text, styles: row.styles)
             context.saveGState()
-            context.clip(to: CGRect(x: textX, y: top, width: max(0, bounds.width - textX), height: metrics.lineHeight))
+            // Text never runs under the line numbers.
+            let gutterWidth = editor.gutterWidth
+            context.clip(to: CGRect(x: gutterWidth, y: top, width: max(0, bounds.width - gutterWidth), height: metrics.lineHeight))
             context.textPosition = CGPoint(x: textX, y: top + metrics.ascent)
             CTLineDraw(line, context)
             // The layout keeps room for parameter hints; fill it the same way.
@@ -159,8 +174,11 @@ final class StickyScopeView: NSView {
             context.restoreGState()
         }
 
-        // The gutter divider carries on through the pinned rows.
-        NSColor.separatorColor.withAlphaComponent(0.28).setFill()
-        NSRect(x: editor.gutterWidth - 1, y: 0, width: 1, height: bounds.height).fill()
+        // The gutter divider carries on through the pinned rows. It is the
+        // left edge of the text, so it scrolls away with it, as in the editor.
+        if shift <= 0 {
+            NSColor.separatorColor.withAlphaComponent(0.28).setFill()
+            NSRect(x: editor.gutterWidth - 1, y: 0, width: 1, height: bounds.height).fill()
+        }
     }
 }

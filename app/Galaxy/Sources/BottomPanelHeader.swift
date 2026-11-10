@@ -187,9 +187,6 @@ final class BottomPanelHeader: NSView {
     override func draw(_ dirtyRect: NSRect) {
         Theme.editorBackground.resolved(for: effectiveAppearance).setFill()
         dirtyRect.fill()
-        // The line between the editor and the panel.
-        NSColor.separatorColor.setFill()
-        NSRect(x: 0, y: 0, width: bounds.width, height: 1).intersection(dirtyRect).fill()
     }
 
     @objc private func splitTerminal(_ sender: Any?) { onSplitTerminal?() }

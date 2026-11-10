@@ -18,7 +18,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
     func application(_ application: NSApplication, open urls: [URL]) {
         guard let url = urls.first else { return }
         if let windowController = activeWindowController {
-            windowController.open(url: url)
+            windowController.open(urls: urls)
         } else {
             pendingURL = url
         }

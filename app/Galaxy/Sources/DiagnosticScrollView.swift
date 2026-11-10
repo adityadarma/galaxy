@@ -5,6 +5,35 @@ import AppKit
 @MainActor
 final class DiagnosticScrollView: NSScrollView {
     let ruler = OverviewRulerView()
+
+    /// Set in `init`: no sideways rubber band. Past the ends the clip would
+    /// leave the document, and the pinned line numbers would be dragged
+    /// with it.
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        horizontalScrollElasticity = .none
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    /// AppKit lays the horizontal scroller across the whole width; it belongs
+    /// to the text, so it starts where the text does and never draws over
+    /// the line numbers. `super.tile()` resets the frame first, so the inset
+    /// is applied once per layout.
+    override func tile() {
+        super.tile()
+        updateScrollerInset()
+    }
+
+    func updateScrollerInset() {
+        guard hasHorizontalScroller, let scroller = horizontalScroller,
+              let editor = documentView as? EditorView else { return }
+        let frame = scroller.frame
+        let left = min(max(editor.gutterWidth, 0), max(frame.width - 1, 0))
+        guard left > 0, abs(frame.minX - left) > 0.01 else { return }
+        scroller.frame = NSRect(x: frame.minX + left, y: frame.minY, width: frame.width - left, height: frame.height)
+    }
 }
 
 /// A narrow strip down the right edge of the editor, always visible (an overlay
@@ -18,8 +47,10 @@ final class OverviewRulerView: NSView {
     private var gitMarkers: [(line: UInt64, kind: GitLineChangeKind)] = []
     private var lineCount: UInt64 = 1
 
-    override var isFlipped: Bool { true }
-    override var isOpaque: Bool { true }
+    // Constants, so no main-actor check is needed. AppKit asks during hit
+    // testing, and the isolation check in the `@objc` thunk crashed there.
+    nonisolated override var isFlipped: Bool { true }
+    nonisolated override var isOpaque: Bool { true }
     override var acceptsFirstResponder: Bool { false }
 
     override init(frame: NSRect) {

@@ -74,6 +74,28 @@ fn all_text(doc: &DocumentHandle) -> String {
     doc.lines(0, doc.line_count()).join("\n")
 }
 
+/// Dotenv files share the INI grammar but comment with `#`; a real `.ini`
+/// file keeps `;`.
+#[test]
+fn toggle_comment_uses_hash_in_env_files_and_semicolon_in_ini_files() {
+    for (name, text, commented) in [
+        (".env", "APP_KEY=1\n", "# APP_KEY=1\n"),
+        (".env.local", "APP_KEY=1\n", "# APP_KEY=1\n"),
+        ("php.ini", "memory=1\n", "; memory=1\n"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(name);
+        std::fs::write(&path, text).unwrap();
+        let doc = Core::new()
+            .open_document(path.to_string_lossy().into_owned())
+            .unwrap();
+        doc.edit(EditCommand::ToggleComment);
+        assert_eq!(doc.text(), commented, "{name}");
+        doc.edit(EditCommand::ToggleComment);
+        assert_eq!(doc.text(), text, "{name} round trip");
+    }
+}
+
 #[test]
 fn folding_hides_lines_and_shrinks_the_row_map() {
     let doc = folding_doc();

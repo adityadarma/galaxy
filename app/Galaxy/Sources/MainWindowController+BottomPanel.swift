@@ -23,6 +23,9 @@ extension MainWindowController {
         bottomPanelHeaderHeight.constant = open ? BottomPanelHeader.height : 0
         bottomPanelHeader.isHidden = !open
         bottomPanelContent.isHidden = !open
+        // A card of its own, apart from the editor card by the card gap.
+        bottomPanelCard.isHidden = !open
+        bottomPanelGap.constant = open ? -Theme.cardGap : 0
         titleBar.setPanelVisible(open)
         detailView.needsLayout = true
     }
@@ -30,7 +33,7 @@ extension MainWindowController {
     private func currentBottomPanelHeight() -> CGFloat {
         guard isBottomPanelMaximized else { return bottomPanelOpenHeight }
         // Leave the tab strip and a sliver of editor, like VS Code.
-        let available = detailView.bounds.height - Theme.tabHeight - BottomPanelHeader.height - 40
+        let available = detailView.bounds.height - Theme.tabHeight - BottomPanelHeader.height - Theme.cardGap - 40
         return max(bottomPanelOpenHeight, available)
     }
 
@@ -46,7 +49,7 @@ extension MainWindowController {
     /// Sets the open panel's content height, leaving the editor some room.
     func setBottomPanelHeight(_ height: CGFloat) {
         let maximum = max(Self.minBottomPanelHeight,
-                          detailView.bounds.height - Theme.tabHeight - BottomPanelHeader.height - 40)
+                          detailView.bounds.height - Theme.tabHeight - BottomPanelHeader.height - Theme.cardGap - 40)
         let clamped = min(max(height, Self.minBottomPanelHeight), maximum)
         isBottomPanelMaximized = false
         bottomPanelHeader.setMaximized(false)

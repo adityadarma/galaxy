@@ -72,6 +72,7 @@ extension MainWindowController {
         }
         showEditorTerminal(for: tab)
         showEditorGitGraph(for: tab)
+        showEditorMedia(for: tab)
         showEmptyEditor(false)
         if tab.terminal != nil {
             if isFindVisible { closeFind(nil) }
@@ -79,6 +80,9 @@ extension MainWindowController {
         } else if tab.isGitGraph {
             if isFindVisible { closeFind(nil) }
             gitGraphPanel.focus()
+        } else if tab.mediaURL != nil {
+            if isFindVisible { closeFind(nil) }
+            mediaViewer.focus()
         } else if isFindVisible {
             applyFind(select: false)
         } else {
@@ -290,6 +294,7 @@ extension MainWindowController {
         if isFindVisible { closeFind(nil) }
         showEditorTerminal(for: nil)
         showEditorGitGraph(for: nil)
+        showEditorMedia(for: nil)
         showEmptyEditor(true)
         if isDiffPaneShown { leaveDiffPane() }
         editorView.document = nil

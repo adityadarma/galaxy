@@ -3,12 +3,15 @@
 use std::path::Path;
 
 use super::{
-    Ctx, PhpEngine, byte_offset, clean_doc, import_edit, is_ident, member_operator, position_of,
-    receiver_start, word_start,
+    Ctx, PhpEngine, byte_offset, clean_doc, import_edit, is_ident, is_scope, member_operator,
+    position_of, receiver_start, word_start,
 };
+use crate::lang::Insertion;
 use crate::lang::{Action, Edit, OutlineSymbol, Signature};
 use crate::parameter_hints::{self, Argument, Parameter, ParameterHint};
-use crate::php::parse::{ClassKind, FileSymbols, MemberKind, parse_file, parse_with_tree};
+use crate::php::parse::{
+    ClassKind, FileSymbols, MemberKind, parse_file, parse_with_tree, resolve_name,
+};
 
 const MAX_IMPORT_CHOICES: usize = 8;
 
@@ -227,6 +230,31 @@ fn php_argument(text: &str, argument: tree_sitter::Node<'_>) -> Argument {
     }
 }
 
+/// A declaration whose return type can be inferred, and where it goes.
+struct InferredReturn {
+    /// UTF-16 position right after the parameter list's `)`.
+    line: u32,
+    column: u32,
+    /// Fully qualified class, or `static`.
+    ty: String,
+}
+
+/// How `fqn` is written in this file, and the `use` it needs if any.
+fn type_reference(file: &FileSymbols, fqn: &str) -> (String, Option<Insertion>) {
+    if fqn == "static" {
+        return (fqn.to_owned(), None);
+    }
+    let short = fqn.rsplit('\\').next().unwrap_or(fqn);
+    if resolve_name(short, &file.namespace, &file.uses).eq_ignore_ascii_case(fqn) {
+        return (short.to_owned(), None);
+    }
+    // The short name is taken by another import: spell the class out.
+    if file.uses.contains_key(&short.to_lowercase()) {
+        return (format!("\\{fqn}"), None);
+    }
+    (short.to_owned(), import_edit(file, fqn))
+}
+
 impl PhpEngine {
     /// The signature of the call the cursor is in, with the argument being
     /// typed. `None` outside a call or for a callee it cannot find.
@@ -280,9 +308,195 @@ impl PhpEngine {
                 }
             }
         }
+        if let Some((file, tree)) = parse_with_tree(path, text) {
+            for found in self.inferred_returns(text, &file, &tree, first, last) {
+                let (short, _) = type_reference(&file, &found.ty);
+                out.push(ParameterHint {
+                    line: found.line,
+                    column: found.column,
+                    label: format!(": {short}"),
+                    return_type: true,
+                });
+            }
+        }
         self.restore_current(path, previous);
         out.sort_by_key(|hint| (hint.line, hint.column));
         out
+    }
+
+    /// Edits that declare the inferred return type of the function whose
+    /// parameter list closes at `line`/`column`: the type itself, and the
+    /// `use` that makes its short name valid.
+    pub fn return_type_edits(
+        &mut self,
+        path: &Path,
+        text: &str,
+        line: u32,
+        column: u32,
+    ) -> Vec<Edit> {
+        let previous = self.register_current(path, text);
+        let mut edits = Vec::new();
+        if let Some((file, tree)) = parse_with_tree(path, text)
+            && let Some(found) = self
+                .inferred_returns(text, &file, &tree, line, line)
+                .into_iter()
+                .find(|found| found.line == line && found.column == column)
+        {
+            let (short, import) = type_reference(&file, &found.ty);
+            if let Some(import) = import {
+                edits.push(Edit {
+                    start_line: import.line,
+                    start_column: import.column,
+                    end_line: import.line,
+                    end_column: import.column,
+                    text: import.text,
+                });
+            }
+            edits.push(Edit {
+                start_line: line,
+                start_column: column,
+                end_line: line,
+                end_column: column,
+                text: format!(": {short}"),
+            });
+            edits.sort_by_key(|edit| (edit.start_line, edit.start_column));
+        }
+        self.restore_current(path, previous);
+        edits
+    }
+
+    /// Functions and methods with no declared return type whose `return`
+    /// statements all give the same class, found by lines `first..=last`
+    /// of their parameter list's end. Bodies that can run off their end
+    /// are left alone: the type would be nullable.
+    fn inferred_returns(
+        &mut self,
+        text: &str,
+        file: &FileSymbols,
+        tree: &tree_sitter::Tree,
+        first: u32,
+        last: u32,
+    ) -> Vec<InferredReturn> {
+        let mut declarations = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if (node.end_position().row as u32) < first || node.start_position().row as u32 > last {
+                continue;
+            }
+            if matches!(node.kind(), "method_declaration" | "function_definition")
+                && declarations.len() < parameter_hints::MAX_CALLS
+            {
+                declarations.push(node);
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        let mut out = Vec::new();
+        for node in declarations {
+            if node.child_by_field_name("return_type").is_some() {
+                continue;
+            }
+            let (Some(parameters), Some(body), Some(name)) = (
+                node.child_by_field_name("parameters"),
+                node.child_by_field_name("body"),
+                node.child_by_field_name("name"),
+            ) else {
+                continue;
+            };
+            let name = &text[name.byte_range()];
+            if body.kind() != "compound_statement"
+                || name.eq_ignore_ascii_case("__construct")
+                || name.eq_ignore_ascii_case("__destruct")
+            {
+                continue;
+            }
+            let (line, column, _) = position_of(text, parameters.end_byte());
+            if line < first || line > last {
+                continue;
+            }
+            if let Some(ty) = self.returned_class(text, file, tree, body) {
+                out.push(InferredReturn { line, column, ty });
+            }
+        }
+        out.sort_by_key(|found| (found.line, found.column));
+        out
+    }
+
+    /// The one class every `return` of `body` gives, or `static` when they
+    /// all give `$this`.
+    fn returned_class(
+        &mut self,
+        text: &str,
+        file: &FileSymbols,
+        tree: &tree_sitter::Tree,
+        body: tree_sitter::Node<'_>,
+    ) -> Option<String> {
+        let mut cursor = body.walk();
+        let ends = body
+            .named_children(&mut cursor)
+            .filter(|child| child.kind() != "comment")
+            .last()
+            .is_some_and(|last| {
+                last.kind() == "return_statement"
+                    || (last.kind() == "expression_statement"
+                        && last
+                            .named_child(0)
+                            .is_some_and(|inner| inner.kind() == "throw_expression"))
+            });
+        if !ends {
+            return None;
+        }
+        let mut returns = Vec::new();
+        let mut stack = vec![body];
+        while let Some(current) = stack.pop() {
+            let mut cursor = current.walk();
+            for child in current.named_children(&mut cursor) {
+                if is_scope(child.kind()) {
+                    continue;
+                }
+                if child.kind() == "return_statement" {
+                    returns.push(child);
+                } else {
+                    stack.push(child);
+                }
+            }
+        }
+        let mut found: Option<String> = None;
+        for statement in &returns {
+            let value = statement.named_child(0)?;
+            let expression = text[value.byte_range()].trim();
+            let ty = if expression == "$this" {
+                "static".to_owned()
+            } else {
+                let row = statement.start_position().row as u32;
+                let ctx = Ctx {
+                    src: text,
+                    tree,
+                    file,
+                    byte: statement.start_byte(),
+                    class: file
+                        .classes
+                        .iter()
+                        .find(|c| c.start_line <= row && row <= c.end_line)
+                        .cloned(),
+                };
+                let ty = self.eval(&ctx, expression, 0)?;
+                if ty.is_empty()
+                    || !ty
+                        .chars()
+                        .all(|c| c.is_alphanumeric() || c == '_' || c == '\\')
+                {
+                    return None;
+                }
+                ty
+            };
+            match &found {
+                Some(known) if !known.eq_ignore_ascii_case(&ty) => return None,
+                Some(_) => {}
+                None => found = Some(ty),
+            }
+        }
+        found
     }
 
     /// Name, parameter detail and docblock of the callee whose argument
@@ -361,9 +575,59 @@ impl PhpEngine {
         }
         if !template {
             self.unused_import_actions(path, text, line, &mut out);
+            self.simplify_name_actions(path, text, line, column, &mut out);
         }
         self.restore_current(path, previous);
         out
+    }
+
+    /// Replaces a fully qualified name by its short form where the file
+    /// already resolves the short form to the same class.
+    fn simplify_name_actions(
+        &mut self,
+        path: &Path,
+        text: &str,
+        line: u32,
+        column: u32,
+        out: &mut Vec<Action>,
+    ) {
+        let edits: Vec<(u32, Edit)> = self
+            .diagnostics(path, text)
+            .into_iter()
+            .filter_map(|p| {
+                let short = super::diag::simplified_to(&p.message)?.to_owned();
+                Some((
+                    p.start_line,
+                    Edit {
+                        start_line: p.start_line,
+                        start_column: p.start_column,
+                        end_line: p.end_line,
+                        end_column: p.end_column,
+                        text: short,
+                    },
+                ))
+            })
+            .collect();
+        // The name under the cursor, else the first one on its line.
+        let under = edits.iter().find(|(row, edit)| {
+            *row == line && edit.start_column <= column && column <= edit.end_column
+        });
+        let on_line = edits.iter().find(|(row, _)| *row == line);
+        let Some((_, edit)) = under.or(on_line) else {
+            return;
+        };
+        out.push(Action {
+            files: Vec::new(),
+            title: format!("Simplify to `{}`", edit.text),
+            edits: vec![edit.clone()],
+        });
+        if edits.len() > 1 {
+            out.push(Action {
+                files: Vec::new(),
+                title: "Simplify all names".into(),
+                edits: edits.into_iter().map(|(_, edit)| edit).collect(),
+            });
+        }
     }
 
     fn import_actions(&mut self, path: &Path, text: &str, byte: usize, out: &mut Vec<Action>) {
@@ -654,6 +918,88 @@ mod tests {
             ],
             "the docblock's `label` is not a member"
         );
+    }
+
+    #[test]
+    fn return_types_are_inferred_and_inserted_with_their_import() {
+        let dir = project();
+        let mut engine = PhpEngine::new(dir.path());
+        let path = dir.path().join("app/Services/S.php");
+        let text = "<?php\nnamespace App\\Services;\n\nclass S\n{\n    public function make()\n    {\n        return new \\App\\Models\\Customer();\n    }\n\n    public function me()\n    {\n        return $this;\n    }\n\n    public function either($a)\n    {\n        if ($a) {\n            return new \\App\\Models\\Customer();\n        }\n        return new \\App\\Models\\Order();\n    }\n\n    public function maybe($a)\n    {\n        if ($a) {\n            return new \\App\\Models\\Customer();\n        }\n    }\n\n    public function declared(): int\n    {\n        return new \\App\\Models\\Customer();\n    }\n}\n";
+
+        let found: Vec<_> = engine
+            .parameter_hints(&path, text, 0, 40)
+            .into_iter()
+            .filter(|hint| hint.return_type)
+            .map(|hint| (hint.line, hint.column, hint.label))
+            .collect();
+        // Same class on every path, `$this`; mixed classes, a path that
+        // falls off the end and a declared type get nothing.
+        assert_eq!(
+            found,
+            vec![
+                (5, 26, ": Customer".to_owned()),
+                (10, 24, ": static".to_owned())
+            ]
+        );
+
+        // Accepting the hint adds the type and the import it needs.
+        let edits = engine.return_type_edits(&path, text, 5, 26);
+        assert_eq!(
+            edits,
+            vec![
+                Edit {
+                    start_line: 2,
+                    start_column: 0,
+                    end_line: 2,
+                    end_column: 0,
+                    text: "\nuse App\\Models\\Customer;\n".into(),
+                },
+                Edit {
+                    start_line: 5,
+                    start_column: 26,
+                    end_line: 5,
+                    end_column: 26,
+                    text: ": Customer".into(),
+                },
+            ]
+        );
+        let edits = engine.return_type_edits(&path, text, 10, 24);
+        assert_eq!(edits.len(), 1, "{edits:?}");
+        assert_eq!(edits[0].text, ": static");
+
+        // Nothing at a position that has no hint.
+        assert!(engine.return_type_edits(&path, text, 5, 3).is_empty());
+    }
+
+    #[test]
+    fn actions_simplify_qualified_names() {
+        let dir = project();
+        let mut engine = PhpEngine::new(dir.path());
+        let path = dir.path().join("app/Services/S.php");
+        let text = "<?php\nnamespace App\\Services;\n\nuse App\\Models\\Customer;\n\nclass S\n{\n    public function f() { return [new \\App\\Models\\Customer(), new \\App\\Models\\Customer()]; }\n}\n";
+
+        let found = engine.actions(&path, text, 7, 45);
+        let titles: Vec<&str> = found.iter().map(|a| a.title.as_str()).collect();
+        assert_eq!(titles, vec!["Simplify to `Customer`", "Simplify all names"]);
+        assert_eq!(
+            found[0].edits,
+            vec![Edit {
+                start_line: 7,
+                start_column: 38,
+                end_line: 7,
+                end_column: 58,
+                text: "Customer".into(),
+            }]
+        );
+        assert_eq!(found[1].edits.len(), 2);
+
+        // On the second name the fix is for that one.
+        let found = engine.actions(&path, text, 7, 80);
+        assert_eq!(found[0].edits[0].start_column, 66);
+
+        // Nowhere near a long name: nothing to offer.
+        assert!(engine.actions(&path, text, 5, 2).is_empty());
     }
 
     #[test]

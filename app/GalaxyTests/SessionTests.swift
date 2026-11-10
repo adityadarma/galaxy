@@ -73,6 +73,126 @@ final class SessionTests: XCTestCase {
         XCTAssertFalse(second.tabs.contains { $0.isEdited }, "restored tabs are clean")
     }
 
+    // MARK: Diff tabs and duplicates
+
+    nonisolated private func git(_ dir: URL, _ args: String...) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        process.arguments = ["git", "-C", dir.path] + args
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0, "git \(args.joined(separator: " "))")
+    }
+
+    /// `ws/src/main.rs` committed, then changed, so it has a diff.
+    private func makeRepo() throws -> URL {
+        let repo = root.appendingPathComponent("ws")
+        try git(repo, "init", "-b", "main")
+        try git(repo, "add", ".")
+        try git(repo, "-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "-m", "initial")
+        try "fn main() { changed(); }\n".write(to: repo.appendingPathComponent("src/main.rs"), atomically: true, encoding: .utf8)
+        return repo
+    }
+
+    private func waitForDiff(_ c: MainWindowController) {
+        let deadline = Date().addingTimeInterval(5)
+        while c.diffMap.hunks.isEmpty, Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+        }
+    }
+
+    func testADiffTabComesBackAsADiffTab() throws {
+        let repo = try makeRepo()
+        let first = makeController()
+        try first.openWorkspace(at: repo)
+        first.openWorkspaceDiff(try XCTUnwrap(first.workspace), relPath: "src/main.rs")
+        waitForDiff(first)
+        try first.openFile(at: repo.appendingPathComponent("src/long.rs"))
+        first.saveSession()
+        first.window?.close()
+
+        let saved = try XCTUnwrap(Session.load(from: sessionURL))
+        XCTAssertEqual(saved.tabs.map(\.isDiff), [true, nil])
+
+        let second = makeController()
+        defer { second.window?.orderOut(nil) }
+        XCTAssertTrue(second.restore(saved))
+        XCTAssertEqual(second.tabBar.items.map(\.title), ["main.rs (Working Tree)", "long.rs"])
+        XCTAssertNotNil(second.tabs[0].diffBase)
+        XCTAssertNil(second.tabs[1].diffBase)
+    }
+
+    func testTheActiveDiffTabShowsTwoPanesAfterRestore() throws {
+        let repo = try makeRepo()
+        let first = makeController()
+        try first.openWorkspace(at: repo)
+        first.openWorkspaceDiff(try XCTUnwrap(first.workspace), relPath: "src/main.rs")
+        waitForDiff(first)
+        first.saveSession()
+        first.window?.close()
+
+        let second = makeController()
+        defer { second.window?.orderOut(nil) }
+        XCTAssertTrue(second.restore(try XCTUnwrap(Session.load(from: sessionURL))))
+        XCTAssertTrue(second.isDiffPaneShown)
+        XCTAssertEqual(second.secondaryEditorView.document?.text(), "fn main() {}\n", "left pane is HEAD")
+    }
+
+    func testAFileWithBothAPlainAndADiffTabKeepsBoth() throws {
+        let repo = try makeRepo()
+        let first = makeController()
+        try first.openWorkspace(at: repo)
+        try first.openFile(at: repo.appendingPathComponent("src/main.rs"))
+        first.openWorkspaceDiff(try XCTUnwrap(first.workspace), relPath: "src/main.rs")
+        waitForDiff(first)
+        XCTAssertEqual(first.tabs.count, 2)
+        first.saveSession()
+        first.window?.close()
+
+        let second = makeController()
+        defer { second.window?.orderOut(nil) }
+        XCTAssertTrue(second.restore(try XCTUnwrap(Session.load(from: sessionURL))))
+        XCTAssertEqual(second.tabs.map { $0.diffBase != nil }.sorted(by: { !$0 && $1 }), [false, true])
+        XCTAssertEqual(second.tabs.count, 2)
+    }
+
+    func testDuplicateSavedTabsCollapseToOne() {
+        let a = Session.Tab(path: path("ws/src/main.rs"), isPreview: false, line: 1, col: 0, scrollY: nil)
+        var diff = a
+        diff.isDiff = true
+        let b = Session.Tab(path: path("ws/src/long.rs"), isPreview: false, line: 0, col: 0, scrollY: nil)
+
+        // An old session saved a diff tab as a plain one: same file twice.
+        var result = MainWindowController.deduplicatedTabs([a, b, a], active: 2)
+        XCTAssertEqual(result.tabs.map(\.path), [a.path, b.path])
+        XCTAssertEqual(result.active, 0, "active follows the entry that was kept")
+
+        // A plain tab and a diff tab of one file are different tabs.
+        result = MainWindowController.deduplicatedTabs([a, diff, diff], active: 1)
+        XCTAssertEqual(result.tabs.map { $0.isDiff == true }, [false, true])
+        XCTAssertEqual(result.active, 1)
+
+        result = MainWindowController.deduplicatedTabs([a, b], active: nil)
+        XCTAssertEqual(result.tabs, [a, b])
+        XCTAssertNil(result.active)
+    }
+
+    func testRestoringASessionWithDuplicateTabsOpensEachFileOnce() throws {
+        let ws = root.appendingPathComponent("ws")
+        let main = path("ws/src/main.rs"), long = path("ws/src/long.rs")
+        var session = Session()
+        session.workspace = ws.path
+        session.tabs = [main, long, main].map { Session.Tab(path: $0, isPreview: false, line: 0, col: 0, scrollY: nil) }
+        session.active = 2
+
+        let c = makeController()
+        defer { c.window?.orderOut(nil) }
+        XCTAssertTrue(c.restore(session))
+        XCTAssertEqual(c.tabBar.items.map(\.title), ["main.rs", "long.rs"])
+    }
+
     func testMissingFilesAndFoldersAreSkipped() throws {
         var session = Session()
         session.workspace = path("gone")
@@ -116,6 +236,33 @@ final class SessionTests: XCTestCase {
         DispatchQueue.main.async {
             XCTAssertEqual(second.tabBar.items.map(\.title), ["long.rs", "main.rs"])
             XCTAssertEqual(second.activeTab?.title, "main.rs", "deferred tabs do not steal focus")
+            restored.fulfill()
+        }
+        wait(for: [restored], timeout: 1)
+    }
+
+    func testLaunchRestoreKeepsTheDiffTabAndDropsDuplicates() throws {
+        let repo = try makeRepo()
+        let first = makeController()
+        try first.openWorkspace(at: repo)
+        try first.openFile(at: repo.appendingPathComponent("src/long.rs"))
+        first.openWorkspaceDiff(try XCTUnwrap(first.workspace), relPath: "src/main.rs")
+        waitForDiff(first)
+        var saved = first.currentSession()
+        // A session written by an older build repeated the file.
+        saved.tabs.append(saved.tabs[0])
+        try saved.save(to: Session.workspaceURL(for: repo.path))
+        first.window?.close()
+
+        let second = makeController()
+        defer { second.window?.orderOut(nil) }
+        XCTAssertTrue(second.restore(saved, incrementally: true))
+        XCTAssertEqual(second.activeTab?.title, "main.rs")
+        XCTAssertNotNil(second.activeTab?.diffBase, "the active tab is the diff")
+
+        let restored = expectation(description: "workspace tabs restored")
+        DispatchQueue.main.async {
+            XCTAssertEqual(second.tabBar.items.map(\.title), ["long.rs", "main.rs (Working Tree)"])
             restored.fulfill()
         }
         wait(for: [restored], timeout: 1)

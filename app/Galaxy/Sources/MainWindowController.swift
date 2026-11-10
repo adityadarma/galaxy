@@ -94,6 +94,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     let outputPanel = OutputPanel()
     let portsPanel = PortsPanel()
     let gitGraphPanel = GitGraphPanel()
+    /// Shows the active tab when it is a picture or a PDF.
+    let mediaViewer = MediaViewerView()
     /// Covers the editor while no tab is open.
     let emptyEditor = EmptyEditorView()
     let bottomPanelHeader = BottomPanelHeader()
@@ -165,7 +167,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     var hoverShownContents: String?
     var hoverShownPosition: TextPos?
     let splitView = CardSplitView()
-    let detailView = CardView()
+    /// Holds the editor card and, under it, the bottom panel card. It draws
+    /// nothing, so the chrome colour shows in the gap between them.
+    let detailView = NSView()
+    let editorCard = CardView()
+    let bottomPanelCard = CardView()
+    /// Space between the two cards: zero while the panel is closed.
+    var bottomPanelGap: NSLayoutConstraint!
     /// Holds the find bar's place in the layout. The bar itself is built on
     /// first use (⌘F): it costs about 20 ms, a tenth of the startup budget.
     let findBarSlot = NSView()
@@ -349,6 +357,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         window.tabbingMode = .disallowed
         super.init(window: window)
         window.delegate = self
+        // The window takes files dragged in from outside the app.
+        let dropView = FileDropView(frame: NSRect(x: 0, y: 0, width: 960, height: 640))
+        dropView.autoresizingMask = [.width, .height]
+        dropView.onDrop = { [weak self] urls in self?.open(urls: urls) }
+        window.contentView = dropView
         buildContent()
         installMemoryPressureHandler()
         editorView.onChange = { [weak self] in
@@ -371,6 +384,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
         editorView.onGitChangeClick = { [weak self] line in
             self?.toggleInlineGitHunk(at: line)
+        }
+        editorView.onReturnTypeHintDoubleClick = { [weak self] line, column in
+            self?.insertReturnType(line: line, column: column)
         }
         editorView.onInlineHunkAction = { [weak self] action in
             self?.handleInlineHunkAction(action)
@@ -674,12 +690,17 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         signaturePopup.translatesAutoresizingMaskIntoConstraints = false
         findBarSlot.isHidden = true
         findBarHeight = findBarSlot.heightAnchor.constraint(equalToConstant: 0)
+        editorCard.translatesAutoresizingMaskIntoConstraints = false
+        bottomPanelCard.translatesAutoresizingMaskIntoConstraints = false
+        bottomPanelCard.isHidden = true
+        detailView.addSubview(editorCard)
+        detailView.addSubview(bottomPanelCard)
         groupsSplitView.translatesAutoresizingMaskIntoConstraints = false
         groupsSplitView.addSubview(activeGroup.slot)
-        detailView.addSubview(groupsSplitView)
+        editorCard.addSubview(groupsSplitView)
         groupChrome.translatesAutoresizingMaskIntoConstraints = false
         groupChrome.wantsLayer = true
-        detailView.addSubview(groupChrome)
+        editorCard.addSubview(groupChrome)
         groupChrome.addSubview(tabBar)
         groupChrome.addSubview(pathBar)
         groupChrome.addSubview(breadcrumbBar)
@@ -691,14 +712,17 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         groupChrome.addSubview(editorTerminalView)
         gitGraphPanel.translatesAutoresizingMaskIntoConstraints = false
         groupChrome.addSubview(gitGraphPanel)
+        mediaViewer.translatesAutoresizingMaskIntoConstraints = false
+        mediaViewer.isHidden = true
+        groupChrome.addSubview(mediaViewer)
         emptyEditor.translatesAutoresizingMaskIntoConstraints = false
         groupChrome.addSubview(emptyEditor)
         // `TerminalView` is layer-backed. Without a layer here, it was
         // composited above every non-layer sibling and blanked the tab bar
         // and path bar while a terminal tab was active.
         detailView.wantsLayer = true
-        detailView.addSubview(bottomPanelHeader)
-        detailView.addSubview(bottomPanelContent)
+        bottomPanelCard.addSubview(bottomPanelHeader)
+        bottomPanelCard.addSubview(bottomPanelContent)
         // Every panel is added once and switched with `isHidden`; see
         // `setBottomPanelOpen`.
         debugConsole.isHidden = true
@@ -713,12 +737,19 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         stickyTrailing = stickyScopeView.trailingAnchor.constraint(equalTo: editorSplitView.trailingAnchor)
         // `updateMinimap` ran before this constraint existed.
         stickyTrailing.constant = -editorRightInset
+        bottomPanelGap = editorCard.bottomAnchor.constraint(equalTo: bottomPanelCard.topAnchor)
         NSLayoutConstraint.activate([
-            groupsSplitView.topAnchor.constraint(equalTo: detailView.topAnchor),
-            groupsSplitView.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
-            groupsSplitView.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
-            // VS Code order: editor, panel title row, panel content.
-            groupsSplitView.bottomAnchor.constraint(equalTo: bottomPanelHeader.topAnchor),
+            editorCard.topAnchor.constraint(equalTo: detailView.topAnchor),
+            editorCard.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
+            editorCard.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
+            bottomPanelGap,
+            bottomPanelCard.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
+            bottomPanelCard.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
+            bottomPanelCard.bottomAnchor.constraint(equalTo: detailView.bottomAnchor),
+            groupsSplitView.topAnchor.constraint(equalTo: editorCard.topAnchor),
+            groupsSplitView.leadingAnchor.constraint(equalTo: editorCard.leadingAnchor),
+            groupsSplitView.trailingAnchor.constraint(equalTo: editorCard.trailingAnchor),
+            groupsSplitView.bottomAnchor.constraint(equalTo: editorCard.bottomAnchor),
             tabBar.topAnchor.constraint(equalTo: groupChrome.topAnchor),
             tabBar.leadingAnchor.constraint(equalTo: groupChrome.leadingAnchor),
             tabBar.trailingAnchor.constraint(equalTo: groupChrome.trailingAnchor),
@@ -750,18 +781,24 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             gitGraphPanel.leadingAnchor.constraint(equalTo: groupChrome.leadingAnchor),
             gitGraphPanel.trailingAnchor.constraint(equalTo: groupChrome.trailingAnchor),
             gitGraphPanel.bottomAnchor.constraint(equalTo: groupChrome.bottomAnchor),
+            // And a picture or PDF.
+            mediaViewer.topAnchor.constraint(equalTo: tabBar.bottomAnchor),
+            mediaViewer.leadingAnchor.constraint(equalTo: groupChrome.leadingAnchor),
+            mediaViewer.trailingAnchor.constraint(equalTo: groupChrome.trailingAnchor),
+            mediaViewer.bottomAnchor.constraint(equalTo: groupChrome.bottomAnchor),
             // So does the empty state, under the tab bar.
             emptyEditor.topAnchor.constraint(equalTo: tabBar.bottomAnchor),
             emptyEditor.leadingAnchor.constraint(equalTo: groupChrome.leadingAnchor),
             emptyEditor.trailingAnchor.constraint(equalTo: groupChrome.trailingAnchor),
             emptyEditor.bottomAnchor.constraint(equalTo: groupChrome.bottomAnchor),
-            bottomPanelHeader.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
-            bottomPanelHeader.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
+            bottomPanelHeader.topAnchor.constraint(equalTo: bottomPanelCard.topAnchor),
+            bottomPanelHeader.leadingAnchor.constraint(equalTo: bottomPanelCard.leadingAnchor),
+            bottomPanelHeader.trailingAnchor.constraint(equalTo: bottomPanelCard.trailingAnchor),
             bottomPanelHeaderHeight,
             bottomPanelContent.topAnchor.constraint(equalTo: bottomPanelHeader.bottomAnchor),
-            bottomPanelContent.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
-            bottomPanelContent.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
-            bottomPanelContent.bottomAnchor.constraint(equalTo: detailView.bottomAnchor),
+            bottomPanelContent.leadingAnchor.constraint(equalTo: bottomPanelCard.leadingAnchor),
+            bottomPanelContent.trailingAnchor.constraint(equalTo: bottomPanelCard.trailingAnchor),
+            bottomPanelContent.bottomAnchor.constraint(equalTo: bottomPanelCard.bottomAnchor),
             bottomPanelHeight,
         ])
         placeChrome(over: activeGroup)

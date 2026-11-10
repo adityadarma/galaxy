@@ -119,6 +119,11 @@ extension EditorView {
             if case .button(let action) = hit { onInlineHunkAction?(action) }
             return
         }
+        // An inferred return type is a button: a double-click writes it into the code.
+        if let hint = returnTypeHint(at: local) {
+            if event.clickCount == 2 { onReturnTypeHintDoubleClick?(hint.line, hint.column) }
+            return
+        }
         let pos = textPosition(at: local)
         // The "..." after a folded line opens it again.
         if event.clickCount == 1, let hit = foldPillRects.first(where: { $0.value.contains(local) }) {

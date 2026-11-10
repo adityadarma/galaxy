@@ -40,6 +40,31 @@ fn char_width(c: char) -> usize {
     }
 }
 
+/// Documents above this size are not scanned for their widest line.
+pub const MAX_SCAN_BYTES: usize = 1024 * 1024;
+
+/// Columns the widest line of `doc` takes when drawn (tabs and wide
+/// characters counted as the wrap map counts them), so a view can size its
+/// horizontal scroll range before the line has been drawn. Each line counts
+/// up to `MAX_LINE_DISPLAY_CHARS` chars, the part that is displayed. `None`
+/// for a document too big to scan on every edit.
+pub fn max_line_columns(doc: &Document) -> Option<usize> {
+    if doc.len_bytes() > MAX_SCAN_BYTES {
+        return None;
+    }
+    let mut widest = 0;
+    for line in doc.rope().lines() {
+        let columns: usize = line
+            .chars()
+            .take(MAX_LINE_DISPLAY_CHARS)
+            .take_while(|c| *c != '\n')
+            .map(char_width)
+            .sum();
+        widest = widest.max(columns);
+    }
+    Some(widest)
+}
+
 fn grapheme_width(g: &str) -> usize {
     g.chars().next().map_or(0, char_width)
 }
@@ -312,6 +337,17 @@ mod tests {
 
     fn doc(text: &str) -> Document {
         Document::from_text(text)
+    }
+
+    #[test]
+    fn widest_line_counts_tabs_and_wide_characters() {
+        assert_eq!(max_line_columns(&doc("")), Some(0));
+        assert_eq!(max_line_columns(&doc("abc\nabcdef\nab")), Some(6));
+        assert_eq!(max_line_columns(&doc("a\tb")), Some(6));
+        assert_eq!(max_line_columns(&doc("\u{4e2d}\u{6587}")), Some(4));
+        // Only the displayed part of a very long line counts.
+        let long = "x".repeat(MAX_LINE_DISPLAY_CHARS + 500);
+        assert_eq!(max_line_columns(&doc(&long)), Some(MAX_LINE_DISPLAY_CHARS));
     }
 
     #[test]

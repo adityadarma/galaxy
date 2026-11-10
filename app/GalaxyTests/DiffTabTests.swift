@@ -171,6 +171,96 @@ final class DiffTabTests: XCTestCase {
         XCTAssertTrue(c.isDiffPaneShown)
     }
 
+    /// Scrolling sideways in either pane moves the other, even when only one
+    /// side has a long line.
+    func testHorizontalScrollFollowsInBothDirections() throws {
+        let long = String(repeating: "wide ", count: 400)
+        try "one\n\(long)\nthree\nfour\nfive\n".write(
+            to: root.appendingPathComponent("tracked.txt"), atomically: true, encoding: .utf8)
+        let c = try makeController()
+        defer { c.window?.orderOut(nil) }
+        c.openWorkspaceDiff(try XCTUnwrap(c.workspace), relPath: "tracked.txt")
+        waitForDiff(c)
+        c.window?.contentView?.layoutSubtreeIfNeeded()
+        c.editorView.updateDocumentWidth()
+        let left = try XCTUnwrap(c.secondaryEditorView.enclosingScrollView)
+        let right = try XCTUnwrap(c.editorView.enclosingScrollView)
+        XCTAssertGreaterThan(c.secondaryEditorView.frame.width, left.contentSize.width,
+                             "the short side can scroll as far as the long one")
+
+        right.contentView.scroll(to: NSPoint(x: 300, y: right.contentView.bounds.origin.y))
+        right.reflectScrolledClipView(right.contentView)
+        XCTAssertEqual(left.contentView.bounds.origin.x, 300, accuracy: 0.5, "left follows right")
+
+        left.contentView.scroll(to: NSPoint(x: 120, y: left.contentView.bounds.origin.y))
+        left.reflectScrolledClipView(left.contentView)
+        XCTAssertEqual(right.contentView.bounds.origin.x, 120, accuracy: 0.5, "right follows left")
+    }
+
+    /// Both panes draw the line beside their numbers the same way, and it
+    /// goes with the text when they scroll sideways.
+    func testGutterLineLooksTheSameInBothPanes() throws {
+        let body = (0..<8).map { "    " + String(repeating: "wide ", count: 120) + "\($0)" }
+        try (["one"] + body).joined(separator: "\n").appending("\n").write(
+            to: root.appendingPathComponent("tracked.txt"), atomically: true, encoding: .utf8)
+        try git("add", "tracked.txt")
+        try git("-c", "user.name=T", "-c", "user.email=t@example.com", "commit", "-m", "wide")
+        try (["ONE"] + body).joined(separator: "\n").appending("\n").write(
+            to: root.appendingPathComponent("tracked.txt"), atomically: true, encoding: .utf8)
+        let c = try makeController()
+        defer { c.window?.orderOut(nil) }
+        c.openWorkspaceDiff(try XCTUnwrap(c.workspace), relPath: "tracked.txt")
+        waitForDiff(c)
+        c.window?.contentView?.layoutSubtreeIfNeeded()
+        c.editorView.updateDocumentWidth()
+        let left = try XCTUnwrap(c.secondaryEditorView.enclosingScrollView)
+        let right = try XCTUnwrap(c.editorView.enclosingScrollView)
+
+        /// Luminance across the gutter line of the second text row.
+        func profile(_ view: EditorView) throws -> [Int] {
+            let rep = try XCTUnwrap(view.bitmapImageRepForCachingDisplay(in: view.bounds))
+            view.cacheDisplay(in: view.bounds, to: rep)
+            let scale = CGFloat(rep.pixelsWide) / view.bounds.width
+            let y = Int((view.metrics.lineHeight * 2.5) * scale)
+            let edge = view.gutterShift + view.gutterWidth
+            return (-6...2).map { dx in
+                let x = Int((edge + CGFloat(dx)) * scale)
+                let color = rep.colorAt(x: x, y: y)?.usingColorSpace(.sRGB)
+                return Int(((color?.brightnessComponent ?? 0) * 255).rounded())
+            }
+        }
+        let past = c.editorView.gutterWidth + 10
+        for x in [CGFloat(0), past] {
+            for scroll in [left, right] {
+                scroll.contentView.scroll(to: NSPoint(x: x, y: 0))
+                scroll.reflectScrolledClipView(scroll.contentView)
+            }
+            let l = try profile(c.secondaryEditorView), r = try profile(c.editorView)
+            XCTAssertEqual(c.secondaryEditorView.gutterShift, x, accuracy: 0.5)
+            XCTAssertEqual(c.editorView.gutterShift, x, accuracy: 0.5)
+            XCTAssertEqual(l, r, "scrolled \(x): left \(l) vs right \(r)")
+            // Scrolled past the numbers the line is gone with the text.
+            XCTAssertEqual(l.filter { $0 != l[0] }.count, x == 0 ? 1 : 0, "scrolled \(x): \(l)")
+        }
+    }
+
+    /// Only the working side (right) carries the overview ruler; the committed
+    /// side (left) is a plain scroll view.
+    func testOnlyTheWorkingSideShowsTheOverviewRuler() throws {
+        let c = try makeController()
+        defer { c.window?.orderOut(nil) }
+        c.openWorkspaceDiff(try XCTUnwrap(c.workspace), relPath: "tracked.txt")
+        waitForDiff(c)
+        c.window?.contentView?.layoutSubtreeIfNeeded()
+        let right = c.scrollView
+        XCTAssertTrue(right.ruler.superview === right)
+        XCTAssertFalse(right.ruler.isHidden, "the working side keeps its ruler")
+        XCTAssertEqual(right.ruler.frame.maxX, right.bounds.width, accuracy: 0.5)
+        XCTAssertNil(c.secondaryScrollView.ruler.superview, "the committed side has none")
+        XCTAssertEqual(c.secondaryEditorView.rightInset, 0)
+        XCTAssertTrue(c.minimap.isHidden, "no minimap in a diff")
+    }
+
     func testBothPanesAreVisibleSideBySide() throws {
         let c = try makeController()
         defer { c.window?.orderOut(nil) }

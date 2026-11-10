@@ -10,20 +10,19 @@ extension MainWindowController {
         updateMinimap()
     }
 
-    /// Whether the overview ruler (Git and problem ticks) is shown; the diff
-    /// pane has its own layout and goes without.
-    var rulerVisible: Bool { !isDiffPaneShown }
+    /// The minimap is off in the diff pane, which has two editors side by side.
+    /// Each pane keeps its overview ruler.
+    var minimapVisible: Bool { minimapEnabled && !isDiffPaneShown }
 
     /// Width at the editor's right edge kept clear for the ruler and minimap.
     var editorRightInset: CGFloat {
-        guard rulerVisible else { return 0 }
-        return OverviewRulerView.width + (minimapEnabled ? MinimapView.width : 0)
+        OverviewRulerView.width + (minimapVisible ? MinimapView.width : 0)
     }
 
     /// The ruler runs down the right edge of the primary editor, in the scroll
     /// track, and the minimap sits left of it. Both lie under the scroller.
     func updateMinimap() {
-        let show = minimapEnabled && rulerVisible
+        let show = minimapVisible
         if minimap.superview == nil {
             minimap.editor = editorView
             minimap.scrollView = scrollView
@@ -39,6 +38,7 @@ extension MainWindowController {
             center.addObserver(forName: NSView.boundsDidChangeNotification, object: scrollView.contentView, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated {
                     self?.scheduleScrollDecorationUpdate()
+                    self?.stickyScopeView.horizontalScrollChanged()
                 }
             }
             // The scroll view is created empty and sized by its split view
@@ -48,7 +48,7 @@ extension MainWindowController {
             }
         }
         minimap.isHidden = !show
-        scrollView.ruler.isHidden = !rulerVisible
+        scrollView.ruler.isHidden = false
         editorView.rightInset = editorRightInset
         editorView.applyRightInset()
         stickyTrailing?.constant = -editorRightInset

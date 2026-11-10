@@ -133,16 +133,35 @@ final class EditorView: NSView {
 
     /// Wide enough for the longest line seen, never narrower than the visible
     /// area. Soft wrap fits the text to the width, so nothing scrolls then.
-    func updateDocumentWidth() {
+    func updateDocumentWidth(propagate: Bool = true) {
         guard let scroll = enclosingScrollView else { return }
         var width = max(scroll.contentSize.width - rightInset, 1)
         if !wrapActive {
             // The minimap covers the last `rightInset` points of the clip.
-            width = max(width, textOriginX + contentTextWidth + Self.trailingRoom + rightInset)
+            width = max(width, textOriginX + scrollTextWidth + Self.trailingRoom + rightInset)
         }
+        // The two sides of a diff scroll together, so both must reach as far
+        // right as the longer one.
+        if let partner = diffPartner, let partnerScroll = partner.enclosingScrollView, !partner.wrapActive {
+            width = max(width, max(partnerScroll.contentSize.width - partner.rightInset, 1),
+                        partner.textOriginX + partner.scrollTextWidth + Self.trailingRoom + partner.rightInset)
+        }
+        if propagate { diffPartner?.updateDocumentWidth(propagate: false) }
         guard abs(width - frame.width) > 0.5 else { return }
         setFrameSize(NSSize(width: width, height: frame.height))
     }
+
+    /// Width the text scrolls over: the widest line drawn so far, or the
+    /// widest line of the document when the core knows it, so the scroll
+    /// range is whole from the start and does not grow while scrolling.
+    var scrollTextWidth: CGFloat {
+        let columns = CGFloat(document?.maxLineColumns() ?? 0)
+        return max(contentTextWidth, ceil(columns * metrics.spaceWidth))
+    }
+
+    /// The other side of an open diff, whose horizontal scroll range this
+    /// side shares.
+    weak var diffPartner: EditorView?
 
     override func viewDidMoveToSuperview() {
         super.viewDidMoveToSuperview()
@@ -253,6 +272,9 @@ final class EditorView: NSView {
     /// A click on a Git change marker. The controller supplies the hunk from
     /// HEAD and toggles its inline representation.
     var onGitChangeClick: ((UInt64) -> Void)?
+    /// A double-click on an inferred return type: line and UTF-16 column
+    /// of the hint, where the type goes.
+    var onReturnTypeHintDoubleClick: ((UInt64, Int) -> Void)?
     /// The header buttons of the open hunk.
     enum InlineHunkAction: Equatable { case stage, revert, next, previous, close }
     var onInlineHunkAction: ((InlineHunkAction) -> Void)?
@@ -283,7 +305,8 @@ final class EditorView: NSView {
         let end = point(column: text.utf16.count, text: text, rows: lineRows(blame.line),
                         top: rowTop(of: blame.line), originX: textOriginX)
         let width = ceil((blame.text as NSString).size(withAttributes: [.font: font]).width)
-        return NSRect(x: end.x + Self.blameGap, y: end.y, width: width, height: metrics.lineHeight)
+        return NSRect(x: end.x + trailingHintExtent(text: text) + Self.blameGap, y: end.y,
+                      width: width, height: metrics.lineHeight)
     }
 
     /// Drops derived Core Text caches while retaining the document.
@@ -545,6 +568,8 @@ final class EditorView: NSView {
 
     private func applyDocumentMetadata(lineCount newCount: UInt64?) {
         lineCount = Int(newCount ?? 0)
+        // The gutter grows with the digit count; the scroller starts after it.
+        (enclosingScrollView as? DiagnosticScrollView)?.updateScrollerInset()
         hasFolds = !wrapSuspended && (document?.hasFolds() ?? false)
         rowCount = (rowMapped ? Int(document?.totalRows() ?? 0) : lineCount)
             + diffSpacers.reduce(0) { $0 + $1.rows }
@@ -1136,13 +1161,13 @@ final class EditorView: NSView {
             // annotations never occupy the same pixels.
             let sourceEnd = point(column: line.text.utf16.count, text: line.text, rows: rows,
                                   top: top, originX: originX)
-            var trailingAnnotationEnd = sourceEnd.x
+            var trailingAnnotationEnd = sourceEnd.x + trailingHintExtent(text: line.text)
             if let blame = blameAnnotation, blame.line == line.line {
                 let note = CTLineCreateWithAttributedString(NSAttributedString(
                     string: blame.text,
                     attributes: [.font: font, .foregroundColor: Self.blameTextColor]
                 ))
-                let start = sourceEnd.x + Self.blameGap
+                let start = trailingAnnotationEnd + Self.blameGap
                 context.textPosition = CGPoint(x: start, y: sourceEnd.y + metrics.ascent)
                 CTLineDraw(note, context)
                 trailingAnnotationEnd = start + CGFloat(CTLineGetTypographicBounds(note, nil, nil, nil))
@@ -1201,6 +1226,12 @@ final class EditorView: NSView {
                 }
             }
 
+            // The line beside the numbers is the text's left edge: it scrolls
+            // away with the text, and the cover below hides it on the way.
+            if drawsDivider {
+                context.setFillColor(NSColor.separatorColor.withAlphaComponent(0.28).cgColor)
+                context.fill(CGRect(x: gutterWidth - 1, y: top, width: 1, height: block))
+            }
             if shift > 0 {
                 // Scrolled sideways: cover the text that ran under the line numbers.
                 let gutterRect = CGRect(x: shift, y: top, width: gutterWidth, height: block)
@@ -1210,10 +1241,6 @@ final class EditorView: NSView {
                     context.setFillColor(Theme.currentLine.cgColor)
                     context.fill(gutterRect)
                 }
-            }
-            if drawsDivider {
-                context.setFillColor(NSColor.separatorColor.withAlphaComponent(0.28).cgColor)
-                context.fill(CGRect(x: shift + gutterWidth - 1, y: top, width: 1, height: block))
             }
             // Gutter: right-aligned line number, copper on caret lines.
             let number = layout(for: String(line.line + 1))
@@ -1651,6 +1678,8 @@ extension EditorView {
     struct InlineHint: Equatable {
         let column: Int
         let label: String
+        /// An inferred return type; a double-click inserts it into the code.
+        var returnType = false
     }
 
     static let hintPadding: CGFloat = 3
@@ -1681,7 +1710,7 @@ extension EditorView {
         if wrapActive, metrics.spaceWidth > 0 {
             for (text, hints) in inlineHints {
                 let length = text.utf16.count
-                let slots = hints.filter { $0.column > 0 && $0.column <= length }.map {
+                let slots = hints.filter { $0.column > 0 && $0.column <= length && !trailsLine($0, lineLength: length) }.map {
                     WrapHintSlot(column: UInt64($0.column),
                                  columns: UInt64(ceil(hintAdvance($0.label) / metrics.spaceWidth)))
                 }
@@ -1714,7 +1743,7 @@ extension EditorView {
     func addHintSpacing(to attributed: NSMutableAttributedString, text: String) {
         guard let hints = inlineHints[text] else { return }
         let string = text as NSString
-        for hint in hints where hint.column > 0 && hint.column <= string.length {
+        for hint in hints where hint.column > 0 && hint.column <= string.length && !trailsLine(hint, lineLength: string.length) {
             let previous = string.rangeOfComposedCharacterSequence(at: hint.column - 1)
             // Only the last unit of a composed character may carry the space.
             guard NSMaxRange(previous) == hint.column else { continue }
@@ -1726,15 +1755,13 @@ extension EditorView {
     func drawInlineHints(text: String, rows: LineRows, top: CGFloat, originX: CGFloat, context: CGContext) {
         guard let hints = inlineHints[text] else { return }
         let hintFont = self.hintFont
-        let pillHeight = max(0, metrics.lineHeight - 4)
         let textHeight = hintFont.ascender - hintFont.descender
         for hint in hints {
             // A label whose argument starts a wrapped row is drawn at that row's start.
             guard hint.column > 0 else { continue }
             let at = point(column: hint.column, text: text, rows: rows, top: top, originX: originX)
             let label = hintLabel(hint.label)
-            let pill = CGRect(x: at.x - Self.hintGap - label.width - 2 * Self.hintPadding,
-                              y: at.y + 2, width: label.width + 2 * Self.hintPadding, height: pillHeight)
+            let pill = hintPill(hint, at: at, lineLength: text.utf16.count)
             context.addPath(CGPath(roundedRect: pill, cornerWidth: 3, cornerHeight: 3, transform: nil))
             context.setFillColor(NSColor.secondaryLabelColor.withAlphaComponent(0.12).cgColor)
             context.fillPath()
@@ -1743,6 +1770,46 @@ extension EditorView {
                                            y: at.y + (metrics.lineHeight - textHeight) / 2 + hintFont.ascender)
             CTLineDraw(label.line, context)
         }
+    }
+
+    /// Where the label of `hint` is drawn, given the point of its column.
+    func hintPill(_ hint: InlineHint, at: CGPoint, lineLength: Int) -> CGRect {
+        let label = hintLabel(hint.label)
+        let width = label.width + 2 * Self.hintPadding
+        // Nothing follows a hint at the end of the line, and Core Text does not
+        // kern the last character, so there is no reserved room: draw after the text.
+        let x = trailsLine(hint, lineLength: lineLength)
+            ? at.x + Self.hintGap + Self.hintPadding
+            : at.x - Self.hintGap - width
+        return CGRect(x: x, y: at.y + 2, width: width, height: max(0, metrics.lineHeight - 4))
+    }
+
+    /// How far past the last character of `text` its trailing return type
+    /// pill reaches, so annotations drawn after the text start beyond it.
+    func trailingHintExtent(text: String) -> CGFloat {
+        let length = text.utf16.count
+        guard let hint = inlineHints[text]?.first(where: { trailsLine($0, lineLength: length) }) else { return 0 }
+        return Self.hintGap + Self.hintPadding + hintLabel(hint.label).width + 2 * Self.hintPadding
+    }
+
+    /// A return type after the last character of its line.
+    func trailsLine(_ hint: InlineHint, lineLength: Int) -> Bool {
+        hint.returnType && hint.column >= lineLength
+    }
+
+    /// The return type label under `point` (view coordinates), if any.
+    func returnTypeHint(at point: NSPoint) -> (line: UInt64, column: Int)? {
+        guard let document, lineCount > 0, !inlineHints.isEmpty, point.y >= 0 else { return nil }
+        let line = self.line(atY: point.y).line
+        let text = document.displayLine(line: line)
+        guard let hints = inlineHints[text] else { return nil }
+        let rows = lineRows(line)
+        let top = rowTop(of: line)
+        for hint in hints where hint.returnType && hint.column > 0 {
+            let at = self.point(column: hint.column, text: text, rows: rows, top: top, originX: textOriginX)
+            if hintPill(hint, at: at, lineLength: text.utf16.count).contains(point) { return (line, hint.column) }
+        }
+        return nil
     }
 
     private var hintFont: NSFont {

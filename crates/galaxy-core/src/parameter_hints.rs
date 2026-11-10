@@ -10,6 +10,8 @@ pub struct ParameterHint {
     pub line: u32,
     pub column: u32,
     pub label: String,
+    /// A return type the editor can insert, not a parameter name.
+    pub return_type: bool,
 }
 
 /// One declared parameter. An empty `name` (a destructured pattern) keeps
@@ -55,6 +57,7 @@ pub fn hints(parameters: &[Parameter], arguments: &[Argument]) -> Vec<ParameterH
                 line: argument.line,
                 column: argument.column,
                 label: format!("{dots}{}:", parameter.name),
+                return_type: false,
             });
         }
         if parameter.rest {
@@ -103,7 +106,8 @@ mod tests {
             vec![ParameterHint {
                 line: 0,
                 column: 12,
-                label: "age:".into()
+                label: "age:".into(),
+                return_type: false,
             }]
         );
     }

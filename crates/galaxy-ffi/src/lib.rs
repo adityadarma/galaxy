@@ -1403,6 +1403,7 @@ impl Core {
                     line: entry.line,
                     column,
                     label: hint.label,
+                    return_type: hint.return_type,
                 });
             }
             lines.retain(|line| !line.hints.is_empty());
@@ -1412,6 +1413,49 @@ impl Core {
             }
         }))
         .unwrap_or(empty)
+    }
+
+    /// Edits that declare the inferred return type of the PHP function whose
+    /// parameter list closes at `line`/`column`, with the `use` it needs.
+    /// Empty when nothing can be inferred there.
+    pub fn return_type_edits(
+        &self,
+        document: Arc<DocumentHandle>,
+        line: u64,
+        column: u64,
+    ) -> Vec<RenameEdit> {
+        let path = document.path();
+        let file = Path::new(&path);
+        if path.is_empty() || !is_php_path(file) {
+            return Vec::new();
+        }
+        let (Ok(line), Ok(column)) = (u32::try_from(line), u32::try_from(column)) else {
+            return Vec::new();
+        };
+        let text = document.lock().editor.doc.text();
+        let uri = file_uri(file);
+        catch_unwind(AssertUnwindSafe(|| {
+            let Some(engine) = self.php_engine(file) else {
+                return Vec::new();
+            };
+            let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+            if !engine.is_ready() {
+                return Vec::new();
+            }
+            engine
+                .return_type_edits(file, &text, line, column)
+                .into_iter()
+                .map(|edit| RenameEdit {
+                    uri: uri.clone(),
+                    start_line: u64::from(edit.start_line),
+                    start_character: u64::from(edit.start_column),
+                    end_line: u64::from(edit.end_line),
+                    end_character: u64::from(edit.end_column),
+                    new_text: edit.text,
+                })
+                .collect()
+        }))
+        .unwrap_or_default()
     }
 
     pub fn signature_help(&self, document: Arc<DocumentHandle>) -> Option<SignatureInfo> {
@@ -1911,6 +1955,8 @@ pub struct ParameterHintInfo {
     pub line: u64,
     pub column: u64,
     pub label: String,
+    /// An inferred return type that a double-click can insert.
+    pub return_type: bool,
 }
 
 /// The hints of one line, with the displayed text they were computed for.
@@ -6784,6 +6830,8 @@ struct State {
     syntax: Option<SyntaxState>,
     diagnostics: Vec<DiagnosticInfo>,
     diagnostics_revision: u64,
+    /// Widest line in columns and the revision it was measured at.
+    max_columns: Option<(u64, usize)>,
     /// Soft wrap width in columns; `None` while wrap is off.
     wrap_columns: Option<usize>,
     /// Row table for `wrap_columns`, rebuilt when the text or width changes.
@@ -7234,6 +7282,22 @@ impl DocumentHandle {
         self.lock().editor.doc.is_large()
     }
 
+    /// Columns the widest line takes, so the editor can size its horizontal
+    /// scroll range before long lines are drawn. Measured once per
+    /// revision. `0` for a document too big to scan.
+    pub fn max_line_columns(&self) -> u64 {
+        let mut st = self.lock();
+        let revision = st.editor.doc.revision();
+        if let Some((measured, columns)) = st.max_columns
+            && measured == revision
+        {
+            return columns as u64;
+        }
+        let columns = galaxy_core::wrap::max_line_columns(&st.editor.doc).unwrap_or(0);
+        st.max_columns = Some((revision, columns));
+        columns as u64
+    }
+
     /// The displayed text of `line`: the whole line, or the first
     /// `MAX_LINE_DISPLAY_CHARS` chars of a very long one. Use it for
     /// hit-testing so clicks agree with what was drawn.
@@ -7380,10 +7444,11 @@ impl DocumentHandle {
     pub fn edit(&self, command: EditCommand) {
         let mut st = self.lock();
         let cfg = st.indent;
+        let path = st.path.to_string_lossy().into_owned();
         let comment_marker = st
             .syntax
             .as_ref()
-            .and_then(|syntax| syntax.language.comment_marker());
+            .and_then(|syntax| syntax.language.comment_marker_for(&path));
         let flavor = st
             .syntax
             .as_ref()
@@ -8156,6 +8221,7 @@ impl DocumentHandle {
                 syntax,
                 diagnostics: Vec::new(),
                 diagnostics_revision: 0,
+                max_columns: None,
                 wrap_columns: None,
                 wrap_map: None,
                 wrap_extras: galaxy_core::wrap::Extras::default(),

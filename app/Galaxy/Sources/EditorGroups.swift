@@ -189,7 +189,15 @@ final class EditorGroupPane: NSView {
         } else {
             scrollView.isHidden = true
             clear()
-            placeholder.stringValue = tab == nil ? "" : (tab?.isGitGraph == true ? "Git Graph" : "Terminal")
+            if tab == nil {
+                placeholder.stringValue = ""
+            } else if tab?.isGitGraph == true {
+                placeholder.stringValue = "Git Graph"
+            } else if let tab, tab.mediaURL != nil {
+                placeholder.stringValue = tab.title
+            } else {
+                placeholder.stringValue = "Terminal"
+            }
             placeholder.isHidden = tab == nil
         }
     }

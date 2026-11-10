@@ -17,6 +17,16 @@ final class AICommitService {
         static let apiKey = "AICommitApiKey"
     }
 
+    /// Commit requests give up after 45 s in total. The per-request timeout
+    /// only counts idle time, so a proxy that keeps the connection alive
+    /// would leave the button loading forever.
+    private static let session: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 20
+        configuration.timeoutIntervalForResource = 45
+        return URLSession(configuration: configuration)
+    }()
+
     /// Base URL without a trailing slash, e.g. `https://api.openai.com/v1`.
     var baseURL: String {
         let saved = Self.trimmed(UserDefaults.standard.string(forKey: Keys.baseURL))
@@ -144,7 +154,7 @@ final class AICommitService {
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await Self.session.data(for: request)
         guard let http = response as? HTTPURLResponse else { return nil }
         guard http.statusCode == 200 else {
             // Log the status and the API's error code only, never the request.

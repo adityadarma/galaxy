@@ -72,7 +72,7 @@ extension MainWindowController {
             let answer = core.parameterHints(document: doc, firstLine: first, lineCount: count)
             var hints: [String: [EditorView.InlineHint]] = [:]
             for line in answer.lines {
-                hints[line.text] = line.hints.map { EditorView.InlineHint(column: Int($0.column), label: $0.label) }
+                hints[line.text] = line.hints.map { EditorView.InlineHint(column: Int($0.column), label: $0.label, returnType: $0.returnType) }
             }
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -91,5 +91,17 @@ extension MainWindowController {
                 }
             }
         }
+    }
+
+    /// Writes the inferred return type of the function whose parameter list
+    /// closes at `line`/`column`, with the `use` it needs.
+    func insertReturnType(line: UInt64, column: Int) {
+        guard let doc = activeTab?.doc else { return }
+        let edits = bridge.core.returnTypeEdits(document: doc, line: line, column: UInt64(column))
+        guard !edits.isEmpty else { return }
+        _ = bridge.applyRenameEdits(document: doc, edits: edits)
+        editorView.reloadDocument()
+        updateEditedState()
+        scheduleParameterHints(after: 0)
     }
 }

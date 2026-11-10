@@ -22,7 +22,8 @@ extension MainWindowController {
                 let y = live ? scrollView.contentView.bounds.origin.y : tab.scrollY
                 if tab === group.activeTab { out.active = out.tabs.count }
                 out.tabs.append(Session.Tab(path: path, isPreview: tab.isPreview, line: loc.line, col: loc.col,
-                                            scrollY: y.map(Double.init), isPinned: tab.isPinned ? true : nil))
+                                            scrollY: y.map(Double.init), isPinned: tab.isPinned ? true : nil,
+                                            isDiff: tab.diffBase != nil ? true : nil))
             }
             saved.append(out)
         }
@@ -56,7 +57,40 @@ extension MainWindowController {
 
     func saveWorkspaceSessionForQuit() { saveWorkspaceSession() }
 
+    /// `tabs` without a second entry for the same file (and the same kind of
+    /// tab: plain or diff), with `active` following the entry that was kept.
+    /// Older sessions saved a diff tab as a plain one, so they hold both.
+    static func deduplicatedTabs(_ tabs: [Session.Tab], active: Int?) -> (tabs: [Session.Tab], active: Int?) {
+        var kept: [String: Int] = [:]
+        var out: [Session.Tab] = []
+        var newActive: Int?
+        for (i, tab) in tabs.enumerated() {
+            let key = (fileKey(tab.path) ?? tab.path) + (tab.isDiff == true ? "#diff" : "")
+            if let existing = kept[key] {
+                if i == active { newActive = existing }
+                continue
+            }
+            kept[key] = out.count
+            if i == active { newActive = out.count }
+            out.append(tab)
+        }
+        return (out, newActive)
+    }
+
+    /// `session` with each group's duplicate tabs removed.
+    static func deduplicatedSession(_ session: Session) -> Session {
+        var session = session
+        (session.tabs, session.active) = deduplicatedTabs(session.tabs, active: session.active)
+        session.extraGroups = session.extraGroups?.map { group in
+            var group = group
+            (group.tabs, group.active) = deduplicatedTabs(group.tabs, active: group.active)
+            return group
+        }
+        return session
+    }
+
     func restoreTabs(from session: Session) {
+        let session = Self.deduplicatedSession(session)
         restoreTabs(session.tabs, active: session.active)
         guard let extra = session.extraGroups, !extra.isEmpty else { return }
         let first = activeGroup
@@ -108,6 +142,10 @@ extension MainWindowController {
             tab.fileKey = key
             tab.relPath = relPath
             tab.isPinned = saved.isPinned == true
+            if saved.isDiff == true, let workspace, let relPath,
+               let base = (try? workspace.gitBaseDocument(relPath: relPath)) ?? nil {
+                tab.diffBase = base
+            }
             tab.scrollY = saved.scrollY.map { CGFloat($0) }
             tab.isEdited = doc.isModified()
             applyTagEditing(to: tab)
@@ -126,12 +164,18 @@ extension MainWindowController {
         for (i, saved) in savedTabs.enumerated() {
             guard FileManager.default.fileExists(atPath: saved.path) else { continue }
             if let workspace, let rel = relativePath(saved.path) {
-                let entry = FileEntry(name: (rel as NSString).lastPathComponent, relPath: rel, isDir: false)
-                openWorkspaceFile(workspace, entry, preview: saved.isPreview)
+                if saved.isDiff == true {
+                    openWorkspaceDiff(workspace, relPath: rel)
+                } else {
+                    let entry = FileEntry(name: (rel as NSString).lastPathComponent, relPath: rel, isDir: false)
+                    openWorkspaceFile(workspace, entry, preview: saved.isPreview)
+                }
             } else {
                 try? openFile(at: URL(fileURLWithPath: saved.path))
             }
-            guard let index = tabIndex(forPath: saved.path) else { continue }
+            // A diff with no committed version opens as a plain tab.
+            guard let index = tabIndex(forPath: saved.path, diff: saved.isDiff == true)
+                ?? tabIndex(forPath: saved.path) else { continue }
             let tab = tabs[index]
             tab.doc.goToLine(line: saved.line, col: saved.col)
             if saved.isPinned == true { setPinned(true, tab: tab) }
@@ -174,6 +218,9 @@ extension MainWindowController {
             let end = min(next + batchSize, pending.count)
             for (savedIndex, saved) in pending[next..<end] {
                 guard let tab = self.openRestoredTab(saved) else { continue }
+                // The user may have opened this file while the batches ran. A
+                // diff without a committed version came back as a plain tab.
+                if self.tabIndex(forPath: saved.path, diff: tab.diffBase != nil) != nil { continue }
                 let insertionIndex = min(savedIndex, self.tabs.count)
                 self.tabs.insert(tab, at: insertionIndex)
                 if let activeIndex = self.activeIndex, activeIndex >= insertionIndex {

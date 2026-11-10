@@ -78,7 +78,7 @@ extension MainWindowController {
         updateEditedState()
         statusLabel.stringValue = ""
         resetBottomPanelForNewWorkspace()
-        if let session = Session.load(from: Session.workspaceURL(for: ws.root())) {
+        if let session = Session.load(from: Session.workspaceURL(for: ws.root())).map(Self.deduplicatedSession) {
             if restoresTabsIncrementally, session.extraGroups?.isEmpty ?? true {
                 restoreTabsIncrementally(session.tabs, active: session.active, workspace: ws)
             } else {
@@ -136,6 +136,7 @@ extension MainWindowController {
 
     /// Opens a file in its own tab (or shows its tab if already open).
     func openFile(at url: URL) throws {
+        if MediaKind.kind(for: url) != nil { return openMediaFile(at: url) }
         if let i = tabIndex(forPath: url.path) {
             tabs[i].isPreview = false
             return selectTab(i)
@@ -154,6 +155,8 @@ extension MainWindowController {
     /// single click replaces; a double click or an edit keeps it.
     func openWorkspaceFile(_ workspace: Workspace, _ entry: FileEntry, preview: Bool) {
         let path = URL(fileURLWithPath: workspace.root()).appendingPathComponent(entry.relPath).path
+        let fileURL = URL(fileURLWithPath: path)
+        if MediaKind.kind(for: fileURL) != nil { return openMediaFile(at: fileURL, preview: preview) }
         if let i = tabIndex(forPath: path) {
             if !preview { tabs[i].isPreview = false }
             selectTab(i)

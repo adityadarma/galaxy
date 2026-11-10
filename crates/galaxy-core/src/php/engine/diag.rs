@@ -10,9 +10,10 @@ use std::path::Path;
 use regex::Regex;
 use tree_sitter::Node;
 
-use super::{PhpEngine, position_of};
+use super::{Ctx, PhpEngine, is_scope, position_of};
 use crate::lang::{Problem, Severity};
-use crate::php::parse::{parse_with_tree, resolve_name};
+use crate::php::generics;
+use crate::php::parse::{FileSymbols, doc_tag_type, parse_with_tree, resolve_name};
 
 const MAX_PROBLEMS: usize = 200;
 /// How many unterminated statements are repaired before giving up.
@@ -63,13 +64,16 @@ impl PhpEngine {
             }
             match node.kind() {
                 "namespace_use_declaration" => imports.push(node),
-                "name" | "qualified_name" if known && is_class_reference(node) => {
+                "name" | "qualified_name" if is_class_reference(node) => {
                     let raw = &text[node.byte_range()];
                     if NOT_CLASSES.contains(&raw.to_ascii_lowercase().as_str()) {
                         continue;
                     }
+                    if let Some(found) = simplifiable_name(text, node, &file) {
+                        out.push(found);
+                    }
                     let fqn = resolve_name(raw, &file.namespace, &file.uses);
-                    if self.is_missing_class(&fqn, &mut verdicts) {
+                    if known && self.is_missing_class(&fqn, &mut verdicts) {
                         out.push(problem(
                             text,
                             node,
@@ -83,9 +87,135 @@ impl PhpEngine {
             }
         }
         self.check_imports(text, &imports, known, &mut verdicts, &mut out);
+        self.check_returns(text, &file, &tree, &mut out);
         out.sort_by_key(|p| (p.start_line, p.start_column));
         out.truncate(MAX_PROBLEMS);
         out
+    }
+
+    /// `return` values that are a class the declared return type cannot
+    /// hold. Only clear cases: the value must be a known class whose whole
+    /// ancestry is known, and the declaration must list classes alone.
+    fn check_returns(
+        &mut self,
+        text: &str,
+        file: &FileSymbols,
+        tree: &tree_sitter::Tree,
+        out: &mut Vec<Problem>,
+    ) {
+        let mut declarations = Vec::new();
+        let mut stack = vec![tree.root_node()];
+        while let Some(node) = stack.pop() {
+            if matches!(node.kind(), "method_declaration" | "function_definition") {
+                declarations.push(node);
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+        for node in declarations {
+            let (Some(body), Some(name)) = (
+                node.child_by_field_name("body"),
+                node.child_by_field_name("name"),
+            ) else {
+                continue;
+            };
+            // The native type and the docblock both count: a return is fine
+            // when either allows it.
+            let mut raw = Vec::new();
+            if let Some(declared) = node.child_by_field_name("return_type") {
+                raw.push(text[declared.byte_range()].trim().to_owned());
+            }
+            if let Some(previous) = node.prev_named_sibling()
+                && previous.kind() == "comment"
+                && text[previous.byte_range()].starts_with("/**")
+                && let Some(documented) = doc_tag_type(&text[previous.byte_range()], "return")
+            {
+                raw.push(documented);
+            }
+            if raw.is_empty() {
+                continue;
+            }
+            let Some(expected) = expected_classes(&raw, file) else {
+                continue;
+            };
+            let mut returns = Vec::new();
+            let mut work = vec![body];
+            while let Some(current) = work.pop() {
+                let mut cursor = current.walk();
+                for child in current.named_children(&mut cursor) {
+                    if is_scope(child.kind()) {
+                        continue;
+                    }
+                    if child.kind() == "return_statement" {
+                        returns.push(child);
+                    } else {
+                        work.push(child);
+                    }
+                }
+            }
+            for statement in returns {
+                let Some(value) = statement.named_child(0) else {
+                    continue;
+                };
+                let row = statement.start_position().row as u32;
+                let ctx = Ctx {
+                    src: text,
+                    tree,
+                    file,
+                    byte: statement.start_byte(),
+                    class: file
+                        .classes
+                        .iter()
+                        .find(|c| c.start_line <= row && row <= c.end_line)
+                        .cloned(),
+                };
+                let Some(given) = self.eval(&ctx, &text[value.byte_range()], 0) else {
+                    continue;
+                };
+                if !self.fits(&given, &expected) {
+                    out.push(problem(
+                        text,
+                        value,
+                        Severity::Warning,
+                        format!(
+                            "Return value of {}() is expected to be of type {}",
+                            &text[name.byte_range()],
+                            expected.join(", ")
+                        ),
+                        false,
+                    ));
+                }
+            }
+        }
+    }
+
+    /// `false` only when `given` is a class with a fully known ancestry
+    /// that none of `expected` is part of.
+    fn fits(&mut self, given: &str, expected: &[String]) -> bool {
+        if given.is_empty()
+            || !given
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == '_' || c == '\\')
+        {
+            return true;
+        }
+        let mut names: Vec<String> = Vec::new();
+        for (class, _) in self.lineage_env(given) {
+            names.push(class.fqn.to_lowercase());
+            for parent in class.extends.iter().chain(&class.implements) {
+                if self.class(parent).is_none() {
+                    // An ancestor outside what is known could be anything.
+                    return true;
+                }
+                names.push(parent.trim_start_matches('\\').to_lowercase());
+            }
+        }
+        if names.is_empty() {
+            return true;
+        }
+        expected
+            .iter()
+            .any(|e| names.contains(&e.trim_start_matches('\\').to_lowercase()))
     }
 
     fn is_missing_class(&mut self, fqn: &str, verdicts: &mut HashMap<String, bool>) -> bool {
@@ -176,6 +306,74 @@ impl PhpEngine {
             }
         }
     }
+}
+
+/// Message prefix of the problem [`simplifiable_name`] reports. The quick fix
+/// reads the short name back out of it.
+pub(super) const SIMPLIFY_PREFIX: &str = "Name '";
+const SIMPLIFY_MIDDLE: &str = "' can be simplified with '";
+
+/// The short name a message from [`simplifiable_name`] suggests.
+pub(super) fn simplified_to(message: &str) -> Option<&str> {
+    let rest = message.strip_prefix(SIMPLIFY_PREFIX)?;
+    let (_, short) = rest.split_once(SIMPLIFY_MIDDLE)?;
+    short.strip_suffix('\'')
+}
+
+/// A fully qualified class name (`\App\Services\Foo`) that its short name
+/// already stands for here: imported with `use`, or in the file's own
+/// namespace. The short name has to resolve to the same class, so a clashing
+/// import keeps the long form.
+fn simplifiable_name(
+    text: &str,
+    node: Node<'_>,
+    file: &crate::php::parse::FileSymbols,
+) -> Option<Problem> {
+    let raw = &text[node.byte_range()];
+    let fqn = raw.strip_prefix('\\')?;
+    let short = fqn.rsplit('\\').next().filter(|short| !short.is_empty())?;
+    let resolved = resolve_name(short, &file.namespace, &file.uses);
+    if !resolved.eq_ignore_ascii_case(fqn) {
+        return None;
+    }
+    Some(problem(
+        text,
+        node,
+        Severity::Hint,
+        format!("{SIMPLIFY_PREFIX}\\{fqn}{SIMPLIFY_MIDDLE}{short}'"),
+        false,
+    ))
+}
+
+/// The classes a declaration allows, native type and docblock together,
+/// or `None` when it also allows anything that is not a plain class.
+fn expected_classes(raw: &[String], file: &FileSymbols) -> Option<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for declared in raw {
+        for part in generics::split_union(declared.trim().trim_start_matches('?')) {
+            let part = part.trim().trim_matches(['(', ')']);
+            let base = generics::base(part);
+            if base.is_empty() || base.ends_with("[]") || part.contains('{') || part.contains('$') {
+                return None;
+            }
+            let lower = base.to_ascii_lowercase();
+            if NOT_CLASSES.contains(&lower.as_str())
+                || matches!(
+                    lower.as_str(),
+                    "resource" | "scalar" | "numeric" | "class-string"
+                )
+            {
+                return None;
+            }
+            let fqn = resolve_name(base, &file.namespace, &file.uses)
+                .trim_start_matches('\\')
+                .to_owned();
+            if !out.iter().any(|known| known.eq_ignore_ascii_case(&fqn)) {
+                out.push(fqn);
+            }
+        }
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 fn problem(
@@ -398,6 +596,111 @@ mod tests {
             .into_iter()
             .map(|p| (p.start_line, p.start_column, p.severity, p.message))
             .collect()
+    }
+
+    #[test]
+    fn qualified_names_the_file_already_resolves_can_be_simplified() {
+        let dir = project();
+        let hint = |text: &str| -> Vec<String> {
+            run(dir.path(), text)
+                .into_iter()
+                .filter(|f| f.3.starts_with(SIMPLIFY_PREFIX))
+                .map(|f| format!("{}:{} {}", f.0, f.1, f.3))
+                .collect()
+        };
+
+        // Imported with `use`: the short name is the same class.
+        let text = "<?php\nnamespace App\\Services;\n\nuse App\\Models\\User;\n\nclass S\n{\n    public function f() { return new \\App\\Models\\User(); }\n}\n";
+        assert_eq!(
+            hint(text),
+            vec!["7:37 Name '\\App\\Models\\User' can be simplified with 'User'"]
+        );
+
+        // The file's own namespace counts as well.
+        let text = "<?php\nnamespace App\\Models;\n\nclass S\n{\n    public function f() { return new \\App\\Models\\User(); }\n}\n";
+        assert_eq!(hint(text).len(), 1, "{:?}", hint(text));
+
+        // In the global namespace a global class needs no leading slash.
+        let text = "<?php\n\nfunction f() { return new \\Exception(); }\n";
+        assert_eq!(hint(text).len(), 1, "{:?}", hint(text));
+
+        // A different class with the same short name keeps the long form.
+        let text = "<?php\nnamespace App\\Services;\n\nuse Other\\User;\n\nclass S\n{\n    public function f() { return new \\App\\Models\\User(); }\n}\n";
+        assert!(hint(text).is_empty(), "{:?}", hint(text));
+
+        // Not imported and in another namespace: the short name would point
+        // somewhere else.
+        let text = "<?php\nnamespace App\\Services;\n\nclass S\n{\n    public function f() { return new \\App\\Models\\User(); }\n}\n";
+        assert!(hint(text).is_empty(), "{:?}", hint(text));
+        let text = "<?php\nnamespace App;\n\nclass S\n{\n    public function f() { return new \\Exception(); }\n}\n";
+        assert!(hint(text).is_empty(), "{:?}", hint(text));
+
+        // Names already short, and `use` lines, are left alone.
+        let text = "<?php\nnamespace App\\Services;\n\nuse App\\Models\\User;\n\nclass S\n{\n    public function f() { return new User(); }\n}\n";
+        assert!(hint(text).is_empty(), "{:?}", hint(text));
+    }
+
+    #[test]
+    fn simplified_name_is_read_back_from_the_message() {
+        assert_eq!(
+            simplified_to("Name '\\App\\Models\\User' can be simplified with 'User'"),
+            Some("User")
+        );
+        assert_eq!(simplified_to("Unused import `User`"), None);
+    }
+
+    #[test]
+    fn a_returned_class_the_declared_type_cannot_hold_is_a_warning() {
+        let dir = project();
+        std::fs::write(
+            dir.path().join("app/Models/Post.php"),
+            "<?php\nnamespace App\\Models;\n\nclass Post\n{\n}\n",
+        )
+        .unwrap();
+        let wrong = |text: &str| -> Vec<String> {
+            run(dir.path(), text)
+                .into_iter()
+                .filter(|f| f.3.starts_with("Return value"))
+                .map(|f| format!("{}: {}", f.0, f.3))
+                .collect()
+        };
+        let head = "<?php\nnamespace App;\n\nuse App\\Models\\Post;\nuse App\\Models\\User;\n\nclass Service\n{\n";
+
+        let text = format!(
+            "{head}    public function a(): User\n    {{\n        return new Post();\n    }}\n}}\n"
+        );
+        assert_eq!(
+            wrong(&text),
+            vec!["10: Return value of a() is expected to be of type App\\Models\\User"]
+        );
+
+        // The docblock widens what is expected, and is named in the message.
+        let text = format!(
+            "{head}    /**\n     * @return \\App\\Models\\Post\n     */\n    public function a(): User\n    {{\n        return new Post();\n    }}\n}}\n"
+        );
+        assert!(wrong(&text).is_empty(), "{:?}", wrong(&text));
+
+        // A docblock alone declares the type as well.
+        let text = format!(
+            "{head}    /**\n     * @return \\App\\Models\\User\n     */\n    public function a()\n    {{\n        return new Post();\n    }}\n}}\n"
+        );
+        assert_eq!(wrong(&text).len(), 1, "{:?}", wrong(&text));
+
+        // Union, the same class, `$this` and unknown values are fine.
+        for body in [
+            ("User|Post", "new Post()"),
+            ("User", "new User()"),
+            ("self", "$this"),
+            ("mixed", "new Post()"),
+            ("User", "$unknown"),
+            ("User", "foo()"),
+        ] {
+            let text = format!(
+                "{head}    public function a(): {}\n    {{\n        return {};\n    }}\n}}\n",
+                body.0, body.1
+            );
+            assert!(wrong(&text).is_empty(), "{body:?}: {:?}", wrong(&text));
+        }
     }
 
     #[test]

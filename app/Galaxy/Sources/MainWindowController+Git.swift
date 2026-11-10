@@ -542,6 +542,8 @@ extension MainWindowController {
         secondaryEditorView.isReadOnly = true
         secondaryEditorView.diffSide = .removed
         editorView.diffSide = .added
+        secondaryEditorView.diffPartner = editorView
+        editorView.diffPartner = secondaryEditorView
         secondaryEditorView.document = base
         editorSplitView.layoutSubtreeIfNeeded()
         // A pane added to a split view starts with no width; give each side half.
@@ -560,6 +562,9 @@ extension MainWindowController {
         secondaryEditorView.isReadOnly = false
         secondaryEditorView.diffSide = nil
         editorView.diffSide = nil
+        secondaryEditorView.diffPartner = nil
+        editorView.diffPartner = nil
+        editorView.updateDocumentWidth()
         secondaryEditorView.diffSpacers = []
         editorView.diffSpacers = []
         secondaryEditorView.lineTints = [:]
@@ -610,9 +615,10 @@ extension MainWindowController {
         guard lineHeight > 0 else { return }
         let inset = scrollView.contentInsets.top
         let y = max(0, source.contentView.bounds.origin.y + inset)
+        let x = max(0, source.contentView.bounds.origin.x)
         isSyncingDiffScroll = true
         defer { isSyncingDiffScroll = false }
-        target.contentView.scroll(to: NSPoint(x: 0, y: y - inset))
+        target.contentView.scroll(to: NSPoint(x: x, y: y - inset))
         target.reflectScrolledClipView(target.contentView)
     }
 

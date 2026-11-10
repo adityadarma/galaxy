@@ -12,8 +12,10 @@ final class EditorTab {
     /// The Git Graph view as a tab. Like a terminal tab, `doc` is an empty,
     /// never-shown buffer.
     let isGitGraph: Bool
-    /// A real text document: not a terminal and not the Git Graph.
-    var isDocument: Bool { terminal == nil && !isGitGraph }
+    /// A picture or PDF opened from disk. `doc` is again an empty buffer.
+    let mediaURL: URL?
+    /// A real text document: not a terminal, the Git Graph or a picture.
+    var isDocument: Bool { terminal == nil && !isGitGraph && mediaURL == nil }
     /// File name shown on the tab.
     var title: String
     /// Breadcrumb for the path bar: workspace, folders, file.
@@ -64,10 +66,12 @@ final class EditorTab {
     var navKey: String { fileKey ?? untitledKey }
 
     init(doc: DocumentHandle, title: String, pathComponents: [String], windowTitle: String,
-         isPreview: Bool, status: String, terminal: TerminalHandle? = nil, isGitGraph: Bool = false) {
+         isPreview: Bool, status: String, terminal: TerminalHandle? = nil, isGitGraph: Bool = false,
+         mediaURL: URL? = nil) {
         self.doc = doc
         self.terminal = terminal
         self.isGitGraph = isGitGraph
+        self.mediaURL = mediaURL
         self.title = title
         self.pathComponents = pathComponents
         self.windowTitle = windowTitle
