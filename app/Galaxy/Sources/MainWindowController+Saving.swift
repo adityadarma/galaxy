@@ -112,6 +112,7 @@ extension MainWindowController {
             reloadSettings(force: true)
             if settingsProblems.isEmpty { statusLabel.stringValue = "Settings updated." }
         }
+        scheduleRustCompilerRefresh(afterSaving: doc)
     }
 
     /// `true` when it is safe to close the window or quit: every tab with

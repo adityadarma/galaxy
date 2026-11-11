@@ -102,6 +102,10 @@ extension MainWindowController {
             } ?? .empty
             settingsProblems = []
             let settings = global.merged(with: workspace)
+            if let ws = self.workspace {
+                _ = bridge.setPHPAnalyzerTarget(root: ws.root(), version: settings.phpVersion)
+                bridge.refreshWorkspaceIndexes(root: ws.root())
+            }
             autoClosingTags = settings.effectiveAutoClosingTags
             linkedEditing = settings.effectiveLinkedEditing
         setGitBlame(settings.effectiveGitBlame)
@@ -113,9 +117,13 @@ extension MainWindowController {
             autoSaveDelay = settings.effectiveAutoSaveDelay
             if autoSaveMode != .afterDelay { autoSaveWorkItem?.cancel(); autoSaveWorkItem = nil }
             for tab in allTabs {
-                bridge.setIndent(document: tab.doc, useTabs: settings.useTabs, tabSize: settings.effectiveTabSize)
+                let indent = tab.indentOverride ?? (settings.useTabs, settings.effectiveTabSize)
+                bridge.setIndent(document: tab.doc, useTabs: indent.useTabs, tabSize: indent.tabSize)
                 applyTagEditing(to: tab)
             }
+            editorView.syncTabSize()
+            for group in groups { group.pane?.editorView.syncTabSize() }
+            secondaryEditorView.syncTabSize()
             editorView.renderWhitespace = settings.effectiveRenderWhitespace
             for group in groups { group.pane?.editorView.renderWhitespace = settings.effectiveRenderWhitespace }
             secondaryEditorView.renderWhitespace = settings.effectiveRenderWhitespace

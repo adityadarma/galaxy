@@ -5,11 +5,17 @@
 //! feature selection are implemented here as the native engine grows.
 
 use std::collections::{HashMap, HashSet};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::time::{Duration, Instant};
 
 use ignore::WalkBuilder;
 use tree_sitter::{Node, Parser, Tree};
 
+use crate::analysis::{DiagnosticSeverity, Range, RenameEdit};
 use crate::lang::{
     Action, Completion, Edit, HoverResult, ItemKind, Occurrence, OutlineSymbol, Problem, Severity,
     Signature, Target,
@@ -21,6 +27,11 @@ const MAX_FILE_BYTES: u64 = 2 << 20;
 const MAX_ITEMS: usize = 200;
 const MAX_PROBLEMS: usize = 200;
 const MAX_OCCURRENCES: usize = 2_000;
+const CARGO_OUTPUT_LIMIT: usize = 64 * 1024;
+const CARGO_RETAINED_JSON_LIMIT: usize = 8 * 1024 * 1024;
+const CARGO_REFRESH_TIMEOUT: Duration = Duration::from_secs(120);
+const CARGO_OUTPUT_COLLECTION_TIMEOUT: Duration = Duration::from_secs(2);
+const NO_DEFAULT_FEATURES: &str = "__galaxy_no_default_features";
 const KEYWORDS: &[&str] = &[
     "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
     "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
@@ -34,7 +45,9 @@ const STD_TYPES: &[&str] = &[
 #[derive(Debug, Clone)]
 struct Declaration {
     name: String,
+    crate_name: String,
     module: Vec<String>,
+    visibility: Visibility,
     kind: ItemKind,
     path: PathBuf,
     line: u32,
@@ -43,11 +56,53 @@ struct Declaration {
     signature: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Visibility {
+    Private,
+    Public,
+    Restricted(Vec<String>),
+}
+
+#[derive(Debug, Clone)]
+struct CargoDependency {
+    name: String,
+    package: String,
+    path: Option<PathBuf>,
+    git: bool,
+    optional: bool,
+    default_features: bool,
+    features: HashSet<String>,
+}
+
+#[derive(Debug, Clone)]
+struct CargoTarget {
+    name: String,
+    source_root: PathBuf,
+    root: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct CargoPackage {
+    name: String,
+    root: PathBuf,
+    targets: Vec<CargoTarget>,
+    dependencies: Vec<CargoDependency>,
+    selected_features: HashSet<String>,
+    indexed: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CfgContext {
+    features: HashSet<String>,
+}
+
 #[derive(Debug, Clone)]
 struct UseBinding {
     local: String,
     target: Vec<String>,
     glob: bool,
+    public: bool,
+    module: Vec<String>,
 }
 
 /// Project declarations built on a worker thread.
@@ -56,7 +111,9 @@ pub struct Built {
     declarations: Vec<Declaration>,
     files: Vec<PathBuf>,
     uses: HashMap<PathBuf, Vec<UseBinding>>,
+    module_identities: HashMap<PathBuf, Vec<String>>,
     source_roots: Vec<PathBuf>,
+    packages: Vec<CargoPackage>,
 }
 
 /// Static index for one Cargo project or repository.
@@ -65,9 +122,567 @@ pub struct RustEngine {
     declarations: Vec<Declaration>,
     files: Vec<PathBuf>,
     uses: HashMap<PathBuf, Vec<UseBinding>>,
+    module_identities: HashMap<PathBuf, Vec<String>>,
     source_roots: Vec<PathBuf>,
+    packages: Vec<CargoPackage>,
     open: HashMap<PathBuf, (Vec<Declaration>, Vec<UseBinding>, String)>,
     ready: bool,
+}
+
+/// Result of an explicitly requested Cargo refresh. This is never invoked by
+/// indexing or watching because Cargo can execute workspace code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeneratedSourceRefresh {
+    pub succeeded: bool,
+    pub timed_out: bool,
+    pub canceled: bool,
+    pub compiler_artifacts: u32,
+    pub message: String,
+    pub diagnostics: Vec<CompilerDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompilerDiagnostic {
+    pub uri: String,
+    pub range: Range,
+    pub severity: DiagnosticSeverity,
+    pub message: String,
+    pub code: Option<String>,
+    pub actions: Vec<crate::analysis::CodeActionInfo>,
+}
+
+struct ActiveGeneratedSourceRefresh {
+    child: Mutex<Child>,
+    canceled: AtomicBool,
+}
+
+fn active_generated_source_refreshes()
+-> &'static Mutex<HashMap<PathBuf, Arc<ActiveGeneratedSourceRefresh>>> {
+    static ACTIVE: OnceLock<Mutex<HashMap<PathBuf, Arc<ActiveGeneratedSourceRefresh>>>> =
+        OnceLock::new();
+    ACTIVE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_generated_source_refresh(
+    root: &Path,
+    refresh: Arc<ActiveGeneratedSourceRefresh>,
+) -> bool {
+    let mut active = active_generated_source_refreshes()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if active.contains_key(root) {
+        return false;
+    }
+    active.insert(root.to_path_buf(), refresh);
+    true
+}
+
+fn unregister_generated_source_refresh(root: &Path, refresh: &Arc<ActiveGeneratedSourceRefresh>) {
+    let mut active = active_generated_source_refreshes()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if active
+        .get(root)
+        .is_some_and(|registered| Arc::ptr_eq(registered, refresh))
+    {
+        active.remove(root);
+    }
+}
+
+/// Cancels the active Cargo refresh for `root`. Returns false when none is running.
+pub fn cancel_generated_source_refresh(root: &Path) -> bool {
+    let refresh = active_generated_source_refreshes()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(root)
+        .cloned();
+    let Some(refresh) = refresh else {
+        return false;
+    };
+    let killed = refresh
+        .child
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .kill()
+        .is_ok();
+    if killed {
+        refresh.canceled.store(true, Ordering::Release);
+    }
+    killed
+}
+
+/// Runs Cargo to update build-script and proc-macro output for `root`.
+/// Uses no shell and bounds the command duration and captured output.
+pub fn refresh_generated_sources(root: &Path) -> GeneratedSourceRefresh {
+    let child = match spawn_cargo(root) {
+        Ok(child) => child,
+        Err(message) => return refresh_failure(message),
+    };
+    let refresh = Arc::new(ActiveGeneratedSourceRefresh {
+        child: Mutex::new(child),
+        canceled: AtomicBool::new(false),
+    });
+    if !register_generated_source_refresh(root, Arc::clone(&refresh)) {
+        let mut child = refresh
+            .child
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _ = child.kill();
+        let _ = child.wait();
+        return refresh_failure("A Cargo refresh is already running for this workspace.".into());
+    }
+    let result = (|| {
+        let (stdout, stderr) = {
+            let mut child = refresh
+                .child
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            (
+                child.stdout.take().map(read_cargo_stdout),
+                child.stderr.take().map(read_bounded),
+            )
+        };
+        let deadline = Instant::now() + CARGO_REFRESH_TIMEOUT;
+        let (status, timed_out) = loop {
+            let mut child = refresh
+                .child
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            match child.try_wait() {
+                Ok(Some(status)) => break (Some(status), false),
+                Ok(None) if Instant::now() < deadline => {
+                    drop(child);
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break (None, true);
+                }
+                Err(error) => return refresh_failure(format!("Could not wait for cargo: {error}")),
+            }
+        };
+        let stdout = stdout
+            .map(|reader| collect_bounded(reader, CARGO_OUTPUT_COLLECTION_TIMEOUT))
+            .unwrap_or_default();
+        let stderr = stderr
+            .map(|reader| collect_bounded(reader, CARGO_OUTPUT_COLLECTION_TIMEOUT))
+            .unwrap_or_default();
+        let compiler_artifacts = cargo_compiler_artifact_count(&stdout);
+        if refresh.canceled.load(Ordering::Acquire) {
+            return refresh_canceled(compiler_artifacts);
+        }
+        if timed_out {
+            return GeneratedSourceRefresh {
+                succeeded: false,
+                timed_out: true,
+                canceled: false,
+                compiler_artifacts,
+                message: "Cargo refresh timed out after 120 seconds.".into(),
+                diagnostics: Vec::new(),
+            };
+        }
+        let diagnostics = parse_compiler_diagnostics(root, &stdout);
+        if status.is_some_and(|status| status.success()) {
+            return GeneratedSourceRefresh {
+                succeeded: true,
+                timed_out: false,
+                canceled: false,
+                compiler_artifacts,
+                message: format!(
+                    "Rust checked: {} errors, {} warnings.",
+                    diagnostics
+                        .iter()
+                        .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+                        .count(),
+                    diagnostics
+                        .iter()
+                        .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Warning)
+                        .count(),
+                ),
+                diagnostics,
+            };
+        }
+        let errors = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
+            .count();
+        let warnings = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Warning)
+            .count();
+        let message = if errors + warnings > 0 {
+            format!("Rust check found {errors} errors, {warnings} warnings.")
+        } else {
+            cargo_failure_message(&stderr)
+        };
+        let mut failure = refresh_failure(message);
+        failure.diagnostics = diagnostics;
+        failure
+    })();
+    unregister_generated_source_refresh(root, &refresh);
+    result
+}
+
+fn refresh_canceled(compiler_artifacts: u32) -> GeneratedSourceRefresh {
+    GeneratedSourceRefresh {
+        succeeded: false,
+        timed_out: false,
+        canceled: true,
+        compiler_artifacts,
+        message: "Cargo refresh canceled.".into(),
+        diagnostics: Vec::new(),
+    }
+}
+
+fn parse_compiler_diagnostics(root: &Path, output: &[u8]) -> Vec<CompilerDiagnostic> {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut out = Vec::new();
+    for line in String::from_utf8_lossy(output).lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(message) = value.get("message").filter(|_| {
+            value.get("reason").and_then(serde_json::Value::as_str) == Some("compiler-message")
+        }) else {
+            continue;
+        };
+        let Some(span) = message
+            .get("spans")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|spans| {
+                spans.iter().find(|span| {
+                    span.get("is_primary").and_then(serde_json::Value::as_bool) == Some(true)
+                })
+            })
+        else {
+            continue;
+        };
+        let Some((path, range)) = compiler_span(root.as_path(), span) else {
+            continue;
+        };
+        let level = message
+            .get("level")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("error");
+        let severity = match level {
+            "warning" => DiagnosticSeverity::Warning,
+            "note" => DiagnosticSeverity::Information,
+            "help" => DiagnosticSeverity::Hint,
+            _ => DiagnosticSeverity::Error,
+        };
+        let mut text = message
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Rust compiler diagnostic")
+            .to_owned();
+        let labels: Vec<_> = message
+            .get("spans")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|span| span.get("label").and_then(serde_json::Value::as_str))
+            .collect();
+        if !labels.is_empty() {
+            text.push_str(&format!("\n{}", labels.join("\n")));
+        }
+        let code = message
+            .get("code")
+            .and_then(|code| code.get("code").or(Some(code)))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        let edits: Vec<RenameEdit> = message
+            .get("children")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .flat_map(|child| {
+                child
+                    .get("spans")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .filter(|span| {
+                span.get("suggestion_applicability")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("MachineApplicable")
+            })
+            .filter_map(|span| {
+                Some((
+                    compiler_span(root.as_path(), span)?,
+                    span.get("suggested_replacement")?.as_str()?.to_owned(),
+                ))
+            })
+            .filter(|((suggestion_path, _), _)| suggestion_path == &path)
+            .map(|((_, range), new_text)| RenameEdit {
+                uri: file_uri_for_compiler(&path),
+                range,
+                new_text,
+            })
+            .collect();
+        let actions = if edits.is_empty() {
+            Vec::new()
+        } else {
+            vec![crate::analysis::CodeActionInfo {
+                title: message
+                    .get("children")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .find_map(|child| child.get("message").and_then(serde_json::Value::as_str))
+                    .unwrap_or("Apply compiler suggestion")
+                    .to_owned(),
+                kind: Some("quickfix".into()),
+                edits,
+            }]
+        };
+        let uri = file_uri_for_compiler(&path);
+        // `--all-targets` can report the same source error for lib and test
+        // targets. Keep one only when the diagnostic and its available fixes match.
+        if out.iter().any(|existing: &CompilerDiagnostic| {
+            existing.uri == uri
+                && existing.range == range
+                && existing.severity == severity
+                && existing.message == text
+                && existing.code == code
+                && existing.actions == actions
+        }) {
+            continue;
+        }
+        out.push(CompilerDiagnostic {
+            uri,
+            range,
+            severity,
+            message: text,
+            code,
+            actions,
+        });
+    }
+    out
+}
+
+fn compiler_span(root: &Path, span: &serde_json::Value) -> Option<(PathBuf, Range)> {
+    let path = PathBuf::from(span.get("file_name")?.as_str()?);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        root.join(path)
+    };
+    let path = path.canonicalize().ok()?;
+    if !path.starts_with(root) {
+        return None;
+    }
+    let source = std::fs::read_to_string(&path).ok()?;
+    let line = |number: u64| source.lines().nth(number.saturating_sub(1) as usize);
+    let column = |number: u64, column: u64| {
+        line(number).map(|line| {
+            line.chars()
+                .take(column.saturating_sub(1) as usize)
+                .map(char::len_utf16)
+                .sum::<usize>() as u64
+        })
+    };
+    Some((
+        path,
+        Range {
+            start_line: span.get("line_start")?.as_u64()?.saturating_sub(1),
+            start_character: column(
+                span.get("line_start")?.as_u64()?,
+                span.get("column_start")?.as_u64()?,
+            )?,
+            end_line: span.get("line_end")?.as_u64()?.saturating_sub(1),
+            end_character: column(
+                span.get("line_end")?.as_u64()?,
+                span.get("column_end")?.as_u64()?,
+            )?,
+        },
+    ))
+}
+
+fn file_uri_for_compiler(path: &Path) -> String {
+    format!("file://{}", path.to_string_lossy())
+}
+
+fn cargo_refresh_args() -> [&'static str; 5] {
+    [
+        "check",
+        "--workspace",
+        "--all-targets",
+        "--offline",
+        "--message-format=json",
+    ]
+}
+
+fn cargo_executables(cargo_home: Option<&Path>, home: Option<&Path>) -> Vec<PathBuf> {
+    let cargo_name = format!("cargo{}", std::env::consts::EXE_SUFFIX);
+    let home_cargo = home.map(|home| home.join(".cargo"));
+    let mut executables = Vec::new();
+    for root in [cargo_home, home_cargo.as_deref()] {
+        let Some(root) = root else {
+            continue;
+        };
+        let executable = root.join("bin").join(&cargo_name);
+        if is_executable_file(&executable) && !executables.contains(&executable) {
+            executables.push(executable);
+        }
+    }
+    executables.push(PathBuf::from(cargo_name));
+    executables
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn spawn_cargo(root: &Path) -> Result<Child, String> {
+    let cargo_home = std::env::var_os("CARGO_HOME").map(PathBuf::from);
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    for executable in cargo_executables(cargo_home.as_deref(), home.as_deref()) {
+        let mut command = Command::new(executable);
+        command
+            .args(cargo_refresh_args())
+            .current_dir(root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        match command.spawn() {
+            Ok(child) => return Ok(child),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("Could not start cargo: {error}")),
+        }
+    }
+    Err("Could not find cargo. Install Rust with rustup or set CARGO_HOME/PATH.".into())
+}
+
+fn read_bounded<R: Read + Send + 'static>(mut reader: R) -> mpsc::Receiver<Vec<u8>> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let mut buffer = [0; 8192];
+        while let Ok(read) = reader.read(&mut buffer) {
+            if read == 0 {
+                break;
+            }
+            let remaining = CARGO_OUTPUT_LIMIT.saturating_sub(output.len());
+            output.extend_from_slice(&buffer[..read.min(remaining)]);
+        }
+        let _ = sender.send(output);
+    });
+    receiver
+}
+
+fn read_cargo_stdout<R: Read + Send + 'static>(mut reader: R) -> mpsc::Receiver<Vec<u8>> {
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut output = Vec::new();
+        let mut retained = Vec::new();
+        let mut line = Vec::new();
+        let mut line_overflowed = false;
+        let mut buffer = [0; 8192];
+        while let Ok(read) = reader.read(&mut buffer) {
+            if read == 0 {
+                break;
+            }
+            for byte in &buffer[..read] {
+                if !line_overflowed {
+                    if line.len() < CARGO_RETAINED_JSON_LIMIT {
+                        line.push(*byte);
+                    } else {
+                        line_overflowed = true;
+                    }
+                }
+                if *byte != b'\n' {
+                    continue;
+                }
+                if !line_overflowed && output.len() + line.len() <= CARGO_OUTPUT_LIMIT {
+                    output.extend_from_slice(&line);
+                } else if !line_overflowed
+                    && is_retained_cargo_record(&line)
+                    && retained.len() + line.len() <= CARGO_RETAINED_JSON_LIMIT
+                {
+                    retained.extend_from_slice(&line);
+                }
+                line.clear();
+                line_overflowed = false;
+            }
+        }
+        if !retained.is_empty() && !output.is_empty() {
+            output.push(b'\n');
+        }
+        output.extend_from_slice(&retained);
+        let _ = sender.send(output);
+    });
+    receiver
+}
+
+fn is_retained_cargo_record(line: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(line).is_ok_and(|message| {
+        matches!(
+            message.get("reason").and_then(serde_json::Value::as_str),
+            Some("compiler-message" | "build-finished")
+        )
+    })
+}
+
+fn collect_bounded(receiver: mpsc::Receiver<Vec<u8>>, timeout: Duration) -> Vec<u8> {
+    receiver.recv_timeout(timeout).unwrap_or_default()
+}
+
+fn cargo_compiler_artifact_count(stdout: &[u8]) -> u32 {
+    std::str::from_utf8(stdout)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .and_then(|message| {
+                    message
+                        .get("reason")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .is_some_and(|reason| reason == "compiler-artifact")
+        })
+        .count() as u32
+}
+
+fn cargo_failure_message(stderr: &[u8]) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let detail = stderr
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("Cargo check failed.")
+        .trim();
+    format!(
+        "Cargo refresh failed: {}",
+        detail.chars().take(240).collect::<String>()
+    )
+}
+
+fn refresh_failure(message: String) -> GeneratedSourceRefresh {
+    GeneratedSourceRefresh {
+        succeeded: false,
+        timed_out: false,
+        canceled: false,
+        compiler_artifacts: 0,
+        message,
+        diagnostics: Vec::new(),
+    }
 }
 
 impl RustEngine {
@@ -92,7 +707,9 @@ impl RustEngine {
             declarations: Vec::new(),
             files: Vec::new(),
             uses: HashMap::new(),
+            module_identities: HashMap::new(),
             source_roots: Vec::new(),
+            packages: Vec::new(),
             open: HashMap::new(),
             ready: false,
         }
@@ -109,38 +726,85 @@ impl RustEngine {
         let mut declarations = Vec::new();
         let mut files = Vec::new();
         let mut uses = HashMap::new();
+        let packages = cargo_packages(root);
         let roots = cargo_source_roots(root);
+        let module_graph = static_module_graph(&packages);
         let mut candidates = Vec::new();
-        for source_root in &roots {
-            let mut walker = WalkBuilder::new(source_root);
-            walker
-                .hidden(false)
-                .git_ignore(true)
-                .git_global(true)
-                .parents(true);
-            for entry in walker.build().flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|ext| ext.to_str()) != Some("rs")
-                    || entry
-                        .metadata()
-                        .is_ok_and(|metadata| metadata.len() > MAX_FILE_BYTES)
-                {
-                    continue;
+        for package in &packages {
+            if !package.indexed {
+                continue;
+            }
+            for target in &package.targets {
+                let source_root = &target.source_root;
+                let mut walker = WalkBuilder::new(source_root);
+                walker
+                    .hidden(false)
+                    .git_ignore(true)
+                    .git_global(true)
+                    .parents(true);
+                for entry in walker.build().flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|ext| ext.to_str()) != Some("rs")
+                        || entry
+                            .metadata()
+                            .is_ok_and(|metadata| metadata.len() > MAX_FILE_BYTES)
+                    {
+                        continue;
+                    }
+                    let features = package.selected_features.clone();
+                    candidates.push((
+                        path.to_path_buf(),
+                        source_root.clone(),
+                        target.name.clone(),
+                        CfgContext { features },
+                        module_graph.identities.get(path).cloned(),
+                        module_graph.uses.get(path).cloned(),
+                    ));
                 }
-                candidates.push((path.to_path_buf(), source_root.clone()));
+            }
+        }
+        for path in module_graph.identities.keys() {
+            if candidates.iter().any(|candidate| candidate.0 == *path) {
+                continue;
+            }
+            if let Some(package) = packages
+                .iter()
+                .find(|package| path.starts_with(&package.root))
+                && let Some(target) = package.targets.first()
+            {
+                candidates.push((
+                    path.clone(),
+                    target.source_root.clone(),
+                    target.name.clone(),
+                    CfgContext {
+                        features: package.selected_features.clone(),
+                    },
+                    module_graph.identities.get(path).cloned(),
+                    module_graph.uses.get(path).cloned(),
+                ));
             }
         }
         candidates.sort_by(|left, right| left.0.cmp(&right.0));
         candidates.dedup_by(|left, right| left.0 == right.0);
         candidates.truncate(MAX_FILES);
-        let indexed = scheduler.map_ordered(candidates, |(path, source_root)| {
-            let text = std::fs::read_to_string(&path).ok()?;
-            Some((
-                path.clone(),
-                parse_declarations(&path, &text, &source_root),
-                parse_use_bindings(&text),
-            ))
-        });
+        let indexed = scheduler.map_ordered(
+            candidates,
+            |(path, source_root, crate_name, cfg, module, uses)| {
+                let text = std::fs::read_to_string(&path).ok()?;
+                Some((
+                    path.clone(),
+                    parse_declarations(
+                        &path,
+                        &text,
+                        &source_root,
+                        &crate_name,
+                        &cfg,
+                        module.as_deref(),
+                    ),
+                    uses.unwrap_or_else(|| parse_use_bindings(&text)),
+                ))
+            },
+        );
         for (path, parsed_declarations, parsed_uses) in indexed.into_iter().flatten() {
             files.push(path.clone());
             declarations.extend(parsed_declarations);
@@ -153,7 +817,9 @@ impl RustEngine {
             declarations,
             files,
             uses,
+            module_identities: module_graph.identities,
             source_roots: roots,
+            packages,
         }
     }
 
@@ -161,7 +827,9 @@ impl RustEngine {
         self.declarations = built.declarations;
         self.files = built.files;
         self.uses = built.uses;
+        self.module_identities = built.module_identities;
         self.source_roots = built.source_roots;
+        self.packages = built.packages;
         self.ready = true;
     }
 
@@ -194,8 +862,15 @@ impl RustEngine {
                 && text.len() as u64 <= MAX_FILE_BYTES
             {
                 let source_root = self.source_root_for(path);
-                self.declarations
-                    .extend(parse_declarations(path, &text, &source_root));
+                let cfg = self.cfg_for(path);
+                self.declarations.extend(parse_declarations(
+                    path,
+                    &text,
+                    &source_root,
+                    &self.crate_for(path),
+                    &cfg,
+                    self.module_identities.get(path).map(Vec::as_slice),
+                ));
                 self.uses.insert(path.clone(), parse_use_bindings(&text));
                 self.files.push(path.clone());
             }
@@ -210,7 +885,14 @@ impl RustEngine {
         self.open.insert(
             path.to_path_buf(),
             (
-                parse_declarations(path, text, &self.source_root_for(path)),
+                parse_declarations(
+                    path,
+                    text,
+                    &self.source_root_for(path),
+                    &self.crate_for(path),
+                    &self.cfg_for(path),
+                    self.module_identities.get(path).map(Vec::as_slice),
+                ),
                 parse_use_bindings(text),
                 text.to_owned(),
             ),
@@ -547,6 +1229,7 @@ impl RustEngine {
         };
         let mut errors = Vec::new();
         collect_errors(tree.root_node(), text, &mut errors);
+        errors.extend(module_problems(path, text, &self.cfg_for(path)));
         errors.sort_by_key(|problem| (problem.start_line, problem.start_column));
         errors.truncate(MAX_PROBLEMS);
         errors
@@ -656,16 +1339,23 @@ impl RustEngine {
     }
 
     pub fn outline(&self, path: &Path, text: &str) -> Vec<OutlineSymbol> {
-        parse_declarations(path, text, &self.source_root_for(path))
-            .into_iter()
-            .map(|item| OutlineSymbol {
-                name: item.name,
-                kind: item_kind_name(item.kind),
-                line: item.line,
-                column: item.column,
-                children: Vec::new(),
-            })
-            .collect()
+        parse_declarations(
+            path,
+            text,
+            &self.source_root_for(path),
+            &self.crate_for(path),
+            &self.cfg_for(path),
+            self.module_identities.get(path).map(Vec::as_slice),
+        )
+        .into_iter()
+        .map(|item| OutlineSymbol {
+            name: item.name,
+            kind: item_kind_name(item.kind),
+            line: item.line,
+            column: item.column,
+            children: Vec::new(),
+        })
+        .collect()
     }
 
     fn all_declarations(&self) -> Vec<Declaration> {
@@ -681,7 +1371,11 @@ impl RustEngine {
     }
 
     fn visible_declarations(&self, path: &Path) -> Vec<Declaration> {
-        let mut visible = self.all_declarations();
+        let mut visible: Vec<_> = self
+            .all_declarations()
+            .into_iter()
+            .filter(|item| self.accessible_from(path, item))
+            .collect();
         let aliases = self.use_bindings(path);
         for binding in aliases {
             let targets = if binding.glob {
@@ -826,7 +1520,10 @@ impl RustEngine {
         if globbed.len() == 1 {
             return globbed;
         }
-        let matching: Vec<_> = all.into_iter().filter(|item| item.name == name).collect();
+        let matching: Vec<_> = all
+            .into_iter()
+            .filter(|item| item.name == name && self.accessible_from(path, item))
+            .collect();
         if matching.len() == 1 {
             matching
         } else {
@@ -835,16 +1532,35 @@ impl RustEngine {
     }
 
     fn resolve_path(&self, path: &Path, target: &[String]) -> Vec<Declaration> {
+        self.resolve_path_bounded(path, target, &mut HashSet::new(), 0)
+    }
+
+    /// Follow only explicit public re-export edges. This makes aliases usable
+    /// without treating macro output or private imports as declarations.
+    fn resolve_path_bounded(
+        &self,
+        path: &Path,
+        target: &[String],
+        seen: &mut HashSet<(String, Vec<String>, String)>,
+        depth: usize,
+    ) -> Vec<Declaration> {
+        if depth >= 32 {
+            return Vec::new();
+        }
         let Some(name) = target.last() else {
             return Vec::new();
         };
+        let current_crate = self.crate_for(path);
         let current = self.module_for(path);
-        let module = match target.first().map(String::as_str) {
-            Some("crate") => target[1..target.len().saturating_sub(1)].to_vec(),
+        let (crate_name, module) = match target.first().map(String::as_str) {
+            Some("crate") => (
+                current_crate,
+                target[1..target.len().saturating_sub(1)].to_vec(),
+            ),
             Some("self") => {
                 let mut module = current;
                 module.extend_from_slice(&target[1..target.len().saturating_sub(1)]);
-                module
+                (current_crate, module)
             }
             Some("super") => {
                 let mut module = current;
@@ -856,28 +1572,92 @@ impl RustEngine {
                     module.pop();
                 }
                 module.extend_from_slice(&target[parents..target.len().saturating_sub(1)]);
-                module
+                (current_crate, module)
             }
-            _ if target.len() > 1 => target[..target.len() - 1].to_vec(),
-            _ => Vec::new(),
+            _ if target.len() > 1 => {
+                if let Some(dependency) = self.dependency_for(path, &target[0]) {
+                    (dependency.package, target[1..target.len() - 1].to_vec())
+                } else {
+                    let mut module = current;
+                    module.extend_from_slice(&target[..target.len() - 1]);
+                    (current_crate, module)
+                }
+            }
+            _ => return Vec::new(),
         };
         let matches: Vec<_> = self
             .all_declarations()
             .into_iter()
-            .filter(|item| item.name == *name && item.module == module)
+            .filter(|item| {
+                item.name == *name
+                    && item.crate_name == crate_name
+                    && item.module == module
+                    && self.module_accessible_from(path, &crate_name, &module)
+                    && self.accessible_from(path, item)
+            })
             .collect();
         if matches.len() == 1 {
-            matches
-        } else {
-            Vec::new()
+            return matches;
         }
+        let key = (crate_name.clone(), module.clone(), (*name).clone());
+        if !seen.insert(key) {
+            return Vec::new();
+        }
+        let mut resolved = Vec::new();
+        for (binding_path, bindings) in &self.uses {
+            if self.crate_for(binding_path) != crate_name {
+                continue;
+            }
+            for binding in bindings.iter().filter(|binding| {
+                binding.public
+                    && if binding.module.is_empty() {
+                        self.module_for(binding_path) == module
+                    } else {
+                        binding.module == module
+                    }
+            }) {
+                if binding.glob || binding.local == *name {
+                    let targets = if binding.glob {
+                        self.declarations_in_module(binding_path, &binding.target)
+                    } else {
+                        self.resolve_path_bounded(binding_path, &binding.target, seen, depth + 1)
+                    };
+                    resolved.extend(
+                        targets
+                            .into_iter()
+                            .filter(|item| !binding.glob || item.name == *name),
+                    );
+                }
+            }
+        }
+        resolved.sort_by(|left, right| {
+            (&left.path, left.line, left.column).cmp(&(&right.path, right.line, right.column))
+        });
+        resolved.dedup_by(|left, right| {
+            left.path == right.path && left.line == right.line && left.column == right.column
+        });
+        (resolved.len() == 1)
+            .then_some(resolved)
+            .unwrap_or_default()
     }
 
     fn declarations_in_module(&self, path: &Path, target: &[String]) -> Vec<Declaration> {
-        let module = self.module_target(path, target);
+        let current_crate = self.crate_for(path);
+        let (crate_name, module) = match target.first().map(String::as_str) {
+            Some("crate" | "self" | "super") => (current_crate, self.module_target(path, target)),
+            Some(dependency) => {
+                let Some(dependency) = self.dependency_for(path, dependency) else {
+                    return Vec::new();
+                };
+                (dependency.package, target[1..].to_vec())
+            }
+            None => return Vec::new(),
+        };
         self.all_declarations()
             .into_iter()
-            .filter(|item| item.module == module)
+            .filter(|item| item.crate_name == crate_name && item.module == module)
+            .filter(|_| self.module_accessible_from(path, &crate_name, &module))
+            .filter(|item| self.accessible_from(path, item))
             .collect()
     }
 
@@ -916,7 +1696,84 @@ impl RustEngine {
     }
 
     fn module_for(&self, path: &Path) -> Vec<String> {
-        module_path(path, &self.source_root_for(path))
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        self.module_identities
+            .get(&canonical)
+            .or_else(|| self.module_identities.get(path))
+            .cloned()
+            .unwrap_or_else(|| module_path(path, &self.source_root_for(path)))
+    }
+
+    fn crate_for(&self, path: &Path) -> String {
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        self.packages
+            .iter()
+            .flat_map(|package| package.targets.iter())
+            .find(|target| path.starts_with(&target.source_root))
+            .map(|target| target.name.clone())
+            .or_else(|| {
+                self.packages
+                    .iter()
+                    .find(|package| path.starts_with(&package.root))
+                    .map(|package| package.name.clone())
+            })
+            .unwrap_or_default()
+    }
+
+    fn dependency_for(&self, path: &Path, name: &str) -> Option<CargoDependency> {
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let package = self
+            .packages
+            .iter()
+            .find(|package| path.starts_with(&package.root))?;
+        package
+            .dependencies
+            .iter()
+            .find(|dependency| dependency.name == name)
+            .cloned()
+    }
+
+    /// Private items are kept within their defining module. This intentionally
+    /// does not approximate Rust's wider parent/child private-item rules.
+    fn accessible_from(&self, path: &Path, item: &Declaration) -> bool {
+        let current_crate = self.crate_for(path);
+        if item.crate_name != current_crate {
+            return item.visibility == Visibility::Public;
+        }
+        let current_module = self.module_for(path);
+        match &item.visibility {
+            Visibility::Public => true,
+            Visibility::Private => module_is_within(&current_module, &item.module),
+            Visibility::Restricted(scope) => module_is_within(&current_module, scope),
+        }
+    }
+
+    /// Every named module on a path must itself be visible from the caller.
+    fn module_accessible_from(&self, path: &Path, crate_name: &str, module: &[String]) -> bool {
+        let all = self.all_declarations();
+        (1..=module.len()).all(|depth| {
+            let parent = &module[..depth - 1];
+            let name = &module[depth - 1];
+            all.iter()
+                .filter(|item| {
+                    item.kind == ItemKind::Class
+                        && item.name == *name
+                        && item.crate_name == crate_name
+                        && item.module == parent
+                })
+                .all(|item| self.accessible_from(path, item))
+        })
+    }
+
+    fn cfg_for(&self, path: &Path) -> CfgContext {
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        self.packages
+            .iter()
+            .find(|package| path.starts_with(&package.root))
+            .map(|package| CfgContext {
+                features: package.selected_features.clone(),
+            })
+            .unwrap_or_default()
     }
 
     fn use_bindings(&self, path: &Path) -> Vec<UseBinding> {
@@ -1005,11 +1862,530 @@ pub fn project_root(file: &Path) -> PathBuf {
         .to_path_buf()
 }
 
-/// Source directories configured by the nearest Cargo manifest. A normal
+/// Source directories in the local Cargo package or workspace. A normal
 /// package uses `src`; custom `path` targets add their containing directory.
-/// This parser intentionally reads only local manifest paths and never runs
-/// Cargo or resolves dependencies.
+/// Workspace members are expanded before indexing so crates do not disappear
+/// merely because the opened folder is a virtual Cargo workspace. This reads
+/// manifests only; dependency resolution and feature selection come later in
+/// the native Cargo graph.
 fn cargo_source_roots(root: &Path) -> Vec<PathBuf> {
+    let manifest = root.join("Cargo.toml");
+    let mut packages = vec![root.to_path_buf()];
+    let Ok(contents) = std::fs::read_to_string(&manifest) else {
+        return vec![root.join("src")];
+    };
+    for member in toml_array_values(&contents, "members") {
+        let pattern = root.join(member);
+        if member.ends_with("/*") {
+            let Some(parent) = pattern.parent() else {
+                continue;
+            };
+            let Ok(entries) = std::fs::read_dir(parent) else {
+                continue;
+            };
+            packages.extend(
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| path.is_dir() && path.join("Cargo.toml").is_file()),
+            );
+        } else if pattern.join("Cargo.toml").is_file() {
+            packages.push(pattern);
+        }
+    }
+    packages.sort();
+    packages.dedup();
+    let mut roots = Vec::new();
+    for package in packages {
+        roots.extend(cargo_package_source_roots(&package));
+    }
+    roots.retain(|path| path.is_dir());
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+fn cargo_packages(root: &Path) -> Vec<CargoPackage> {
+    let manifest = root.join("Cargo.toml");
+    let Ok(contents) = std::fs::read_to_string(&manifest) else {
+        return vec![cargo_package(root).unwrap_or_else(|| CargoPackage {
+            name: String::new(),
+            root: root.to_path_buf(),
+            targets: vec![CargoTarget {
+                name: String::new(),
+                source_root: root.join("src"),
+                root: root.join("src/lib.rs"),
+            }],
+            dependencies: Vec::new(),
+            selected_features: HashSet::new(),
+            indexed: true,
+        })];
+    };
+    let mut roots = vec![root.to_path_buf()];
+    for member in toml_array_values(&contents, "members") {
+        let pattern = root.join(member);
+        if member.ends_with("/*") {
+            if let Some(parent) = pattern.parent()
+                && let Ok(entries) = std::fs::read_dir(parent)
+            {
+                roots.extend(
+                    entries
+                        .flatten()
+                        .map(|entry| entry.path())
+                        .filter(|path| path.is_dir() && path.join("Cargo.toml").is_file()),
+                );
+            }
+        } else if pattern.join("Cargo.toml").is_file() {
+            roots.push(pattern);
+        }
+    }
+    let mut packages = Vec::new();
+    let mut processed = HashMap::new();
+    let mut requested: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+    while let Some(root) = roots.pop() {
+        let root = root.canonicalize().unwrap_or(root);
+        let requested_features = requested.get(&root).cloned().unwrap_or_default();
+        if processed.get(&root) == Some(&requested_features) {
+            continue;
+        }
+        let Some(package) = cargo_package_with_requested(&root, requested_features.clone()) else {
+            continue;
+        };
+        processed.insert(root.clone(), requested_features);
+        for dependency in &package.dependencies {
+            let Some(path) = dependency
+                .path
+                .as_ref()
+                .filter(|path| path.join("Cargo.toml").is_file())
+            else {
+                continue;
+            };
+            let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+            let requested = requested.entry(path.clone()).or_default();
+            requested.extend(dependency.features.iter().cloned());
+            if dependency.default_features {
+                requested.remove(NO_DEFAULT_FEATURES);
+            } else if requested.is_empty() {
+                requested.insert(NO_DEFAULT_FEATURES.to_owned());
+            }
+            roots.push(path);
+        }
+        if let Some(previous) = packages
+            .iter()
+            .position(|known: &CargoPackage| known.root == root)
+        {
+            packages[previous] = package;
+        } else {
+            packages.push(package);
+        }
+    }
+    let locked = cargo_lock_packages(root);
+    let cached: Vec<_> = packages
+        .iter()
+        .flat_map(|package| package.dependencies.iter())
+        .filter(|dependency| dependency.path.is_none())
+        .filter_map(|dependency| cached_package(dependency, &locked))
+        .collect();
+    for package in cached {
+        if !packages.iter().any(|known| known.root == package.root) {
+            packages.push(package);
+        }
+    }
+    packages.sort_by(|left, right| left.root.cmp(&right.root));
+    packages
+}
+
+fn cargo_package(root: &Path) -> Option<CargoPackage> {
+    cargo_package_with_requested(root, HashSet::new())
+}
+
+fn cargo_package_with_requested(
+    root: &Path,
+    requested_features: HashSet<String>,
+) -> Option<CargoPackage> {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let contents = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
+    let name = toml_section_value(&contents, "package", "name")?.replace('-', "_");
+    let targets = cargo_target_roots(&root)
+        .into_iter()
+        .map(|root| CargoTarget {
+            name: name.clone(),
+            source_root: root.parent().unwrap_or(&root).to_path_buf(),
+            root,
+        })
+        .collect();
+    let default_features = (!requested_features.contains(NO_DEFAULT_FEATURES))
+        .then(|| cargo_default_features(&contents))
+        .unwrap_or_default();
+    let features = cargo_features(&contents);
+    let selected_features = selected_features(&default_features, &features, &requested_features);
+    Some(CargoPackage {
+        name,
+        root: root.clone(),
+        targets,
+        dependencies: cargo_dependencies(&root, &contents, &selected_features, &features),
+        selected_features,
+        indexed: true,
+    })
+}
+
+fn cargo_dependencies(
+    root: &Path,
+    contents: &str,
+    selected_features: &HashSet<String>,
+    feature_definitions: &HashMap<String, Vec<String>>,
+) -> Vec<CargoDependency> {
+    let mut section = "";
+    let mut dependencies = Vec::new();
+    for line in contents.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line.trim_matches(&['[', ']'][..]);
+            continue;
+        }
+        if !dependency_section_active(section) {
+            continue;
+        }
+        let Some((name, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim();
+        let simple_version = toml_string(value);
+        let path = toml_inline_value(value, "path");
+        let version = toml_inline_value(value, "version").or(simple_version);
+        let git = toml_inline_value(value, "git");
+        let registry = toml_inline_value(value, "registry");
+        if path.is_none() && version.is_none() && git.is_none() && registry.is_none() {
+            continue;
+        }
+        let package = toml_inline_value(value, "package")
+            .unwrap_or_else(|| name.trim().to_owned())
+            .replace('-', "_");
+        let optional = toml_inline_value(value, "optional").as_deref() == Some("true");
+        let default_features =
+            toml_inline_value(value, "default-features").as_deref() != Some("false");
+        let mut features: HashSet<_> = toml_array_values_in_inline(value, "features")
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        features.extend(forwarded_dependency_features(
+            name.trim(),
+            selected_features,
+            feature_definitions,
+        ));
+        let dependency = CargoDependency {
+            name: name.trim().replace('-', "_"),
+            package,
+            path: path.map(|path| root.join(path)),
+            git: git.is_some(),
+            optional,
+            default_features,
+            features,
+        };
+        if !dependency.optional || selected_features.contains(&dependency.name) {
+            dependencies.push(dependency);
+        }
+    }
+    dependencies
+}
+
+/// Cargo feature entries such as `dep/feature` enable a feature in a
+/// dependency. The package's selected features have already been expanded,
+/// so only direct forwarding remains here.
+fn forwarded_dependency_features(
+    dependency: &str,
+    selected_features: &HashSet<String>,
+    definitions: &HashMap<String, Vec<String>>,
+) -> HashSet<String> {
+    let mut forwarded = HashSet::new();
+    for feature in selected_features {
+        for entry in definitions.get(feature).into_iter().flatten() {
+            let Some((name, feature)) = entry.split_once('/') else {
+                continue;
+            };
+            if name.trim_end_matches('?') == dependency
+                && (!name.ends_with('?') || selected_features.contains(dependency))
+            {
+                forwarded.insert(feature.to_owned());
+            }
+        }
+    }
+    forwarded
+}
+
+fn dependency_section_active(section: &str) -> bool {
+    matches!(
+        section,
+        "dependencies" | "dev-dependencies" | "build-dependencies"
+    ) || section.strip_prefix("target.").is_some_and(|target| {
+        target.ends_with(".dependencies")
+            || target.ends_with(".dev-dependencies")
+            || target.ends_with(".build-dependencies")
+    }) && target_section_matches(section)
+}
+
+fn target_section_matches(section: &str) -> bool {
+    let Some(target) = section.strip_prefix("target.") else {
+        return false;
+    };
+    let target = target
+        .strip_suffix(".dependencies")
+        .or_else(|| target.strip_suffix(".dev-dependencies"))
+        .or_else(|| target.strip_suffix(".build-dependencies"))
+        .unwrap_or("")
+        .trim_matches('"')
+        .trim_matches('\'');
+    target == "cfg(unix)"
+        || target == "cfg(macos)"
+        || target == "cfg(target_os = \"macos\")"
+        || target == "cfg(target_arch = \"aarch64\")"
+        || target.contains("target_os = \"macos\"") && target.contains("target_arch = \"aarch64\"")
+}
+
+fn cargo_features(contents: &str) -> HashMap<String, Vec<String>> {
+    let mut features = HashMap::new();
+    let mut section = "";
+    for line in contents.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            section = line.trim_matches(&['[', ']'][..]);
+        } else if section == "features"
+            && let Some((name, value)) = line.split_once('=')
+        {
+            features.insert(
+                name.trim().to_owned(),
+                toml_strings(value).into_iter().map(str::to_owned).collect(),
+            );
+        }
+    }
+    features
+}
+
+fn selected_features(
+    defaults: &HashSet<String>,
+    features: &HashMap<String, Vec<String>>,
+    requested: &HashSet<String>,
+) -> HashSet<String> {
+    let mut selected = HashSet::new();
+    let mut pending: Vec<_> = defaults.iter().chain(requested).cloned().collect();
+    while let Some(entry) = pending.pop() {
+        if entry.contains("?/") {
+            continue;
+        }
+        let feature = entry
+            .strip_prefix("dep:")
+            .unwrap_or(&entry)
+            .trim_end_matches('?')
+            .split('/')
+            .next()
+            .unwrap_or(&entry);
+        if selected.insert(feature.to_owned()) {
+            for entry in features.get(feature).into_iter().flatten() {
+                pending.push(entry.to_owned());
+            }
+        }
+    }
+    selected
+}
+
+fn toml_string(value: &str) -> Option<String> {
+    let value = value.trim();
+    (value.starts_with('"') && value.ends_with('"') && value.len() >= 2)
+        .then(|| value[1..value.len() - 1].to_owned())
+}
+
+/// Package-local default features only. Dependency feature unification belongs
+/// to Cargo and is deliberately not guessed by this static index.
+fn cargo_default_features(contents: &str) -> HashSet<String> {
+    let mut defaults = HashSet::new();
+    for feature in toml_array_values_in_section(contents, "features", "default") {
+        defaults.insert(feature.to_owned());
+    }
+    defaults
+}
+
+fn toml_array_values_in_section<'a>(contents: &'a str, section: &str, key: &str) -> Vec<&'a str> {
+    let mut in_section = false;
+    let mut collecting = false;
+    let mut values = Vec::new();
+    for line in contents.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_section = line.trim_matches(&['[', ']'][..]) == section;
+            collecting = false;
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        if !collecting {
+            let Some((found, value)) = line.split_once('=') else {
+                continue;
+            };
+            if found.trim() != key {
+                continue;
+            }
+            collecting = true;
+            collect_toml_strings(value, &mut values);
+            if value.contains(']') {
+                break;
+            }
+        } else {
+            collect_toml_strings(line, &mut values);
+            if line.contains(']') {
+                break;
+            }
+        }
+    }
+    values
+}
+
+fn toml_section_value(contents: &str, section: &str, key: &str) -> Option<String> {
+    let mut in_section = false;
+    for line in contents.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if line.starts_with('[') && line.ends_with(']') {
+            in_section = line.trim_matches(&['[', ']'][..]) == section;
+            continue;
+        }
+        if in_section
+            && let Some((found, value)) = line.split_once('=')
+            && found.trim() == key
+        {
+            return Some(value.trim().trim_matches('"').to_owned());
+        }
+    }
+    None
+}
+
+fn toml_inline_value(value: &str, key: &str) -> Option<String> {
+    let value = value.trim().trim_matches(&['{', '}'][..]);
+    value.split(',').find_map(|field| {
+        let (found, value) = field.split_once('=')?;
+        (found.trim() == key).then(|| value.trim().trim_matches('"').to_owned())
+    })
+}
+
+fn toml_array_values_in_inline<'a>(value: &'a str, key: &str) -> Vec<&'a str> {
+    let Some((_, value)) = value.split_once(&format!("{key} =")) else {
+        return Vec::new();
+    };
+    toml_strings(value)
+}
+
+fn toml_strings(source: &str) -> Vec<&str> {
+    let mut values = Vec::new();
+    collect_toml_strings(source, &mut values);
+    values
+}
+
+#[derive(Debug, Clone)]
+struct LockedPackage {
+    name: String,
+    version: String,
+    source: Option<String>,
+}
+
+fn cargo_lock_packages(root: &Path) -> Vec<LockedPackage> {
+    let Ok(contents) = std::fs::read_to_string(root.join("Cargo.lock")) else {
+        return Vec::new();
+    };
+    let mut packages = Vec::new();
+    let mut current: Option<LockedPackage> = None;
+    for line in contents.lines().map(str::trim) {
+        if line == "[[package]]" {
+            if let Some(package) = current.take() {
+                packages.push(package);
+            }
+            current = Some(LockedPackage {
+                name: String::new(),
+                version: String::new(),
+                source: None,
+            });
+        } else if let Some(package) = &mut current {
+            if let Some(value) = line.strip_prefix("name = ").and_then(toml_string) {
+                package.name = value;
+            } else if let Some(value) = line.strip_prefix("version = ").and_then(toml_string) {
+                package.version = value;
+            } else if let Some(value) = line.strip_prefix("source = ").and_then(toml_string) {
+                package.source = Some(value);
+            }
+        }
+    }
+    if let Some(package) = current {
+        packages.push(package);
+    }
+    packages
+}
+
+fn cached_package(dependency: &CargoDependency, locked: &[LockedPackage]) -> Option<CargoPackage> {
+    let package = locked.iter().find(|package| {
+        package.name.replace('-', "_") == dependency.package
+            && if dependency.git {
+                package
+                    .source
+                    .as_deref()
+                    .is_some_and(|source| source.starts_with("git+"))
+            } else {
+                package
+                    .source
+                    .as_deref()
+                    .is_some_and(|source| source.starts_with("registry+"))
+            }
+    })?;
+    let root = if dependency.git {
+        git_checkout_package(&package.name, &package.version)?
+    } else {
+        registry_package_source(&package.name, &package.version)?
+    };
+    let contents = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
+    if toml_section_value(&contents, "package", "name")? != package.name
+        || toml_section_value(&contents, "package", "version")? != package.version
+    {
+        return None;
+    }
+    let mut cached = cargo_package(&root)?;
+    cached.indexed = true;
+    Some(cached)
+}
+
+fn cargo_home() -> Option<PathBuf> {
+    std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")))
+}
+
+fn registry_package_source(name: &str, version: &str) -> Option<PathBuf> {
+    registry_package_source_in(&cargo_home()?, name, version)
+}
+
+fn registry_package_source_in(cargo_home: &Path, name: &str, version: &str) -> Option<PathBuf> {
+    let src = cargo_home.join("registry/src");
+    std::fs::read_dir(src)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path().join(format!("{name}-{version}")))
+        .find(|path| path.is_dir())
+}
+
+fn git_checkout_package(name: &str, version: &str) -> Option<PathBuf> {
+    let checkouts = cargo_home()?.join("git/checkouts");
+    for checkout in std::fs::read_dir(checkouts).ok()?.flatten() {
+        for revision in std::fs::read_dir(checkout.path()).ok()?.flatten() {
+            let path = revision.path();
+            let manifest = path.join("Cargo.toml");
+            if let Ok(contents) = std::fs::read_to_string(manifest)
+                && toml_section_value(&contents, "package", "name").as_deref() == Some(name)
+                && toml_section_value(&contents, "package", "version").as_deref() == Some(version)
+            {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+fn cargo_package_source_roots(root: &Path) -> Vec<PathBuf> {
     let manifest = root.join("Cargo.toml");
     let mut roots = vec![root.join("src")];
     let Ok(contents) = std::fs::read_to_string(manifest) else {
@@ -1030,10 +2406,357 @@ fn cargo_source_roots(root: &Path) -> Vec<PathBuf> {
             roots.push(parent.to_path_buf());
         }
     }
-    roots.retain(|path| path.is_dir());
+    roots
+}
+
+/// Manifest-declared and conventional Cargo entry points. This is deliberately
+/// structural: it does not ask Cargo which target configuration it would build.
+fn cargo_target_roots(root: &Path) -> Vec<PathBuf> {
+    let mut targets = vec![root.join("src/lib.rs"), root.join("src/main.rs")];
+    for directory in ["src/bin", "examples", "tests", "benches"] {
+        if let Ok(entries) = std::fs::read_dir(root.join(directory)) {
+            targets.extend(
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| path.extension().is_some_and(|extension| extension == "rs")),
+            );
+        }
+    }
+    if let Ok(contents) = std::fs::read_to_string(root.join("Cargo.toml")) {
+        targets.extend(contents.lines().map(str::trim).filter_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            (key.trim() == "path")
+                .then(|| root.join(value.trim().trim_matches('"')))
+                .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
+        }));
+    }
+    targets.retain(|path| path.is_file());
+    targets.sort();
+    targets.dedup();
+    targets
+}
+
+/// Quoted values from a TOML array assignment. Cargo workspace membership is
+/// intentionally parsed narrowly here: strings and comments, not arbitrary
+/// TOML expressions. The parser can be replaced by the full manifest model
+/// once package metadata, features, and dependencies are added.
+fn toml_array_values<'a>(contents: &'a str, key: &str) -> Vec<&'a str> {
+    let mut collecting = false;
+    let mut values = Vec::new();
+    for line in contents.lines() {
+        let line = line.split('#').next().unwrap_or("").trim();
+        if !collecting {
+            let Some((found, value)) = line.split_once('=') else {
+                continue;
+            };
+            if found.trim() != key {
+                continue;
+            }
+            collecting = true;
+            collect_toml_strings(value, &mut values);
+            if value.contains(']') {
+                break;
+            }
+        } else {
+            collect_toml_strings(line, &mut values);
+            if line.contains(']') {
+                break;
+            }
+        }
+    }
+    values
+}
+
+fn collect_toml_strings<'a>(source: &'a str, values: &mut Vec<&'a str>) {
+    let mut rest = source;
+    while let Some(start) = rest.find('"') {
+        rest = &rest[start + 1..];
+        let Some(end) = rest.find('"') else { break };
+        values.push(&rest[..end]);
+        rest = &rest[end + 1..];
+    }
+}
+
+#[derive(Default)]
+struct StaticModuleGraph {
+    identities: HashMap<PathBuf, Vec<String>>,
+    uses: HashMap<PathBuf, Vec<UseBinding>>,
+}
+
+/// Discover the subset of Rust's module graph that can be followed without
+/// macro expansion. Files not reached here retain their filesystem identity.
+fn static_module_graph(packages: &[CargoPackage]) -> StaticModuleGraph {
+    let mut graph = StaticModuleGraph::default();
+    let mut visited = HashSet::new();
+    for package in packages.iter().filter(|package| package.indexed) {
+        for target in &package.targets {
+            for path in static_target_roots(package, target) {
+                discover_static_module(
+                    &path,
+                    Vec::new(),
+                    &package.root,
+                    &CfgContext {
+                        features: package.selected_features.clone(),
+                    },
+                    &mut graph,
+                    &mut visited,
+                );
+            }
+        }
+    }
+    graph
+}
+
+fn static_target_roots(_package: &CargoPackage, target: &CargoTarget) -> Vec<PathBuf> {
+    let mut roots = vec![target.root.clone()];
     roots.sort();
     roots.dedup();
     roots
+}
+
+fn discover_static_module(
+    path: &Path,
+    module: Vec<String>,
+    manifest_dir: &Path,
+    cfg: &CfgContext,
+    graph: &mut StaticModuleGraph,
+    visited: &mut HashSet<PathBuf>,
+) {
+    if graph.identities.len() >= MAX_FILES {
+        return;
+    }
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if !visited.insert(path.clone())
+        || std::fs::metadata(&path).map_or(true, |metadata| metadata.len() > MAX_FILE_BYTES)
+    {
+        return;
+    }
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    graph.identities.insert(path.clone(), module.clone());
+    let Some(tree) = parse_tree(&text) else {
+        return;
+    };
+    discover_static_items(
+        &path,
+        &text,
+        tree.root_node(),
+        &module,
+        manifest_dir,
+        cfg,
+        graph,
+        visited,
+    );
+}
+
+fn discover_static_items(
+    path: &Path,
+    text: &str,
+    node: Node<'_>,
+    module: &[String],
+    manifest_dir: &Path,
+    cfg: &CfgContext,
+    graph: &mut StaticModuleGraph,
+    visited: &mut HashSet<PathBuf>,
+) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if cfg_disabled(child, text, cfg) {
+            continue;
+        }
+        if child.kind() == "use_declaration" {
+            graph.uses.entry(path.to_path_buf()).or_default().extend(
+                use_bindings(child.utf8_text(text.as_bytes()).unwrap_or(""))
+                    .into_iter()
+                    .map(|mut binding| {
+                        binding.module = module.to_vec();
+                        binding
+                    }),
+            );
+        }
+        if child.kind() == "mod_item" {
+            let Some(name) = child
+                .child_by_field_name("name")
+                .and_then(|name| name.utf8_text(text.as_bytes()).ok())
+            else {
+                continue;
+            };
+            let mut child_module = module.to_vec();
+            child_module.push(name.to_owned());
+            if child
+                .utf8_text(text.as_bytes())
+                .is_ok_and(|source| source.trim_end().ends_with('}'))
+            {
+                discover_static_items(
+                    path,
+                    text,
+                    child,
+                    &child_module,
+                    manifest_dir,
+                    cfg,
+                    graph,
+                    visited,
+                );
+            } else if let Some(child_path) = static_module_file(path, text, child, name) {
+                discover_static_module(
+                    &child_path,
+                    child_module,
+                    manifest_dir,
+                    cfg,
+                    graph,
+                    visited,
+                );
+            }
+            continue;
+        }
+        if child.kind() == "macro_invocation"
+            && let Some(include) = static_include_file(child, text, path, manifest_dir)
+        {
+            discover_static_module(&include, module.to_vec(), manifest_dir, cfg, graph, visited);
+            let include = include.canonicalize().unwrap_or(include);
+            if let Some(bindings) = graph.uses.get(&include).cloned() {
+                graph
+                    .uses
+                    .entry(path.to_path_buf())
+                    .or_default()
+                    .extend(bindings);
+            }
+            continue;
+        }
+        discover_static_items(path, text, child, module, manifest_dir, cfg, graph, visited);
+    }
+}
+
+fn static_module_file(path: &Path, text: &str, node: Node<'_>, name: &str) -> Option<PathBuf> {
+    if let Some(override_path) = module_path_override(node, text) {
+        let path = module_directory(path).join(override_path);
+        return path.is_file().then_some(path);
+    }
+    let directory = module_directory(path);
+    let files = [
+        directory.join(format!("{name}.rs")),
+        directory.join(name).join("mod.rs"),
+    ];
+    let mut found = files.into_iter().filter(|path| path.is_file());
+    let path = found.next()?;
+    found.next().is_none().then_some(path)
+}
+
+fn static_include_file(
+    node: Node<'_>,
+    text: &str,
+    path: &Path,
+    manifest_dir: &Path,
+) -> Option<PathBuf> {
+    let source = node.utf8_text(text.as_bytes()).ok()?.trim();
+    let argument = source
+        .strip_prefix("include!")?
+        .trim()
+        .strip_prefix('(')?
+        .strip_suffix(')')?
+        .trim();
+    if let Some(relative) = rust_string_literal(argument) {
+        return static_include_path(path.parent()?, &relative);
+    }
+    let body = argument
+        .strip_prefix("concat!")?
+        .trim()
+        .strip_prefix('(')?
+        .strip_suffix(')')?;
+    let manifest_prefix = "env!(\"CARGO_MANIFEST_DIR\")";
+    if let Some(suffix) = body
+        .strip_prefix(manifest_prefix)
+        .map(str::trim_start)
+        .and_then(|suffix| suffix.strip_prefix(','))
+        .map(str::trim)
+        .and_then(rust_string_literal)
+    {
+        return static_include_path(manifest_dir, suffix.trim_start_matches(['/', '\\']));
+    }
+    let suffix = body
+        .strip_prefix("env!(\"OUT_DIR\")")?
+        .trim_start()
+        .strip_prefix(',')?
+        .trim();
+    out_dir_include_file_in(&manifest_dir.join("target"), &rust_string_literal(suffix)?)
+}
+
+fn static_include_path(base: &Path, relative: &str) -> Option<PathBuf> {
+    let include = PathBuf::from(relative);
+    let include = if include.is_absolute() {
+        include
+    } else {
+        base.join(include)
+    };
+    include.is_file().then_some(include)
+}
+
+/// Find a single existing Cargo build-script output without evaluating `OUT_DIR`.
+fn out_dir_include_file_in(target_dir: &Path, suffix: &str) -> Option<PathBuf> {
+    let suffix = Path::new(suffix.trim_start_matches(['/', '\\']));
+    if suffix.as_os_str().is_empty()
+        || !suffix
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    let target_dir = target_dir.canonicalize().ok()?;
+    let mut matches = Vec::new();
+    for entry in WalkBuilder::new(&target_dir)
+        .hidden(false)
+        .git_ignore(false)
+        .git_global(false)
+        .parents(false)
+        .build()
+        .flatten()
+        .take(MAX_FILES)
+    {
+        let path = entry.path();
+        if !path.is_file()
+            || entry
+                .metadata()
+                .map_or(true, |metadata| metadata.len() > MAX_FILE_BYTES)
+        {
+            continue;
+        }
+        let Ok(path) = path.canonicalize() else {
+            continue;
+        };
+        let Ok(relative) = path.strip_prefix(&target_dir) else {
+            continue;
+        };
+        let components: Vec<_> = relative.components().collect();
+        let Some(build) = components
+            .iter()
+            .position(|component| component.as_os_str() == "build")
+        else {
+            continue;
+        };
+        if components
+            .get(build + 2)
+            .is_none_or(|component| component.as_os_str() != "out")
+            || components[build + 3..]
+                .iter()
+                .map(|component| component.as_os_str())
+                .ne(suffix.components().map(|component| component.as_os_str()))
+        {
+            continue;
+        }
+        matches.push(path);
+        if matches.len() > 1 {
+            return None;
+        }
+    }
+    matches.pop()
+}
+
+fn rust_string_literal(source: &str) -> Option<String> {
+    let source = source.trim();
+    (source.starts_with('"') && source.ends_with('"') && source.len() >= 2)
+        .then(|| source[1..source.len() - 1].to_owned())
 }
 
 fn module_path(path: &Path, source_root: &Path) -> Vec<String> {
@@ -1066,7 +2789,14 @@ fn parse_tree(text: &str) -> Option<Tree> {
     parser.parse(text, None)
 }
 
-fn parse_declarations(path: &Path, text: &str, source_root: &Path) -> Vec<Declaration> {
+fn parse_declarations(
+    path: &Path,
+    text: &str,
+    source_root: &Path,
+    crate_name: &str,
+    cfg: &CfgContext,
+    module: Option<&[String]>,
+) -> Vec<Declaration> {
     let Some(tree) = parse_tree(text) else {
         return Vec::new();
     };
@@ -1075,7 +2805,9 @@ fn parse_declarations(path: &Path, text: &str, source_root: &Path) -> Vec<Declar
         path,
         text,
         tree.root_node(),
-        &module_path(path, source_root),
+        crate_name,
+        module.unwrap_or(&module_path(path, source_root)),
+        cfg,
         &mut out,
     );
     out
@@ -1085,10 +2817,12 @@ fn collect_declarations(
     path: &Path,
     text: &str,
     node: Node<'_>,
+    crate_name: &str,
     module: &[String],
+    cfg: &CfgContext,
     out: &mut Vec<Declaration>,
 ) {
-    collect_declaration(path, text, node, module, out);
+    collect_declaration(path, text, node, crate_name, module, cfg, out);
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         let mut child_module = module.to_vec();
@@ -1099,7 +2833,7 @@ fn collect_declarations(
         {
             child_module.push(name.to_owned());
         }
-        collect_declarations(path, text, child, &child_module, out);
+        collect_declarations(path, text, child, crate_name, &child_module, cfg, out);
     }
 }
 
@@ -1122,18 +2856,19 @@ fn parse_use_bindings(text: &str) -> Vec<UseBinding> {
 }
 
 fn use_bindings(source: &str) -> Vec<UseBinding> {
+    let source = source.trim();
+    let public = source.starts_with("pub use ");
     let source = source
-        .trim()
         .trim_start_matches("pub ")
         .trim_start_matches("use ")
         .trim_end_matches(';')
         .trim();
     let mut out = Vec::new();
-    collect_use_bindings(source, "", &mut out);
+    collect_use_bindings(source, "", public, &mut out);
     out
 }
 
-fn collect_use_bindings(source: &str, prefix: &str, out: &mut Vec<UseBinding>) {
+fn collect_use_bindings(source: &str, prefix: &str, public: bool, out: &mut Vec<UseBinding>) {
     for item in split_use_items(source) {
         let item = item.trim();
         if let Some(open) = item.find('{') {
@@ -1144,7 +2879,7 @@ fn collect_use_bindings(source: &str, prefix: &str, out: &mut Vec<UseBinding>) {
             } else {
                 format!("{prefix}{before}::")
             };
-            collect_use_bindings(&item[open + 1..close], &next_prefix, out);
+            collect_use_bindings(&item[open + 1..close], &next_prefix, public, out);
             continue;
         }
         let (path, alias) = item.rsplit_once(" as ").unwrap_or((item, ""));
@@ -1161,6 +2896,8 @@ fn collect_use_bindings(source: &str, prefix: &str, out: &mut Vec<UseBinding>) {
                     local: "*".to_owned(),
                     target,
                     glob: true,
+                    public,
+                    module: Vec::new(),
                 });
             }
             continue;
@@ -1184,6 +2921,8 @@ fn collect_use_bindings(source: &str, prefix: &str, out: &mut Vec<UseBinding>) {
                 local: local.to_owned(),
                 target,
                 glob: false,
+                public,
+                module: Vec::new(),
             });
         }
     }
@@ -1212,9 +2951,14 @@ fn collect_declaration(
     path: &Path,
     text: &str,
     node: Node<'_>,
+    crate_name: &str,
     module: &[String],
+    cfg: &CfgContext,
     out: &mut Vec<Declaration>,
 ) {
+    if cfg_disabled(node, text, cfg) {
+        return;
+    }
     let kind = match node.kind() {
         "function_item" => ItemKind::Function,
         "struct_item" => ItemKind::Class,
@@ -1241,7 +2985,9 @@ fn collect_declaration(
         .to_owned();
     out.push(Declaration {
         name: name_text.to_owned(),
+        crate_name: crate_name.to_owned(),
         module: module.to_vec(),
+        visibility: item_visibility(&text[node.start_byte()..name.start_byte()], module),
         kind,
         path: path.to_path_buf(),
         line: point.row as u32,
@@ -1249,6 +2995,157 @@ fn collect_declaration(
         scope_depth: 0,
         signature,
     });
+}
+
+fn item_visibility(prefix: &str, module: &[String]) -> Visibility {
+    let prefix = prefix.trim_start();
+    if prefix.starts_with("pub ") || prefix == "pub" {
+        return Visibility::Public;
+    }
+    let Some(scope) = prefix
+        .strip_prefix("pub(")
+        .and_then(|value| value.split_once(')'))
+        .map(|(scope, _)| scope.trim())
+    else {
+        return Visibility::Private;
+    };
+    let target = match scope {
+        "crate" => Some(Vec::new()),
+        "self" => Some(module.to_vec()),
+        "super" => Some(module[..module.len().saturating_sub(1)].to_vec()),
+        _ => scope
+            .strip_prefix("in ")
+            .and_then(|path| visibility_scope(path.trim(), module)),
+    };
+    target
+        .map(Visibility::Restricted)
+        .unwrap_or(Visibility::Private)
+}
+
+fn visibility_scope(path: &str, module: &[String]) -> Option<Vec<String>> {
+    let segments: Vec<_> = path
+        .split("::")
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    let first = *segments.first()?;
+    let mut scope = match first {
+        "crate" => Vec::new(),
+        "self" => module.to_vec(),
+        "super" => {
+            let parents = segments
+                .iter()
+                .take_while(|segment| **segment == "super")
+                .count();
+            module[..module.len().saturating_sub(parents)].to_vec()
+        }
+        _ => return None,
+    };
+    let skip = if first == "super" {
+        segments
+            .iter()
+            .take_while(|segment| **segment == "super")
+            .count()
+    } else {
+        1
+    };
+    scope.extend(segments[skip..].iter().map(|segment| (*segment).to_owned()));
+    Some(scope)
+}
+
+fn module_is_within(module: &[String], scope: &[String]) -> bool {
+    module.starts_with(scope)
+}
+
+fn cfg_disabled(node: Node<'_>, text: &str, cfg: &CfgContext) -> bool {
+    let node_attributes = text[node.start_byte()..node.end_byte()]
+        .lines()
+        .take_while(|line| {
+            let line = line.trim();
+            line.is_empty() || (line.starts_with("#[") && line.ends_with(']'))
+        });
+    if node_attributes
+        .filter_map(cfg_attribute_expression)
+        .any(|expression| !cfg_matches(expression, cfg))
+    {
+        return true;
+    }
+
+    // Older Tree-sitter Rust grammars exclude outer attributes from `mod_item`.
+    text[..node.start_byte()]
+        .lines()
+        .rev()
+        .take_while(|line| {
+            let line = line.trim();
+            line.is_empty() || (line.starts_with("#[") && line.ends_with(']'))
+        })
+        .filter_map(cfg_attribute_expression)
+        .any(|expression| !cfg_matches(expression, cfg))
+}
+
+fn cfg_attribute_expression(line: &str) -> Option<&str> {
+    line.trim()
+        .strip_prefix("#[cfg(")
+        .and_then(|value| value.strip_suffix(")]"))
+}
+
+fn cfg_matches(expression: &str, cfg: &CfgContext) -> bool {
+    let expression = expression.trim();
+    if let Some(arguments) = cfg_call_arguments(expression, "any") {
+        return split_cfg_arguments(arguments)
+            .iter()
+            .any(|arg| cfg_matches(arg, cfg));
+    }
+    if let Some(arguments) = cfg_call_arguments(expression, "all") {
+        return split_cfg_arguments(arguments)
+            .iter()
+            .all(|arg| cfg_matches(arg, cfg));
+    }
+    if let Some(arguments) = cfg_call_arguments(expression, "not") {
+        let arguments = split_cfg_arguments(arguments);
+        return arguments.len() == 1 && !cfg_matches(arguments[0], cfg);
+    }
+    match expression {
+        "unix" | "macos" => true,
+        "test" | "false" => false,
+        _ => expression.split_once('=').is_some_and(|(key, value)| {
+            match (key.trim(), value.trim().trim_matches('"')) {
+                ("target_os", "macos") => true,
+                ("target_arch", "aarch64") => true,
+                ("feature", feature) => cfg.features.contains(feature),
+                _ => false,
+            }
+        }),
+    }
+}
+
+fn cfg_call_arguments<'a>(expression: &'a str, name: &str) -> Option<&'a str> {
+    expression
+        .strip_prefix(name)
+        .and_then(|arguments| arguments.strip_prefix('('))
+        .and_then(|arguments| arguments.strip_suffix(')'))
+}
+
+fn split_cfg_arguments(source: &str) -> Vec<&str> {
+    let mut depth = 0;
+    let mut quoted = false;
+    let mut start = 0;
+    let mut out = Vec::new();
+    for (index, character) in source.char_indices() {
+        match character {
+            '"' => quoted = !quoted,
+            '(' if !quoted => depth += 1,
+            ')' if !quoted => depth -= 1,
+            ',' if !quoted && depth == 0 => {
+                out.push(source[start..index].trim());
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    if !source[start..].trim().is_empty() {
+        out.push(source[start..].trim());
+    }
+    out
 }
 
 fn local_declaration(path: &Path, text: &str, name: &str, at: usize) -> Option<Declaration> {
@@ -1336,7 +3233,9 @@ fn collect_pattern_bindings(
             let point = node.start_position();
             out.push(Declaration {
                 name: name.to_owned(),
+                crate_name: String::new(),
                 module: Vec::new(),
+                visibility: Visibility::Private,
                 kind: ItemKind::Variable,
                 path: path.to_path_buf(),
                 line: point.row as u32,
@@ -1374,6 +3273,108 @@ fn collect_errors(node: Node<'_>, text: &str, out: &mut Vec<Problem>) {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         collect_errors(child, text, out);
+    }
+}
+
+/// Check conventional paths and literal `#[path = "..."]` overrides for
+/// out-of-line modules without invoking Cargo or the compiler.
+fn module_problems(path: &Path, text: &str, cfg: &CfgContext) -> Vec<Problem> {
+    let Some(tree) = parse_tree(text) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "mod_item"
+            && !text[node.start_byte()..node.end_byte()]
+                .trim_end()
+                .ends_with('}')
+            && !cfg_disabled(node, text, cfg)
+            && let Some(name) = node.child_by_field_name("name")
+            && let Ok(name_text) = name.utf8_text(text.as_bytes())
+        {
+            let found = module_path_override(node, text)
+                .map(|override_path| module_directory(path).join(override_path))
+                .filter(|candidate| candidate.is_file())
+                .map(|candidate| vec![candidate])
+                .unwrap_or_else(|| {
+                    let parent = module_directory(path);
+                    [
+                        parent.join(format!("{name_text}.rs")),
+                        parent.join(name_text).join("mod.rs"),
+                    ]
+                    .into_iter()
+                    .filter(|candidate| candidate.is_file())
+                    .collect()
+                });
+            let message = if found.is_empty() {
+                Some(format!("module `{name_text}` not found"))
+            } else if found.len() > 1 {
+                Some(format!(
+                    "module `{name_text}` found at both conventional paths"
+                ))
+            } else if found[0] == path {
+                Some(format!("module `{name_text}` creates a cyclic module path"))
+            } else {
+                None
+            };
+            if let Some(message) = message {
+                let point = name.start_position();
+                out.push(Problem {
+                    start_line: point.row as u32,
+                    start_column: utf16_column(text, name.start_byte()),
+                    end_line: point.row as u32,
+                    end_column: utf16_column(text, name.end_byte()),
+                    severity: Severity::Error,
+                    message,
+                    unnecessary: false,
+                });
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    out
+}
+
+fn module_path_override<'a>(node: Node<'_>, text: &'a str) -> Option<&'a str> {
+    let prefix = &text[..node.start_byte()];
+    if let Some(value) = prefix
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .and_then(|line| line.trim().strip_prefix("#[path = "))
+    {
+        let value = value.trim_end_matches(']').trim().trim_matches('"');
+        return (!value.is_empty()).then_some(value);
+    }
+    let mut previous = node.prev_named_sibling();
+    while let Some(attribute) = previous {
+        if attribute.kind() == "attribute_item" {
+            let source = attribute.utf8_text(text.as_bytes()).ok()?.trim();
+            if let Some(value) = source
+                .strip_prefix("#[path")
+                .and_then(|value| value.strip_prefix('='))
+            {
+                let value = value.trim().trim_end_matches(']').trim().trim_matches('"');
+                return (!value.is_empty()).then_some(value);
+            }
+        }
+        previous = attribute.prev_named_sibling();
+    }
+    None
+}
+
+fn module_directory(path: &Path) -> PathBuf {
+    if matches!(
+        path.file_stem().and_then(|stem| stem.to_str()),
+        Some("lib" | "main" | "mod")
+    ) {
+        path.parent().unwrap_or(path).to_path_buf()
+    } else {
+        path.parent()
+            .unwrap_or(path)
+            .join(path.file_stem().unwrap_or_default())
     }
 }
 
@@ -1849,7 +3850,9 @@ fn std_type_declaration(path: &Path, ty: &str) -> Option<Declaration> {
         {
             return Some(Declaration {
                 name: ty.to_owned(),
+                crate_name: String::new(),
                 module: vec!["alloc".to_owned()],
+                visibility: Visibility::Public,
                 kind: ItemKind::Class,
                 path: path.to_path_buf(),
                 line: node.start_position().row as u32,
@@ -1932,7 +3935,9 @@ fn struct_field_declarations(path: &Path, text: &str, ty: &str, name: &str) -> V
     let point = text[..start].lines().count().saturating_sub(1) as u32;
     vec![Declaration {
         name: name.to_owned(),
+        crate_name: String::new(),
         module: Vec::new(),
+        visibility: Visibility::Private,
         kind: ItemKind::Variable,
         path: path.to_path_buf(),
         line: point,
@@ -1963,7 +3968,9 @@ fn push_member_declaration(
     let point = member_name.start_position();
     out.push(Declaration {
         name: name.to_owned(),
+        crate_name: String::new(),
         module: Vec::new(),
+        visibility: Visibility::Private,
         kind,
         path: path.to_path_buf(),
         line: point.row as u32,
@@ -2465,7 +4472,183 @@ fn local_occurrences(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cargo_refresh_uses_the_requested_shell_free_arguments() {
+        assert_eq!(
+            cargo_refresh_args(),
+            [
+                "check",
+                "--workspace",
+                "--all-targets",
+                "--offline",
+                "--message-format=json"
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_executables_prioritizes_valid_rustup_locations_before_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cargo_home = dir.path().join("cargo-home");
+        let home = dir.path().join("home");
+        for root in [&cargo_home, &home.join(".cargo")] {
+            let binary = root.join("bin").join("cargo");
+            std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+            std::fs::write(&binary, "").unwrap();
+            let mut permissions = std::fs::metadata(&binary).unwrap().permissions();
+            permissions.set_mode(0o755);
+            std::fs::set_permissions(&binary, permissions).unwrap();
+        }
+
+        assert_eq!(
+            cargo_executables(Some(&cargo_home), Some(&home)),
+            vec![
+                cargo_home.join("bin/cargo"),
+                home.join(".cargo/bin/cargo"),
+                PathBuf::from("cargo"),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cargo_executables_ignores_missing_or_non_executable_locations() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo_home = dir.path().join("cargo-home");
+        let home = dir.path().join("home");
+        let binary = home.join(".cargo/bin/cargo");
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        std::fs::write(binary, "").unwrap();
+
+        assert_eq!(
+            cargo_executables(Some(&cargo_home), Some(&home)),
+            vec![PathBuf::from("cargo")]
+        );
+    }
+
+    #[test]
+    fn cargo_refresh_counts_compiler_artifacts_only() {
+        let output = b"{\"reason\":\"compiler-artifact\"}\n{\"reason\":\"build-finished\"}\n{\"reason\":\"compiler-artifact\"}\n";
+        assert_eq!(cargo_compiler_artifact_count(output), 2);
+    }
+
+    #[test]
+    fn canceled_refresh_is_distinct_from_timeout_and_failure() {
+        let canceled = refresh_canceled(3);
+        assert!(!canceled.succeeded);
+        assert!(!canceled.timed_out);
+        assert!(canceled.canceled);
+        assert_eq!(canceled.compiler_artifacts, 3);
+
+        let failed = refresh_failure("failed".into());
+        assert!(!failed.timed_out);
+        assert!(!failed.canceled);
+    }
+
+    #[test]
+    fn cancel_returns_false_without_an_active_refresh() {
+        assert!(!cancel_generated_source_refresh(Path::new(
+            "/tmp/galaxy-no-active-cargo-refresh"
+        )));
+    }
+
+    #[test]
+    fn cargo_refresh_output_collection_returns_after_timeout() {
+        let (sender, receiver) = mpsc::channel();
+        let output = collect_bounded(receiver, Duration::from_millis(1));
+        assert!(output.is_empty());
+        drop(sender);
+    }
+
+    #[test]
+    fn cargo_stdout_retains_late_compiler_messages_after_generic_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("src/lib.rs");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "fn main() {}\n").unwrap();
+        let diagnostic = format!(
+            r#"{{"reason":"compiler-message","message":{{"message":"late diagnostic","level":"error","spans":[{{"file_name":"{}","line_start":1,"column_start":1,"line_end":1,"column_end":3,"is_primary":true}}],"children":[]}}}}"#,
+            source.display()
+        );
+        let artifact =
+            b"{\"reason\":\"compiler-artifact\",\"package_id\":\"large-workspace-artifact\"}\n";
+        let mut stdout = Vec::new();
+        while stdout.len() <= CARGO_OUTPUT_LIMIT {
+            stdout.extend_from_slice(artifact);
+        }
+        stdout.extend_from_slice(diagnostic.as_bytes());
+        stdout.push(b'\n');
+        stdout.extend_from_slice(b"{\"reason\":\"build-finished\",\"success\":false}\n");
+
+        let output = collect_bounded(
+            super::read_cargo_stdout(std::io::Cursor::new(stdout)),
+            Duration::from_secs(1),
+        );
+        assert!(std::str::from_utf8(&output).unwrap().lines().any(|line| {
+            serde_json::from_str::<serde_json::Value>(line).is_ok_and(|value| {
+                value.get("reason").and_then(serde_json::Value::as_str) == Some("build-finished")
+            })
+        }));
+        let diagnostics = parse_compiler_diagnostics(dir.path(), &output);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].message, "late diagnostic");
+    }
+
+    #[test]
+    fn compiler_diagnostics_parse_machine_applicable_unicode_suggestions() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("src/lib.rs");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "fn main() { let cafe = \"cafe\"; }\n").unwrap();
+        let json = format!(
+            r#"{{"reason":"compiler-message","message":{{"message":"borrow of moved value","level":"error","code":{{"code":"E0382"}},"spans":[{{"file_name":"{}","line_start":1,"column_start":17,"line_end":1,"column_end":21,"is_primary":true,"label":"value moved here"}}],"children":[{{"message":"consider cloning","spans":[{{"file_name":"{}","line_start":1,"column_start":17,"line_end":1,"column_end":21,"suggested_replacement":"café.clone()","suggestion_applicability":"MachineApplicable"}}]}}]}}}}"#,
+            source.display(),
+            source.display()
+        );
+        let diagnostics = parse_compiler_diagnostics(dir.path(), json.as_bytes());
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code.as_deref(), Some("E0382"));
+        assert_eq!(diagnostics[0].message, "borrow of moved value");
+        assert_eq!(diagnostics[0].actions[0].edits[0].new_text, "café.clone()");
+        assert_eq!(diagnostics[0].range.start_character, 16);
+    }
+
+    #[test]
+    fn compiler_diagnostics_deduplicate_repeated_target_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("src/lib.rs");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "fn main() {}\n").unwrap();
+        let json = format!(
+            r#"{{"reason":"compiler-message","message":{{"message":"borrow of moved value","level":"error","code":{{"code":"E0382"}},"spans":[{{"file_name":"{}","line_start":1,"column_start":1,"line_end":1,"column_end":3,"is_primary":true,"label":"value moved here"}}],"children":[]}}}}"#,
+            source.display()
+        );
+        let output = format!("{json}\n{json}\n");
+        let diagnostics = parse_compiler_diagnostics(dir.path(), output.as_bytes());
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code.as_deref(), Some("E0382"));
+    }
+
     use super::*;
+
+    fn definition_at(
+        engine: &mut RustEngine,
+        path: &Path,
+        source: &str,
+        name: &str,
+    ) -> Vec<Target> {
+        let offset = source.rfind(name).unwrap();
+        let before = &source[..offset];
+        engine.definition(
+            path,
+            source,
+            before.bytes().filter(|byte| *byte == b'\n').count() as u32,
+            before.rsplit('\n').next().unwrap_or("").len() as u32,
+        )
+    }
 
     #[test]
     fn open_buffer_provides_completion_definition_hover_and_outline() {
@@ -2551,7 +4734,9 @@ mod tests {
         engine.install(Built {
             declarations: vec![Declaration {
                 name: "Coffee".to_owned(),
+                crate_name: String::new(),
                 module: vec!["models".to_owned()],
+                visibility: Visibility::Public,
                 kind: ItemKind::Class,
                 path: definition.clone(),
                 line: 0,
@@ -2561,7 +4746,9 @@ mod tests {
             }],
             files: Vec::new(),
             uses: HashMap::new(),
+            module_identities: HashMap::new(),
             source_roots: Vec::new(),
+            packages: Vec::new(),
         });
         assert_eq!(
             engine.definition(importer, source, 1, 14)[0].path,
@@ -2584,7 +4771,9 @@ mod tests {
             declarations: vec![
                 Declaration {
                     name: "Config".to_owned(),
+                    crate_name: String::new(),
                     module: vec!["client".to_owned()],
+                    visibility: Visibility::Public,
                     kind: ItemKind::Class,
                     path: PathBuf::from("/project/src/client.rs"),
                     line: 0,
@@ -2594,7 +4783,9 @@ mod tests {
                 },
                 Declaration {
                     name: "Config".to_owned(),
+                    crate_name: String::new(),
                     module: vec!["server".to_owned()],
+                    visibility: Visibility::Public,
                     kind: ItemKind::Class,
                     path: PathBuf::from("/project/src/server.rs"),
                     line: 0,
@@ -2605,7 +4796,9 @@ mod tests {
             ],
             files: Vec::new(),
             uses: HashMap::new(),
+            module_identities: HashMap::new(),
             source_roots: vec![root.to_path_buf()],
+            packages: Vec::new(),
         });
         let source = "use crate::server::Config;\nfn main() { Config; }";
         assert_eq!(
@@ -2632,7 +4825,9 @@ mod tests {
         engine.install(Built {
             declarations: vec![Declaration {
                 name: "Coffee".to_owned(),
+                crate_name: String::new(),
                 module: vec!["models".to_owned(), "drink".to_owned()],
+                visibility: Visibility::Public,
                 kind: ItemKind::Class,
                 path: PathBuf::from("/project/src/models/drink.rs"),
                 line: 0,
@@ -2642,7 +4837,9 @@ mod tests {
             }],
             files: Vec::new(),
             uses: HashMap::new(),
+            module_identities: HashMap::new(),
             source_roots: vec![root.to_path_buf()],
+            packages: Vec::new(),
         });
         let source = "use crate::models::{drink::{Coffee as Bean}};\nfn main() { Bean; }";
         assert_eq!(
@@ -2685,7 +4882,9 @@ mod tests {
         engine.install(Built {
             declarations: vec![Declaration {
                 name: "Coffee".to_owned(),
+                crate_name: String::new(),
                 module: vec!["models".to_owned()],
+                visibility: Visibility::Public,
                 kind: ItemKind::Class,
                 path: target.clone(),
                 line: 0,
@@ -2695,7 +4894,9 @@ mod tests {
             }],
             files: vec![target],
             uses: HashMap::new(),
+            module_identities: HashMap::new(),
             source_roots: vec![root.to_path_buf()],
+            packages: Vec::new(),
         });
         let source = "use crate::models::*;\nfn main() { Coffee; }";
         assert_eq!(
@@ -2831,7 +5032,9 @@ mod tests {
             declarations: Vec::new(),
             files: vec![definition.clone()],
             uses: HashMap::new(),
+            module_identities: HashMap::new(),
             source_roots: vec![PathBuf::from("/tmp")],
+            packages: Vec::new(),
         });
         engine.sync_document(
             &definition,
@@ -2846,6 +5049,733 @@ mod tests {
     }
 
     #[test]
+    fn cargo_workspace_source_roots_include_members_custom_targets_and_globs() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/core\", \"tools/*\"]\n",
+        )
+        .unwrap();
+        for package in ["crates/core", "tools/cli", "tools/codegen"] {
+            let package = root.path().join(package);
+            std::fs::create_dir_all(package.join("src")).unwrap();
+            std::fs::write(package.join("Cargo.toml"), "[package]\nname = \"test\"\n").unwrap();
+        }
+        let custom = root.path().join("crates/core/generated");
+        std::fs::create_dir_all(&custom).unwrap();
+        std::fs::write(
+            root.path().join("crates/core/Cargo.toml"),
+            "[package]\nname = \"core\"\n[[bin]]\npath = \"generated/main.rs\"\n",
+        )
+        .unwrap();
+
+        let roots = cargo_source_roots(root.path());
+        assert_eq!(
+            roots,
+            vec![
+                root.path().join("crates/core/generated"),
+                root.path().join("crates/core/src"),
+                root.path().join("tools/cli/src"),
+                root.path().join("tools/codegen/src"),
+            ]
+        );
+    }
+
+    #[test]
+    fn path_dependency_alias_resolves_only_the_declared_package() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\", \"library\", \"other\"]\n",
+        )
+        .unwrap();
+        for package in ["app", "library", "other"] {
+            std::fs::create_dir_all(root.path().join(package).join("src")).unwrap();
+        }
+        std::fs::write(
+            root.path().join("app/Cargo.toml"),
+            "[package]\nname = \"app\"\n[dependencies]\nrenamed = { package = \"library\", path = \"../library\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("library/Cargo.toml"),
+            "[package]\nname = \"library\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("other/Cargo.toml"),
+            "[package]\nname = \"other\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("library/src/lib.rs"),
+            "pub struct Widget;\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("other/src/lib.rs"), "pub struct Widget;\n").unwrap();
+        let app = root.path().join("app/src/lib.rs");
+        let source = "use renamed::Widget;\nfn main() { Widget; }\n";
+        std::fs::write(&app, source).unwrap();
+
+        let mut engine = RustEngine::pending(root.path());
+        engine.install(RustEngine::build(root.path()));
+        let target = engine.definition(&app, source, 1, 14);
+        assert_eq!(target.len(), 1);
+        assert_eq!(
+            target[0].path,
+            root.path()
+                .join("library/src/lib.rs")
+                .canonicalize()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn out_of_line_modules_and_disabled_cfg_items_are_indexed_correctly() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src/api")).unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"app\"\n",
+        )
+        .unwrap();
+        let lib = root.path().join("src/lib.rs");
+        std::fs::write(&lib, "mod api;\n#[cfg(false)]\npub struct Hidden;\n").unwrap();
+        let endpoint = root.path().join("src/api/mod.rs");
+        std::fs::write(&endpoint, "pub struct Endpoint;\n").unwrap();
+
+        let mut engine = RustEngine::pending(root.path());
+        engine.install(RustEngine::build(root.path()));
+        let source = "use crate::api::Endpoint;\nfn main() { Endpoint; }\n";
+        let target = engine.definition(&lib, source, 1, 14);
+        assert_eq!(target.len(), 1);
+        assert_eq!(target[0].path, endpoint.canonicalize().unwrap());
+        assert!(!engine.declarations.iter().any(|item| item.name == "Hidden"));
+    }
+
+    #[test]
+    fn path_modules_use_declared_identity_for_nested_imports() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src/generated/api")).unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"app\"\n",
+        )
+        .unwrap();
+        let lib = root.path().join("src/lib.rs");
+        std::fs::write(&lib, "#[path = \"generated/api.rs\"]\npub mod api;\n").unwrap();
+        std::fs::write(
+            root.path().join("src/generated/api.rs"),
+            "pub mod nested;\n",
+        )
+        .unwrap();
+        let nested = root.path().join("src/generated/api/nested.rs");
+        std::fs::write(&nested, "pub struct Endpoint;\n").unwrap();
+
+        let mut engine = RustEngine::pending(root.path());
+        engine.install(RustEngine::build(root.path()));
+        let source = "use crate::api::nested::Endpoint;\nfn main() { Endpoint; }\n";
+        let target = definition_at(&mut engine, &lib, source, "Endpoint");
+        assert_eq!(target.len(), 1);
+        assert_eq!(target[0].path, nested.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn custom_target_roots_seed_the_static_module_graph() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("generated")).unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"app\"\n[[bin]]\npath = \"generated/main.rs\"\n",
+        )
+        .unwrap();
+        let main = root.path().join("generated/main.rs");
+        std::fs::write(&main, "#[path = \"api.rs\"] mod api;\n").unwrap();
+        let api = root.path().join("generated/api.rs");
+        std::fs::write(&api, "pub struct Endpoint;\n").unwrap();
+
+        let mut engine = RustEngine::pending(root.path());
+        engine.install(RustEngine::build(root.path()));
+        let source = "use crate::api::Endpoint;\nfn main() { Endpoint; }\n";
+        assert_eq!(
+            definition_at(&mut engine, &main, source, "Endpoint")[0].path,
+            api.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn literal_includes_share_the_including_module_identity_and_imports() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src/parts")).unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"app\"\n",
+        )
+        .unwrap();
+        let lib = root.path().join("src/lib.rs");
+        std::fs::write(
+            &lib,
+            "pub struct Root;\ninclude!(\"parts/root.rs\");\nmod api { include!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/src/parts/api.rs\")); }\n",
+        )
+        .unwrap();
+        let root_include = root.path().join("src/parts/root.rs");
+        std::fs::write(
+            &root_include,
+            "use crate::Root;\npub fn root() -> Root { Root }\n",
+        )
+        .unwrap();
+        let api_include = root.path().join("src/parts/api.rs");
+        std::fs::write(&api_include, "pub struct Endpoint;\n").unwrap();
+
+        let mut engine = RustEngine::pending(root.path());
+        engine.install(RustEngine::build(root.path()));
+        let root_source = std::fs::read_to_string(&root_include).unwrap();
+        assert!(!definition_at(&mut engine, &root_include, &root_source, "Root").is_empty());
+        let source = "use crate::api::Endpoint;\nfn main() { Endpoint; }\n";
+        assert_eq!(
+            definition_at(&mut engine, &lib, source, "Endpoint")[0].path,
+            api_include.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn dynamic_includes_are_not_read() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"app\"\n",
+        )
+        .unwrap();
+        let lib = root.path().join("src/lib.rs");
+        std::fs::write(
+            &lib,
+            "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\npub struct Local;\n",
+        )
+        .unwrap();
+
+        let mut engine = RustEngine::pending(root.path());
+        engine.install(RustEngine::build(root.path()));
+        assert!(engine.declarations.iter().any(|item| item.name == "Local"));
+        assert!(
+            engine
+                .diagnostics(&lib, &std::fs::read_to_string(&lib).unwrap())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn out_dir_include_uses_one_local_build_output() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"app\"\n",
+        )
+        .unwrap();
+        let lib = root.path().join("src/lib.rs");
+        std::fs::write(
+            &lib,
+            "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));\n",
+        )
+        .unwrap();
+        let generated = root
+            .path()
+            .join("target/debug/build/app-hash/out/generated.rs");
+        std::fs::create_dir_all(generated.parent().unwrap()).unwrap();
+        std::fs::write(&generated, "pub struct Generated;\n").unwrap();
+
+        let mut engine = RustEngine::pending(root.path());
+        engine.install(RustEngine::build(root.path()));
+        let source = "fn main() { Generated; }\n";
+        let target = definition_at(&mut engine, &lib, source, "Generated");
+        assert_eq!(target.len(), 1);
+        assert_eq!(target[0].path, generated.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn out_dir_include_ignores_ambiguous_or_unsafe_outputs() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("target");
+        for build in ["one", "two"] {
+            let output = target.join(format!("debug/build/{build}/out/generated.rs"));
+            std::fs::create_dir_all(output.parent().unwrap()).unwrap();
+            std::fs::write(output, "pub struct Generated;\n").unwrap();
+        }
+        assert_eq!(out_dir_include_file_in(&target, "/generated.rs"), None);
+        assert_eq!(out_dir_include_file_in(&target, "../generated.rs"), None);
+        assert_eq!(out_dir_include_file_in(&target, "/tmp/generated.rs"), None);
+    }
+
+    #[test]
+    fn manifest_dependencies_resolve_local_and_external_packages() {
+        let dependencies = cargo_dependencies(
+            Path::new("/project"),
+            "[dependencies]\nlocal = { package = \"local-package\", path = \"../local\", version = \"1\" }\nregistry = \"2.0\"\ngit = { git = \"https://example.test/repo\", registry = \"private\" }\n",
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(dependencies.len(), 3);
+        assert_eq!(dependencies[0].package, "local_package");
+        assert_eq!(
+            dependencies[0].path,
+            Some(PathBuf::from("/project/../local"))
+        );
+        assert_eq!(dependencies[1].path, None);
+        assert_eq!(dependencies[1].package, "registry");
+        assert_eq!(dependencies[2].package, "git");
+    }
+
+    #[test]
+    fn cfg_evaluator_uses_mac_arm_and_package_default_features() {
+        let cfg = CfgContext {
+            features: ["editor".to_owned()].into_iter().collect(),
+        };
+        assert!(cfg_matches(
+            "all(unix, target_os = \"macos\", target_arch = \"aarch64\", feature = \"editor\")",
+            &cfg
+        ));
+        assert!(cfg_matches("any(not(feature = \"missing\"), macos)", &cfg));
+        assert!(!cfg_matches("all(feature = \"missing\", unix)", &cfg));
+    }
+
+    #[test]
+    fn registry_cache_locator_uses_the_locked_name_and_version() {
+        let root = tempfile::tempdir().unwrap();
+        let cargo = root.path().join("cargo");
+        let source = cargo.join("registry/src/example-registry/widget-1.2.3");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("Cargo.toml"),
+            "[package]\nname = \"widget\"\nversion = \"1.2.3\"\n",
+        )
+        .unwrap();
+        // The locator reads no registry index and creates no files.
+        assert_eq!(
+            registry_package_source_in(&cargo, "widget", "1.2.3"),
+            Some(source)
+        );
+    }
+
+    #[test]
+    fn target_dependencies_and_local_optional_features_are_selected() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\n",
+        )
+        .unwrap();
+        for package in ["app", "optional", "mac"] {
+            std::fs::create_dir_all(root.path().join(package).join("src")).unwrap();
+        }
+        std::fs::write(
+            root.path().join("app/Cargo.toml"),
+            "[package]\nname = \"app\"\n[dependencies]\noptional = { path = \"../optional\", optional = true }\n[target.'cfg(target_os = \"macos\")'.dependencies]\nmac = { path = \"../mac\", features = [\"enabled\"] }\n[features]\ndefault = [\"dep:optional\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("optional/Cargo.toml"),
+            "[package]\nname = \"optional\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("mac/Cargo.toml"),
+            "[package]\nname = \"mac\"\n[features]\nenabled = []\n",
+        )
+        .unwrap();
+        let package = cargo_package(root.path().join("app").as_path()).unwrap();
+        assert_eq!(package.dependencies.len(), 2);
+        assert!(
+            package
+                .dependencies
+                .iter()
+                .any(|dependency| dependency.name == "optional")
+        );
+        assert!(
+            package
+                .dependencies
+                .iter()
+                .any(|dependency| dependency.name == "mac")
+        );
+        let packages = cargo_packages(root.path());
+        assert!(
+            packages
+                .iter()
+                .find(|package| package.name == "mac")
+                .is_some_and(|package| package.selected_features.contains("enabled"))
+        );
+    }
+
+    #[test]
+    fn local_dependency_feature_forwarding_is_selected() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("app/src")).unwrap();
+        std::fs::create_dir_all(root.path().join("library/src")).unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("app/Cargo.toml"),
+            "[package]\nname = \"app\"\n[dependencies]\nlibrary = { path = \"../library\" }\n[features]\ndefault = [\"with-library\"]\nwith-library = [\"library/extra\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("library/Cargo.toml"),
+            "[package]\nname = \"library\"\n[features]\nextra = []\n",
+        )
+        .unwrap();
+
+        let packages = cargo_packages(root.path());
+        assert!(
+            packages
+                .iter()
+                .find(|package| package.name == "library")
+                .is_some_and(|package| package.selected_features.contains("extra"))
+        );
+    }
+
+    #[test]
+    fn public_reexports_follow_aliases_groups_globs_and_stop_at_cycles() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src/api")).unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"app\"\n",
+        )
+        .unwrap();
+        let lib = root.path().join("src/lib.rs");
+        std::fs::write(
+            &lib,
+            "pub mod api;\npub use api::{Alias, *};\npub use loop_a::Missing;\nmod loop_a { pub use super::loop_b::Missing; }\nmod loop_b { pub use super::loop_a::Missing; }\n",
+        )
+        .unwrap();
+        let api = root.path().join("src/api/mod.rs");
+        std::fs::write(&api, "pub mod inner;\npub use inner::Widget as Alias;\n").unwrap();
+        let inner = root.path().join("src/api/inner.rs");
+        std::fs::write(&inner, "pub struct Widget;\npub struct Other;\n").unwrap();
+
+        let mut engine = RustEngine::pending(root.path());
+        engine.install(RustEngine::build(root.path()));
+        let source = "use crate::{Alias, Other};\nfn main() { Alias; Other; Missing; }\n";
+        assert_eq!(
+            definition_at(&mut engine, &lib, source, "Alias")[0].path,
+            inner.canonicalize().unwrap()
+        );
+        assert_eq!(
+            definition_at(&mut engine, &lib, source, "Other")[0].path,
+            inner.canonicalize().unwrap()
+        );
+        assert!(definition_at(&mut engine, &lib, source, "Missing").is_empty());
+    }
+
+    #[test]
+    fn private_reexports_do_not_escape_their_module() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"app\"\n",
+        )
+        .unwrap();
+        let lib = root.path().join("src/lib.rs");
+        std::fs::write(
+            &lib,
+            "pub mod api { pub struct Widget; use Widget as Alias; }\n",
+        )
+        .unwrap();
+        let mut engine = RustEngine::pending(root.path());
+        engine.install(RustEngine::build(root.path()));
+        let source = "use crate::api::Alias;\nfn main() { Alias; }\n";
+        assert!(definition_at(&mut engine, &lib, source, "Alias").is_empty());
+    }
+
+    #[test]
+    fn cargo_target_roots_cover_all_target_kinds_and_custom_paths() {
+        let root = tempfile::tempdir().unwrap();
+        for path in [
+            "src/lib.rs",
+            "src/main.rs",
+            "src/bin/tool.rs",
+            "examples/demo.rs",
+            "tests/integration.rs",
+            "benches/speed.rs",
+            "generated/custom.rs",
+        ] {
+            let path = root.path().join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "").unwrap();
+        }
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"app\"\n[[example]]\npath = \"generated/custom.rs\"\n",
+        )
+        .unwrap();
+        assert_eq!(cargo_target_roots(root.path()).len(), 7);
+    }
+
+    #[test]
+    fn weak_dependency_features_do_not_enable_optional_dependencies() {
+        let definitions =
+            HashMap::from([("with-extra".to_owned(), vec!["optional?/extra".to_owned()])]);
+        let selected = ["with-extra".to_owned()].into_iter().collect();
+        assert!(forwarded_dependency_features("optional", &selected, &definitions).is_empty());
+        let selected = ["with-extra".to_owned(), "optional".to_owned()]
+            .into_iter()
+            .collect();
+        assert!(
+            forwarded_dependency_features("optional", &selected, &definitions).contains("extra")
+        );
+    }
+
+    #[test]
+    fn disabled_dependency_defaults_do_not_select_local_default_features() {
+        let root = tempfile::tempdir().unwrap();
+        for package in ["app", "library"] {
+            std::fs::create_dir_all(root.path().join(package).join("src")).unwrap();
+        }
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("app/Cargo.toml"),
+            "[package]\nname = \"app\"\n[dependencies]\nlibrary = { path = \"../library\", default-features = false }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("library/Cargo.toml"),
+            "[package]\nname = \"library\"\n[features]\ndefault = [\"enabled\"]\nenabled = []\n",
+        )
+        .unwrap();
+        let packages = cargo_packages(root.path());
+        assert!(
+            !packages
+                .iter()
+                .find(|package| package.name == "library")
+                .is_some_and(|package| package.selected_features.contains("enabled"))
+        );
+    }
+
+    #[test]
+    fn private_imports_do_not_cross_module_boundaries() {
+        let root = Path::new("/project/src");
+        let mut engine = RustEngine::pending(Path::new("/project"));
+        engine.install(Built {
+            declarations: vec![Declaration {
+                name: "Hidden".to_owned(),
+                crate_name: String::new(),
+                module: vec!["models".to_owned()],
+                visibility: Visibility::Private,
+                kind: ItemKind::Class,
+                path: PathBuf::from("/project/src/models.rs"),
+                line: 0,
+                column: 7,
+                scope_depth: 0,
+                signature: "struct Hidden;".to_owned(),
+            }],
+            files: Vec::new(),
+            uses: HashMap::new(),
+            module_identities: HashMap::new(),
+            source_roots: vec![root.to_path_buf()],
+            packages: Vec::new(),
+        });
+        let source = "use crate::models::Hidden;\nfn main() { Hidden; }";
+        assert!(
+            engine
+                .definition(Path::new("/project/src/lib.rs"), source, 1, 14)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn bounded_visibility_follows_module_and_crate_scopes() {
+        let root = tempfile::tempdir().unwrap();
+        let library = root.path().join("library");
+        let app = root.path().join("app");
+        for package in [&library, &app] {
+            std::fs::create_dir_all(package.join("src")).unwrap();
+        }
+        std::fs::create_dir_all(library.join("src/child")).unwrap();
+        std::fs::create_dir_all(library.join("src/api")).unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"library\", \"app\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            library.join("Cargo.toml"),
+            "[package]\nname = \"library\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("Cargo.toml"),
+            "[package]\nname = \"app\"\n[dependencies]\nlibrary = { path = \"../library\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            library.join("src/lib.rs"),
+            "pub mod child;\npub mod sibling;\npub mod api;\npub(crate) fn crate_only() {}\npub(in crate::api) fn api_only() {}\npub fn external() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            library.join("src/child.rs"),
+            "pub mod nested;\nfn private_child() {}\npub(super) fn parent_visible() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            library.join("src/child/nested.rs"),
+            "use super::private_child;\nfn use_private() { private_child(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            library.join("src/sibling.rs"),
+            "use crate::{crate_only, child::{private_child, parent_visible}};\nfn use_parent() { crate_only(); parent_visible(); }\n",
+        )
+        .unwrap();
+        std::fs::write(library.join("src/api.rs"), "pub mod nested;\n").unwrap();
+        std::fs::write(
+            library.join("src/api/nested.rs"),
+            "use crate::api_only;\nfn use_api() { api_only(); }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("src/lib.rs"),
+            "use library::{crate_only, external};\nfn use_external() { external(); }\n",
+        )
+        .unwrap();
+
+        let mut engine = RustEngine::pending(root.path());
+        engine.install(RustEngine::build(root.path()));
+        let child_nested = library.join("src/child/nested.rs");
+        let child_source = std::fs::read_to_string(&child_nested).unwrap();
+        assert!(
+            !definition_at(&mut engine, &child_nested, &child_source, "private_child").is_empty()
+        );
+
+        let sibling = library.join("src/sibling.rs");
+        let sibling_source = std::fs::read_to_string(&sibling).unwrap();
+        assert!(definition_at(&mut engine, &sibling, &sibling_source, "private_child").is_empty());
+        assert!(!definition_at(&mut engine, &sibling, &sibling_source, "crate_only").is_empty());
+        assert!(
+            !definition_at(&mut engine, &sibling, &sibling_source, "parent_visible").is_empty()
+        );
+
+        let api_nested = library.join("src/api/nested.rs");
+        let api_source = std::fs::read_to_string(&api_nested).unwrap();
+        assert!(!definition_at(&mut engine, &api_nested, &api_source, "api_only").is_empty());
+        let library_root = library.join("src/lib.rs");
+        let outside_api = "use crate::api_only;\nfn outside() { api_only(); }\n";
+        assert!(definition_at(&mut engine, &library_root, outside_api, "api_only").is_empty());
+
+        let app_root = app.join("src/lib.rs");
+        let app_source = std::fs::read_to_string(&app_root).unwrap();
+        assert!(definition_at(&mut engine, &app_root, &app_source, "crate_only").is_empty());
+        assert!(!definition_at(&mut engine, &app_root, &app_source, "external").is_empty());
+    }
+
+    #[test]
+    fn parses_all_bounded_visibility_forms() {
+        let declarations = parse_declarations(
+            Path::new("/project/src/lib.rs"),
+            "fn private() {}\npub fn public() {}\npub(crate) fn crate_only() {}\npub(self) fn self_only() {}\npub(super) fn parent() {}\npub(in crate::api) fn api() {}\nmod child { pub(in super::super::api) fn ancestor_api() {} }\n",
+            Path::new("/project/src"),
+            "project",
+            &CfgContext::default(),
+            None,
+        );
+        let visibility = |name| {
+            declarations
+                .iter()
+                .find(|item| item.name == name)
+                .unwrap()
+                .visibility
+                .clone()
+        };
+        assert_eq!(visibility("private"), Visibility::Private);
+        assert_eq!(visibility("public"), Visibility::Public);
+        assert_eq!(visibility("crate_only"), Visibility::Restricted(Vec::new()));
+        assert_eq!(visibility("self_only"), Visibility::Restricted(Vec::new()));
+        assert_eq!(visibility("parent"), Visibility::Restricted(Vec::new()));
+        assert_eq!(
+            visibility("api"),
+            Visibility::Restricted(vec!["api".to_owned()])
+        );
+        assert_eq!(
+            visibility("ancestor_api"),
+            Visibility::Restricted(vec!["api".to_owned()])
+        );
+    }
+
+    #[test]
+    fn diagnostics_report_missing_and_duplicate_out_of_line_modules() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("lib.rs");
+        std::fs::write(&source, "mod absent;\nmod both;\n").unwrap();
+        std::fs::write(root.path().join("both.rs"), "").unwrap();
+        std::fs::create_dir(root.path().join("both")).unwrap();
+        std::fs::write(root.path().join("both/mod.rs"), "").unwrap();
+        let mut engine = RustEngine::pending(root.path());
+        let problems = engine.diagnostics(&source, "mod absent;\nmod both;\n");
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.message == "module `absent` not found")
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.message == "module `both` found at both conventional paths")
+        );
+    }
+
+    #[test]
+    fn diagnostics_ignore_cfg_test_modules_in_normal_static_context() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("lib.rs");
+        let text = "#[cfg(test)]\nmod missing_tests;\nmod missing;\n";
+        let mut engine = RustEngine::pending(root.path());
+        let problems = engine.diagnostics(&source, text);
+        assert!(
+            !problems
+                .iter()
+                .any(|problem| problem.message == "module `missing_tests` not found")
+        );
+        assert!(
+            problems
+                .iter()
+                .any(|problem| problem.message == "module `missing` not found")
+        );
+    }
+
+    #[test]
+    fn diagnostics_ignore_cfg_test_modules_with_path_attribute() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("lib.rs");
+        let text = "#[cfg(test)]\n#[path = \"missing_tests.rs\"]\nmod missing_tests;\n";
+        let mut engine = RustEngine::pending(root.path());
+        let problems = engine.diagnostics(&source, text);
+        assert!(
+            !problems
+                .iter()
+                .any(|problem| problem.message == "module `missing_tests` not found")
+        );
+    }
+
+    #[test]
+    fn diagnostics_respect_literal_path_module_overrides() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("lib.rs");
+        std::fs::create_dir_all(root.path().join("generated")).unwrap();
+        std::fs::write(root.path().join("generated/api.rs"), "").unwrap();
+        let text = "#[path = \"generated/api.rs\"]\nmod api;\n";
+        let mut engine = RustEngine::pending(root.path());
+        assert!(engine.diagnostics(&source, text).is_empty());
+    }
+
+    #[test]
     fn member_definition_resolves_methods_and_fields_in_another_buffer() {
         let definition = PathBuf::from("/tmp/models.rs");
         let path = Path::new("/tmp/lib.rs");
@@ -2855,7 +5785,9 @@ mod tests {
             declarations: Vec::new(),
             files: vec![definition.clone()],
             uses: HashMap::new(),
+            module_identities: HashMap::new(),
             source_roots: vec![PathBuf::from("/tmp")],
+            packages: Vec::new(),
         });
         engine.sync_document(
             &definition,

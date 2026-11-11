@@ -208,6 +208,13 @@ impl PhpEngine {
         &self.root
     }
 
+    /// Overrides Composer's PHP target for compatibility diagnostics and stubs.
+    pub fn set_php_version(&mut self, version: Option<super::version::PhpVersion>) {
+        self.php_version = version
+            .map(VersionSelection::Supported)
+            .unwrap_or_else(|| for_project(&self.root));
+    }
+
     /// `true` when the project uses the framework called `name`.
     pub fn is_framework(&self, name: &str) -> bool {
         self.frameworks.iter().any(|fw| fw.name() == name)

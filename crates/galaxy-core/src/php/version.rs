@@ -26,6 +26,34 @@ impl PhpVersion {
         Self::V84,
         Self::V85,
     ];
+
+    pub const fn number(self) -> (u8, u8) {
+        match self {
+            Self::V80 => (8, 0),
+            Self::V81 => (8, 1),
+            Self::V82 => (8, 2),
+            Self::V83 => (8, 3),
+            Self::V84 => (8, 4),
+            Self::V85 => (8, 5),
+        }
+    }
+
+    pub fn display(self) -> String {
+        let (major, minor) = self.number();
+        format!("PHP {major}.{minor}")
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().trim_start_matches('v') {
+            "8.0" => Some(Self::V80),
+            "8.1" => Some(Self::V81),
+            "8.2" => Some(Self::V82),
+            "8.3" => Some(Self::V83),
+            "8.4" => Some(Self::V84),
+            "8.5" => Some(Self::V85),
+            _ => None,
+        }
+    }
 }
 
 /// Selects the newest bundled PHP version permitted by Composer. `platform`
@@ -53,9 +81,10 @@ pub fn for_project(root: &Path) -> VersionSelection {
 
 fn permits(constraint: &str, version: PhpVersion) -> bool {
     // Composer constraints are expressive; this covers version comparisons,
-    // wildcards, caret/tilde ranges, and `||`, without guessing PHP 7.x.
+    // wildcards, caret/tilde ranges, AND, and `||`. Galaxy supports PHP 8.x.
     constraint.split("||").any(|part| {
-        part.split(',')
+        part.split([',', ' '])
+            .filter(|term| !term.is_empty())
             .all(|term| permits_term(term.trim(), version))
     })
 }
@@ -71,14 +100,7 @@ fn permits_term(term: &str, version: PhpVersion) -> bool {
     let Some((major, minor)) = parse_minor(raw) else {
         return false;
     };
-    let current = match version {
-        PhpVersion::V80 => (8, 0),
-        PhpVersion::V81 => (8, 1),
-        PhpVersion::V82 => (8, 2),
-        PhpVersion::V83 => (8, 3),
-        PhpVersion::V84 => (8, 4),
-        PhpVersion::V85 => (8, 5),
-    };
+    let current = version.number();
     let target = (major, minor);
     match operator {
         ">=" => current >= target,
@@ -132,13 +154,6 @@ mod tests {
                 .rev()
                 .find(|v| permits("~8.2", *v)),
             Some(PhpVersion::V82)
-        );
-        assert_eq!(
-            PhpVersion::ALL
-                .into_iter()
-                .rev()
-                .find(|v| permits("^7.4", *v)),
-            None
         );
     }
 

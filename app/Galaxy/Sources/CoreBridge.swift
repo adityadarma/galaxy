@@ -13,6 +13,7 @@ final class CoreBridge {
     /// contend with newer requests.
     private let completionQueue = DispatchQueue(label: "dev.adityadarma.galaxy.completion")
     private let referencesQueue = DispatchQueue(label: "dev.adityadarma.galaxy.references")
+    private let rustRefreshQueue = DispatchQueue(label: "dev.adityadarma.galaxy.rust-refresh")
     private var pendingCompletionRequest: DispatchWorkItem?
     private var pendingReferencesRequest: DispatchWorkItem?
     private(set) var lastEvent: CoreEvent?
@@ -71,6 +72,25 @@ final class CoreBridge {
 
     func refreshWorkspaceIndexes(root: String) {
         core.refreshWorkspaceIndexes(root: root)
+    }
+
+    @discardableResult
+    func setPHPAnalyzerTarget(root: String, version: String?) -> Bool {
+        core.setPhpTargetVersion(root: root, version: version ?? "")
+    }
+
+    /// Cargo can run build scripts and proc macros, so this is exposed only to
+    /// the explicit workspace command and never to indexing or file watching.
+    func refreshGeneratedRustSources(root: String, completion: @escaping @MainActor (RustGeneratedSourceRefresh) -> Void) {
+        let core = core
+        rustRefreshQueue.async {
+            let result = core.refreshGeneratedRustSources(root: root)
+            Task { @MainActor in completion(result) }
+        }
+    }
+
+    func cancelGeneratedRustSourceRefresh(root: String) -> Bool {
+        core.cancelGeneratedRustSourceRefresh(root: root)
     }
 
     func applyWorkspaceChanges(root: String, paths: [String], rescan: Bool) {

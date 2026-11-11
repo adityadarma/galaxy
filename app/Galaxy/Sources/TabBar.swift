@@ -55,6 +55,8 @@ final class EditorTab {
     var blameLineCount: UInt64 = 0
     /// Bumped per request, so a slow answer for old text is dropped.
     var blameGeneration = 0
+    /// Per-document choice made from the status bar indentation picker.
+    var indentOverride: (useTabs: Bool, tabSize: UInt32)?
     /// Title with the file's state on disk.
     var displayTitle: String {
         if isDeletedOnDisk { return "\(title) (deleted)" }

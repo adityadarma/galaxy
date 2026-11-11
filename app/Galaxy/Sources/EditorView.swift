@@ -290,6 +290,15 @@ final class EditorView: NSView {
     var renderWhitespace: WhitespaceRendering = .all {
         didSet { if renderWhitespace != oldValue { needsDisplay = true } }
     }
+    private(set) var tabSize = 4
+
+    func syncTabSize() {
+        let next = max(Int(document?.indentSettings().tabSize ?? 4), 1)
+        guard next != tabSize else { return }
+        tabSize = next
+        releaseNonEssentialCaches()
+        onLayoutChange?()
+    }
 
     /// Git blame shown after the text of one line (`line` is 0-based).
     struct BlameAnnotation: Equatable {
@@ -412,6 +421,7 @@ final class EditorView: NSView {
                 setInlineHints([:])
             }
             applyWrapColumns()
+            syncTabSize()
             syntaxAwaiting = document?.syntaxLanguage() != nil
             startSyntaxPollingIfNeeded()
             reloadDocument()
@@ -1025,11 +1035,14 @@ final class EditorView: NSView {
             return padded.lines[index - padded.first]
         }
         let scopeIndent = { (line: Int) -> Int in
+            let tabSize = self.tabSize
             func nearestIndent(step: Int) -> Int? {
                 var index = line + step
                 while index >= 0, index < total, abs(index - line) <= scanLimit {
                     guard let text = textOfLine(index) else { return nil }
-                    if !text.allSatisfy(\.isWhitespace) { return Self.leadingIndentColumns(in: text) }
+                    if !text.allSatisfy(\.isWhitespace) {
+                        return Self.leadingIndentColumns(in: text, tabSize: tabSize)
+                    }
                     index += step
                 }
                 return nil
@@ -1069,21 +1082,21 @@ final class EditorView: NSView {
             let startsAtDivider = line.text.first.map { $0 != " " && $0 != "\t" } ?? false
             // A blank line is part of the block around it, so it takes that indent.
             let indentColumns = isBlank
-                ? max(Self.leadingIndentColumns(in: line.text), scopeIndent(Int(line.line)))
-                : Self.leadingIndentColumns(in: line.text)
+                ? max(Self.leadingIndentColumns(in: line.text, tabSize: tabSize), scopeIndent(Int(line.line)))
+                : Self.leadingIndentColumns(in: line.text, tabSize: tabSize)
             let drawsDivider = isBlank ? indentColumns > 0 : !startsAtDivider
 
             // Indent guides sit behind text and whitespace markers. Draw one
             // guide for each complete four-space indentation level.
-            if indentColumns >= 4 {
+            if indentColumns >= tabSize {
                 context.setFillColor(NSColor.separatorColor.withAlphaComponent(0.08).cgColor)
-                var column = 4
+                var column = tabSize
                 // The deepest guide sits immediately beside the text and is
                 // visually noisy; keep only the parent-level guides.
                 while column < indentColumns {
                     let x = originX + CGFloat(column) * metrics.spaceWidth - 0.5
                     context.fill(CGRect(x: x, y: top, width: 1, height: block))
-                    column += 4
+                    column += tabSize
                 }
             }
 
@@ -1603,12 +1616,13 @@ final class EditorView: NSView {
         return columns
     }
 
-    private nonisolated static func leadingIndentColumns(in text: String) -> Int {
+    private nonisolated static func leadingIndentColumns(in text: String, tabSize: Int) -> Int {
         var columns = 0
+        let tabSize = max(tabSize, 1)
         for character in text {
             switch character {
             case " ": columns += 1
-            case "\t": columns += 4
+            case "\t": columns += tabSize - columns % tabSize
             default: return columns
             }
         }
@@ -1637,7 +1651,17 @@ final class EditorView: NSView {
             let x1 = x0 + max(0, cellWidth)
             let midY = origin.y + midOffset
             if units[column] == tab {
-                context.fill(CGRect(x: x0 + 2, y: midY - 0.5, width: max(1, x1 - x0 - 4), height: 1))
+                let start = x0 + 2
+                let end = max(start + 2, x1 - 3)
+                context.setStrokeColor(Theme.whitespace.cgColor)
+                context.setLineWidth(1)
+                context.beginPath()
+                context.move(to: CGPoint(x: start, y: midY))
+                context.addLine(to: CGPoint(x: end, y: midY))
+                context.addLine(to: CGPoint(x: end - 3, y: midY - 2.5))
+                context.move(to: CGPoint(x: end, y: midY))
+                context.addLine(to: CGPoint(x: end - 3, y: midY + 2.5))
+                context.strokePath()
             } else {
                 let cx = (x0 + x1) / 2
                 context.fillEllipse(in: CGRect(x: cx - radius, y: midY - radius, width: radius * 2, height: radius * 2))
@@ -1682,6 +1706,7 @@ final class EditorView: NSView {
         // one cached layout works for every colour and appearance.
         let fromContext = NSAttributedString.Key(kCTForegroundColorFromContextAttributeName as String)
         let attributed = NSMutableAttributedString(string: text, attributes: [.font: font, fromContext: true])
+        attributed.addAttribute(.paragraphStyle, value: paragraphStyle(), range: NSRange(location: 0, length: attributed.length))
         addHintSpacing(to: attributed, text: text)
         let line = CTLineCreateWithAttributedString(attributed)
         layouts.insert(line, for: text)
@@ -1699,6 +1724,7 @@ final class EditorView: NSView {
         if let cached = syntaxLayouts.value(for: key) { return cached }
         let base = Theme.editorForeground.resolved(for: effectiveAppearance)
         let attributed = NSMutableAttributedString(string: text, attributes: [.font: font, .foregroundColor: base])
+        attributed.addAttribute(.paragraphStyle, value: paragraphStyle(), range: NSRange(location: 0, length: attributed.length))
         let length = (text as NSString).length
         for style in styles {
             let start = min(Int(style.start), length)
@@ -1724,6 +1750,13 @@ final class EditorView: NSView {
         syntaxLayouts.insert(line, for: key)
         layoutsCreated += 1
         return line
+    }
+
+    private func paragraphStyle() -> NSParagraphStyle {
+        let style = NSMutableParagraphStyle()
+        style.tabStops = []
+        style.defaultTabInterval = CGFloat(tabSize) * metrics.spaceWidth
+        return style
     }
 }
 

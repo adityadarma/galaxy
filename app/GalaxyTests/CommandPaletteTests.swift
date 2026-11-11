@@ -34,6 +34,11 @@ final class CommandPaletteTests: XCTestCase {
         XCTAssertEqual(ids, Set(CommandPaletteView.actions.keys))
     }
 
+    func testRustGeneratedSourceRefreshCommandIsRegistered() {
+        XCTAssertNotNil(CommandPaletteView.actions["galaxy.rust.refreshGeneratedSources"])
+        XCTAssertTrue(CommandPalette().commands().contains { $0.id == "galaxy.rust.refreshGeneratedSources" })
+    }
+
     /// NSWindow implements `toggleSidebar:`, `selectNextTab:` and others
     /// for its own features, and it comes before the controller in the
     /// responder chain, so a same-named action never reached us.

@@ -62,6 +62,7 @@ extension MainWindowController {
             switch action {
             case #selector(showGoToFile(_:)) where workspace == nil: return false
             case #selector(showGoToLine(_:)) where editorView.document == nil: return false
+            case #selector(refreshRustGeneratedSources(_:)) where workspace == nil: return false
             default: break
             }
             let item = NSMenuItem(title: "", action: action, keyEquivalent: "")
@@ -103,6 +104,8 @@ extension MainWindowController {
         if isQuickOpenVisible { closeGoToFile() }
         if isOutlinePickerVisible { closeGoToSymbol() }
         if isGoToLineVisible { closeGoToLine() }
+        if isPHPVersionPickerVisible { closePHPVersionPicker() }
+        if isIndentationPickerVisible { closeIndentationPicker() }
         if isCommandPaletteVisible {
             commandPalette.isHidden = true
         }

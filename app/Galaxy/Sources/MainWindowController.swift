@@ -24,6 +24,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     var documentSymbols: [OutlineSymbol] = []
     var lastDiagnosticsRevision: UInt64?
     var lastSignatureRequest: (path: String, revision: UInt64, line: UInt64, column: UInt64)?
+    var rustGeneratedSourceRefresh: (root: String, id: UUID, automatic: Bool)?
+    var rustCompilerRefreshWorkItem: DispatchWorkItem?
+    var rustCompilerRefreshGeneration = 0
     /// The document in which the user typed since signature help was last
     /// dismissed. Help follows typing, not the caret: a click elsewhere in a
     /// call must not pop it up.
@@ -234,6 +237,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     var loadedOutlinePicker: OutlinePicker?
     var loadedPalette: CommandPaletteView?
     var loadedGitPicker: GitBranchPicker?
+    var loadedPHPVersionPicker: PHPVersionPicker?
+    var loadedIndentationPicker: IndentationPicker?
     var syntaxEvictionTimer: Timer?
     var lspTimer: Timer?
     private var lastProblemsRefresh = Date.distantPast
@@ -482,6 +487,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
         statusBar.onGitClick = { [weak self] in self?.showGitBranchPicker() }
         statusBar.onGitGraphClick = { [weak self] in self?.toggleGitGraph(nil) }
+        statusBar.onLanguageClick = { [weak self] in self?.showPHPAnalyzerTargetMenu() }
+        statusBar.onIndentClick = { [weak self] in self?.showIndentationPicker() }
     }
 
     private func installMemoryPressureHandler() {

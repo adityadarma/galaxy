@@ -46,6 +46,7 @@ extension MainWindowController {
         tabOrderByUse.insert(id, at: 0)
         pathBar.show(tab.pathComponents)
         editorView.document = tab.doc
+        editorView.syncTabSize()
         parameterHintsRequest = nil
         scheduleParameterHints(after: 0)
         refreshDebugMarkers()

@@ -3,6 +3,26 @@ import XCTest
 
 @MainActor
 final class SettingsTests: XCTestCase {
+    func testWorkspaceRustCompilerRefreshDefaultsOffAndParsesEnabled() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-settings-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        XCTAssertNil(GalaxySettings.empty.rustCompilerRefreshEnabled)
+        try #"{"rust":{"compilerRefreshEnabled":true}}"#.write(to: url, atomically: true, encoding: .utf8)
+        XCTAssertEqual(try GalaxySettings.load(from: url).rustCompilerRefreshEnabled, true)
+    }
+
+    func testPHPAnalyzerVersionParsesAndWorkspaceOverridesGlobal() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-settings-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try #"{"php":{"version":"8.1"}}"#.write(to: url, atomically: true, encoding: .utf8)
+        XCTAssertEqual(try GalaxySettings.load(from: url).phpVersion, "8.1")
+        var global = GalaxySettings.empty
+        global.phpVersion = "8.3"
+        var workspace = GalaxySettings.empty
+        workspace.phpVersion = "8.1"
+        XCTAssertEqual(global.merged(with: workspace).phpVersion, "8.1")
+    }
+
     func testWorkspaceSettingsOverrideGlobalEditorValues() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-settings-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

@@ -14,6 +14,7 @@ use super::{Ctx, PhpEngine, is_scope, position_of};
 use crate::lang::{Problem, Severity};
 use crate::php::generics;
 use crate::php::parse::{FileSymbols, doc_tag_type, parse_with_tree, resolve_name};
+use crate::php::version::{PhpVersion, VersionSelection};
 
 const MAX_PROBLEMS: usize = 200;
 /// How many unterminated statements are repaired before giving up.
@@ -53,6 +54,7 @@ impl PhpEngine {
         if root.has_error() {
             return syntax_problems(root, text);
         }
+        compatibility_problems(root, text, self.php_version, &mut out);
         let known = !self.autoload.is_empty();
         let mut verdicts: HashMap<String, bool> = HashMap::new();
         let mut imports: Vec<Node<'_>> = Vec::new();
@@ -306,6 +308,90 @@ impl PhpEngine {
             }
         }
     }
+}
+
+fn compatibility_problems(
+    root: Node<'_>,
+    text: &str,
+    target: VersionSelection,
+    out: &mut Vec<Problem>,
+) {
+    let VersionSelection::Supported(target) = target else {
+        return;
+    };
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+        let feature = match node.kind() {
+            "attribute_list" => Some(("attributes", PhpVersion::V80)),
+            "union_type" => Some(("union types", PhpVersion::V80)),
+            "match_expression" => Some(("match expressions", PhpVersion::V80)),
+            "nullsafe_member_access_expression" | "nullsafe_member_call_expression" => {
+                Some(("nullsafe operator", PhpVersion::V80))
+            }
+            "argument" if node.child_by_field_name("name").is_some() => {
+                Some(("named arguments", PhpVersion::V80))
+            }
+            "enum_declaration" => Some(("enums", PhpVersion::V81)),
+            "intersection_type" => Some(("intersection types", PhpVersion::V81)),
+            "disjunctive_normal_form_type" => Some(("DNF types", PhpVersion::V82)),
+            "property_hook_list" => Some(("property hooks", PhpVersion::V84)),
+            "const_declaration"
+                if is_class_constant(node) && node.child_by_field_name("type").is_some() =>
+            {
+                Some(("typed class constants", PhpVersion::V83))
+            }
+            "readonly_modifier" => readonly_feature(node),
+            _ => None,
+        };
+        let Some((feature, required)) = feature else {
+            continue;
+        };
+        if target < required {
+            out.push(problem(
+                text,
+                node,
+                Severity::Error,
+                format!(
+                    "{} does not support {feature}; requires {}.",
+                    target.display(),
+                    required.display()
+                ),
+                false,
+            ));
+        }
+    }
+}
+
+fn readonly_feature(node: Node<'_>) -> Option<(&'static str, PhpVersion)> {
+    match node.parent()?.kind() {
+        "class_declaration" => Some(("readonly classes", PhpVersion::V82)),
+        "property_declaration" | "property_promotion_parameter" => {
+            Some(("readonly properties", PhpVersion::V81))
+        }
+        _ => None,
+    }
+}
+
+fn is_class_constant(node: Node<'_>) -> bool {
+    let mut parent = node.parent();
+    while let Some(current) = parent {
+        if matches!(
+            current.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "trait_declaration"
+                | "enum_declaration"
+        ) {
+            return true;
+        }
+        if matches!(current.kind(), "program" | "namespace_definition") {
+            return false;
+        }
+        parent = current.parent();
+    }
+    false
 }
 
 /// Message prefix of the problem [`simplifiable_name`] reports. The quick fix
@@ -708,6 +794,83 @@ mod tests {
         let dir = project();
         let text = "<?php\nnamespace App;\n\nuse App\\Models\\User;\nuse Exception;\n\nclass Service\n{\n    public function run(User $user): ?User\n    {\n        try {\n            return new User();\n        } catch (Exception $e) {\n            return null;\n        }\n    }\n}\n";
         assert_eq!(run(dir.path(), text), vec![]);
+    }
+
+    #[test]
+    fn compatibility_diagnostics_cover_newer_php_syntax() {
+        let dir = project();
+        std::fs::write(
+            dir.path().join("composer.json"),
+            r#"{"require":{"php":"8.0"},"autoload":{"psr-4":{"App\\":"app/"}}}"#,
+        )
+        .unwrap();
+        let text = "<?php
+#[Example]
+function run(int|string $value): int|string {
+    return match ($value) { 1 => check(value: $value?->name) };
+}
+enum Status { case Ready; }
+class Record {
+    public readonly int $id;
+    public const string NAME = 'record';
+}
+readonly class Snapshot {}
+class Profile {
+    public string $name { get => $this->name; }
+}
+function accepts((First&Second)|Third $value): void {}
+";
+        let found = run(dir.path(), text);
+        let messages: Vec<_> = found
+            .iter()
+            .filter(|(_, _, severity, message)| {
+                *severity == Severity::Error && message.starts_with("PHP 8.0")
+            })
+            .collect();
+        for (feature, required) in [
+            ("enums", "PHP 8.1"),
+            ("intersection types", "PHP 8.1"),
+            ("readonly properties", "PHP 8.1"),
+            ("readonly classes", "PHP 8.2"),
+            ("DNF types", "PHP 8.2"),
+            ("typed class constants", "PHP 8.3"),
+            ("property hooks", "PHP 8.4"),
+        ] {
+            assert!(
+                messages.iter().any(|(_, _, _, message)| message
+                    == &format!("PHP 8.0 does not support {feature}; requires {required}.")),
+                "missing {feature}: {messages:?}"
+            );
+        }
+        assert!(
+            messages.iter().any(|(line, column, _, message)| {
+                *line == 5 && *column == 0 && message.contains("enums")
+            }),
+            "{messages:?}"
+        );
+    }
+
+    #[test]
+    fn compatibility_diagnostics_accept_supported_syntax() {
+        let dir = project();
+        std::fs::write(
+            dir.path().join("composer.json"),
+            r#"{"require":{"php":"^8.4"},"autoload":{"psr-4":{"App\\":"app/"}}}"#,
+        )
+        .unwrap();
+        let text = "<?php
+#[Example]
+readonly class Record {
+    public const string NAME = 'record';
+    public string $name { get => $this->name; }
+}
+";
+        assert!(
+            run(dir.path(), text)
+                .into_iter()
+                .all(|(_, _, severity, message)| severity != Severity::Error
+                    || !message.starts_with("PHP "))
+        );
     }
 
     #[test]

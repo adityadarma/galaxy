@@ -233,6 +233,12 @@ impl CommandRegistry {
 /// VSCode where it has the same command, so keymaps carry over (M2-10).
 const BUILTIN: &[(&str, &str, &str, &[&str])] = &[
     (
+        "galaxy.rust.refreshGeneratedSources",
+        "Rust",
+        "Refresh Generated Sources",
+        &["cargo", "build script", "proc macro", "out dir"],
+    ),
+    (
         "workbench.action.files.newUntitledFile",
         "File",
         "New File",

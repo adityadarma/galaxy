@@ -54,7 +54,8 @@ extension MainWindowController {
         case 4: "Hint"
         default: "Diagnostic"
         }
-        let contents = "**\(severity)**\n\n\(diagnostic.message)"
+        let origin = [diagnostic.source, diagnostic.code].compactMap { $0 }.joined(separator: " ")
+        let contents = "**\(severity)\(origin.isEmpty ? "" : " [\(origin)]")**\n\n\(diagnostic.message)"
         if hoverShownContents != contents || hoverPopover.isHidden {
             hoverPopover.show(contents)
             hoverPopover.frame = hoverFrame(for: HoverInfo(

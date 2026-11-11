@@ -25,7 +25,9 @@ final class StatusBar: NSView {
     private var clearWorkspaceStatus: DispatchWorkItem?
     let cursor = StatusBar.label("status-cursor")
     let language = StatusBar.label("status-language")
+    var onLanguageClick: (() -> Void)?
     let indent = StatusBar.label("status-indent")
+    var onIndentClick: (() -> Void)?
     let lineEnding = StatusBar.label("status-eol")
     let encoding = StatusBar.label("status-encoding")
 
@@ -76,6 +78,9 @@ final class StatusBar: NSView {
 
         workspaceScan.setAccessibilityLabel("Workspace scan status")
         workspaceScan.isHidden = true
+
+        language.addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(languageClicked(_:))))
+        indent.addGestureRecognizer(NSClickGestureRecognizer(target: self, action: #selector(indentClicked(_:))))
 
         let left = NSStackView(views: [git, gitGraph, workspaceScan, message, largeFileBadge])
         left.spacing = 8
@@ -208,6 +213,8 @@ final class StatusBar: NSView {
 
     @objc private func gitClicked(_ sender: Any?) { onGitClick?() }
     @objc private func gitGraphClicked(_ sender: Any?) { onGitGraphClick?() }
+    @objc private func languageClicked(_ sender: Any?) { onLanguageClick?() }
+    @objc private func indentClicked(_ sender: Any?) { onIndentClick?() }
 
     /// Brighter while the Git Graph tab is showing.
     func setGitGraphVisible(_ visible: Bool) {

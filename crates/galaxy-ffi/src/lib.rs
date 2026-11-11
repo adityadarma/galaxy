@@ -77,6 +77,16 @@ pub enum CoreError {
     Io { message: String },
 }
 
+/// Outcome of an explicitly requested Rust generated-source refresh.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct RustGeneratedSourceRefresh {
+    pub succeeded: bool,
+    pub timed_out: bool,
+    pub canceled: bool,
+    pub compiler_artifacts: u32,
+    pub message: String,
+}
+
 impl std::fmt::Display for CoreError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -777,6 +787,98 @@ impl Core {
         );
     }
 
+    /// Sets the PHP compatibility target for a workspace. An empty value uses
+    /// Composer's platform constraint again.
+    pub fn set_php_target_version(&self, root: String, version: String) -> bool {
+        let root = PathBuf::from(root);
+        let version = if version.is_empty() {
+            None
+        } else {
+            match php::PhpVersion::parse(&version) {
+                Some(version) => Some(version),
+                None => return false,
+            }
+        };
+        let engines = self.php.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(engine) = engines.get(&root) else {
+            return true;
+        };
+        engine
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .set_php_version(version);
+        true
+    }
+
+    /// Runs Cargo only for an explicit UI request, then rebuilds the Rust
+    /// engine so static OUT_DIR include scanning observes fresh output.
+    pub fn refresh_generated_rust_sources(&self, root: String) -> RustGeneratedSourceRefresh {
+        let root = PathBuf::from(root);
+        let result = rust::refresh_generated_sources(&root);
+        if !result.canceled {
+            let mut analysis = self.analysis.lock().unwrap_or_else(|e| e.into_inner());
+            analysis.clear_compiler_diagnostics_under(&file_uri(&root));
+            let mut diagnostics_by_uri: HashMap<String, Vec<LspDiagnostic>> = HashMap::new();
+            let mut actions_by_uri: HashMap<String, Vec<galaxy_core::analysis::CodeActionInfo>> =
+                HashMap::new();
+            for diagnostic in &result.diagnostics {
+                diagnostics_by_uri
+                    .entry(diagnostic.uri.clone())
+                    .or_default()
+                    .push(LspDiagnostic {
+                        uri: diagnostic.uri.clone(),
+                        range: diagnostic.range,
+                        severity: diagnostic.severity,
+                        message: diagnostic.message.clone(),
+                        source: Some("rustc".into()),
+                        code: diagnostic.code.clone(),
+                        unnecessary: false,
+                    });
+                if !diagnostic.actions.is_empty() {
+                    actions_by_uri
+                        .entry(diagnostic.uri.clone())
+                        .or_default()
+                        .extend(diagnostic.actions.clone());
+                }
+            }
+            for (uri, diagnostics) in diagnostics_by_uri {
+                analysis.set_compiler_diagnostics(&uri, diagnostics);
+                analysis.set_compiler_code_actions(
+                    &uri,
+                    actions_by_uri.remove(&uri).unwrap_or_default(),
+                );
+            }
+        }
+        // A failed check can still regenerate build-script output and must not
+        // leave semantic requests pending after an automatic refresh.
+        if !result.canceled && !result.timed_out {
+            let engine = {
+                let mut engines = self.rust.lock().unwrap_or_else(|e| e.into_inner());
+                engines
+                    .entry(root.clone())
+                    .or_insert_with(|| Arc::new(Mutex::new(RustEngine::pending(&root))))
+                    .clone()
+            };
+            let built = RustEngine::build(&root);
+            engine
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .install(built);
+        }
+        RustGeneratedSourceRefresh {
+            succeeded: result.succeeded,
+            timed_out: result.timed_out,
+            canceled: result.canceled,
+            compiler_artifacts: result.compiler_artifacts,
+            message: result.message,
+        }
+    }
+
+    /// Cancels an explicitly requested Cargo refresh for this workspace.
+    pub fn cancel_generated_rust_source_refresh(&self, root: String) -> bool {
+        rust::cancel_generated_source_refresh(&PathBuf::from(root))
+    }
+
     /// Applies source changes directly. Only project metadata that can change
     /// module resolution needs a full workspace snapshot rebuild.
     pub fn apply_workspace_changes(&self, root: String, paths: Vec<String>, rescan: bool) {
@@ -998,6 +1100,8 @@ impl Core {
                         galaxy_core::analysis::DiagnosticSeverity::Hint => 4,
                     },
                     message: diagnostic.message.clone(),
+                    source: diagnostic.source.clone(),
+                    code: diagnostic.code.clone(),
                     unnecessary: diagnostic.unnecessary,
                 })
                 .collect();
@@ -1705,11 +1809,9 @@ impl Core {
                         .collect(),
                 })
                 .collect();
-            let answered = !actions.is_empty();
-            self.analysis
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .set_code_actions(&uri, actions);
+            let mut analysis = self.analysis.lock().unwrap_or_else(|e| e.into_inner());
+            let answered = !actions.is_empty() || !analysis.code_actions(&uri).is_empty();
+            analysis.set_code_actions(&uri, actions);
             return answered;
         }
         false
@@ -6634,6 +6736,8 @@ pub struct DiagnosticInfo {
     /// LSP severity: 1 error, 2 warning, 3 information, 4 hint.
     pub severity: u8,
     pub message: String,
+    pub source: Option<String>,
+    pub code: Option<String>,
     /// LSP `Unnecessary` tag: unused code, drawn faded.
     pub unnecessary: bool,
 }

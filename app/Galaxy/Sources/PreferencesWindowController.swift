@@ -37,7 +37,7 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
     }
     private var editorControls: [NSControl] {
         [tabSizePopup, insertSpacesBox, whitespacePopup, parameterHintsBox, autoClosingTagsBox, linkedEditingBox,
-         autoSavePopup, autoSaveDelay, gitBlameBox] + excludeBoxes
+          autoSavePopup, autoSaveDelay, gitBlameBox] + excludeBoxes
     }
 
     // View tab: the same switches as the View menu.

@@ -82,12 +82,13 @@ extension MainWindowController {
                     self.scheduleParameterHints(after: 0)
                     return
                 }
-                self.editorView.setInlineHints(hints)
                 if answer.lines.isEmpty {
                     self.parameterHintsRequest?.empty = true
                     if !self.parameterHintsRetried {
                         self.scheduleParameterHints(after: Self.parameterHintsRetry + 0.1)
                     }
+                } else {
+                    self.editorView.setInlineHints(hints)
                 }
             }
         }

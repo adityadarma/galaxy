@@ -815,6 +815,8 @@ fn diagnostics_are_clipped_to_visible_utf16_lines() {
         end_character: 2,
         severity: 1,
         message: "bad".into(),
+        source: None,
+        code: None,
         unnecessary: false,
     }]);
     let snap = doc.viewport(0, 2);
@@ -904,6 +906,8 @@ fn unnecessary_flag_reaches_the_viewport() {
         end_character: 8,
         severity: 4,
         message: "unused".into(),
+        source: None,
+        code: None,
         unnecessary: true,
     }]);
     let span = doc.viewport(0, 1).lines[0].diagnostics[0].clone();

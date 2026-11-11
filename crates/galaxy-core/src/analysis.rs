@@ -95,6 +95,7 @@ pub struct DocumentSymbolInfo {
 #[derive(Debug, Default)]
 pub struct BuiltinStore {
     diagnostics: std::collections::HashMap<String, Vec<Diagnostic>>,
+    compiler_diagnostics: std::collections::HashMap<String, Vec<Diagnostic>>,
     hover: std::collections::HashMap<String, HoverInfo>,
     completion: std::collections::HashMap<String, Vec<CompletionItem>>,
     definitions: std::collections::HashMap<String, Vec<DefinitionLocation>>,
@@ -102,6 +103,7 @@ pub struct BuiltinStore {
     rename_edits: std::collections::HashMap<String, Vec<RenameEdit>>,
     signatures: std::collections::HashMap<String, SignatureInfo>,
     code_actions: std::collections::HashMap<String, Vec<CodeActionInfo>>,
+    compiler_code_actions: std::collections::HashMap<String, Vec<CodeActionInfo>>,
     document_symbols: std::collections::HashMap<String, Vec<DocumentSymbolInfo>>,
 }
 
@@ -110,6 +112,7 @@ impl BuiltinStore {
     /// them would show diagnostics and navigation results from the old root.
     pub fn clear(&mut self) {
         self.diagnostics.clear();
+        self.compiler_diagnostics.clear();
         self.hover.clear();
         self.completion.clear();
         self.definitions.clear();
@@ -117,16 +120,28 @@ impl BuiltinStore {
         self.rename_edits.clear();
         self.signatures.clear();
         self.code_actions.clear();
+        self.compiler_code_actions.clear();
         self.document_symbols.clear();
     }
 
-    pub fn diagnostics(&self, uri: &str) -> &[Diagnostic] {
-        self.diagnostics.get(uri).map(Vec::as_slice).unwrap_or(&[])
+    pub fn diagnostics(&self, uri: &str) -> Vec<Diagnostic> {
+        self.diagnostics
+            .get(uri)
+            .into_iter()
+            .chain(self.compiler_diagnostics.get(uri))
+            .flatten()
+            .cloned()
+            .collect()
     }
 
     /// Every problem in every document, ordered by file, position, severity.
     pub fn problems(&self) -> Vec<&Diagnostic> {
-        let mut out: Vec<_> = self.diagnostics.values().flatten().collect();
+        let mut out: Vec<_> = self
+            .diagnostics
+            .values()
+            .chain(self.compiler_diagnostics.values())
+            .flatten()
+            .collect();
         out.sort_by_key(|d| {
             (
                 &d.uri,
@@ -151,10 +166,31 @@ impl BuiltinStore {
         true
     }
 
+    /// Replaces diagnostics reported by an external compiler. Static engines
+    /// continue to own their normal channel, so indexing cannot erase rustc.
+    pub fn set_compiler_diagnostics(&mut self, uri: &str, diagnostics: Vec<Diagnostic>) -> bool {
+        if diagnostics.is_empty() {
+            return self.compiler_diagnostics.remove(uri).is_some();
+        }
+        if self.compiler_diagnostics.get(uri) == Some(&diagnostics) {
+            return false;
+        }
+        self.compiler_diagnostics
+            .insert(uri.to_owned(), diagnostics);
+        true
+    }
+
     /// Drops diagnostics matching a workspace URI prefix. Workspace scanners
     /// use this to replace provisional open-document results atomically.
     pub fn clear_diagnostics_under(&mut self, uri_prefix: &str) {
         self.diagnostics
+            .retain(|uri, _| !uri.starts_with(uri_prefix));
+    }
+
+    pub fn clear_compiler_diagnostics_under(&mut self, uri_prefix: &str) {
+        self.compiler_diagnostics
+            .retain(|uri, _| !uri.starts_with(uri_prefix));
+        self.compiler_code_actions
             .retain(|uri, _| !uri.starts_with(uri_prefix));
     }
 
@@ -212,12 +248,26 @@ impl BuiltinStore {
         };
     }
 
-    pub fn code_actions(&self, uri: &str) -> &[CodeActionInfo] {
-        self.code_actions.get(uri).map(Vec::as_slice).unwrap_or(&[])
+    pub fn code_actions(&self, uri: &str) -> Vec<CodeActionInfo> {
+        self.code_actions
+            .get(uri)
+            .into_iter()
+            .chain(self.compiler_code_actions.get(uri))
+            .flatten()
+            .cloned()
+            .collect()
     }
 
     pub fn set_code_actions(&mut self, uri: &str, actions: Vec<CodeActionInfo>) {
         self.code_actions.insert(uri.to_owned(), actions);
+    }
+
+    pub fn set_compiler_code_actions(&mut self, uri: &str, actions: Vec<CodeActionInfo>) {
+        if actions.is_empty() {
+            self.compiler_code_actions.remove(uri);
+        } else {
+            self.compiler_code_actions.insert(uri.to_owned(), actions);
+        }
     }
 
     pub fn document_symbols(&self, uri: &str) -> &[DocumentSymbolInfo] {
@@ -234,6 +284,7 @@ impl BuiltinStore {
     /// Forgets everything stored for `uri` (the document was closed).
     pub fn forget(&mut self, uri: &str) {
         self.diagnostics.remove(uri);
+        self.compiler_diagnostics.remove(uri);
         self.hover.remove(uri);
         self.completion.remove(uri);
         self.definitions.remove(uri);
@@ -241,6 +292,7 @@ impl BuiltinStore {
         self.rename_edits.remove(uri);
         self.signatures.remove(uri);
         self.code_actions.remove(uri);
+        self.compiler_code_actions.remove(uri);
         self.document_symbols.remove(uri);
     }
 }
@@ -308,5 +360,14 @@ mod tests {
         store.forget("file:///a.php");
         assert!(store.hover("file:///a.php").is_none());
         assert!(store.problems().is_empty());
+    }
+
+    #[test]
+    fn compiler_overlay_survives_static_updates() {
+        let mut store = BuiltinStore::default();
+        store.set_diagnostics("file:///a.php", vec![problem("static")]);
+        store.set_compiler_diagnostics("file:///a.php", vec![problem("compiler")]);
+        store.set_diagnostics("file:///a.php", vec![problem("updated static")]);
+        assert_eq!(store.diagnostics("file:///a.php").len(), 2);
     }
 }

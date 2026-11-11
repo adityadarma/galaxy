@@ -19,6 +19,10 @@ struct GalaxySettings: Equatable {
     /// `files.exclude` as written in the file: glob to on/off. Entries are
     /// layered over `defaultFilesExclude`, so `false` turns a default off.
     var filesExclude: [String: Bool]? = nil
+    /// Allows the explicit Rust refresh command to run Cargo in this workspace.
+    var rustCompilerRefreshEnabled: Bool? = nil
+    /// PHP 8.x compatibility target; nil follows Composer or PHP 8.5.
+    var phpVersion: String? = nil
 
     /// VSCode's defaults, plus the Flutter folders.
     static let defaultFilesExclude: [String] = [
@@ -40,7 +44,9 @@ struct GalaxySettings: Equatable {
             gitBlame: override.gitBlame ?? gitBlame,
             inlineParameterHints: override.inlineParameterHints ?? inlineParameterHints,
             filesExclude: filesExclude.map { $0.merging(override.filesExclude ?? [:]) { _, new in new } }
-                ?? override.filesExclude
+                ?? override.filesExclude,
+            rustCompilerRefreshEnabled: override.rustCompilerRefreshEnabled ?? rustCompilerRefreshEnabled,
+            phpVersion: override.phpVersion ?? phpVersion
         )
     }
 
@@ -69,6 +75,8 @@ struct GalaxySettings: Equatable {
         }
         let editor = root["editor"] as? [String: Any] ?? root
         let files = root["files"] as? [String: Any] ?? [:]
+        let rust = root["rust"] as? [String: Any] ?? [:]
+        let php = root["php"] as? [String: Any] ?? [:]
         let insertSpaces = editor["insertSpaces"] as? Bool
         let tabSize: UInt32?
         if let number = editor["tabSize"] as? NSNumber, number.intValue > 0 {
@@ -99,9 +107,11 @@ struct GalaxySettings: Equatable {
                               renderWhitespace: renderWhitespace,
                               autoClosingTags: editor["autoClosingTags"] as? Bool,
                               linkedEditing: editor["linkedEditing"] as? Bool,
-                              gitBlame: editor["gitBlame"] as? Bool,
-                              inlineParameterHints: editor["inlineParameterHints"] as? Bool,
-                              filesExclude: filesExclude)
+                               gitBlame: editor["gitBlame"] as? Bool,
+                               inlineParameterHints: editor["inlineParameterHints"] as? Bool,
+                               filesExclude: filesExclude,
+                                rustCompilerRefreshEnabled: rust["compilerRefreshEnabled"] as? Bool,
+                                phpVersion: (php["version"] as? String).flatMap { $0.isEmpty ? nil : $0 })
     }
 
     static func completionItems() -> [CompletionInfo] {

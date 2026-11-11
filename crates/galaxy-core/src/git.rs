@@ -1,6 +1,6 @@
 //! Read-only Git state for workspace UI (M6-01).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -941,12 +941,14 @@ pub struct DiffHunk {
     pub new_len: usize,
 }
 
-/// Longest middle section (old lines x new lines) compared line by line.
-/// Beyond it the whole middle is reported as one replaced hunk.
-const MAX_DIFF_CELLS: usize = 4_000_000;
+/// Myers keeps a full frontier for each edit distance to make backtracking
+/// possible. Bound that storage and fall back to one hunk when it is exceeded.
+const MAX_DIFF_TRACE_CELLS: usize = 4_000_000;
+const MAX_DIFF_LINES: usize = 200_000;
 
 /// Changed regions turning `old` into `new`. Common leading and trailing
-/// lines are skipped first, so the quadratic part only sees what changed.
+/// lines are skipped first. Patience anchors keep repeated source-code
+/// sections aligned before Myers finds the remaining changed regions.
 pub fn diff_hunks(old: &str, new: &str) -> Vec<DiffHunk> {
     let old: Vec<&str> = old.lines().collect();
     let new: Vec<&str> = new.lines().collect();
@@ -968,55 +970,212 @@ pub fn diff_hunks(old: &str, new: &str) -> Vec<DiffHunk> {
         new_start: prefix,
         new_len: b.len(),
     };
-    if a.is_empty() || b.is_empty() || a.len().saturating_mul(b.len()) > MAX_DIFF_CELLS {
-        return vec![whole];
-    }
-
-    let width = b.len() + 1;
-    let mut lcs = vec![0u16; (a.len() + 1) * width];
-    for i in (0..a.len()).rev() {
-        for j in (0..b.len()).rev() {
-            lcs[i * width + j] = if a[i] == b[j] {
-                lcs[(i + 1) * width + j + 1] + 1
-            } else {
-                lcs[(i + 1) * width + j].max(lcs[i * width + j + 1])
-            };
-        }
-    }
-
     let mut hunks = Vec::new();
-    let (mut i, mut j) = (0, 0);
-    let mut open: Option<(usize, usize)> = None;
-    let close = |hunks: &mut Vec<DiffHunk>, (os, ns): (usize, usize), i: usize, j: usize| {
-        hunks.push(DiffHunk {
-            old_start: prefix + os,
-            old_len: i - os,
-            new_start: prefix + ns,
-            new_len: j - ns,
-        });
-    };
-    while i < a.len() || j < b.len() {
-        if i < a.len() && j < b.len() && a[i] == b[j] {
-            if let Some(start) = open.take() {
-                close(&mut hunks, start, i, j);
-            }
-            i += 1;
-            j += 1;
-        } else {
-            open.get_or_insert((i, j));
-            let take_new =
-                j < b.len() && (i == a.len() || lcs[i * width + j + 1] >= lcs[(i + 1) * width + j]);
-            if take_new {
-                j += 1;
-            } else {
-                i += 1;
-            }
-        }
-    }
-    if let Some(start) = open.take() {
-        close(&mut hunks, start, i, j);
+    let (mut old_at, mut new_at) = (0, 0);
+    for (old_anchor, new_anchor) in patience_anchors(a, b)
+        .into_iter()
+        .chain(std::iter::once((a.len(), b.len())))
+    {
+        let Some(mut changed) = myers_hunks(
+            &a[old_at..old_anchor],
+            &b[new_at..new_anchor],
+            prefix + old_at,
+            prefix + new_at,
+        ) else {
+            return vec![whole];
+        };
+        hunks.append(&mut changed);
+        old_at = old_anchor.saturating_add(1);
+        new_at = new_anchor.saturating_add(1);
     }
     hunks
+}
+
+#[derive(Clone, Copy)]
+enum DiffOp {
+    Equal,
+    Delete,
+    Insert,
+}
+
+/// Lines unique on both sides are reliable anchors. Select their longest
+/// increasing sequence so moved lines do not cross.
+fn patience_anchors(old: &[&str], new: &[&str]) -> Vec<(usize, usize)> {
+    if old.len().saturating_add(new.len()) > MAX_DIFF_LINES {
+        return Vec::new();
+    }
+    let old_positions = line_positions(old);
+    let new_positions = line_positions(new);
+    let pairs: Vec<_> = old_positions
+        .iter()
+        .filter_map(|(&line, &(old_count, old_index))| {
+            let &(new_count, new_index) = new_positions.get(line)?;
+            (old_count == 1 && new_count == 1).then_some((old_index, new_index))
+        })
+        .collect();
+    let mut pairs = pairs;
+    pairs.sort_unstable();
+
+    let mut tails = Vec::new();
+    let mut previous = vec![None; pairs.len()];
+    for (index, &(_, new_index)) in pairs.iter().enumerate() {
+        let slot = tails.partition_point(|&tail: &usize| pairs[tail].1 < new_index);
+        if slot > 0 {
+            previous[index] = Some(tails[slot - 1]);
+        }
+        if slot == tails.len() {
+            tails.push(index);
+        } else {
+            tails[slot] = index;
+        }
+    }
+    let mut anchors = Vec::with_capacity(tails.len());
+    let mut current = tails.last().copied();
+    while let Some(index) = current {
+        anchors.push(pairs[index]);
+        current = previous[index];
+    }
+    anchors.reverse();
+    anchors
+}
+
+fn line_positions<'a>(lines: &[&'a str]) -> HashMap<&'a str, (usize, usize)> {
+    let mut result = HashMap::new();
+    for (index, &line) in lines.iter().enumerate() {
+        let entry = result.entry(line).or_insert((0usize, index));
+        entry.0 += 1;
+    }
+    result
+}
+
+fn myers_hunks(
+    old: &[&str],
+    new: &[&str],
+    old_start: usize,
+    new_start: usize,
+) -> Option<Vec<DiffHunk>> {
+    if old.is_empty() && new.is_empty() {
+        return Some(Vec::new());
+    }
+    if old.is_empty() || new.is_empty() {
+        return Some(vec![DiffHunk {
+            old_start,
+            old_len: old.len(),
+            new_start,
+            new_len: new.len(),
+        }]);
+    }
+    let max = old.len().checked_add(new.len())?;
+    if max > MAX_DIFF_LINES {
+        return None;
+    }
+    let width = max.checked_mul(2)?.checked_add(1)?;
+    let offset = max as isize;
+    let mut frontier = vec![0i32; width];
+    let mut trace = Vec::new();
+    let mut final_distance = None;
+    for distance in 0..=max {
+        if width.saturating_mul(trace.len().saturating_add(1)) > MAX_DIFF_TRACE_CELLS {
+            return None;
+        }
+        for diagonal in (-(distance as isize)..=distance as isize).step_by(2) {
+            let index = (offset + diagonal) as usize;
+            let mut x = if diagonal == -(distance as isize)
+                || (diagonal != distance as isize && frontier[index - 1] < frontier[index + 1])
+            {
+                frontier[index + 1]
+            } else {
+                frontier[index - 1] + 1
+            };
+            let mut y = x - diagonal as i32;
+            while x < old.len() as i32 && y < new.len() as i32 && old[x as usize] == new[y as usize]
+            {
+                x += 1;
+                y += 1;
+            }
+            frontier[index] = x;
+            if x == old.len() as i32 && y == new.len() as i32 {
+                final_distance = Some(distance);
+                break;
+            }
+        }
+        trace.push(frontier.clone());
+        if final_distance.is_some() {
+            break;
+        }
+    }
+    let distance = final_distance?;
+    let (mut x, mut y) = (old.len() as i32, new.len() as i32);
+    let mut reversed = Vec::with_capacity(max);
+    for current_distance in (1..=distance).rev() {
+        let previous = &trace[current_distance - 1];
+        let diagonal = x - y;
+        let index = (offset + diagonal as isize) as usize;
+        let previous_diagonal = if diagonal == -(current_distance as i32)
+            || (diagonal != current_distance as i32 && previous[index - 1] < previous[index + 1])
+        {
+            diagonal + 1
+        } else {
+            diagonal - 1
+        };
+        let previous_x = previous[(offset + previous_diagonal as isize) as usize];
+        let previous_y = previous_x - previous_diagonal;
+        while x > previous_x && y > previous_y {
+            reversed.push(DiffOp::Equal);
+            x -= 1;
+            y -= 1;
+        }
+        if x == previous_x {
+            reversed.push(DiffOp::Insert);
+            y -= 1;
+        } else {
+            reversed.push(DiffOp::Delete);
+            x -= 1;
+        }
+    }
+    while x > 0 && y > 0 {
+        reversed.push(DiffOp::Equal);
+        x -= 1;
+        y -= 1;
+    }
+    reversed.reverse();
+
+    let (mut old_at, mut new_at) = (old_start, new_start);
+    let mut open = None;
+    let mut hunks = Vec::new();
+    for operation in reversed {
+        match operation {
+            DiffOp::Equal => {
+                if let Some((old_hunk_start, new_hunk_start)) = open.take() {
+                    hunks.push(DiffHunk {
+                        old_start: old_hunk_start,
+                        old_len: old_at - old_hunk_start,
+                        new_start: new_hunk_start,
+                        new_len: new_at - new_hunk_start,
+                    });
+                }
+                old_at += 1;
+                new_at += 1;
+            }
+            DiffOp::Delete => {
+                open.get_or_insert((old_at, new_at));
+                old_at += 1;
+            }
+            DiffOp::Insert => {
+                open.get_or_insert((old_at, new_at));
+                new_at += 1;
+            }
+        }
+    }
+    if let Some((old_hunk_start, new_hunk_start)) = open {
+        hunks.push(DiffHunk {
+            old_start: old_hunk_start,
+            old_len: old_at - old_hunk_start,
+            new_start: new_hunk_start,
+            new_len: new_at - new_hunk_start,
+        });
+    }
+    Some(hunks)
 }
 
 /// The file's content at `HEAD`, or `None` when HEAD has no such file (new,
@@ -1536,6 +1695,20 @@ mod tests {
         // New file and emptied file.
         assert_eq!(hunks("", "a\nb\n"), [(0, 0, 0, 2)]);
         assert_eq!(hunks("a\nb\n", ""), [(0, 2, 0, 0)]);
+    }
+
+    #[test]
+    fn diff_hunks_keeps_struct_fields_after_an_insertion_unchanged() {
+        let old = "struct Package {\n    name: String,\n    version: String,\n    description: String,\n}\n";
+        let new = "struct Package {\n    name: String,\n    crate_name: String,\n    version: String,\n    description: String,\n}\n";
+        assert_eq!(hunks(old, new), [(2, 0, 2, 1)]);
+    }
+
+    #[test]
+    fn diff_hunks_aligns_repeated_lines_with_patience_anchors() {
+        let old = "fn first() {\n    log();\n}\n\nfn second() {\n    log();\n}\n";
+        let new = "fn first() {\n    log();\n}\n\nfn inserted() {\n    log();\n}\n\nfn second() {\n    log();\n}\n";
+        assert_eq!(hunks(old, new), [(4, 0, 4, 4)]);
     }
 
     #[test]

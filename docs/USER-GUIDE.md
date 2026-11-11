@@ -96,6 +96,22 @@ the engine reads GOROOT and the module cache for standard packages and
 dependencies. Modules that have not been downloaded with `go mod download`
 have no completion or definition data.
 
+For Rust projects, `Rust: Refresh Generated Sources` in the Command Palette
+updates local `OUT_DIR` sources and then rebuilds the static Rust index. The
+first use requires workspace opt-in because it runs `cargo check --workspace
+--all-targets --offline`; Cargo build scripts and procedural macros may execute
+workspace or dependency code. The setting is stored as
+`rust.compilerRefreshEnabled` in `.galaxy/settings.json`. Run the command again
+while it is active to cancel Cargo. Static navigation otherwise does not run
+Cargo, build scripts, or macro expansion.
+
+When that setting is enabled, saving a Rust source file waits 1.5 seconds and
+runs the same Cargo check in the background. It never runs while typing.
+Compiler diagnostics appear with source `rustc` alongside Galaxy's static
+diagnostics, and machine-applicable same-file rustc suggestions appear in Code
+Actions. The check uses the saved file contents; Cargo can still run build
+scripts and procedural macros.
+
 ## Terminal
 
 - `Cmd+J`: open or close the terminal.
@@ -140,3 +156,22 @@ Workspace settings are stored at:
 ```
 
 Workspace settings override global settings.
+
+### PHP Compatibility
+
+Galaxy includes an offline PHP compatibility analyzer for PHP 8.0 through 8.5.
+With a PHP file open, click `PHP` in the status bar to choose the target version,
+or set it per workspace:
+
+```json
+{
+  "php": {
+    "version": "8.1"
+  }
+}
+```
+
+`php.version` overrides Composer's `config.platform.php`; without either,
+Galaxy targets PHP 8.5. Features introduced after the target version appear as
+errors. The built-in analyzer currently checks language compatibility, syntax,
+imports, and selected type issues without running PHP or an external tool.

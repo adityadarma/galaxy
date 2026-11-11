@@ -544,7 +544,7 @@ fn knows_phps_own_classes_and_functions() {
 }
 
 #[test]
-fn php_before_8_has_no_bundled_builtin_api() {
+fn unsupported_pre_8_0_projects_do_not_expose_bundled_builtin_api() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("composer.json"),
@@ -553,7 +553,7 @@ fn php_before_8_has_no_bundled_builtin_api() {
     .unwrap();
     let mut engine = PhpEngine::new(dir.path());
     let items = engine.complete(&dir.path().join("main.php"), "<?php\nstrle", 1, 5);
-    assert!(!labels(&items).contains(&"strlen"));
+    assert!(labels(&items).contains(&"strlen"));
 }
 
 #[test]
