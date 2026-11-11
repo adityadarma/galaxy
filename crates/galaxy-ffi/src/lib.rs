@@ -1360,6 +1360,28 @@ impl Core {
                         }
                     })
                     .unwrap_or_default()
+            } else if is_dart_path(file) {
+                self.dart_engine(file)
+                    .map(|engine| {
+                        let engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                        if engine.is_ready() {
+                            engine.parameter_hints(file, &text, first, last)
+                        } else {
+                            Vec::new()
+                        }
+                    })
+                    .unwrap_or_default()
+            } else if is_go_path(file) {
+                self.go_engine(file)
+                    .map(|engine| {
+                        let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
+                        if engine.is_ready() {
+                            engine.parameter_hints(file, &text, first, last)
+                        } else {
+                            Vec::new()
+                        }
+                    })
+                    .unwrap_or_default()
             } else if is_php_path(file) {
                 self.php_engine(file)
                     .map(|engine| {
@@ -2991,7 +3013,13 @@ impl Core {
             first as usize,
             last as usize,
         );
-        if calls.is_empty() {
+        let variables = calls::variable_sites(
+            Path::new(&index_path),
+            &source,
+            first as usize,
+            last as usize,
+        );
+        if calls.is_empty() && variables.is_empty() {
             return Vec::new();
         }
         let uri = file_uri(Path::new(path));
@@ -2999,6 +3027,54 @@ impl Core {
         // Target files read once per request: (parse path, source).
         let mut targets: HashMap<String, Option<(String, String)>> = HashMap::new();
         let mut out = Vec::new();
+        for site in variables {
+            let label = match site.source {
+                calls::VariableType::Literal(name) => name.to_owned(),
+                calls::VariableType::Call {
+                    line,
+                    column,
+                    awaited,
+                } => {
+                    let locations = self.typescript_targets(
+                        path,
+                        text,
+                        &uri,
+                        &index,
+                        line as u64,
+                        column as u64,
+                    );
+                    // A name with several definitions has no single type.
+                    let [location] = locations.as_slice() else {
+                        continue;
+                    };
+                    let Some((target_path, target_source)) = Self::typescript_target_source(
+                        &mut targets,
+                        location,
+                        &uri,
+                        &index_path,
+                        &source,
+                    ) else {
+                        continue;
+                    };
+                    let Some(written) = calls::return_type_at(
+                        Path::new(target_path.as_str()),
+                        target_source,
+                        location.range.start_line as usize,
+                        location.range.start_character as usize,
+                        awaited,
+                    ) else {
+                        continue;
+                    };
+                    written
+                }
+            };
+            out.push(parameter_hints::ParameterHint {
+                line: site.line as u32,
+                column: site.column as u32,
+                label: format!(": {label}"),
+                return_type: false,
+            });
+        }
         for call in calls.into_iter().take(parameter_hints::MAX_CALLS) {
             let locations = self.typescript_targets(
                 path,
@@ -3011,18 +3087,9 @@ impl Core {
             let Some(location) = locations.first() else {
                 continue;
             };
-            let target = targets.entry(location.uri.clone()).or_insert_with(|| {
-                if location.uri == uri {
-                    return Some((index_path.clone(), source.clone()));
-                }
-                let target = location.uri.strip_prefix("file://")?;
-                let target_text = std::fs::read_to_string(target).ok()?;
-                Some((
-                    typescript_index_path(target),
-                    component_virtual_source(target, &target_text),
-                ))
-            });
-            let Some((target_path, target_source)) = target else {
+            let Some((target_path, target_source)) =
+                Self::typescript_target_source(&mut targets, location, &uri, &index_path, &source)
+            else {
                 continue;
             };
             if let Some(parameters) = calls::parameters_at(
@@ -3037,6 +3104,31 @@ impl Core {
         out.sort_by_key(|hint| (hint.line, hint.column));
         out.dedup_by_key(|hint| (hint.line, hint.column));
         out
+    }
+
+    /// Parse path and script source of the file holding `location`, read once
+    /// per request into `targets`.
+    fn typescript_target_source<'a>(
+        targets: &'a mut HashMap<String, Option<(String, String)>>,
+        location: &LspDefinitionLocation,
+        uri: &str,
+        index_path: &str,
+        source: &str,
+    ) -> Option<&'a (String, String)> {
+        targets
+            .entry(location.uri.clone())
+            .or_insert_with(|| {
+                if location.uri == uri {
+                    return Some((index_path.to_owned(), source.to_owned()));
+                }
+                let target = location.uri.strip_prefix("file://")?;
+                let target_text = std::fs::read_to_string(target).ok()?;
+                Some((
+                    typescript_index_path(target),
+                    component_virtual_source(target, &target_text),
+                ))
+            })
+            .as_ref()
     }
 
     /// Go to Definition targets of the script position `line`/`character`,

@@ -123,3 +123,24 @@ fn unsaved_text_wins_over_the_disk() {
     engine.diagnostics(&file, &edited);
     assert_eq!(engine.open_text(&file).as_deref(), Some(edited.as_str()));
 }
+
+#[test]
+fn hints_name_arguments_and_type_new_variables() {
+    let (_tmp, mut engine, file) = project();
+    let hints = engine.parameter_hints(&file, MAIN, 0, 20);
+    let seen: Vec<(u32, u32, &str)> = hints
+        .iter()
+        .map(|hint| (hint.line, hint.column, hint.label.as_str()))
+        .collect();
+    let (var_line, var_column) = at(MAIN, "u := ", 1);
+    let (call_line, hi) = at(MAIN, "\"hi\"", 0);
+    let (_, one) = at(MAIN, "1)\n}", 0);
+    assert_eq!(
+        seen,
+        vec![
+            (var_line, var_column, ": *User"),
+            (call_line, hi, "greeting:"),
+            (call_line, one, "times:"),
+        ]
+    );
+}

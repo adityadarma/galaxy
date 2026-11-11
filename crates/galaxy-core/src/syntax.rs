@@ -879,6 +879,55 @@ pub fn style_runs_for_viewport(
     } else {
         rope.line_to_byte(last)
     };
+    if cached_highlight_query(language).is_none() {
+        return Vec::new();
+    }
+    let mut spans = collect_style_spans(rope, tree, language, start_byte, end_byte);
+    // The window starts mid-file, so brackets opened above it still count.
+    // Without them a nesting level changes color as the window scrolls.
+    let outer = open_brackets_before(rope, tree, language, start_byte);
+    rainbow_brackets(rope, &mut spans, &outer);
+    // Tree-sitter does not guarantee that a broad fallback capture precedes a
+    // semantic capture of the same token. Apply the generic variable color
+    // first so the renderer lets the more specific scope win.
+    spans.sort_by_key(|(start, end, scope)| (*start, *end, highlight_priority(*scope)));
+    let mut runs = Vec::new();
+    for (start, end, scope) in spans {
+        let start_char = rope.byte_to_char(start);
+        let end_char = rope.byte_to_char(end);
+        let start_line = rope.char_to_line(start_char);
+        let end_line = rope.char_to_line(end_char);
+        for line in start_line..=end_line.min(last - 1) {
+            let line_start = rope.line_to_char(line);
+            let line_end = doc
+                .line_end_char(line)
+                .min(line_start + crate::viewport::MAX_LINE_DISPLAY_CHARS);
+            let from = start_char.max(line_start);
+            let to = end_char.min(line_end);
+            if from < to {
+                let base = rope.char_to_utf16_cu(line_start);
+                runs.push(StyleRun {
+                    line,
+                    start: rope.char_to_utf16_cu(from) - base,
+                    end: rope.char_to_utf16_cu(to) - base,
+                    scope,
+                });
+            }
+        }
+    }
+    runs.sort_by_key(|run| (run.line, run.start, run.end));
+    runs
+}
+
+/// Every highlight span of `start_byte..end_byte`, before bracket pairs are
+/// colored: the grammar's captures and the overlays of embedded languages.
+fn collect_style_spans(
+    rope: &Rope,
+    tree: &Tree,
+    language: SyntaxLanguage,
+    start_byte: usize,
+    end_byte: usize,
+) -> Vec<(usize, usize, HighlightScope)> {
     let Some(query) = cached_highlight_query(language) else {
         return Vec::new();
     };
@@ -946,37 +995,7 @@ pub fn style_runs_for_viewport(
     if language == SyntaxLanguage::Php && tree.root_node().has_error() {
         recover_php_errors(rope, tree, start_byte, end_byte, &mut spans);
     }
-    rainbow_brackets(rope, &mut spans);
-    // Tree-sitter does not guarantee that a broad fallback capture precedes a
-    // semantic capture of the same token. Apply the generic variable color
-    // first so the renderer lets the more specific scope win.
-    spans.sort_by_key(|(start, end, scope)| (*start, *end, highlight_priority(*scope)));
-    let mut runs = Vec::new();
-    for (start, end, scope) in spans {
-        let start_char = rope.byte_to_char(start);
-        let end_char = rope.byte_to_char(end);
-        let start_line = rope.char_to_line(start_char);
-        let end_line = rope.char_to_line(end_char);
-        for line in start_line..=end_line.min(last - 1) {
-            let line_start = rope.line_to_char(line);
-            let line_end = doc
-                .line_end_char(line)
-                .min(line_start + crate::viewport::MAX_LINE_DISPLAY_CHARS);
-            let from = start_char.max(line_start);
-            let to = end_char.min(line_end);
-            if from < to {
-                let base = rope.char_to_utf16_cu(line_start);
-                runs.push(StyleRun {
-                    line,
-                    start: rope.char_to_utf16_cu(from) - base,
-                    end: rope.char_to_utf16_cu(to) - base,
-                    scope,
-                });
-            }
-        }
-    }
-    runs.sort_by_key(|run| (run.line, run.start, run.end));
-    runs
+    spans
 }
 
 /// Tree-sitter can put a long valid tail inside `ERROR` after one missing
@@ -1030,7 +1049,7 @@ fn recover_php_errors(
         // Pair brackets before clipping to the viewport. Otherwise a closing
         // bracket whose opener scrolled above the window loses its rainbow
         // scope and appears as plain punctuation.
-        rainbow_brackets(rope, &mut recovered);
+        let _ = rainbow_brackets(rope, &mut recovered, &[]);
         spans.extend(
             recovered
                 .into_iter()
@@ -1162,17 +1181,36 @@ fn recover_php_range(
 
 /// Color matching bracket pairs by nesting level while leaving every other
 /// punctuation token on the theme's ordinary punctuation color.
-fn rainbow_brackets(rope: &Rope, spans: &mut [(usize, usize, HighlightScope)]) {
+///
+/// `outer` lists the brackets already open where `spans` begin, outermost
+/// first, as their closing characters.
+///
+/// Returns the closing characters of the brackets still open after the last
+/// span, outermost first.
+fn rainbow_brackets(
+    rope: &Rope,
+    spans: &mut [(usize, usize, HighlightScope)],
+    outer: &[u8],
+) -> Vec<u8> {
     spans.sort_by_key(|(start, end, scope)| (*start, *end, highlight_priority(*scope)));
-    let mut stack = Vec::new();
+    let mut stack: Vec<(u8, HighlightScope)> = outer
+        .iter()
+        .enumerate()
+        .map(|(depth, marker)| (*marker, rainbow_bracket_scope(depth)))
+        .collect();
     let mut index = 0;
     while index < spans.len() {
-        let (start, end, scope) = spans[index];
+        let (start, end, _) = spans[index];
         let mut next = index + 1;
         while next < spans.len() && spans[next].0 == start && spans[next].1 == end {
             next += 1;
         }
-        if scope == HighlightScope::Punctuation {
+        // A token can carry several captures (a Lua `{` is also the table
+        // constructor), so any plain punctuation capture makes it a bracket.
+        let punctuation = spans[index..next]
+            .iter()
+            .any(|span| span.2 == HighlightScope::Punctuation);
+        if punctuation {
             let token = rope.byte_slice(start..end).to_string();
             let bracket = match token.as_str() {
                 "(" => Some((b')', true)),
@@ -1205,6 +1243,67 @@ fn rainbow_brackets(rope: &Rope, spans: &mut [(usize, usize, HighlightScope)]) {
         }
         index = next;
     }
+    stack.into_iter().map(|(marker, _)| marker).collect()
+}
+
+/// Closing characters of the brackets that are open at `byte`, outermost
+/// first, so a window that starts mid-file colors them as the whole file
+/// would.
+///
+/// Embedded languages (the script of a Vue or Svelte component) put their
+/// brackets in spans that the main tree does not hold, so those files are
+/// counted from the first span of the file. Other files read the syntax
+/// tree: for each node around `byte`, its direct bracket children that end
+/// before `byte` are paired off, and the ones left over are still open.
+fn open_brackets_before(
+    rope: &Rope,
+    tree: &Tree,
+    language: SyntaxLanguage,
+    byte: usize,
+) -> Vec<u8> {
+    if byte == 0 {
+        return Vec::new();
+    }
+    let embedded = matches!(
+        language,
+        SyntaxLanguage::Vue | SyntaxLanguage::Svelte | SyntaxLanguage::Blade
+    );
+    if embedded && byte <= MAX_TAG_SCAN_BYTES {
+        let mut spans = collect_style_spans(rope, tree, language, 0, byte);
+        return rainbow_brackets(rope, &mut spans, &[]);
+    }
+    let mut ancestors = Vec::new();
+    let mut node = tree.root_node().descendant_for_byte_range(byte, byte);
+    while let Some(current) = node {
+        ancestors.push(current);
+        node = current.parent();
+    }
+    let mut open = Vec::new();
+    for ancestor in ancestors.into_iter().rev() {
+        let mut stack: Vec<u8> = Vec::new();
+        let mut cursor = ancestor.walk();
+        for child in ancestor.children(&mut cursor) {
+            if child.start_byte() >= byte {
+                break;
+            }
+            if child.is_named() {
+                continue;
+            }
+            match child.kind() {
+                "(" => stack.push(b')'),
+                "[" => stack.push(b']'),
+                "{" => stack.push(b'}'),
+                kind @ (")" | "]" | "}") => {
+                    if stack.last() == Some(&kind.as_bytes()[0]) {
+                        stack.pop();
+                    }
+                }
+                _ => {}
+            }
+        }
+        open.extend(stack);
+    }
+    open
 }
 
 fn rainbow_bracket_scope(depth: usize) -> HighlightScope {
@@ -3165,6 +3264,292 @@ mod tests {
                 "{token} must be punctuation"
             );
         }
+    }
+
+    #[test]
+    fn rainbow_color_does_not_depend_on_where_the_window_starts() {
+        let language = SyntaxLanguage::TypeScript;
+        let mut source = String::from("const items = [\n");
+        for i in 0..60 {
+            source.push_str(&format!("  (item{i}),\n"));
+        }
+        source.push_str("];\n");
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(&source, None).unwrap();
+        let doc = Document::from_text(&source);
+        let whole = style_runs_for_viewport(&doc, &tree, language, 0, doc.line_count());
+        let brackets = |runs: &[StyleRun], line: usize| {
+            runs.iter()
+                .filter(|run| run.line == line && matches!(run.start, 2 | 9 | 10))
+                .map(|run| (run.start, run.scope))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            brackets(&whole, 40)[0],
+            (2, HighlightScope::PunctuationBracket2)
+        );
+        // This window starts at line 30, below the `[` on line 0.
+        let part = style_runs_for_viewport(&doc, &tree, language, 40, 3);
+        for line in [30, 40, 41, 42, 43] {
+            assert_eq!(brackets(&part, line), brackets(&whole, line), "line {line}");
+        }
+    }
+
+    /// Rainbow depth is counted from the start of the file, so a line has the
+    /// same bracket colors whichever window is asked for.
+    #[test]
+    fn rainbow_colors_match_the_whole_file_in_every_language() {
+        // (language, text before the repeated lines, a repeated line, text after)
+        let samples: &[(SyntaxLanguage, &str, &str, &str)] = &[
+            (
+                SyntaxLanguage::Rust,
+                "fn main() {\n    let v = vec![\n",
+                "        (a{i}, [b]),\n",
+                "    ];\n}\n",
+            ),
+            (
+                SyntaxLanguage::TypeScript,
+                "const a = [\n",
+                "  (a{i}, [b]),\n",
+                "];\n",
+            ),
+            (
+                SyntaxLanguage::Tsx,
+                "const a = [\n",
+                "  (a{i}, [b]),\n",
+                "];\n",
+            ),
+            (
+                SyntaxLanguage::JavaScript,
+                "const a = [\n",
+                "  (a{i}, [b]),\n",
+                "];\n",
+            ),
+            (
+                SyntaxLanguage::Json,
+                "{\"a\": [\n",
+                "  [{i}, {\"b\": [1]}],\n",
+                "  []\n]}\n",
+            ),
+            (SyntaxLanguage::Toml, "a = [\n", "  [{i}, [2]],\n", "]\n"),
+            (SyntaxLanguage::Yaml, "a: [\n", "  [{i}, [2]],\n", "]\n"),
+            (
+                SyntaxLanguage::Markdown,
+                "# T\n\n",
+                "text (a{i} [b]) done\n\n",
+                "end\n",
+            ),
+            (
+                SyntaxLanguage::Python,
+                "x = [\n",
+                "    (a{i}, [b]),\n",
+                "]\n",
+            ),
+            (
+                SyntaxLanguage::Go,
+                "var x = []int{\n",
+                "\t(a{i}), [1][0],\n",
+                "}\n",
+            ),
+            (
+                SyntaxLanguage::Html,
+                "<div>\n",
+                "<p title=\"(x)\">(a{i}) [b]</p>\n",
+                "</div>\n",
+            ),
+            (
+                SyntaxLanguage::Xml,
+                "<a>\n",
+                "<b k=\"(x)\">(a{i}) [b]</b>\n",
+                "</a>\n",
+            ),
+            (
+                SyntaxLanguage::Css,
+                "@media (min-width: 1px) {\n",
+                "  a{i} { b: calc((1px) + (2px)); }\n",
+                "}\n",
+            ),
+            (
+                SyntaxLanguage::Bash,
+                "f() {\n",
+                "  (echo a{i}) ; [ -f x ] && { echo; }\n",
+                "}\n",
+            ),
+            (
+                SyntaxLanguage::Nginx,
+                "http {\n",
+                "  server {\n    listen {i};\n  }\n",
+                "}\n",
+            ),
+            (
+                SyntaxLanguage::Php,
+                "<?php\n$a = [\n",
+                "    (a{i}, [b]),\n",
+                "];\n",
+            ),
+            (
+                SyntaxLanguage::C,
+                "int a[] = {\n",
+                "  (a{i}), [1][0],\n",
+                "};\n",
+            ),
+            (
+                SyntaxLanguage::Cpp,
+                "int a[] = {\n",
+                "  (a{i}), [1][0],\n",
+                "};\n",
+            ),
+            (
+                SyntaxLanguage::CSharp,
+                "class A {\n  int[] a = new int[] {\n",
+                "    (a{i}), [1][0],\n",
+                "  };\n}\n",
+            ),
+            (
+                SyntaxLanguage::Java,
+                "class A {\n  int[] a = new int[] {\n",
+                "    (a{i}), [1][0],\n",
+                "  };\n}\n",
+            ),
+            (SyntaxLanguage::Ruby, "a = [\n", "  (a{i}), [b],\n", "]\n"),
+            (
+                SyntaxLanguage::Lua,
+                "local a = {\n",
+                "  (a{i}), t[1], f(g(2)),\n",
+                "}\n",
+            ),
+            (
+                SyntaxLanguage::Swift,
+                "let a = [\n",
+                "  (a{i}), [1][0],\n",
+                "]\n",
+            ),
+            (
+                SyntaxLanguage::Sql,
+                "select (\n",
+                "  (a{i}) + (select [1]),\n",
+                "  1\n) from t;\n",
+            ),
+            (
+                SyntaxLanguage::Make,
+                "a = $(foo\n",
+                "  $(bar {i}) $(baz)\n",
+                ")\n",
+            ),
+            (
+                SyntaxLanguage::Ini,
+                "[sec]\n",
+                "k{i} = (a) [b] {c}\n",
+                "z = 1\n",
+            ),
+            (
+                SyntaxLanguage::PowerShell,
+                "$a = @(\n",
+                "  (a{i}), @{k=1},\n",
+                ")\n",
+            ),
+            (
+                SyntaxLanguage::Dart,
+                "var a = [\n",
+                "  (a{i}), [1][0],\n",
+                "];\n",
+            ),
+            (
+                SyntaxLanguage::R,
+                "a <- c(\n",
+                "  (a{i}), list(1)[[1]],\n",
+                "  2\n)\n",
+            ),
+            (
+                SyntaxLanguage::Blade,
+                "<div>\n@foreach ($items as $i)\n",
+                "  <p>{{ ($a{i}) }} (x) [y]</p>\n",
+                "@endforeach\n</div>\n",
+            ),
+            (
+                SyntaxLanguage::Vue,
+                "<script>\nconst a = [\n",
+                "  (a{i}), [1][0],\n",
+                "]\n</script>\n",
+            ),
+            (
+                SyntaxLanguage::Svelte,
+                "<script>\n  let a = [\n",
+                "    (a{i}), [1][0],\n",
+                "  ]\n</script>\n",
+            ),
+        ];
+        assert_eq!(
+            samples.len(),
+            SyntaxLanguage::ALL.len(),
+            "a sample for every language"
+        );
+        let is_bracket_scope = |scope: HighlightScope| {
+            matches!(
+                scope,
+                HighlightScope::Punctuation
+                    | HighlightScope::PunctuationBracket1
+                    | HighlightScope::PunctuationBracket2
+                    | HighlightScope::PunctuationBracket3
+                    | HighlightScope::PunctuationBracket4
+            )
+        };
+        let mut failures = Vec::new();
+        for (language, head, line, tail) in samples {
+            let mut source = String::from(*head);
+            for i in 0..80 {
+                source.push_str(&line.replace("{i}", &i.to_string()));
+            }
+            source.push_str(tail);
+            let mut parser = Parser::new();
+            parser.set_language(&language.grammar()).unwrap();
+            let tree = parser.parse(&source, None).unwrap();
+            let doc = Document::from_text(&source);
+            let line_count = doc.line_count();
+            let whole = style_runs_for_viewport(&doc, &tree, *language, 0, line_count);
+            let mut checked_brackets = 0;
+            for start in (0..line_count).step_by(5) {
+                let part = style_runs_for_viewport(&doc, &tree, *language, start, 3);
+                let first = start.saturating_sub(VIEWPORT_STYLE_MARGIN_LINES);
+                let last = (start + 3 + VIEWPORT_STYLE_MARGIN_LINES).min(line_count);
+                let pick = |runs: &[StyleRun]| {
+                    runs.iter()
+                        .filter(|run| {
+                            (first..last).contains(&run.line) && is_bracket_scope(run.scope)
+                        })
+                        .copied()
+                        .collect::<Vec<_>>()
+                };
+                let (expected, got) = (pick(&whole), pick(&part));
+                checked_brackets += expected
+                    .iter()
+                    .filter(|run| run.scope != HighlightScope::Punctuation)
+                    .count();
+                if expected != got {
+                    let differs = expected.iter().find(|run| !got.contains(run)).map(|run| {
+                        let text = doc.rope().line(run.line).to_string();
+                        format!(
+                            "line {} col {} {:?} in {:?}",
+                            run.line, run.start, run.scope, text
+                        )
+                    });
+                    failures.push(format!(
+                        "{} (window at line {start}): {differs:?}",
+                        language.name()
+                    ));
+                    break;
+                }
+            }
+            eprintln!(
+                "{}: {checked_brackets} colored brackets compared",
+                language.name()
+            );
+        }
+        assert!(
+            failures.is_empty(),
+            "different colors than the whole file: {failures:?}"
+        );
     }
 
     #[test]

@@ -54,7 +54,8 @@ extension MainWindowController {
         guard let workspace else { return }
         openWorkspaceFile(workspace, FileEntry(name: (match.relPath as NSString).lastPathComponent,
                                                relPath: match.relPath, isDir: false), preview: false)
-        activeTab?.doc.goToLine(line: match.line, col: match.column)
+        showSearchMatchPosition(match)
+        window?.makeFirstResponder(editorView)
     }
 
     func closeWorkspaceSearch() {

@@ -24,6 +24,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     var documentSymbols: [OutlineSymbol] = []
     var lastDiagnosticsRevision: UInt64?
     var lastSignatureRequest: (path: String, revision: UInt64, line: UInt64, column: UInt64)?
+    /// The document in which the user typed since signature help was last
+    /// dismissed. Help follows typing, not the caret: a click elsewhere in a
+    /// call must not pop it up.
+    var signatureHelpDocument: ObjectIdentifier?
     let titleBar = TitleBar()
     let activityBar = ActivityBar()
     let sourceControl = SourceControlController()
@@ -405,6 +409,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             guard let self, let tab = self.activeTab else { return }
             self.signaturePopup.isHidden = true
             self.lastSignatureRequest = nil
+            self.signatureHelpDocument = nil
             _ = self.navHistory.recordJump(
                 from: NavLocation(key: tab.navKey, line: before.line, col: before.col),
                 to: NavLocation(key: tab.navKey, line: after.line, col: after.col))
@@ -897,6 +902,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         editorView.onCompletionKey = { [weak self] event in self?.handleCompletionKey(event) ?? false }
         editorView.onTextInput = { [weak self] text in
             self?.completionDismissed = false
+            self?.signatureHelpDocument = self?.activeTab.map { ObjectIdentifier($0.doc) }
         }
 
         buildSidebar()

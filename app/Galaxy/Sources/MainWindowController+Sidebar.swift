@@ -215,7 +215,17 @@ extension MainWindowController {
     func openSearchSidebarMatch(_ match: WorkspaceSearchMatch) {
         guard let workspace else { return }
         openWorkspaceFile(workspace, FileEntry(name: (match.relPath as NSString).lastPathComponent, relPath: match.relPath, isDir: false), preview: false)
-        activeTab?.doc.goToLine(line: match.line, col: match.column)
+        showSearchMatchPosition(match)
+    }
+
+    /// Puts the caret on `match` and scrolls it into view. A file that was
+    /// already open does not reload, so the editor must be told. Focus stays
+    /// where it was, so the results list keeps its arrow-key navigation.
+    func showSearchMatchPosition(_ match: WorkspaceSearchMatch) {
+        guard let tab = activeTab, tab.isDocument else { return }
+        tab.doc.goToLine(line: match.line, col: match.column)
+        editorView.didChangeSelection()
+        editorView.revealLine(Int(min(match.line, max(tab.doc.lineCount(), 1) - 1)))
     }
 
     func searchSidebarReplaceAll(query: String, replacement: String, options: WorkspaceSearchOptions) {

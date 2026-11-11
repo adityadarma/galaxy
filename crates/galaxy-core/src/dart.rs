@@ -5,6 +5,7 @@
 //! answers rather than guessing.
 
 mod flutter;
+mod hints;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1351,5 +1352,32 @@ mod tests {
         let found = engine.definition(&main, &source, 5, column);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].line, 0);
+    }
+
+    #[test]
+    fn hints_name_arguments_and_type_variables() {
+        let main = "import 'brew.dart';\nvoid main() {\n  var a = 89;\n  final b = 'x';\n  const c = 1.5;\n  var d = true;\n  int e = 2;\n  var f = Brew.make();\n  var g = Brew.generic(1);\n  Brew.greet(a, 'x', loud: true);\n  var h = -3;\n}\n";
+        let brew = "class Brew {\n  static String make() => 'x';\n  static T generic<T>(T item) => item;\n  static void greet(String name, int times, {bool loud = false}) {}\n}\n";
+        let (root, engine) = engine(&[("main.dart", main), ("brew.dart", brew)]);
+        let path = root.path().join("lib/main.dart");
+        let found = engine.parameter_hints(&path, main, 0, 20);
+        let seen: Vec<(u32, u32, &str)> = found
+            .iter()
+            .map(|hint| (hint.line, hint.column, hint.label.as_str()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (2, 7, ": int"),
+                (3, 9, ": String"),
+                (4, 9, ": double"),
+                (5, 7, ": bool"),
+                (7, 7, ": String"),
+                (9, 13, "name:"),
+                (9, 16, "times:"),
+                (10, 7, ": int"),
+            ],
+            "{seen:?}"
+        );
     }
 }

@@ -303,16 +303,8 @@ impl RustEngine {
             let [declaration] = declarations.as_slice() else {
                 continue;
             };
-            let source = sources.entry(declaration.path.clone()).or_insert_with(|| {
-                if declaration.path == path {
-                    Some(text.to_owned())
-                } else {
-                    self.document(&declaration.path)
-                        .map(|(_, text)| text.to_owned())
-                        .or_else(|| std::fs::read_to_string(&declaration.path).ok())
-                }
-            });
-            let Some(source) = source.as_deref() else {
+            let Some(source) = self.declaration_source(&mut sources, path, text, declaration)
+            else {
                 continue;
             };
             if let Some(parameters) =
@@ -321,8 +313,158 @@ impl RustEngine {
                 out.extend(parameter_hints::hints(&parameters, &arguments));
             }
         }
+        self.type_hints(
+            path,
+            text,
+            tree.root_node(),
+            (first, last),
+            &mut sources,
+            &mut out,
+        );
         out.sort_by_key(|hint| (hint.line, hint.column));
         out
+    }
+
+    /// Source text of the file that holds `declaration`: the open buffer, the
+    /// text being analyzed, or the file on disk. Cached in `sources`.
+    fn declaration_source<'a>(
+        &self,
+        sources: &'a mut HashMap<PathBuf, Option<String>>,
+        path: &Path,
+        text: &str,
+        declaration: &Declaration,
+    ) -> Option<&'a str> {
+        sources
+            .entry(declaration.path.clone())
+            .or_insert_with(|| {
+                if declaration.path == path {
+                    Some(text.to_owned())
+                } else {
+                    self.document(&declaration.path)
+                        .map(|(_, text)| text.to_owned())
+                        .or_else(|| std::fs::read_to_string(&declaration.path).ok())
+                }
+            })
+            .as_deref()
+    }
+
+    /// `: type` labels after the name in `let` statements without a type, on
+    /// lines `rows.0..=rows.1`. Only types that can be named with certainty
+    /// get a label: literals, struct literals, and calls of one resolved
+    /// function with a written return type.
+    fn type_hints(
+        &self,
+        path: &Path,
+        text: &str,
+        root: Node<'_>,
+        rows: (u32, u32),
+        sources: &mut HashMap<PathBuf, Option<String>>,
+        out: &mut Vec<ParameterHint>,
+    ) {
+        let (first, last) = (rows.0 as usize, rows.1 as usize);
+        let mut found = 0;
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            if node.end_position().row < first || node.start_position().row > last {
+                continue;
+            }
+            if node.kind() == "let_declaration"
+                && found < parameter_hints::MAX_CALLS
+                && let Some(hint) = self.let_type_hint(path, text, node, sources)
+            {
+                found += 1;
+                out.push(hint);
+            }
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+        }
+    }
+
+    fn let_type_hint(
+        &self,
+        path: &Path,
+        text: &str,
+        declaration: Node<'_>,
+        sources: &mut HashMap<PathBuf, Option<String>>,
+    ) -> Option<ParameterHint> {
+        if declaration.child_by_field_name("type").is_some() {
+            return None;
+        }
+        let mut pattern = declaration.child_by_field_name("pattern")?;
+        if pattern.kind() == "mut_pattern" {
+            let mut cursor = pattern.walk();
+            pattern = pattern.named_children(&mut cursor).last()?;
+        }
+        if pattern.kind() != "identifier" {
+            return None;
+        }
+        let name = pattern.utf8_text(text.as_bytes()).ok()?;
+        let value = declaration.child_by_field_name("value")?;
+        let label = match value.kind() {
+            "string_literal" | "raw_string_literal" => "&str".to_owned(),
+            "boolean_literal" => "bool".to_owned(),
+            "char_literal" => "char".to_owned(),
+            "integer_literal" | "float_literal" | "unary_expression" | "negative_literal" => {
+                numeric_literal_type(text, declaration, value, name)?
+            }
+            "struct_expression" => {
+                let type_name = value.child_by_field_name("name")?;
+                if type_name.kind() != "type_identifier" {
+                    return None;
+                }
+                let type_name = type_name.utf8_text(text.as_bytes()).ok()?;
+                if type_name == "Self" {
+                    return None;
+                }
+                type_name.to_owned()
+            }
+            "call_expression" => self.call_result_type(path, text, value, sources)?,
+            _ => return None,
+        };
+        Some(ParameterHint {
+            line: pattern.end_position().row as u32,
+            column: utf16_column(text, pattern.end_byte()),
+            label: format!(": {label}"),
+            return_type: false,
+        })
+    }
+
+    /// The written return type of the single function that `call` names.
+    fn call_result_type(
+        &self,
+        path: &Path,
+        text: &str,
+        call: Node<'_>,
+        sources: &mut HashMap<PathBuf, Option<String>>,
+    ) -> Option<String> {
+        let function = call.child_by_field_name("function")?;
+        let (name, owner) = match function.kind() {
+            "identifier" => (function, None),
+            "scoped_identifier" => {
+                let owner = function
+                    .child_by_field_name("path")?
+                    .utf8_text(text.as_bytes())
+                    .ok()?
+                    .rsplit("::")
+                    .next()?;
+                (function.child_by_field_name("name")?, Some(owner))
+            }
+            _ => return None,
+        };
+        let name = name.utf8_text(text.as_bytes()).ok()?;
+        if name.starts_with(|c: char| c.is_uppercase()) {
+            return None;
+        }
+        let declarations: Vec<_> = self
+            .resolve_nonlocal(path, name)
+            .into_iter()
+            .filter(|item| item.kind == ItemKind::Function)
+            .collect();
+        let [declaration] = declarations.as_slice() else {
+            return None;
+        };
+        let source = self.declaration_source(sources, path, text, declaration)?;
+        rust_return_type_at(source, declaration.line, declaration.column, owner)
     }
 
     pub fn definition(&mut self, path: &Path, text: &str, line: u32, column: u32) -> Vec<Target> {
@@ -1889,6 +2031,133 @@ fn rust_parameters_at(
     Some(out)
 }
 
+/// Type of a number written in a `let`. A suffix (`89u64`) names the type.
+/// Without one the type is only the default (`i32`, `f64`) when nothing
+/// later in the block could pick another: any use of the variable outside a
+/// formatting macro may.
+fn numeric_literal_type(
+    text: &str,
+    declaration: Node<'_>,
+    value: Node<'_>,
+    name: &str,
+) -> Option<String> {
+    let mut literal = value;
+    if matches!(value.kind(), "unary_expression" | "negative_literal") {
+        if !text[value.start_byte()..value.end_byte()].starts_with('-') {
+            return None;
+        }
+        let mut cursor = value.walk();
+        literal = value
+            .named_children(&mut cursor)
+            .find(|child| matches!(child.kind(), "integer_literal" | "float_literal"))?;
+    }
+    let source = literal.utf8_text(text.as_bytes()).ok()?;
+    const INTEGERS: [&str; 12] = [
+        "u128", "i128", "usize", "isize", "u16", "u32", "u64", "i16", "i32", "i64", "u8", "i8",
+    ];
+    if let Some(suffix) = INTEGERS.iter().find(|suffix| source.ends_with(**suffix)) {
+        return Some((*suffix).to_owned());
+    }
+    let hex = source.starts_with("0x") || source.starts_with("0X");
+    if !hex && (source.ends_with("f32") || source.ends_with("f64")) {
+        return Some(source[source.len() - 3..].to_owned());
+    }
+    if !only_printed_after(text, declaration, name) {
+        return None;
+    }
+    let float = literal.kind() == "float_literal";
+    Some(if float { "f64" } else { "i32" }.to_owned())
+}
+
+/// True when every later use of `name` in the enclosing block is an argument
+/// of a macro that only formats it.
+fn only_printed_after(text: &str, declaration: Node<'_>, name: &str) -> bool {
+    const FORMATTING: [&str; 8] = [
+        "println", "print", "eprintln", "eprint", "format", "dbg", "write", "writeln",
+    ];
+    let Some(block) = declaration.parent() else {
+        return false;
+    };
+    let mut stack = vec![block];
+    while let Some(node) = stack.pop() {
+        if node.end_byte() <= declaration.end_byte() {
+            continue;
+        }
+        if node.kind() == "identifier" && node.utf8_text(text.as_bytes()).ok() == Some(name) {
+            let mut ancestor = node.parent();
+            while ancestor.is_some_and(|parent| parent.kind() == "token_tree") {
+                ancestor = ancestor.and_then(|parent| parent.parent());
+            }
+            let formatted = ancestor
+                .filter(|parent| parent.kind() == "macro_invocation")
+                .and_then(|parent| parent.child_by_field_name("macro"))
+                .and_then(|mac| mac.utf8_text(text.as_bytes()).ok())
+                .and_then(|mac| mac.rsplit("::").next())
+                .is_some_and(|mac| FORMATTING.contains(&mac));
+            if !formatted {
+                return false;
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    true
+}
+
+/// The return type written on the function whose name is at `line`/`column`.
+/// `owner` replaces `Self` for associated calls (`Coffee::new()`). Generic,
+/// `async` and `impl Trait` signatures give no answer.
+fn rust_return_type_at(text: &str, line: u32, column: u32, owner: Option<&str>) -> Option<String> {
+    let tree = parse_tree(text)?;
+    let byte = cursor_byte(text, line, column);
+    let mut node = tree.root_node().descendant_for_byte_range(byte, byte)?;
+    while node.kind() != "function_item" {
+        node = node.parent()?;
+    }
+    if node.child_by_field_name("type_parameters").is_some() {
+        return None;
+    }
+    let mut cursor = node.walk();
+    let asynchronous = node.named_children(&mut cursor).any(|child| {
+        child.kind() == "function_modifiers"
+            && child
+                .utf8_text(text.as_bytes())
+                .is_ok_and(|m| m.contains("async"))
+    });
+    if asynchronous {
+        return None;
+    }
+    let written = node
+        .child_by_field_name("return_type")?
+        .utf8_text(text.as_bytes())
+        .ok()?
+        .trim();
+    if written.contains("impl ") || written.contains("dyn ") || written.contains('\'') {
+        return None;
+    }
+    if !written
+        .split(|c: char| !is_ident(c))
+        .any(|word| word == "Self")
+    {
+        return Some(written.to_owned());
+    }
+    let owner =
+        owner.filter(|owner| owner.starts_with(|c: char| c.is_uppercase()) && *owner != "Self")?;
+    let mut out = String::new();
+    let mut word = String::new();
+    for character in written.chars().chain(std::iter::once(' ')) {
+        if is_ident(character) {
+            word.push(character);
+            continue;
+        }
+        out.push_str(if word == "Self" { owner } else { &word });
+        word.clear();
+        out.push(character);
+    }
+    out.pop();
+    Some(out)
+}
+
 fn deepest_call(node: Node<'_>, byte: usize) -> Option<Node<'_>> {
     if node.start_byte() > byte || node.end_byte() < byte {
         return None;
@@ -2332,6 +2601,60 @@ mod tests {
                 (line.find("&pot").unwrap() as u32, "self:"),
                 (line.find("2)").unwrap() as u32, "litres:"),
             ]
+        );
+    }
+
+    #[test]
+    fn let_bindings_without_a_type_get_one() {
+        let path = Path::new("/tmp/lets.rs");
+        let source = concat!(
+            "struct Coffee;\n",
+            "impl Coffee { fn new() -> Self { Coffee } fn cups() -> Vec<Self> { vec![] } }\n",
+            "fn count() -> usize { 3 }\n",
+            "fn pick<T>(item: T) -> T { item }\n",
+            "fn main() {\n",
+            "    let a = 89;\n",
+            "    let b = 89u64;\n",
+            "    let c = -1.5;\n",
+            "    let d = \"hi\";\n",
+            "    let mut e = true;\n",
+            "    let f = Coffee;\n",
+            "    let g = count();\n",
+            "    let h = Coffee::new();\n",
+            "    let i = Coffee::cups();\n",
+            "    let j = pick(1);\n",
+            "    let k: u8 = 4;\n",
+            "    let (l, m) = (1, 2);\n",
+            "    let n = 5;\n",
+            "    takes(n);\n",
+            "    println!(\"{a} {}\", a);\n",
+            "}\n",
+        );
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        engine.install(Built::default());
+        let found = engine.parameter_hints(path, source, 0, 40);
+        let labels: Vec<(u32, &str)> = found
+            .iter()
+            .filter(|hint| hint.label.starts_with(':'))
+            .map(|hint| (hint.line, hint.label.as_str()))
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                (5, ": i32"),
+                (6, ": u64"),
+                (7, ": f64"),
+                (8, ": &str"),
+                (9, ": bool"),
+                (11, ": usize"),
+                (12, ": Coffee"),
+                (13, ": Vec<Coffee>"),
+            ]
+        );
+        let line = source.lines().nth(5).unwrap();
+        assert_eq!(
+            found.iter().find(|hint| hint.line == 5).unwrap().column as usize,
+            line.find(" =").unwrap()
         );
     }
 

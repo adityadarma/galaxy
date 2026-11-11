@@ -194,6 +194,12 @@ extension MainWindowController {
             signaturePopup.isHidden = true
             return
         }
+        // Only after typing in this document (see `signatureHelpDocument`).
+        guard signatureHelpDocument == ObjectIdentifier(document) else {
+            lastSignatureRequest = nil
+            signaturePopup.isHidden = true
+            return
+        }
         let position = document.primaryCursor()
         let request = (
             path: document.path(),
@@ -208,7 +214,12 @@ extension MainWindowController {
         else { return }
         lastSignatureRequest = request
         bridge.requestSignatureHelp(document: document, line: position.line, character: position.colUtf16)
-        guard let signature = bridge.signatureHelp(document: document) else { signaturePopup.isHidden = true; return }
+        guard let signature = bridge.signatureHelp(document: document) else {
+            // The caret left the call: stay quiet until the next keystroke.
+            signaturePopup.isHidden = true
+            signatureHelpDocument = nil
+            return
+        }
         signaturePopup.show(signature)
         signaturePopup.isHidden = false
         signaturePopup.frame = popupFrame(size: NSSize(width: 520, height: signature.documentation == nil ? 48 : 78),
@@ -216,6 +227,12 @@ extension MainWindowController {
     }
 
     func handleCompletionKey(_ event: NSEvent) -> Bool {
+        if event.keyCode == 53, !signaturePopup.isHidden, completionPopup.isHidden, snippetSession == nil {
+            // Escape closes the signature help, as in other editors.
+            signaturePopup.isHidden = true
+            signatureHelpDocument = nil
+            return true
+        }
         if completionPopup.isHidden, let session = snippetSession {
             switch event.keyCode {
             case 48: // Tab

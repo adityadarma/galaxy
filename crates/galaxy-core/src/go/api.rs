@@ -10,6 +10,7 @@ use super::parse::parse;
 use super::types::{Symbol, callee_at, resolve_at};
 use super::{actions, complete, diag, refs};
 use crate::lang::{Action, Completion, HoverResult, Occurrence, Problem, Signature, Target};
+use crate::parameter_hints::ParameterHint;
 
 /// The directory a Go file belongs to as a project. A `go.work` root is used
 /// only when it declares the nearest module; this keeps unrelated monorepo
@@ -135,6 +136,22 @@ impl GoEngine {
             parameters: callee.params,
             active: callee.active,
         })
+    }
+
+    /// Parameter names before the arguments of calls, and the types of
+    /// variables declared with `:=`, on lines `first..=last`.
+    pub fn parameter_hints(
+        &mut self,
+        path: &Path,
+        text: &str,
+        first: u32,
+        last: u32,
+    ) -> Vec<ParameterHint> {
+        self.sync_document(path, text);
+        let Some((_, tree)) = parse(path, text) else {
+            return Vec::new();
+        };
+        super::types::parameter_hints(self, path, text, &tree, first, last)
     }
 
     pub fn actions(&mut self, path: &Path, text: &str, line: u32, column: u32) -> Vec<Action> {

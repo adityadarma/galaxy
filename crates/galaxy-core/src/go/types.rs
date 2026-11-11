@@ -16,11 +16,13 @@ use tree_sitter::Tree;
 use super::engine::{GoEngine, Member, Package};
 use super::parse::GoFile;
 
+pub use hints::parameter_hints;
 pub use lookup::{Callee, Resolved, Symbol, callee_at, resolve_at, resolve_ids};
 
 mod builtins;
 mod eval;
 mod generic;
+mod hints;
 mod lookup;
 mod range;
 mod receiver;

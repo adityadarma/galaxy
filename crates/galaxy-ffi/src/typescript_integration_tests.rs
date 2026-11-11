@@ -3760,3 +3760,41 @@ fn parameter_hints_follow_local_imported_and_package_callees() {
         ]
     );
 }
+
+#[test]
+fn variable_type_hints_follow_literals_and_written_return_types() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("package.json"), "{}\n").unwrap();
+    std::fs::write(
+        root.join("api.ts"),
+        "export function count(): number {\n\treturn 1;\n}\nexport async function load(): Promise<string> {\n\treturn 'x';\n}\nexport function same<T>(item: T): T {\n\treturn item;\n}\nexport function bare() {\n\treturn 1;\n}\n",
+    )
+    .unwrap();
+    let path = root.join("main.ts");
+    let source = "import { count, load, same, bare } from './api';\nlet a = 89;\nconst b = 89;\nlet c = count();\nconst d = await load();\nlet e = same(1);\nlet f = bare();\nlet g: number = 2;\n";
+    std::fs::write(&path, source).unwrap();
+    let core = Core::new();
+    let document = core
+        .open_document(path.to_string_lossy().into_owned())
+        .unwrap();
+
+    let hints = core.parameter_hints(document.clone(), 0, 20);
+    let found: Vec<(u64, u64, &str)> = hints
+        .lines
+        .iter()
+        .flat_map(|line| &line.hints)
+        .map(|hint| (hint.line, hint.column, hint.label.as_str()))
+        .collect();
+    assert_eq!(
+        found,
+        vec![
+            (1, 5, ": number"),
+            (3, 5, ": number"),
+            (4, 7, ": string"),
+            // `same<T>` and `bare` have no certain type; the argument of
+            // `same(1)` still gets its parameter name.
+            (5, 13, "item:"),
+        ]
+    );
+}

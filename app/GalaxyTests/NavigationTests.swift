@@ -1154,6 +1154,67 @@ final class NavigationTests: XCTestCase {
         XCTAssertEqual(asked, 1)
         XCTAssertEqual(c.window?.isDocumentEdited, true)
     }
+
+    func testSignatureHelpFollowsTypingNotTheCaret() throws {
+        let controller = try makeController(text: "foo(a, b)\n")
+        let view = controller.editorView
+        let cursor = try XCTUnwrap(view.document?.primaryCursor())
+
+        // Nothing typed yet: a caret inside a call shows no popup.
+        XCTAssertNil(controller.signatureHelpDocument)
+        controller.signaturePopup.isHidden = false
+        controller.refreshSignatureHelp()
+        XCTAssertTrue(controller.signaturePopup.isHidden, "a caret alone does not open signature help")
+
+        // Typing arms it for this document.
+        view.insertText("x", replacementRange: NSRange(location: NSNotFound, length: 0))
+        XCTAssertEqual(controller.signatureHelpDocument, controller.activeTab.map { ObjectIdentifier($0.doc) })
+
+        // A click moves the caret and disarms it until the next keystroke.
+        view.onClickMove?(cursor, cursor)
+        XCTAssertNil(controller.signatureHelpDocument)
+        controller.signaturePopup.isHidden = false
+        controller.refreshSignatureHelp()
+        XCTAssertTrue(controller.signaturePopup.isHidden)
+    }
+
+    func testSearchResultsInTheOpenFileMoveTheCaretToEachClickedLine() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-search-jump-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let lines = (0..<300).map { "line \($0) needle" }
+        try (lines.joined(separator: "\n") + "\n").write(
+            to: root.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+
+        let controller = MainWindowController(bridge: CoreBridge())
+        controller.showWindow(nil)
+        defer { controller.window?.orderOut(nil) }
+        try controller.openWorkspace(at: root)
+        func match(_ line: UInt64) -> WorkspaceSearchMatch {
+            WorkspaceSearchMatch(relPath: "a.txt", line: line, column: 5, text: lines[Int(line)],
+                                 contextBefore: "", contextAfter: "")
+        }
+        func caretLine() -> Int {
+            Int(controller.activeTab?.doc.primaryCursor().line ?? .max)
+        }
+
+        controller.openSearchSidebarMatch(match(250))
+        XCTAssertEqual(caretLine(), 250)
+        let tabs = controller.allTabs.count
+
+        // Same file, still open, another line: the caret must follow.
+        controller.openSearchSidebarMatch(match(10))
+        XCTAssertEqual(caretLine(), 10)
+        controller.openSearchSidebarMatch(match(120))
+        XCTAssertEqual(caretLine(), 120)
+        XCTAssertEqual(controller.allTabs.count, tabs, "no extra tab opens")
+
+        let scroll = try XCTUnwrap(controller.editorView.enclosingScrollView)
+        scroll.layoutSubtreeIfNeeded()
+        let top = controller.editorView.rowTop(of: 120)
+        XCTAssertTrue(scroll.contentView.bounds.contains(NSPoint(x: 0, y: top)),
+                      "the clicked line is scrolled into view")
+    }
 }
 
 @MainActor

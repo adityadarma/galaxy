@@ -3,6 +3,9 @@
 use super::*;
 use crate::parameter_hints::{Argument, Parameter};
 
+/// Longest type written in a label; longer ones would crowd the line.
+const MAX_LABEL_CHARS: usize = 48;
+
 /// A call in the requested lines: where its callee name is, so the host can
 /// resolve it like Go to Definition, and its arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,6 +120,12 @@ pub fn parameters_at(
 }
 
 fn callable_parameters(text: &str, node: Node<'_>) -> Option<Vec<Parameter>> {
+    formal_parameters(text, callable_node(text, node)?)
+}
+
+/// The function-like node behind a declaration: the function itself, the
+/// function a variable or property holds, or a class's constructor.
+fn callable_node<'t>(text: &str, node: Node<'t>) -> Option<Node<'t>> {
     match node.kind() {
         "function_declaration"
         | "generator_function_declaration"
@@ -128,7 +137,7 @@ fn callable_parameters(text: &str, node: Node<'_>) -> Option<Vec<Parameter>> {
         | "method_signature"
         | "abstract_method_signature"
         | "function_type"
-        | "construct_signature" => formal_parameters(text, node),
+        | "construct_signature" => Some(node),
         "variable_declarator" | "public_field_definition" | "pair" | "property_signature" => {
             let value = node.child_by_field_name("value").or_else(|| {
                 // `run: (a: string) => void` is typed, not assigned.
@@ -136,21 +145,21 @@ fn callable_parameters(text: &str, node: Node<'_>) -> Option<Vec<Parameter>> {
                 let mut cursor = annotation.walk();
                 annotation.named_children(&mut cursor).next()
             })?;
-            callable_parameters(text, value)
+            callable_node(text, value)
         }
         "lexical_declaration" | "variable_declaration" => {
             let mut cursor = node.walk();
             let declarator = node
                 .named_children(&mut cursor)
                 .find(|child| child.kind() == "variable_declarator")?;
-            callable_parameters(text, declarator)
+            callable_node(text, declarator)
         }
-        "export_statement" => callable_parameters(text, node.child_by_field_name("declaration")?),
+        "export_statement" => callable_node(text, node.child_by_field_name("declaration")?),
         // `declare function f(a: string): void;`
         "ambient_declaration" => {
             let mut cursor = node.walk();
             let inner = node.named_children(&mut cursor).next()?;
-            callable_parameters(text, inner)
+            callable_node(text, inner)
         }
         "class_declaration" | "class" | "abstract_class_declaration" => {
             let body = node.child_by_field_name("body")?;
@@ -162,7 +171,7 @@ fn callable_parameters(text: &str, node: Node<'_>) -> Option<Vec<Parameter>> {
                         .and_then(|name| node_text(text, name))
                         == Some("constructor")
             })?;
-            formal_parameters(text, constructor)
+            Some(constructor)
         }
         _ => None,
     }
@@ -208,6 +217,192 @@ fn formal_parameters(text: &str, node: Node<'_>) -> Option<Vec<Parameter>> {
         }
     }
     Some(out)
+}
+
+/// A variable declared without a type, in the requested lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VariableSite {
+    /// Where the name ends, which is where the type label goes.
+    pub line: usize,
+    pub column: usize,
+    pub source: VariableType,
+}
+
+/// Where the type of a variable without annotation comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VariableType {
+    /// The widened type of a literal: `let n = 1` is `number`.
+    Literal(&'static str),
+    /// The result of the call whose callee name is at `line`/`column`.
+    Call {
+        line: usize,
+        column: usize,
+        awaited: bool,
+    },
+}
+
+/// `let`, `var` and `const` declarations without a type annotation whose
+/// initializer is a literal or a call, in `first..=last`. A `const` literal
+/// keeps its literal type, which the code already shows, so it gets none.
+pub fn variable_sites(path: &Path, text: &str, first: usize, last: usize) -> Vec<VariableSite> {
+    let Some(tree) = parse(path, text) else {
+        return Vec::new();
+    };
+    let locations = Locations::new(text);
+    let mut out = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.end_position().row < first || node.start_position().row > last {
+            continue;
+        }
+        if node.kind() == "variable_declarator"
+            && out.len() < crate::parameter_hints::MAX_CALLS
+            && let Some(site) = variable_site(text, node, &locations)
+        {
+            out.push(site);
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    out.sort_by_key(|site| (site.line, site.column));
+    out
+}
+
+fn variable_site(text: &str, declarator: Node<'_>, locations: &Locations) -> Option<VariableSite> {
+    let declaration = declarator.parent()?;
+    if !matches!(
+        declaration.kind(),
+        "lexical_declaration" | "variable_declaration"
+    ) {
+        return None;
+    }
+    let name = declarator.child_by_field_name("name")?;
+    if name.kind() != "identifier" || declarator.child_by_field_name("type").is_some() {
+        return None;
+    }
+    let mut value = declarator.child_by_field_name("value")?;
+    let constant = node_text(text, declaration)?.starts_with("const");
+    let source = if let Some(literal) = (!constant).then(|| literal_type(text, value)).flatten() {
+        VariableType::Literal(literal)
+    } else {
+        let awaited = value.kind() == "await_expression";
+        if awaited {
+            let mut cursor = value.walk();
+            value = value.named_children(&mut cursor).next()?;
+        }
+        let callee = call_callee(value)?;
+        let position = locations.position(callee.start_byte());
+        VariableType::Call {
+            line: position.line,
+            column: position.col,
+            awaited,
+        }
+    };
+    let end = locations.position(name.end_byte());
+    Some(VariableSite {
+        line: end.line,
+        column: end.col,
+        source,
+    })
+}
+
+/// The name called by `f(..)` or `x.f(..)`.
+fn call_callee(call: Node<'_>) -> Option<Node<'_>> {
+    if call.kind() != "call_expression" {
+        return None;
+    }
+    let function = call.child_by_field_name("function")?;
+    match function.kind() {
+        "identifier" => Some(function),
+        "member_expression" => function.child_by_field_name("property"),
+        _ => None,
+    }
+}
+
+/// What `let x = <literal>` is declared as: the literal's widened type.
+fn literal_type(text: &str, value: Node<'_>) -> Option<&'static str> {
+    match value.kind() {
+        "number" => {
+            let source = node_text(text, value)?;
+            Some(if source.ends_with('n') {
+                "bigint"
+            } else {
+                "number"
+            })
+        }
+        "string" | "template_string" => Some("string"),
+        "true" | "false" => Some("boolean"),
+        "regex" => Some("RegExp"),
+        "unary_expression" => {
+            let operator = node_text(text, value.child_by_field_name("operator")?)?;
+            let literal = literal_type(text, value.child_by_field_name("argument")?)?;
+            (operator == "-" && matches!(literal, "number" | "bigint")).then_some(literal)
+        }
+        _ => None,
+    }
+}
+
+/// The return type written on the function declared at `line`/`column`
+/// (a Go to Definition target). `None` when nothing is written, or when the
+/// type could mention a type parameter of the function or its class.
+/// `awaited` unwraps `Promise<T>` for a call that is awaited.
+pub fn return_type_at(
+    path: &Path,
+    text: &str,
+    line: usize,
+    column: usize,
+    awaited: bool,
+) -> Option<String> {
+    let tree = parse(path, text)?;
+    let byte = byte_at(text, line, column)?;
+    let mut node = tree
+        .root_node()
+        .descendant_for_byte_range(byte, byte.saturating_add(1).min(text.len()))?;
+    for _ in 0..4 {
+        if matches!(
+            node.kind(),
+            "class_declaration" | "class" | "abstract_class_declaration"
+        ) {
+            return None;
+        }
+        // The target can be the `function` keyword, whose token shares its
+        // kind name with the JavaScript function expression.
+        if node.is_named()
+            && let Some(function) = callable_node(text, node)
+        {
+            let written = written_return_type(text, function)?;
+            return if awaited {
+                let inner = written.strip_prefix("Promise<")?.strip_suffix('>')?;
+                Some(inner.trim().to_owned())
+            } else {
+                Some(written)
+            };
+        }
+        node = node.parent()?;
+    }
+    None
+}
+
+fn written_return_type(text: &str, function: Node<'_>) -> Option<String> {
+    let annotation = function.child_by_field_name("return_type")?;
+    if annotation.kind() != "type_annotation" {
+        return None; // `x is string`, `asserts x`.
+    }
+    let mut owner = Some(function);
+    while let Some(node) = owner {
+        if node.child_by_field_name("type_parameters").is_some() {
+            return None;
+        }
+        owner = node.parent();
+    }
+    let written = node_text(text, annotation)?.trim_start_matches(':').trim();
+    let unusable = written.is_empty()
+        || written.contains('\n')
+        || written.chars().count() > MAX_LABEL_CHARS
+        || written
+            .split(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
+            .any(|word| matches!(word, "this" | "infer" | "asserts"));
+    (!unusable).then(|| written.to_owned())
 }
 
 fn byte_at(text: &str, line: usize, column: usize) -> Option<usize> {
@@ -284,5 +479,82 @@ mod tests {
             names(parameters_at(Path::new("a.js"), text, 0, 9)),
             ["a", "b", "...c"]
         );
+    }
+
+    fn column(text: &str, line: usize, needle: &str) -> usize {
+        text.lines().nth(line).unwrap().find(needle).unwrap()
+    }
+
+    #[test]
+    fn variables_without_a_type_name_where_it_comes_from() {
+        let text = "let a = 89;\nconst b = 89;\nlet c = `x${a}`;\nvar d = true;\nlet e: number = 1;\nlet f = -2;\nlet g = make();\nconst h = await api.load();\nlet { i } = obj;\nlet j = new Box();\nlet k = 5n;\n";
+        let sites = variable_sites(Path::new("a.ts"), text, 0, 10);
+        let seen: Vec<_> = sites
+            .iter()
+            .map(|site| (site.line, site.column, site.source.clone()))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (0, 5, VariableType::Literal("number")),
+                (2, 5, VariableType::Literal("string")),
+                (3, 5, VariableType::Literal("boolean")),
+                (5, 5, VariableType::Literal("number")),
+                (
+                    6,
+                    5,
+                    VariableType::Call {
+                        line: 6,
+                        column: column(text, 6, "make"),
+                        awaited: false
+                    }
+                ),
+                (
+                    7,
+                    7,
+                    VariableType::Call {
+                        line: 7,
+                        column: column(text, 7, "load"),
+                        awaited: true
+                    }
+                ),
+                (10, 5, VariableType::Literal("bigint")),
+            ]
+        );
+        assert!(variable_sites(Path::new("a.ts"), text, 8, 9).is_empty());
+    }
+
+    #[test]
+    fn javascript_variables_get_literal_types_too() {
+        let sites = variable_sites(Path::new("a.js"), "let a = 'x';\n", 0, 0);
+        assert_eq!(sites[0].source, VariableType::Literal("string"));
+    }
+
+    #[test]
+    fn reads_written_return_types_only_when_they_are_certain() {
+        let text = "function a(): number { return 1; }\n\
+                    function b<T>(x: T): T { return x; }\n\
+                    class Box<T> { get(): T { return this.v; } }\n\
+                    const c = (): string => 'x';\n\
+                    async function d(): Promise<User> {}\n\
+                    function e(x) {}\n\
+                    function f(x): x is string { return true; }\n";
+        let at = |line, needle: &str, awaited| {
+            return_type_at(
+                Path::new("a.ts"),
+                text,
+                line,
+                column(text, line, needle),
+                awaited,
+            )
+        };
+        assert_eq!(at(0, "a(", false).as_deref(), Some("number"));
+        assert_eq!(at(1, "b<", false), None);
+        assert_eq!(at(2, "get", false), None);
+        assert_eq!(at(3, "c =", false).as_deref(), Some("string"));
+        assert_eq!(at(4, "d(", true).as_deref(), Some("User"));
+        assert_eq!(at(4, "d(", false).as_deref(), Some("Promise<User>"));
+        assert_eq!(at(5, "e(", false), None);
+        assert_eq!(at(6, "f(", false), None);
     }
 }
