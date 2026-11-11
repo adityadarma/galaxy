@@ -14,7 +14,15 @@ extension MainWindowController {
         var saved: [Session.Group] = []
         for group in groups {
             var out = Session.Group()
-            for tab in group.tabs where tab.isDocument {
+            for tab in group.tabs {
+                if tab.terminal != nil {
+                    if tab === group.activeTab { out.active = out.tabs.count }
+                    out.tabs.append(Session.Tab(path: "", isPreview: false, line: 0, col: 0, scrollY: nil,
+                                                isPinned: tab.isPinned ? true : nil, isTerminal: true,
+                                                terminalTitle: tab.title, terminalID: UUID().uuidString))
+                    continue
+                }
+                guard tab.isDocument else { continue }
                 let path = tab.doc.path()
                 guard !path.isEmpty, !tab.isDeletedOnDisk else { continue }
                 let loc = location(of: tab)
@@ -65,7 +73,9 @@ extension MainWindowController {
         var out: [Session.Tab] = []
         var newActive: Int?
         for (i, tab) in tabs.enumerated() {
-            let key = (fileKey(tab.path) ?? tab.path) + (tab.isDiff == true ? "#diff" : "")
+            let key = tab.isTerminal == true
+                ? "#terminal:\(tab.terminalID ?? UUID().uuidString)"
+                : (fileKey(tab.path) ?? tab.path) + (tab.isDiff == true ? "#diff" : "")
             if let existing = kept[key] {
                 if i == active { newActive = existing }
                 continue
@@ -119,6 +129,13 @@ extension MainWindowController {
     /// A tab for a saved file, not yet in any group. It shares the buffer
     /// of the same file in another group.
     private func openRestoredTab(_ saved: Session.Tab) -> EditorTab? {
+        if saved.isTerminal == true {
+            guard let workspace, let handle = bridge.terminal(workspace: workspace, cols: 100, rows: 24) else { return nil }
+            let title = saved.terminalTitle ?? handle.shellName()
+            let tab = terminalTab(handle, title: title)
+            tab.isPinned = saved.isPinned == true
+            return tab
+        }
         guard FileManager.default.fileExists(atPath: saved.path) else { return nil }
         let key = Self.fileKey(saved.path)
         let name = (saved.path as NSString).lastPathComponent
@@ -162,8 +179,13 @@ extension MainWindowController {
         var restored: [(EditorTab, CGFloat?)] = []
         var target: EditorTab? = activeIsFirst ? firstRestored : nil
         for (i, saved) in savedTabs.enumerated() {
-            guard FileManager.default.fileExists(atPath: saved.path) else { continue }
-            if let workspace, let rel = relativePath(saved.path) {
+            guard saved.isTerminal == true || FileManager.default.fileExists(atPath: saved.path) else { continue }
+            if saved.isTerminal == true {
+                guard let tab = openRestoredTab(saved) else { continue }
+                tabs.append(tab)
+                if i == active { target = tab }
+                continue
+            } else if let workspace, let rel = relativePath(saved.path) {
                 if saved.isDiff == true {
                     openWorkspaceDiff(workspace, relPath: rel)
                 } else {
@@ -190,6 +212,9 @@ extension MainWindowController {
                 selectTab(i)
             }
             editorView.didChangeSelection()
+        } else if let target, let i = tabs.firstIndex(where: { $0 === target }) {
+            // Terminal tabs have no document-opening path that selects them.
+            selectTab(i)
         }
     }
 
@@ -220,7 +245,8 @@ extension MainWindowController {
                 guard let tab = self.openRestoredTab(saved) else { continue }
                 // The user may have opened this file while the batches ran. A
                 // diff without a committed version came back as a plain tab.
-                if self.tabIndex(forPath: saved.path, diff: tab.diffBase != nil) != nil { continue }
+                if saved.isTerminal != true,
+                   self.tabIndex(forPath: saved.path, diff: tab.diffBase != nil) != nil { continue }
                 let insertionIndex = min(savedIndex, self.tabs.count)
                 self.tabs.insert(tab, at: insertionIndex)
                 if let activeIndex = self.activeIndex, activeIndex >= insertionIndex {

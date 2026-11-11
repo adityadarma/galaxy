@@ -631,6 +631,17 @@ final class TabTests: XCTestCase {
         XCTAssertGreaterThan(long, short)
     }
 
+    func testLongTabTitleUsesItsFullWidthWithoutMiddleEllipsis() {
+        let title = "MainWindowController+Session.swift (Working Tree) M"
+        let bar = TabBar(frame: NSRect(x: 0, y: 0, width: 300, height: Theme.tabHeight))
+        bar.set(items: [TabBar.Item(title: title, isPreview: false, isEdited: false, isGitChanged: false)], selected: 0)
+        bar.layoutSubtreeIfNeeded()
+
+        XCTAssertGreaterThan(bar.contentWidth, 300, "the full title widens the scrollable strip")
+        XCTAssertEqual(bar.tabViews[0].label.lineBreakMode, .byClipping)
+        XCTAssertEqual(bar.tabViews[0].label.stringValue, title)
+    }
+
     /// A long path wrapped the file name onto a second line that overlapped
     /// the editor. It stays on one line and truncates at the head.
     func testLongPathStaysOnOneLine() {

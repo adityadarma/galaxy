@@ -186,9 +186,13 @@ extension MainWindowController {
 
     private func openTerminalTab(_ handle: TerminalHandle, name customName: String? = nil) {
         let name = customName ?? handle.shellName()
-        let tab = EditorTab(doc: bridge.newDocument(), title: name, pathComponents: [name], windowTitle: name,
-                            isPreview: false, status: "Terminal: \(name)", terminal: handle)
+        let tab = terminalTab(handle, title: name)
         add(tab, replacing: nil)
+    }
+
+    func terminalTab(_ handle: TerminalHandle, title: String) -> EditorTab {
+        EditorTab(doc: bridge.newDocument(), title: title, pathComponents: [title], windowTitle: title,
+                  isPreview: false, status: "Terminal: \(title)", terminal: handle)
     }
 
     /// Shows or hides the editor-area terminal for the active tab.

@@ -139,7 +139,6 @@ final class TabBar: NSView {
     }
 
     static let minTabWidth: CGFloat = 96
-    static let maxTabWidth: CGFloat = 240
 
     private(set) var items: [Item] = []
     private(set) var selectedIndex: Int?
@@ -262,7 +261,7 @@ final class TabBar: NSView {
 
     /// Width a tab takes: its title, within the tab limits.
     private static func width(of tab: TabItemView) -> CGFloat {
-        min(max(tab.intrinsicContentSize.width, minTabWidth), maxTabWidth)
+        max(tab.intrinsicContentSize.width, minTabWidth)
     }
 
     override func layout() {
@@ -437,7 +436,7 @@ final class TabItemView: NSView {
         icon.imageScaling = .scaleProportionallyDown
         icon.setAccessibilityElement(false)
         icon.translatesAutoresizingMaskIntoConstraints = false
-        label.lineBreakMode = .byTruncatingMiddle
+        label.lineBreakMode = .byClipping
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         label.translatesAutoresizingMaskIntoConstraints = false
 
@@ -471,7 +470,6 @@ final class TabItemView: NSView {
         NSLayoutConstraint.activate([
             titleEndsAtButton,
             widthAnchor.constraint(greaterThanOrEqualToConstant: TabBar.minTabWidth),
-            widthAnchor.constraint(lessThanOrEqualToConstant: TabBar.maxTabWidth),
             heightAnchor.constraint(equalToConstant: Theme.tabHeight),
             icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 12),
             icon.centerYAnchor.constraint(equalTo: centerYAnchor),

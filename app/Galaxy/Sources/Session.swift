@@ -19,6 +19,13 @@ struct Session: Codable, Equatable {
         /// The tab was the file's working-tree diff, not its plain editor.
         /// Optional so older sessions still decode.
         var isDiff: Bool? = nil
+        /// An editor-area terminal. Its shell starts again when restoring; a
+        /// terminated app cannot reconnect to the former child process.
+        var isTerminal: Bool? = nil
+        /// Shell label shown by the terminal tab.
+        var terminalTitle: String? = nil
+        /// Keeps multiple terminal tabs distinct during tab de-duplication.
+        var terminalID: String? = nil
     }
 
     /// A group after the first. Optional fields keep older sessions decoding.

@@ -27,6 +27,9 @@ const KEYWORDS: &[&str] = &[
     "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
     "unsafe", "use", "where", "while",
 ];
+const STD_TYPES: &[&str] = &[
+    "String", "Vec", "Option", "Result", "Box", "Rc", "Arc", "HashMap", "HashSet",
+];
 
 #[derive(Debug, Clone)]
 struct Declaration {
@@ -455,6 +458,14 @@ impl RustEngine {
         if name.starts_with(|c: char| c.is_uppercase()) {
             return None;
         }
+        if let Some(owner) = owner.filter(|owner| STD_TYPES.contains(owner)) {
+            let declarations = self.resolve_std_member(owner, name);
+            let [declaration] = declarations.as_slice() else {
+                return None;
+            };
+            let source = self.declaration_source(sources, path, text, declaration)?;
+            return rust_return_type_at(source, declaration.line, declaration.column, Some(owner));
+        }
         let declarations: Vec<_> = self
             .resolve_nonlocal(path, name)
             .into_iter()
@@ -472,6 +483,31 @@ impl RustEngine {
         let Some(name) = identifier_at(text, line, column) else {
             return Vec::new();
         };
+        let byte = cursor_byte(text, line, column);
+        if STD_TYPES.contains(&name.as_str())
+            && let Some(path) = std_type_source(&name)
+            && let Some(declaration) = std_type_declaration(&path, &name)
+        {
+            return vec![Target {
+                path: declaration.path,
+                line: declaration.line,
+                column: declaration.column,
+            }];
+        }
+        if let Some((ty, _)) = std_member_access(text, byte, &name) {
+            let declarations = self.resolve_std_member(&ty, &name);
+            if !declarations.is_empty() {
+                return declarations
+                    .into_iter()
+                    .map(|item| Target {
+                        path: item.path,
+                        line: item.line,
+                        column: item.column,
+                    })
+                    .take(MAX_ITEMS)
+                    .collect();
+            }
+        }
         self.resolve(path, &name, cursor_byte(text, line, column))
             .into_iter()
             .map(|item| Target {
@@ -668,16 +704,22 @@ impl RustEngine {
         let byte = cursor_byte(text, line, column);
         let before = &text[..byte];
         let Some(receiver) = before
-            .rsplit_once('.')
+            .rsplit_once("::")
+            .or_else(|| before.rsplit_once('.'))
             .map(|(left, _)| left.trim_end())
             .and_then(|left| left.rsplit(|character: char| !is_ident(character)).next())
         else {
             return Vec::new();
         };
-        let Some(ty) = receiver_type(before, receiver) else {
+        let Some(ty) = receiver_type(before, receiver)
+            .or_else(|| STD_TYPES.contains(&receiver).then(|| receiver.to_owned()))
+        else {
             return Vec::new();
         };
         let mut out = Vec::new();
+        if STD_TYPES.contains(&ty.as_str()) {
+            out.extend(std_member_completions(&ty));
+        }
         for (_, source) in self.sources() {
             out.extend(struct_fields(&source, &ty));
             out.extend(impl_methods(&source, &ty));
@@ -699,6 +741,16 @@ impl RustEngine {
             return vec![local];
         }
         self.resolve_nonlocal(path, name)
+    }
+
+    fn resolve_std_member(&self, ty: &str, name: &str) -> Vec<Declaration> {
+        let Some(path) = std_member_source(ty, name) else {
+            return Vec::new();
+        };
+        let Ok(source) = std::fs::read_to_string(&path) else {
+            return Vec::new();
+        };
+        member_declarations(&path, &source, ty, name)
     }
 
     /// Resolve `value.member` after the lightweight local type inference used
@@ -1656,8 +1708,10 @@ fn word_before(text: &str, line: u32, column: u32) -> &str {
 fn member_access_before(text: &str, line: u32, column: u32) -> bool {
     let byte = cursor_byte(text, line, column);
     text[..byte].trim_end().ends_with('.')
+        || text[..byte].trim_end().ends_with("::")
         || text[..byte]
-            .rsplit_once('.')
+            .rsplit_once("::")
+            .or_else(|| text[..byte].rsplit_once('.'))
             .is_some_and(|(_, right)| right.chars().all(is_ident))
 }
 
@@ -1682,6 +1736,22 @@ fn receiver_type(before: &str, receiver: &str) -> Option<String> {
                 .map(str::to_owned)
         })
         .or_else(|| parameter_type(before, receiver))
+}
+
+fn std_member_access(text: &str, byte: usize, name: &str) -> Option<(String, usize)> {
+    let before = text.get(..byte)?;
+    let word_start = before
+        .char_indices()
+        .rev()
+        .find(|(_, character)| !is_ident(*character))
+        .map_or(0, |(offset, character)| offset + character.len_utf8());
+    let prefix = text.get(..word_start)?;
+    let marker = prefix.rfind("::")?;
+    let receiver = prefix[..marker]
+        .rsplit(|character: char| !is_ident(character))
+        .next()?;
+    (STD_TYPES.contains(&receiver) && text[word_start..].starts_with(name))
+        .then(|| (receiver.to_owned(), marker))
 }
 
 fn parameter_type(before: &str, receiver: &str) -> Option<String> {
@@ -1735,14 +1805,85 @@ fn impl_methods(text: &str, ty: &str) -> Vec<Completion> {
     body.lines()
         .filter_map(|line| {
             let line = line.trim();
-            let name = line
-                .strip_prefix("pub fn ")
-                .or_else(|| line.strip_prefix("fn "))?
-                .split('(')
-                .next()?;
+            let signature = line.strip_prefix("pub ").unwrap_or(line);
+            let signature = signature
+                .strip_prefix("const ")
+                .or_else(|| signature.strip_prefix("unsafe "))
+                .or_else(|| signature.strip_prefix("async "))
+                .unwrap_or(signature);
+            let name = signature.strip_prefix("fn ")?.split('(').next()?;
             Some(completion(name, line, ItemKind::Function))
         })
         .collect()
+}
+
+fn std_member_completions(ty: &str) -> Vec<Completion> {
+    let Some(path) = std_type_source(ty) else {
+        return Vec::new();
+    };
+    let Ok(source) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    impl_methods(&source, ty)
+}
+
+fn std_member_source(ty: &str, name: &str) -> Option<PathBuf> {
+    let path = std_type_source(ty)?;
+    let source = std::fs::read_to_string(&path).ok()?;
+    member_declarations(&path, &source, ty, name)
+        .into_iter()
+        .next()
+        .map(|_| path)
+}
+
+fn std_type_declaration(path: &Path, ty: &str) -> Option<Declaration> {
+    let source = std::fs::read_to_string(path).ok()?;
+    let tree = parse_tree(&source)?;
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "struct_item"
+            && node
+                .child_by_field_name("name")
+                .and_then(|name| name.utf8_text(source.as_bytes()).ok())
+                == Some(ty)
+        {
+            return Some(Declaration {
+                name: ty.to_owned(),
+                module: vec!["alloc".to_owned()],
+                kind: ItemKind::Class,
+                path: path.to_path_buf(),
+                line: node.start_position().row as u32,
+                column: node.start_position().column as u32,
+                scope_depth: 0,
+                signature: source[node.start_byte()..node.end_byte()]
+                    .lines()
+                    .next()
+                    .unwrap_or(ty)
+                    .to_owned(),
+            });
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    None
+}
+
+fn std_type_source(ty: &str) -> Option<PathBuf> {
+    if ty != "String" {
+        return None;
+    }
+    let home = std::env::var_os("HOME")?;
+    let toolchains = PathBuf::from(home).join(".rustup/toolchains");
+    let entries = std::fs::read_dir(toolchains).ok()?;
+    for entry in entries.flatten() {
+        let path = entry
+            .path()
+            .join("lib/rustlib/src/rust/library/alloc/src/string.rs");
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    None
 }
 
 fn member_declarations(path: &Path, text: &str, ty: &str, name: &str) -> Vec<Declaration> {
@@ -2582,6 +2723,26 @@ mod tests {
     }
 
     #[test]
+    fn std_string_members_complete_and_goto_definition() {
+        let path = Path::new("/tmp/std.rs");
+        let source = "fn main() { let text = String::; String::new(); }";
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        engine.install(Built::default());
+
+        let completions = engine.complete(path, source, 0, 31);
+        assert!(completions.iter().any(|item| item.label == "new"));
+
+        let name = source.rfind("new").unwrap() as u32 + 1;
+        let definitions = engine.definition(path, source, 0, name);
+        assert_eq!(definitions.len(), 1);
+        assert!(
+            definitions[0]
+                .path
+                .ends_with("lib/rustlib/src/rust/library/alloc/src/string.rs")
+        );
+    }
+
+    #[test]
     fn parameter_hints_name_function_arguments() {
         let path = Path::new("/tmp/hints.rs");
         let source = "fn brew(\n    minutes: u8,\n    mut cups: HashMap<u8, u8>,\n) {}\nstruct Pot;\nimpl Pot { fn fill(&self, litres: u8) {} }\nfn main() { brew(5, map); brew(minutes, &cups); Pot::fill(&pot, 2); Some(1); }";
@@ -2627,6 +2788,7 @@ mod tests {
             "    let (l, m) = (1, 2);\n",
             "    let n = 5;\n",
             "    takes(n);\n",
+            "    let text = String::new();\n",
             "    println!(\"{a} {}\", a);\n",
             "}\n",
         );
@@ -2649,6 +2811,7 @@ mod tests {
                 (11, ": usize"),
                 (12, ": Coffee"),
                 (13, ": Vec<Coffee>"),
+                (19, ": String"),
             ]
         );
         let line = source.lines().nth(5).unwrap();

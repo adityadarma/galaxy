@@ -73,6 +73,29 @@ final class SessionTests: XCTestCase {
         XCTAssertFalse(second.tabs.contains { $0.isEdited }, "restored tabs are clean")
     }
 
+    func testPinnedTerminalTabComesBackWithANewShell() throws {
+        let first = makeController()
+        try first.openWorkspace(at: root.appendingPathComponent("ws"))
+        first.createTerminalEditor(nil)
+        let terminal = try XCTUnwrap(first.activeTab)
+        XCTAssertNotNil(terminal.terminal)
+        first.setPinned(true, tab: terminal)
+        first.saveSession()
+        first.window?.close()
+
+        let saved = try XCTUnwrap(Session.load(from: sessionURL))
+        XCTAssertEqual(saved.tabs.count, 1)
+        XCTAssertEqual(saved.tabs[0].isTerminal, true)
+        XCTAssertEqual(saved.tabs[0].isPinned, true)
+
+        let second = makeController()
+        defer { second.window?.orderOut(nil) }
+        XCTAssertTrue(second.restore(saved))
+        let restored = try XCTUnwrap(second.activeTab)
+        XCTAssertNotNil(restored.terminal)
+        XCTAssertTrue(restored.isPinned)
+    }
+
     // MARK: Diff tabs and duplicates
 
     nonisolated private func git(_ dir: URL, _ args: String...) throws {
