@@ -110,4 +110,31 @@ extension MainWindowController {
             commandPalette.isHidden = true
         }
     }
+
+    func installOverlayClickMonitor() {
+        guard overlayClickMonitor == nil else { return }
+        overlayClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) {
+            [weak self] event in
+            let windowNumber = event.windowNumber
+            let location = event.locationInWindow
+            MainActor.assumeIsolated {
+                guard let self, windowNumber == self.window?.windowNumber else { return }
+                let overlays: [NSView] = [
+                    self.loadedPalette,
+                    self.loadedPHPVersionPicker,
+                    self.loadedIndentationPicker,
+                ].compactMap { $0 }.filter { !$0.isHidden }
+                guard !overlays.isEmpty else { return }
+
+                // Let the status items receive their click so a second click toggles
+                // their picker closed instead of closing and immediately reopening it.
+                let triggers = [self.statusBar.language, self.statusBar.indent]
+                let isInside = (overlays + triggers).contains { view in
+                    view.bounds.contains(view.convert(location, from: nil))
+                }
+                if !isInside { self.closeOverlays() }
+            }
+            return event
+        }
+    }
 }

@@ -325,6 +325,8 @@ extension MainWindowController {
         testRunner.stopAll()
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
         keyMonitor = nil
+        if let overlayClickMonitor { NSEvent.removeMonitor(overlayClickMonitor) }
+        overlayClickMonitor = nil
         workspaceWatch?.stop()
         workspaceWatch = nil
         onWindowClosed?()

@@ -270,6 +270,7 @@ final class IndentationPicker: NSView, NSTableViewDataSource, NSTableViewDelegat
     private let field = NSTextField()
     private let table = NSTableView()
     private let scroll = NSScrollView()
+    private var heightConstraint: NSLayoutConstraint!
     private var entries: [Entry] = []
     private var results: [Entry] = []
     private var useTabs = false
@@ -322,8 +323,9 @@ final class IndentationPicker: NSView, NSTableViewDataSource, NSTableViewDelegat
 
         addSubview(field)
         addSubview(scroll)
+        heightConstraint = heightAnchor.constraint(equalToConstant: 76)
         NSLayoutConstraint.activate([
-            heightAnchor.constraint(equalToConstant: 244),
+            heightConstraint,
             field.topAnchor.constraint(equalTo: topAnchor, constant: 8),
             field.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
             field.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
@@ -383,6 +385,8 @@ final class IndentationPicker: NSView, NSTableViewDataSource, NSTableViewDelegat
             table.selectRowIndexes([0], byExtendingSelection: false)
             table.scrollRowToVisible(0)
         }
+        let rows = min(results.count, 8)
+        heightConstraint.constant = results.isEmpty ? 48 : 8 + 28 + 6 + CGFloat(rows) * table.rowHeight + 4
     }
 
     func controlTextDidChange(_ obj: Notification) { filter() }

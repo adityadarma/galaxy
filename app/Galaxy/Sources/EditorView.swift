@@ -944,9 +944,10 @@ final class EditorView: NSView {
     private func startBlinking() {
         blinkTimer?.invalidate()
         caretOn = true
-        blinkTimer = Timer.scheduledTimer(withTimeInterval: Self.blinkInterval, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.toggleCaret() }
-        }
+        let timer = Timer(timeInterval: Self.blinkInterval, target: self,
+                          selector: #selector(toggleCaret), userInfo: nil, repeats: true)
+        RunLoop.main.add(timer, forMode: .common)
+        blinkTimer = timer
     }
 
     private func stopBlinking() {
@@ -955,7 +956,7 @@ final class EditorView: NSView {
         caretOn = true
     }
 
-    private func toggleCaret() {
+    @objc private func toggleCaret() {
         caretOn.toggle()
         for rect in caretRects.values.joined() { setNeedsDisplay(rect) }
     }

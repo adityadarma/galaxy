@@ -280,6 +280,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     var codeActionRequest: DocumentHandle?
     var outlineRequest: DocumentHandle?
     var keyMonitor: Any?
+    var overlayClickMonitor: Any?
     /// Tabs in the order they were last shown, most recent first (⌃Tab).
     var tabOrderByUse: [ObjectIdentifier] = []
     let editorView = EditorView(frame: .zero)
@@ -377,6 +378,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         dropView.onDrop = { [weak self] urls in self?.open(urls: urls) }
         window.contentView = dropView
         buildContent()
+        installOverlayClickMonitor()
         installMemoryPressureHandler()
         editorView.onChange = { [weak self] in
             if let document = self?.activeTab?.doc,

@@ -14,10 +14,13 @@ extension MainWindowController {
             panel.onClose = { [weak self] in self?.closeIndentationPicker() }
             panel.onSelect = { [weak self] action in self?.applyIndentationAction(action) }
             window?.contentView?.addSubview(panel)
+            let preferred = panel.widthAnchor.constraint(equalToConstant: IndentationPicker.width)
+            preferred.priority = .defaultHigh
             NSLayoutConstraint.activate([
                 panel.topAnchor.constraint(equalTo: titleBar.topAnchor, constant: 6),
                 panel.centerXAnchor.constraint(equalTo: titleBar.centerXAnchor),
-                panel.widthAnchor.constraint(equalToConstant: IndentationPicker.width),
+                panel.widthAnchor.constraint(lessThanOrEqualTo: titleBar.widthAnchor, constant: -24),
+                preferred,
             ])
             loadedIndentationPicker = panel
         }
