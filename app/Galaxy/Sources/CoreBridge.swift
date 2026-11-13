@@ -79,12 +79,12 @@ final class CoreBridge {
         core.setPhpTargetVersion(root: root, version: version ?? "")
     }
 
-    /// Cargo can run build scripts and proc macros, so this is exposed only to
-    /// the explicit workspace command and never to indexing or file watching.
-    func refreshGeneratedRustSources(root: String, completion: @escaping @MainActor (RustGeneratedSourceRefresh) -> Void) {
+    /// Cargo can run build scripts and proc macros, so only explicit refreshes
+    /// and the opt-in after-save check call this path.
+    func refreshGeneratedRustSources(root: String, source: String = "", completion: @escaping @MainActor (RustGeneratedSourceRefresh) -> Void) {
         let core = core
         rustRefreshQueue.async {
-            let result = core.refreshGeneratedRustSources(root: root)
+            let result = core.refreshGeneratedRustSources(root: root, source: source)
             Task { @MainActor in completion(result) }
         }
     }

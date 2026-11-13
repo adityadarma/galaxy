@@ -102,6 +102,31 @@ fn base(language: &str) -> &'static [Snippet] {
                 description: "Struct",
                 body: "struct ${1:Name} {\n\t$0\n}",
             },
+            Snippet {
+                prefix: "println",
+                description: "Print line",
+                body: "println!(\"${1}\");$0",
+            },
+            Snippet {
+                prefix: "print",
+                description: "Print",
+                body: "print!(\"${1}\");$0",
+            },
+            Snippet {
+                prefix: "eprintln",
+                description: "Print error line",
+                body: "eprintln!(\"${1}\");$0",
+            },
+            Snippet {
+                prefix: "eprint",
+                description: "Print error",
+                body: "eprint!(\"${1}\");$0",
+            },
+            Snippet {
+                prefix: "dbg",
+                description: "Debug value",
+                body: "dbg!(${1:value});$0",
+            },
         ],
         "go" => &[
             Snippet {
@@ -670,6 +695,16 @@ mod tests {
         assert_eq!(language_for_path("x.blade.php"), Some("blade"));
         assert_eq!(language_for_path("main.tsx"), Some("tsx"));
         assert!(matching("main.py", "de").iter().any(|s| s.prefix == "def"));
+    }
+
+    #[test]
+    fn rust_println_snippet_matches_typed_prefix() {
+        let snippets = matching("main.rs", "printl");
+        let println = snippets
+            .iter()
+            .find(|snippet| snippet.prefix == "println")
+            .unwrap();
+        assert_eq!(println.body, "println!(\"${1}\");$0");
     }
 
     #[test]

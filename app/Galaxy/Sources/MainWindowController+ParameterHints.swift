@@ -57,11 +57,9 @@ extension MainWindowController {
         let id = ObjectIdentifier(doc)
         if let last = parameterHintsRequest, last.doc == id, last.revision == revision,
            last.lines.contains(visible.lowerBound), last.lines.contains(max(visible.lowerBound, visible.upperBound - 1)),
-           !(last.empty && !parameterHintsRetried && Date().timeIntervalSince(last.at) > Self.parameterHintsRetry) {
+           !(last.empty && Date().timeIntervalSince(last.at) > Self.parameterHintsRetry) {
             return
         }
-        let retrying = parameterHintsRequest.map { $0.doc == id && $0.revision == revision && $0.empty } ?? false
-        parameterHintsRetried = retrying
         parameterHintsRequest = (id, revision, lines, Date(), false)
         parameterHintsGeneration += 1
         parameterHintsInFlight = true
@@ -84,9 +82,7 @@ extension MainWindowController {
                 }
                 if answer.lines.isEmpty {
                     self.parameterHintsRequest?.empty = true
-                    if !self.parameterHintsRetried {
-                        self.scheduleParameterHints(after: Self.parameterHintsRetry + 0.1)
-                    }
+                    self.scheduleParameterHints(after: Self.parameterHintsRetry + 0.1)
                 } else {
                     self.editorView.setInlineHints(hints)
                 }

@@ -25,8 +25,10 @@ final class StickyScopeView: NSView {
         didSet { if hoveredRow != oldValue { needsDisplay = true } }
     }
 
-    override var isFlipped: Bool { true }
-    override var mouseDownCanMoveWindow: Bool { false }
+    // AppKit asks these through Objective-C during hit testing. Keep constant
+    // answers out of the main-actor thunk, whose executor check can crash.
+    nonisolated override var isFlipped: Bool { true }
+    nonisolated override var mouseDownCanMoveWindow: Bool { false }
 
     override init(frame: NSRect) {
         super.init(frame: frame)

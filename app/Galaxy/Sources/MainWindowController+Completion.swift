@@ -302,6 +302,7 @@ extension MainWindowController {
             document.setSelections(selections: selections, primary: 0)
         }
         closeCompletion()
+        bridge.pollAnalysis()
         editorView.didChangeDocument()
     }
 

@@ -194,6 +194,14 @@ impl BuiltinStore {
             .retain(|uri, _| !uri.starts_with(uri_prefix));
     }
 
+    /// Compiler results describe the saved file. Once an open buffer changes,
+    /// their ranges and messages are stale until the next compiler run.
+    pub fn clear_compiler_diagnostics(&mut self, uri: &str) -> bool {
+        let diagnostics = self.compiler_diagnostics.remove(uri).is_some();
+        let actions = self.compiler_code_actions.remove(uri).is_some();
+        diagnostics || actions
+    }
+
     pub fn hover(&self, uri: &str) -> Option<&HoverInfo> {
         self.hover.get(uri)
     }
@@ -369,5 +377,18 @@ mod tests {
         store.set_compiler_diagnostics("file:///a.php", vec![problem("compiler")]);
         store.set_diagnostics("file:///a.php", vec![problem("updated static")]);
         assert_eq!(store.diagnostics("file:///a.php").len(), 2);
+    }
+
+    #[test]
+    fn compiler_overlay_is_cleared_when_the_buffer_changes() {
+        let mut store = BuiltinStore::default();
+        store.set_diagnostics("file:///a.rs", vec![problem("static")]);
+        store.set_compiler_diagnostics("file:///a.rs", vec![problem("compiler")]);
+
+        assert!(store.clear_compiler_diagnostics("file:///a.rs"));
+        let diagnostics = store.diagnostics("file:///a.rs");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].message, "static");
+        assert!(!store.clear_compiler_diagnostics("file:///a.rs"));
     }
 }

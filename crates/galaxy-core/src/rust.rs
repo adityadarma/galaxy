@@ -17,8 +17,8 @@ use tree_sitter::{Node, Parser, Tree};
 
 use crate::analysis::{DiagnosticSeverity, Range, RenameEdit};
 use crate::lang::{
-    Action, Completion, Edit, HoverResult, ItemKind, Occurrence, OutlineSymbol, Problem, Severity,
-    Signature, Target,
+    Action, Completion, Edit, HoverResult, Insertion, ItemKind, Occurrence, OutlineSymbol, Problem,
+    Severity, Signature, Target,
 };
 use crate::parameter_hints::{self, Argument, Parameter, ParameterHint};
 
@@ -129,8 +129,8 @@ pub struct RustEngine {
     ready: bool,
 }
 
-/// Result of an explicitly requested Cargo refresh. This is never invoked by
-/// indexing or watching because Cargo can execute workspace code.
+/// Result of a Cargo refresh requested manually or after saving Rust source.
+/// Indexing and file watching never invoke Cargo because it can execute code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeneratedSourceRefresh {
     pub succeeded: bool,
@@ -211,10 +211,12 @@ pub fn cancel_generated_source_refresh(root: &Path) -> bool {
     killed
 }
 
-/// Runs Cargo to update build-script and proc-macro output for `root`.
+/// Runs Cargo to update build-script and proc-macro output for `root`. An
+/// automatic refresh checks only the package containing `source`; a manual
+/// refresh checks the workspace.
 /// Uses no shell and bounds the command duration and captured output.
-pub fn refresh_generated_sources(root: &Path) -> GeneratedSourceRefresh {
-    let child = match spawn_cargo(root) {
+pub fn refresh_generated_sources(root: &Path, source: Option<&Path>) -> GeneratedSourceRefresh {
+    let child = match spawn_cargo(root, source) {
         Ok(child) => child,
         Err(message) => return refresh_failure(message),
     };
@@ -504,14 +506,33 @@ fn file_uri_for_compiler(path: &Path) -> String {
     format!("file://{}", path.to_string_lossy())
 }
 
-fn cargo_refresh_args() -> [&'static str; 5] {
-    [
-        "check",
-        "--workspace",
-        "--all-targets",
-        "--offline",
-        "--message-format=json",
-    ]
+fn cargo_refresh_args(root: &Path, source: Option<&Path>) -> Vec<String> {
+    let mut args = vec!["check".to_owned()];
+    if let Some(package) = source.and_then(|source| cargo_package_name_for_file(root, source)) {
+        args.extend(["-p".to_owned(), package]);
+    } else {
+        args.push("--workspace".to_owned());
+    }
+    args.extend([
+        "--all-targets".to_owned(),
+        "--offline".to_owned(),
+        "--message-format=json".to_owned(),
+    ]);
+    args
+}
+
+fn cargo_package_name_for_file(root: &Path, source: &Path) -> Option<String> {
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let source = source
+        .canonicalize()
+        .unwrap_or_else(|_| source.to_path_buf());
+    source
+        .ancestors()
+        .take_while(|directory| directory.starts_with(&root))
+        .find_map(|directory| {
+            let contents = std::fs::read_to_string(directory.join("Cargo.toml")).ok()?;
+            toml_section_value(&contents, "package", "name")
+        })
 }
 
 fn cargo_executables(cargo_home: Option<&Path>, home: Option<&Path>) -> Vec<PathBuf> {
@@ -549,13 +570,13 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-fn spawn_cargo(root: &Path) -> Result<Child, String> {
+fn spawn_cargo(root: &Path, source: Option<&Path>) -> Result<Child, String> {
     let cargo_home = std::env::var_os("CARGO_HOME").map(PathBuf::from);
     let home = std::env::var_os("HOME").map(PathBuf::from);
     for executable in cargo_executables(cargo_home.as_deref(), home.as_deref()) {
         let mut command = Command::new(executable);
         command
-            .args(cargo_refresh_args())
+            .args(cargo_refresh_args(root, source))
             .current_dir(root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -924,9 +945,8 @@ impl RustEngine {
         candidates
             .sort_by(|left, right| left.name.cmp(&right.name).then(left.path.cmp(&right.path)));
         candidates.dedup_by(|left, right| left.name == right.name && left.kind == right.kind);
-        candidates
+        let mut completions: Vec<_> = candidates
             .into_iter()
-            .take(MAX_ITEMS)
             .map(|item| Completion {
                 label: item.name.clone(),
                 detail: Some(item.signature.clone()),
@@ -937,7 +957,16 @@ impl RustEngine {
                 extra: Vec::new(),
                 replace_from: None,
             })
-            .collect()
+            .collect();
+        completions.extend(
+            STD_TYPES
+                .iter()
+                .filter(|name| name.starts_with(prefix))
+                .map(|name| std_type_completion(name, text)),
+        );
+        completions.sort_by(|left, right| left.label.cmp(&right.label));
+        completions.dedup_by(|left, right| left.label == right.label && left.kind == right.kind);
+        completions.into_iter().take(MAX_ITEMS).collect()
     }
 
     pub fn signature(
@@ -3825,7 +3854,49 @@ fn std_member_completions(ty: &str) -> Vec<Completion> {
     let Ok(source) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
-    impl_methods(&source, ty)
+    let mut completions = impl_methods(&source, ty);
+    completions.extend(trait_associated_functions(&source, ty));
+    completions
+}
+
+fn trait_associated_functions(text: &str, ty: &str) -> Vec<Completion> {
+    let Some(tree) = parse_tree(text) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "impl_item"
+            && node.child_by_field_name("trait").is_some()
+            && node
+                .child_by_field_name("type")
+                .and_then(|node| node.utf8_text(text.as_bytes()).ok())
+                .is_some_and(|implemented| implemented.trim() == ty)
+        {
+            let mut descendants = vec![node];
+            while let Some(descendant) = descendants.pop() {
+                if descendant.kind() != "function_item" {
+                    let mut cursor = descendant.walk();
+                    descendants.extend(descendant.named_children(&mut cursor));
+                    continue;
+                }
+                let Some(name) = descendant
+                    .child_by_field_name("name")
+                    .and_then(|name| name.utf8_text(text.as_bytes()).ok())
+                else {
+                    continue;
+                };
+                let signature = text[descendant.start_byte()..descendant.end_byte()]
+                    .lines()
+                    .next()
+                    .unwrap_or(name);
+                out.push(completion(name, signature, ItemKind::Function));
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    out
 }
 
 fn std_member_source(ty: &str, name: &str) -> Option<PathBuf> {
@@ -4027,6 +4098,35 @@ fn completion(name: &str, detail: &str, kind: ItemKind) -> Completion {
         extra: Vec::new(),
         replace_from: None,
     }
+}
+
+fn std_type_completion(name: &str, text: &str) -> Completion {
+    let mut item = completion(name, "Rust standard library type", ItemKind::Class);
+    let module = match name {
+        "HashMap" | "HashSet" => "std::collections",
+        "Rc" => "std::rc",
+        "Arc" => "std::sync",
+        _ => return item,
+    };
+    let already_imported = text.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with("use ") && line.contains(module) && line.contains(name)
+    });
+    if !already_imported {
+        let line = text
+            .lines()
+            .take_while(|line| {
+                let line = line.trim();
+                line.is_empty() || line.starts_with("#![") || line.starts_with("//!")
+            })
+            .count() as u32;
+        item.extra.push(Insertion {
+            line,
+            column: 0,
+            text: format!("use {module}::{name};\n"),
+        });
+    }
+    item
 }
 
 fn call_at(text: &str, byte: usize) -> Option<(String, u32)> {
@@ -4475,10 +4575,36 @@ mod tests {
     #[test]
     fn cargo_refresh_uses_the_requested_shell_free_arguments() {
         assert_eq!(
-            cargo_refresh_args(),
+            cargo_refresh_args(Path::new("/tmp/missing-workspace"), None),
             [
                 "check",
                 "--workspace",
+                "--all-targets",
+                "--offline",
+                "--message-format=json"
+            ]
+        );
+    }
+
+    #[test]
+    fn cargo_refresh_checks_only_the_package_containing_the_saved_file() {
+        let root = tempfile::tempdir().unwrap();
+        let package = root.path().join("crates/editor-core");
+        let source = package.join("src/lib.rs");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(
+            package.join("Cargo.toml"),
+            "[package]\nname = \"editor-core\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(&source, "").unwrap();
+
+        assert_eq!(
+            cargo_refresh_args(root.path(), Some(&source)),
+            [
+                "check",
+                "-p",
+                "editor-core",
                 "--all-targets",
                 "--offline",
                 "--message-format=json"
@@ -4944,6 +5070,53 @@ mod tests {
     }
 
     #[test]
+    fn std_string_completion_includes_trait_associated_functions() {
+        let path = Path::new("/tmp/std-from.rs");
+        let source = "fn main() { let text = String::fro; }";
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        engine.install(Built::default());
+
+        let completions = engine.complete(path, source, 0, 34);
+        assert!(completions.iter().any(|item| item.label == "from"));
+    }
+
+    #[test]
+    fn standard_library_types_complete_before_associated_members() {
+        let path = Path::new("/tmp/std-type.rs");
+        let source = "fn main() { let value = Str }";
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        engine.install(Built::default());
+
+        let completions = engine.complete(path, source, 0, 27);
+        assert!(completions.iter().any(|item| item.label == "String"));
+    }
+
+    #[test]
+    fn standard_library_collection_completion_adds_missing_import() {
+        let path = Path::new("/tmp/std-collection.rs");
+        let source = "#![allow(dead_code)]\nfn main() { let value = HashM }";
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        engine.install(Built::default());
+
+        let completions = engine.complete(path, source, 1, 29);
+        let item = completions
+            .iter()
+            .find(|item| item.label == "HashMap")
+            .unwrap();
+        assert_eq!(item.extra.len(), 1);
+        assert_eq!(item.extra[0].line, 1);
+        assert_eq!(item.extra[0].text, "use std::collections::HashMap;\n");
+
+        let imported = "use std::collections::{HashMap, HashSet};\nfn main() { let value = HashM }";
+        let completions = engine.complete(path, imported, 1, 29);
+        let item = completions
+            .iter()
+            .find(|item| item.label == "HashMap")
+            .unwrap();
+        assert!(item.extra.is_empty());
+    }
+
+    #[test]
     fn parameter_hints_name_function_arguments() {
         let path = Path::new("/tmp/hints.rs");
         let source = "fn brew(\n    minutes: u8,\n    mut cups: HashMap<u8, u8>,\n) {}\nstruct Pot;\nimpl Pot { fn fill(&self, litres: u8) {} }\nfn main() { brew(5, map); brew(minutes, &cups); Pot::fill(&pot, 2); Some(1); }";
@@ -5019,6 +5192,21 @@ mod tests {
         assert_eq!(
             found.iter().find(|hint| hint.line == 5).unwrap().column as usize,
             line.find(" =").unwrap()
+        );
+    }
+
+    #[test]
+    fn literal_type_hints_work_while_indexing() {
+        let path = Path::new("/tmp/pending-hints.rs");
+        let source = "fn main() {\n    let answer = 42;\n}\n";
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+
+        assert!(!engine.is_ready());
+        let found = engine.parameter_hints(path, source, 0, 2);
+        assert!(
+            found
+                .iter()
+                .any(|hint| hint.line == 1 && hint.label == ": i32")
         );
     }
 

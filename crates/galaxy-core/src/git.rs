@@ -1388,6 +1388,7 @@ pub fn read_status(root: &Path) -> io::Result<Option<GitStatus>> {
             &root.to_string_lossy(),
             "status",
             "--porcelain=v1",
+            "-z",
             "--untracked-files=all",
         ])
         .output()?;
@@ -1397,18 +1398,20 @@ pub fn read_status(root: &Path) -> io::Result<Option<GitStatus>> {
         ));
     }
     let mut files = Vec::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        if line.len() < 3 {
+    let mut entries = output.stdout.split(|byte| *byte == 0);
+    while let Some(entry) = entries.next() {
+        if entry.len() < 4 {
             continue;
         }
-        let code = line[..2].to_owned();
-        let path = line[3..]
-            .strip_prefix('"')
-            .unwrap_or(&line[3..])
-            .rsplit(" -> ")
-            .next()
-            .unwrap_or(&line[3..])
-            .to_owned();
+        let code = String::from_utf8_lossy(&entry[..2]).into_owned();
+        let path = String::from_utf8_lossy(&entry[3..]).into_owned();
+        // In -z mode rename/copy entries contain the destination first and
+        // the original path as a second NUL-terminated field.
+        if matches!(code.as_bytes().first(), Some(b'R' | b'C'))
+            || matches!(code.as_bytes().get(1), Some(b'R' | b'C'))
+        {
+            let _ = entries.next();
+        }
         files.push(GitFileStatus {
             path,
             kind: GitFileStatusKind::Changed,
@@ -1585,6 +1588,32 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["new.txt", "tracked.txt"]
         );
+    }
+
+    #[test]
+    fn status_paths_with_spaces_are_not_git_quoted() {
+        let dir = tempfile::tempdir().unwrap();
+        run(dir.path(), ["init", "-b", "main"]);
+        let path = "Galaxy Dark.json";
+        fs::write(dir.path().join(path), "{}\n").unwrap();
+
+        let status = read_status(dir.path()).unwrap().unwrap();
+        assert_eq!(status.files.len(), 1);
+        assert_eq!(status.files[0].path, path);
+    }
+
+    #[test]
+    fn status_uses_the_destination_of_a_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        run(dir.path(), ["init", "-b", "main"]);
+        fs::write(dir.path().join("Old Theme.json"), "{}\n").unwrap();
+        commit_all(dir.path(), "initial");
+        run(dir.path(), ["mv", "Old Theme.json", "Galaxy Dark.json"]);
+
+        let status = read_status(dir.path()).unwrap().unwrap();
+        assert_eq!(status.files.len(), 1);
+        assert_eq!(status.files[0].path, "Galaxy Dark.json");
+        assert!(status.files[0].code.contains('R'));
     }
 
     fn commit_all(dir: &Path, message: &str) {

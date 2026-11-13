@@ -162,6 +162,7 @@ extension MainWindowController {
         do {
             try tab.doc.save()
             tab.isEdited = false
+            scheduleRustCompilerRefresh(afterSaving: tab.doc)
         } catch {
             Log.ui.error("auto-save failed for \(tab.doc.path(), privacy: .public): \(String(describing: error), privacy: .public)")
         }

@@ -18,6 +18,12 @@ cd "$ROOT"
 # Xcode runs scripts with a minimal PATH.
 export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 
+# Reuse Rust compilation results across Xcode builds when sccache is installed.
+# Keep it optional so clean machines and CI can still build the project.
+if command -v sccache >/dev/null 2>&1; then
+  export RUSTC_WRAPPER="$(command -v sccache)"
+fi
+
 PROFILE="debug"
 if [[ "${CONFIGURATION:-}" == "Release" ]]; then PROFILE="release"; fi
 for arg in "$@"; do

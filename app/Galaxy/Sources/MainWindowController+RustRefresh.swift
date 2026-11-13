@@ -40,6 +40,7 @@ extension MainWindowController {
                   self.rustGeneratedSourceRefresh?.id == requestID else { return }
             self.rustGeneratedSourceRefresh = nil
             self.statusLabel.stringValue = result.message
+            self.bridge.pollAnalysis()
             self.scheduleParameterHints(after: 0)
         }
     }
@@ -63,12 +64,13 @@ extension MainWindowController {
             let requestID = UUID()
             self.rustGeneratedSourceRefresh = (root, requestID, true)
             self.statusLabel.stringValue = "Rust: checking after save..."
-            self.bridge.refreshGeneratedRustSources(root: root) { [weak self, weak workspace] result in
+            self.bridge.refreshGeneratedRustSources(root: root, source: doc.path()) { [weak self, weak workspace] result in
                 guard let self, let workspace, self.workspace === workspace,
                       self.rustCompilerRefreshGeneration == generation,
                       self.rustGeneratedSourceRefresh?.id == requestID else { return }
                 self.rustGeneratedSourceRefresh = nil
                 self.statusLabel.stringValue = result.message
+                self.bridge.pollAnalysis()
                 self.scheduleParameterHints(after: 0)
             }
         }

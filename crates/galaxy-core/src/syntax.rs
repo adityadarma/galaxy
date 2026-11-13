@@ -566,7 +566,7 @@ fn json_highlights() -> &'static str {
     static QUERY: OnceLock<String> = OnceLock::new();
     QUERY.get_or_init(|| {
         format!(
-            "{}\n[\"[\" \"]\" \"{{\" \"}}\" \",\"] @punctuation\n\":\" @operator\n",
+            "{}\n(pair key: (string) @property.json)\n[\"[\" \"]\" \"{{\" \"}}\" \",\"] @punctuation\n\":\" @operator\n",
             tree_sitter_json::HIGHLIGHTS_QUERY
         )
     })
@@ -769,6 +769,7 @@ pub enum HighlightScope {
     Number,
     Operator,
     Property,
+    PropertyJson,
     Punctuation,
     PunctuationBracket1,
     PunctuationBracket2,
@@ -789,6 +790,7 @@ impl HighlightScope {
     pub fn from_capture(capture: &str) -> Option<Self> {
         match capture {
             "function.builtin" => return Some(Self::FunctionBuiltin),
+            "property.json" => return Some(Self::PropertyJson),
             "variable.builtin" => return Some(Self::VariableBuiltin),
             _ => {}
         }
@@ -825,6 +827,7 @@ impl HighlightScope {
             Self::Number => "number",
             Self::Operator => "operator",
             Self::Property => "property",
+            Self::PropertyJson => "property.json",
             Self::Punctuation => "punctuation",
             Self::PunctuationBracket1 => "punctuation.bracket.1",
             Self::PunctuationBracket2 => "punctuation.bracket.2",
@@ -1319,7 +1322,7 @@ fn highlight_priority(scope: HighlightScope) -> u8 {
     match scope {
         HighlightScope::Variable => 0,
         HighlightScope::Property => 1,
-        HighlightScope::Function | HighlightScope::Type => 2,
+        HighlightScope::Function | HighlightScope::PropertyJson | HighlightScope::Type => 2,
         HighlightScope::FunctionBuiltin => 3,
         _ => 1,
     }
@@ -3605,6 +3608,10 @@ mod tests {
         };
 
         assert!(scope_at("{").iter().any(|scope| is_bracket_scope(*scope)));
+        assert_eq!(
+            scope_at("\"items\"").last(),
+            Some(&HighlightScope::PropertyJson)
+        );
         assert!(scope_at(":").contains(&HighlightScope::Operator));
         assert!(scope_at("[").iter().any(|scope| is_bracket_scope(*scope)));
         assert!(scope_at("]").iter().any(|scope| is_bracket_scope(*scope)));

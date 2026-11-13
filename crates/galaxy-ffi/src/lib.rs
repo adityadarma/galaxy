@@ -810,11 +810,16 @@ impl Core {
         true
     }
 
-    /// Runs Cargo only for an explicit UI request, then rebuilds the Rust
-    /// engine so static OUT_DIR include scanning observes fresh output.
-    pub fn refresh_generated_rust_sources(&self, root: String) -> RustGeneratedSourceRefresh {
+    /// Runs Cargo for a manual workspace refresh or the package containing a
+    /// saved source, then rebuilds the Rust engine for fresh OUT_DIR output.
+    pub fn refresh_generated_rust_sources(
+        &self,
+        root: String,
+        source: String,
+    ) -> RustGeneratedSourceRefresh {
         let root = PathBuf::from(root);
-        let result = rust::refresh_generated_sources(&root);
+        let source = (!source.is_empty()).then(|| PathBuf::from(source));
+        let result = rust::refresh_generated_sources(&root, source.as_deref());
         if !result.canceled {
             let mut analysis = self.analysis.lock().unwrap_or_else(|e| e.into_inner());
             analysis.clear_compiler_diagnostics_under(&file_uri(&root));
@@ -1457,11 +1462,7 @@ impl Core {
                 self.rust_engine(file)
                     .map(|engine| {
                         let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
-                        if engine.is_ready() {
-                            engine.parameter_hints(file, &text, first, last)
-                        } else {
-                            Vec::new()
-                        }
+                        engine.parameter_hints(file, &text, first, last)
                     })
                     .unwrap_or_default()
             } else if is_dart_path(file) {
@@ -2440,14 +2441,17 @@ impl Core {
                 continue;
             }
             let revision = document.revision();
-            let unchanged = self
+            let checked_revision = self
                 .rust_checked
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get(uri)
-                .is_some_and(|checked| *checked == revision);
-            if unchanged {
+                .copied();
+            if checked_revision == Some(revision) {
                 continue;
+            }
+            if checked_revision.is_some() {
+                analysis.clear_compiler_diagnostics(uri);
             }
             let Some(engine) = self.rust_engine(Path::new(&path)) else {
                 continue;

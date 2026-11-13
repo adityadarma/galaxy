@@ -143,8 +143,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     var parameterHintsRequest: (doc: ObjectIdentifier, revision: UInt64, lines: Range<Int>, at: Date, empty: Bool)?
     var parameterHintsGeneration = 0
     var parameterHintsInFlight = false
-    /// One delayed retry after an empty answer (the engine may be indexing).
-    var parameterHintsRetried = false
     var blameShowItem: DispatchWorkItem?
     var blameHideItem: DispatchWorkItem?
     /// Scroll notifications can arrive much faster than display refresh.
