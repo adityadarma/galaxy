@@ -13,6 +13,8 @@ final class TerminalPanelTests: XCTestCase {
 
     func testKeysSendXtermSequences() {
         XCTAssertEqual(TerminalView.bytes(for: key(36, "\r"), appCursor: false), "\r")
+        XCTAssertEqual(TerminalView.bytes(for: key(36, "\r", .shift), appCursor: false), "\u{1b}[13;2u",
+                       "Shift+Enter inserts a newline in modern terminal UIs")
         XCTAssertEqual(TerminalView.bytes(for: key(51, "\u{7f}"), appCursor: false), "\u{7f}")
         XCTAssertEqual(TerminalView.bytes(for: key(126, "\u{F700}"), appCursor: false), "\u{1b}[A")
         XCTAssertEqual(TerminalView.bytes(for: key(126, "\u{F700}"), appCursor: true), "\u{1b}OA",

@@ -130,6 +130,12 @@ pub enum CoreEvent {
         completed: u64,
         total: u64,
     },
+    WorkspaceIndexPhase {
+        root: String,
+        phase: String,
+        completed: u64,
+        total: u64,
+    },
     WorkspaceIndexFinished {
         root: String,
         total: u64,
@@ -2274,11 +2280,7 @@ impl Engine {
             }
             Engine::Rust(engine) => {
                 let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
-                if engine.is_ready() {
-                    engine.definition(path, text, line, column)
-                } else {
-                    Vec::new()
-                }
+                engine.definition(path, text, line, column)
             }
         }
     }
@@ -4805,6 +4807,7 @@ fn spawn_workspace_indexing(
             let started = Instant::now();
             let retry_workspace = workspace.clone();
             let paths = workspace.build_file_index().paths().collect::<Vec<_>>();
+            workspace.set_indexed_paths(paths.clone());
             send_workspace_index_started(&listener, &root, paths.len() as u64);
             // Parsing a large TypeScript workspace is expensive. Build without
             // holding the shared snapshot lock so editor requests stay responsive.
@@ -4833,7 +4836,7 @@ fn spawn_workspace_indexing(
                     store.set_diagnostics(&uri, diagnostics);
                 }
             }
-            publish_workspace_rust_diagnostics(&analysis, &root, &paths, &rust_engines);
+            publish_workspace_rust_diagnostics(&analysis, &root, &paths, &rust_engines, &listener);
             // Globals are scanned before taking the lock; it reads thousands of files.
             let ambient = typescript_globals::scan_ambient_globals(&root, &paths);
             {
@@ -4923,6 +4926,7 @@ fn publish_workspace_rust_diagnostics(
     root: &Path,
     paths: &[String],
     engines: &EngineMap<RustEngine>,
+    listener: &Option<Arc<dyn CoreListener>>,
 ) {
     const MAX_FILES: usize = 10_000;
     let mut projects: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
@@ -4938,6 +4942,8 @@ fn publish_workspace_rust_diagnostics(
             .push(path);
     }
     for (project_root, files) in projects {
+        let started = Instant::now();
+        send_workspace_index_phase(listener, root, "Indexing Rust symbols", 0, 0);
         let engine = {
             let mut engines = engines.lock().unwrap_or_else(|e| e.into_inner());
             engines
@@ -4946,45 +4952,83 @@ fn publish_workspace_rust_diagnostics(
                 .clone()
         };
         let built = RustEngine::build(&project_root);
+        let snapshot = RustEngine::from_built(built);
+        let diagnostic_total = files.len() as u64;
+        send_workspace_index_phase(
+            listener,
+            root,
+            "Checking Rust diagnostics",
+            0,
+            diagnostic_total,
+        );
+        // The immutable snapshot can diagnose files in parallel without
+        // retaining the live engine mutex or populating its open-file cache.
+        let results = galaxy_core::index_scheduler::shared_index_scheduler()
+            .map_ordered_with_progress(
+                files,
+                |path| {
+                    let text = std::fs::read_to_string(&path).ok()?;
+                    let uri = file_uri(&path);
+                    let diagnostics = snapshot
+                        .diagnostics_indexed(&path, &text)
+                        .into_iter()
+                        .map(|problem| LspDiagnostic {
+                            uri: uri.clone(),
+                            range: LspRange {
+                                start_line: u64::from(problem.start_line),
+                                start_character: u64::from(problem.start_column),
+                                end_line: u64::from(problem.end_line),
+                                end_character: u64::from(problem.end_column),
+                            },
+                            severity: DiagnosticSeverity::Error,
+                            message: problem.message,
+                            source: Some("galaxy".into()),
+                            code: None,
+                            unnecessary: false,
+                        })
+                        .collect();
+                    Some((uri, diagnostics))
+                },
+                |completed, total| {
+                    send_workspace_index_phase(
+                        listener,
+                        root,
+                        "Checking Rust diagnostics",
+                        completed as u64,
+                        total as u64,
+                    )
+                },
+            );
         engine
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .install(built);
-        let mut results = Vec::new();
-        for path in files {
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let uri = file_uri(&path);
-            // Open-document analysis runs on the UI poll. Do not retain this
-            // mutex while walking every workspace file, or opening a Rust file
-            // can block the UI until the complete scan finishes.
-            let diagnostics = engine
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .diagnostics(&path, &text)
-                .into_iter()
-                .map(|problem| LspDiagnostic {
-                    uri: uri.clone(),
-                    range: LspRange {
-                        start_line: u64::from(problem.start_line),
-                        start_character: u64::from(problem.start_column),
-                        end_line: u64::from(problem.end_line),
-                        end_character: u64::from(problem.end_column),
-                    },
-                    severity: DiagnosticSeverity::Error,
-                    message: problem.message,
-                    source: Some("galaxy".into()),
-                    code: None,
-                    unnecessary: false,
-                })
-                .collect();
-            results.push((uri, diagnostics));
-        }
+            .install(snapshot.into_built());
         let mut analysis = analysis.lock().unwrap_or_else(|e| e.into_inner());
-        for (uri, diagnostics) in results {
+        for (uri, diagnostics) in results.into_iter().flatten() {
             analysis.set_diagnostics(&uri, diagnostics);
         }
+        tracing::debug!(
+            root = %project_root.display(),
+            ms = started.elapsed().as_millis() as u64,
+            "indexed Rust workspace diagnostics"
+        );
+    }
+}
+
+fn send_workspace_index_phase(
+    listener: &Option<Arc<dyn CoreListener>>,
+    root: &Path,
+    phase: &str,
+    completed: u64,
+    total: u64,
+) {
+    if let Some(listener) = listener {
+        listener.on_event(CoreEvent::WorkspaceIndexPhase {
+            root: root.to_string_lossy().into_owned(),
+            phase: phase.to_owned(),
+            completed,
+            total,
+        });
     }
 }
 

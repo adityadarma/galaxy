@@ -180,7 +180,17 @@ final class StatusBar: NSView {
 
     func workspaceIndexProgress(root: String, completed: UInt64, total: UInt64) {
         guard root == scanRoot else { return }
-        workspaceIndexText = "Scanning workspace \(completed) of \(total) files"
+        workspaceIndexText = completed >= total && total > 0
+            ? "Indexing workspace after scanning \(total) files..."
+            : "Scanning workspace \(completed) of \(total) files"
+        updateWorkspaceScan()
+    }
+
+    func workspaceIndexPhase(root: String, phase: String, completed: UInt64, total: UInt64) {
+        guard root == scanRoot else { return }
+        workspaceIndexText = total == 0
+            ? "\(phase)..."
+            : "\(phase) \(completed) of \(total) files"
         updateWorkspaceScan()
     }
 

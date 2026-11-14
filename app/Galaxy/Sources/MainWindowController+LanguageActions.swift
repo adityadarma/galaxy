@@ -93,10 +93,12 @@ extension MainWindowController {
     func startReferences(document: DocumentHandle, position: TextPos) {
         closeOverlays()
         presentReferencesPeek(at: position)
-        let indexingDetail = workspaceIndexState.flatMap { state in
-            document.path().hasPrefix(state.root + "/")
-                ? "Scanning workspace \(state.completed) of \(state.total) files. References will appear when the language index is ready."
-                : nil
+        let indexingDetail: String? = workspaceIndexState.flatMap { state -> String? in
+            guard document.path().hasPrefix(state.root + "/") else { return nil }
+            let progress = state.total > 0 && state.completed >= state.total
+                ? "Indexing workspace after scanning \(state.total) files"
+                : "Scanning workspace \(state.completed) of \(state.total) files"
+            return "\(progress). References will appear when the language index is ready."
         }
         referencesPanel.showStatus(
             "Finding references...",
@@ -130,7 +132,9 @@ extension MainWindowController {
             if let indexing {
                 let progress = indexing.total == 0
                     ? "Scanning workspace..."
-                    : "Scanning workspace \(indexing.completed) of \(indexing.total) files"
+                    : indexing.completed >= indexing.total
+                        ? "Indexing workspace after scanning \(indexing.total) files..."
+                        : "Scanning workspace \(indexing.completed) of \(indexing.total) files"
                 if bridge.references(document: request.document).isEmpty {
                     referencesPanel.showStatus(
                         "Finding references...",

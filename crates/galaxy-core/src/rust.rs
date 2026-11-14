@@ -854,6 +854,23 @@ impl RustEngine {
         self.ready = true;
     }
 
+    pub fn from_built(built: Built) -> Self {
+        let mut engine = Self::pending(Path::new(""));
+        engine.install(built);
+        engine
+    }
+
+    pub fn into_built(self) -> Built {
+        Built {
+            declarations: self.declarations,
+            files: self.files,
+            uses: self.uses,
+            module_identities: self.module_identities,
+            source_roots: self.source_roots,
+            packages: self.packages,
+        }
+    }
+
     pub fn is_ready(&self) -> bool {
         self.ready
     }
@@ -929,7 +946,7 @@ impl RustEngine {
         let prefix = word_before(text, line, column);
         if member_access_before(text, line, column) {
             return self
-                .member_completions(text, line, column)
+                .member_completions(path, text, line, column)
                 .into_iter()
                 .filter(|item| item.label.starts_with(prefix))
                 .take(MAX_ITEMS)
@@ -947,16 +964,7 @@ impl RustEngine {
         candidates.dedup_by(|left, right| left.name == right.name && left.kind == right.kind);
         let mut completions: Vec<_> = candidates
             .into_iter()
-            .map(|item| Completion {
-                label: item.name.clone(),
-                detail: Some(item.signature.clone()),
-                insert_text: item.name.clone(),
-                is_snippet: false,
-                kind: item.kind,
-                sort: item.name.clone(),
-                extra: Vec::new(),
-                replace_from: None,
-            })
+            .map(|item| self.declaration_completion(path, text, item))
             .collect();
         completions.extend(
             STD_TYPES
@@ -1253,12 +1261,28 @@ impl RustEngine {
 
     pub fn diagnostics(&mut self, path: &Path, text: &str) -> Vec<Problem> {
         self.sync_document(path, text);
+        self.diagnostics_indexed(path, text)
+    }
+
+    /// Diagnoses source already represented by the static workspace index.
+    /// Unlike open-document diagnostics, this does not duplicate declarations,
+    /// imports, and source text in the mutable document cache.
+    pub fn diagnostics_indexed(&self, path: &Path, text: &str) -> Vec<Problem> {
         let Some(tree) = parse_tree(text) else {
             return Vec::new();
         };
         let mut errors = Vec::new();
         collect_errors(tree.root_node(), text, &mut errors);
         errors.extend(module_problems(path, text, &self.cfg_for(path)));
+        let local_bindings = all_local_binding_names(tree.root_node(), text);
+        collect_unresolved(
+            self,
+            path,
+            text,
+            tree.root_node(),
+            &local_bindings,
+            &mut errors,
+        );
         errors.sort_by_key(|problem| (problem.start_line, problem.start_column));
         errors.truncate(MAX_PROBLEMS);
         errors
@@ -1399,6 +1423,28 @@ impl RustEngine {
         all
     }
 
+    fn declarations_named(&self, name: &str) -> Vec<Declaration> {
+        let start = self
+            .declarations
+            .partition_point(|declaration| declaration.name.as_str() < name);
+        let end = self
+            .declarations
+            .partition_point(|declaration| declaration.name.as_str() <= name);
+        let mut matches: Vec<_> = self.declarations[start..end]
+            .iter()
+            .filter(|declaration| !self.open.contains_key(&declaration.path))
+            .cloned()
+            .collect();
+        matches.extend(
+            self.open
+                .values()
+                .flat_map(|(declarations, _, _)| declarations)
+                .filter(|declaration| declaration.name == name)
+                .cloned(),
+        );
+        matches
+    }
+
     fn visible_declarations(&self, path: &Path) -> Vec<Declaration> {
         let mut visible: Vec<_> = self
             .all_declarations()
@@ -1423,7 +1469,13 @@ impl RustEngine {
         visible
     }
 
-    fn member_completions(&self, text: &str, line: u32, column: u32) -> Vec<Completion> {
+    fn member_completions(
+        &self,
+        path: &Path,
+        text: &str,
+        line: u32,
+        column: u32,
+    ) -> Vec<Completion> {
         let byte = cursor_byte(text, line, column);
         let before = &text[..byte];
         let Some(receiver) = before
@@ -1434,7 +1486,8 @@ impl RustEngine {
         else {
             return Vec::new();
         };
-        let Some(ty) = receiver_type(before, receiver)
+        let Some(ty) = self
+            .receiver_type(path, text, before, receiver)
             .or_else(|| STD_TYPES.contains(&receiver).then(|| receiver.to_owned()))
         else {
             return Vec::new();
@@ -1454,9 +1507,27 @@ impl RustEngine {
 
     fn resolve(&self, path: &Path, name: &str, at: usize) -> Vec<Declaration> {
         if let Some((_, text)) = self.document(path)
-            && let Some(members) = self.resolve_member(text, name, at)
+            && let Some(declarations) = self.resolve_scoped_path(path, text, at)
+            && !declarations.is_empty()
+        {
+            return declarations;
+        }
+        if let Some((_, text)) = self.document(path)
+            && let Some(variants) = self.resolve_enum_variant(path, text, name, at)
+            && !variants.is_empty()
+        {
+            return variants;
+        }
+        if let Some((_, text)) = self.document(path)
+            && let Some(members) = self.resolve_member(path, text, name, at)
         {
             return members;
+        }
+        if let Some((_, text)) = self.document(path)
+            && parse_tree(text).is_some_and(|tree| member_access_at(tree.root_node(), at).is_some())
+            && let Some(declaration) = std_prelude_trait_method(name)
+        {
+            return vec![declaration];
         }
         if let Some((_, text)) = self.document(path)
             && let Some(local) = local_declaration(path, text, name, at)
@@ -1464,6 +1535,93 @@ impl RustEngine {
             return vec![local];
         }
         self.resolve_nonlocal(path, name)
+    }
+
+    fn resolve_scoped_path(&self, path: &Path, text: &str, at: usize) -> Option<Vec<Declaration>> {
+        let tree = parse_tree(text)?;
+        let scoped = scoped_path_at(tree.root_node(), at)?;
+        let scoped_text = scoped.utf8_text(text.as_bytes()).ok()?;
+        let relative = at.saturating_sub(scoped.start_byte());
+        let mut start = 0;
+        let mut target = Vec::new();
+        for segment in scoped_text.split("::") {
+            let end = start + segment.len();
+            target.push(segment.to_owned());
+            if start <= relative && relative <= end {
+                if target.len() == 1 {
+                    if let Some(declaration) = self.dependency_root(path, segment) {
+                        return Some(vec![declaration]);
+                    }
+                    return Some(self.resolve_nonlocal(path, segment));
+                }
+                return Some(self.resolve_path(path, &target));
+            }
+            start = end + 2;
+        }
+        None
+    }
+
+    fn dependency_root(&self, path: &Path, name: &str) -> Option<Declaration> {
+        let dependency = self.dependency_for(path, name)?;
+        let package = self
+            .packages
+            .iter()
+            .find(|package| package.name == dependency.package)?;
+        let target = package
+            .targets
+            .iter()
+            .find(|target| target.root.file_name().is_some_and(|file| file == "lib.rs"))?;
+        Some(Declaration {
+            name: name.to_owned(),
+            crate_name: package.name.clone(),
+            module: Vec::new(),
+            visibility: Visibility::Public,
+            kind: ItemKind::Class,
+            path: target.root.clone(),
+            line: 0,
+            column: 0,
+            scope_depth: 0,
+            signature: format!("crate {name}"),
+        })
+    }
+
+    fn resolve_enum_variant(
+        &self,
+        path: &Path,
+        text: &str,
+        name: &str,
+        at: usize,
+    ) -> Option<Vec<Declaration>> {
+        let tree = parse_tree(text)?;
+        let scoped = scoped_identifier_at(tree.root_node(), at)?;
+        let owner = scoped.child_by_field_name("path")?;
+        let owner_name = owner.utf8_text(text.as_bytes()).ok()?;
+        if !is_ident_text(owner_name) {
+            return None;
+        }
+        let enums: Vec<_> = self
+            .resolve(path, owner_name, owner.start_byte())
+            .into_iter()
+            .filter(|declaration| declaration.kind == ItemKind::Enum)
+            .collect();
+        let mut variants = Vec::new();
+        for declaration in enums {
+            let source = self
+                .open
+                .get(&declaration.path)
+                .map(|(_, _, text)| text.clone())
+                .or_else(|| std::fs::read_to_string(&declaration.path).ok());
+            if let Some(source) = source {
+                variants.extend(enum_variant_declarations(&declaration, &source, name));
+            }
+        }
+        variants.sort_by(|left, right| {
+            (&left.path, left.line, left.column).cmp(&(&right.path, right.line, right.column))
+        });
+        variants.dedup_by(|left, right| {
+            left.path == right.path && left.line == right.line && left.column == right.column
+        });
+        Some(variants)
     }
 
     fn resolve_std_member(&self, ty: &str, name: &str) -> Vec<Declaration> {
@@ -1479,7 +1637,13 @@ impl RustEngine {
     /// Resolve `value.member` after the lightweight local type inference used
     /// by member completion. Do not fall back to a name-only match: a method
     /// name is frequently shared by unrelated types.
-    fn resolve_member(&self, text: &str, name: &str, at: usize) -> Option<Vec<Declaration>> {
+    fn resolve_member(
+        &self,
+        path: &Path,
+        text: &str,
+        name: &str,
+        at: usize,
+    ) -> Option<Vec<Declaration>> {
         let tree = parse_tree(text)?;
         let ast_receiver = member_access_at(tree.root_node(), at).and_then(|member| {
             member.child_by_field_name("value").and_then(|receiver| {
@@ -1503,10 +1667,25 @@ impl RustEngine {
         if !is_ident_text(receiver) {
             return None;
         }
-        let ty = receiver_type(before, receiver)?;
+        let ty = self.receiver_type(path, text, before, receiver)?;
+        let mut paths: Vec<_> = self
+            .declarations_named(name)
+            .into_iter()
+            .chain(self.declarations_named(&ty))
+            .map(|declaration| declaration.path)
+            .collect();
+        paths.sort();
+        paths.dedup();
         let mut matches = Vec::new();
-        for (path, source) in self.sources() {
-            matches.extend(member_declarations(&path, &source, &ty, name));
+        for candidate in paths {
+            let source = self
+                .open
+                .get(&candidate)
+                .map(|(_, _, text)| text.clone())
+                .or_else(|| std::fs::read_to_string(&candidate).ok());
+            if let Some(source) = source {
+                matches.extend(member_declarations(&candidate, &source, &ty, name));
+            }
         }
         matches.sort_by(|left, right| {
             (&left.path, left.line, left.column).cmp(&(&right.path, right.line, right.column))
@@ -1517,12 +1696,61 @@ impl RustEngine {
         (matches.len() == 1).then_some(matches)
     }
 
+    fn receiver_type(
+        &self,
+        path: &Path,
+        text: &str,
+        before: &str,
+        receiver: &str,
+    ) -> Option<String> {
+        if let Some(tree) = parse_tree(text)
+            && let Some(call) = local_call_binding(tree.root_node(), text, receiver, before.len())
+        {
+            let mut sources = HashMap::new();
+            if let Some(ty) = self
+                .call_result_type(path, text, call, &mut sources)
+                .and_then(|ty| named_type(&ty))
+            {
+                return Some(ty);
+            }
+        }
+        receiver_type(before, receiver)
+    }
+
+    fn declaration_completion(&self, path: &Path, text: &str, item: Declaration) -> Completion {
+        let mut result = completion(&item.name, &item.signature, item.kind);
+        let current_crate = self.crate_for(path);
+        let same_module = item.crate_name == current_crate && item.module == self.module_for(path);
+        let imported = self
+            .use_bindings(path)
+            .iter()
+            .any(|binding| binding.local == item.name || binding.glob);
+        if item.path != path && !same_module && !imported && item.visibility == Visibility::Public {
+            let root = if item.crate_name == current_crate {
+                "crate".to_owned()
+            } else {
+                item.crate_name.replace('-', "_")
+            };
+            if !root.is_empty() {
+                let mut segments = vec![root];
+                segments.extend(item.module.clone());
+                segments.push(item.name.clone());
+                result.extra.push(Insertion {
+                    line: import_insertion_line(text),
+                    column: 0,
+                    text: format!("use {};\n", segments.join("::")),
+                });
+            }
+        }
+        result
+    }
+
     /// Resolves project and import declarations without reparsing local scopes.
     /// Workspace diagnostics call this after collecting every local binding from
     /// their already-parsed syntax tree.
     fn resolve_nonlocal(&self, path: &Path, name: &str) -> Vec<Declaration> {
-        let all = self.all_declarations();
-        let local: Vec<_> = all
+        let matching_name = self.declarations_named(name);
+        let local: Vec<_> = matching_name
             .iter()
             .filter(|item| item.path == path && item.name == name)
             .cloned()
@@ -1543,21 +1771,113 @@ impl RustEngine {
             .use_bindings(path)
             .into_iter()
             .filter(|binding| binding.glob)
-            .flat_map(|binding| self.declarations_in_module(path, &binding.target))
-            .filter(|item| item.name == name)
+            .flat_map(|binding| {
+                self.resolve_name_in_module(
+                    path,
+                    path,
+                    &binding.target,
+                    name,
+                    &mut HashSet::new(),
+                    0,
+                )
+            })
             .collect();
         if globbed.len() == 1 {
             return globbed;
         }
-        let matching: Vec<_> = all
+        let matching: Vec<_> = matching_name
             .into_iter()
-            .filter(|item| item.name == name && self.accessible_from(path, item))
+            .filter(|item| self.accessible_from(path, item))
             .collect();
         if matching.len() == 1 {
             matching
         } else {
             Vec::new()
         }
+    }
+
+    fn resolve_name_in_module(
+        &self,
+        requester: &Path,
+        context: &Path,
+        target: &[String],
+        name: &str,
+        seen: &mut HashSet<(String, Vec<String>, String)>,
+        depth: usize,
+    ) -> Vec<Declaration> {
+        if depth >= 32 {
+            return Vec::new();
+        }
+        let current_crate = self.crate_for(context);
+        let (crate_name, module) = match target.first().map(String::as_str) {
+            Some("crate" | "self" | "super") => {
+                (current_crate, self.module_target(context, target))
+            }
+            Some(dependency) => {
+                let Some(dependency) = self.dependency_for(context, dependency) else {
+                    return Vec::new();
+                };
+                (dependency.package, target[1..].to_vec())
+            }
+            None => return Vec::new(),
+        };
+        let key = (crate_name.clone(), module.clone(), name.to_owned());
+        if !seen.insert(key) {
+            return Vec::new();
+        }
+
+        let mut resolved: Vec<_> = self
+            .declarations_named(name)
+            .into_iter()
+            .filter(|item| {
+                item.crate_name == crate_name
+                    && item.module == module
+                    && self.accessible_from(requester, item)
+            })
+            .collect();
+        let requester_module = self.module_for(requester);
+        for (binding_path, bindings) in &self.uses {
+            if self.crate_for(binding_path) != crate_name {
+                continue;
+            }
+            let binding_module = self.module_for(binding_path);
+            for binding in bindings.iter().filter(|binding| {
+                let declared_module = if binding.module.is_empty() {
+                    &binding_module
+                } else {
+                    &binding.module
+                };
+                declared_module == &module
+                    && (binding.public || module_is_within(&requester_module, &module))
+                    && (binding.glob || binding.local == name)
+            }) {
+                let targets = if binding.glob {
+                    self.resolve_name_in_module(
+                        requester,
+                        binding_path,
+                        &binding.target,
+                        name,
+                        seen,
+                        depth + 1,
+                    )
+                } else {
+                    self.resolve_path_bounded(
+                        binding_path,
+                        &binding.target,
+                        &mut HashSet::new(),
+                        depth + 1,
+                    )
+                };
+                resolved.extend(targets);
+            }
+        }
+        resolved.sort_by(|left, right| {
+            (&left.path, left.line, left.column).cmp(&(&right.path, right.line, right.column))
+        });
+        resolved.dedup_by(|left, right| {
+            left.path == right.path && left.line == right.line && left.column == right.column
+        });
+        resolved
     }
 
     fn resolve_path(&self, path: &Path, target: &[String]) -> Vec<Declaration> {
@@ -1615,11 +1935,10 @@ impl RustEngine {
             _ => return Vec::new(),
         };
         let matches: Vec<_> = self
-            .all_declarations()
+            .declarations_named(name)
             .into_iter()
             .filter(|item| {
-                item.name == *name
-                    && item.crate_name == crate_name
+                item.crate_name == crate_name
                     && item.module == module
                     && self.module_accessible_from(path, &crate_name, &module)
                     && self.accessible_from(path, item)
@@ -1852,6 +2171,34 @@ fn member_access_at(node: Node<'_>, at: usize) -> Option<Node<'_>> {
         .find_map(|child| member_access_at(child, at))
 }
 
+fn scoped_identifier_at(node: Node<'_>, at: usize) -> Option<Node<'_>> {
+    if node.start_byte() > at || node.end_byte() < at {
+        return None;
+    }
+    if node.kind() == "scoped_identifier"
+        && node
+            .child_by_field_name("name")
+            .is_some_and(|name| name.start_byte() <= at && at <= name.end_byte())
+    {
+        return Some(node);
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find_map(|child| scoped_identifier_at(child, at))
+}
+
+fn scoped_path_at(node: Node<'_>, at: usize) -> Option<Node<'_>> {
+    if node.start_byte() > at || node.end_byte() < at {
+        return None;
+    }
+    if node.kind() == "scoped_identifier" {
+        return Some(node);
+    }
+    let mut cursor = node.walk();
+    node.named_children(&mut cursor)
+        .find_map(|child| scoped_path_at(child, at))
+}
+
 fn structural_braces(line: &str) -> (usize, usize) {
     let mut quoted = false;
     let mut escaped = false;
@@ -2078,7 +2425,21 @@ fn cargo_dependencies(
         let Some((name, value)) = line.split_once('=') else {
             continue;
         };
-        let value = value.trim();
+        let mut name = name.trim();
+        let mut value = value.trim();
+        if value == "true"
+            && let Some(inherited_name) = name.strip_suffix(".workspace")
+        {
+            name = inherited_name;
+            value = "{ workspace = true }";
+        }
+        let inherited = (toml_inline_value(value, "workspace").as_deref() == Some("true"))
+            .then(|| workspace_dependency(root, name))
+            .flatten();
+        let (dependency_root, value) = inherited
+            .as_ref()
+            .map(|(root, value)| (root.as_path(), value.as_str()))
+            .unwrap_or((root, value));
         let simple_version = toml_string(value);
         let path = toml_inline_value(value, "path");
         let version = toml_inline_value(value, "version").or(simple_version);
@@ -2088,7 +2449,7 @@ fn cargo_dependencies(
             continue;
         }
         let package = toml_inline_value(value, "package")
-            .unwrap_or_else(|| name.trim().to_owned())
+            .unwrap_or_else(|| name.to_owned())
             .replace('-', "_");
         let optional = toml_inline_value(value, "optional").as_deref() == Some("true");
         let default_features =
@@ -2098,14 +2459,14 @@ fn cargo_dependencies(
             .map(str::to_owned)
             .collect();
         features.extend(forwarded_dependency_features(
-            name.trim(),
+            name,
             selected_features,
             feature_definitions,
         ));
         let dependency = CargoDependency {
-            name: name.trim().replace('-', "_"),
+            name: name.replace('-', "_"),
             package,
-            path: path.map(|path| root.join(path)),
+            path: path.map(|path| dependency_root.join(path)),
             git: git.is_some(),
             optional,
             default_features,
@@ -2116,6 +2477,32 @@ fn cargo_dependencies(
         }
     }
     dependencies
+}
+
+fn workspace_dependency(root: &Path, name: &str) -> Option<(PathBuf, String)> {
+    for directory in root.ancestors() {
+        let Ok(contents) = std::fs::read_to_string(directory.join("Cargo.toml")) else {
+            continue;
+        };
+        let mut section = "";
+        for line in contents.lines() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            if line.starts_with('[') && line.ends_with(']') {
+                section = line.trim_matches(&['[', ']'][..]);
+                continue;
+            }
+            if section != "workspace.dependencies" {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            if key.trim() == name {
+                return Some((directory.to_path_buf(), value.trim().to_owned()));
+            }
+        }
+    }
+    None
 }
 
 /// Cargo feature entries such as `dep/feature` enable a feature in a
@@ -2316,7 +2703,14 @@ struct LockedPackage {
 }
 
 fn cargo_lock_packages(root: &Path) -> Vec<LockedPackage> {
-    let Ok(contents) = std::fs::read_to_string(root.join("Cargo.lock")) else {
+    let Some(lockfile) = root
+        .ancestors()
+        .map(|directory| directory.join("Cargo.lock"))
+        .find(|path| path.is_file())
+    else {
+        return Vec::new();
+    };
+    let Ok(contents) = std::fs::read_to_string(lockfile) else {
         return Vec::new();
     };
     let mut packages = Vec::new();
@@ -3768,6 +4162,43 @@ fn receiver_type(before: &str, receiver: &str) -> Option<String> {
         .or_else(|| parameter_type(before, receiver))
 }
 
+fn local_call_binding<'tree>(
+    root: Node<'tree>,
+    text: &str,
+    receiver: &str,
+    before: usize,
+) -> Option<Node<'tree>> {
+    let mut found = None;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.start_byte() >= before {
+            continue;
+        }
+        if node.kind() == "let_declaration"
+            && let Some(pattern) = node.child_by_field_name("pattern")
+            && pattern.utf8_text(text.as_bytes()).ok() == Some(receiver)
+            && let Some(value) = node.child_by_field_name("value")
+            && value.kind() == "call_expression"
+        {
+            found = Some(value);
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    found
+}
+
+fn named_type(ty: &str) -> Option<String> {
+    ty.trim()
+        .trim_start_matches('&')
+        .trim_start_matches("mut ")
+        .rsplit("::")
+        .next()?
+        .split(|character: char| !is_ident(character))
+        .find(|segment| !segment.is_empty())
+        .map(str::to_owned)
+}
+
 fn std_member_access(text: &str, byte: usize, name: &str) -> Option<(String, usize)> {
     let before = text.get(..byte)?;
     let word_start = before
@@ -3908,6 +4339,70 @@ fn std_member_source(ty: &str, name: &str) -> Option<PathBuf> {
         .map(|_| path)
 }
 
+fn std_prelude_trait_method(name: &str) -> Option<Declaration> {
+    let (trait_name, relative) = match name {
+        "into" => ("Into", "core/src/convert/mod.rs"),
+        _ => return None,
+    };
+    let path = rust_source_file(relative)?;
+    let source = std::fs::read_to_string(&path).ok()?;
+    let tree = parse_tree(&source)?;
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "trait_item"
+            && node
+                .child_by_field_name("name")
+                .and_then(|node| node.utf8_text(source.as_bytes()).ok())
+                == Some(trait_name)
+        {
+            let mut descendants = vec![node];
+            while let Some(descendant) = descendants.pop() {
+                if descendant.kind() == "function_signature_item"
+                    && let Some(method) = descendant.child_by_field_name("name")
+                    && method.utf8_text(source.as_bytes()).ok() == Some(name)
+                {
+                    let point = method.start_position();
+                    return Some(Declaration {
+                        name: name.to_owned(),
+                        crate_name: "core".to_owned(),
+                        module: vec!["convert".to_owned()],
+                        visibility: Visibility::Public,
+                        kind: ItemKind::Function,
+                        path,
+                        line: point.row as u32,
+                        column: utf16_column(&source, method.start_byte()),
+                        scope_depth: 0,
+                        signature: descendant
+                            .utf8_text(source.as_bytes())
+                            .unwrap_or(name)
+                            .to_owned(),
+                    });
+                }
+                let mut cursor = descendant.walk();
+                descendants.extend(descendant.named_children(&mut cursor));
+            }
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    None
+}
+
+fn rust_source_file(relative: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let toolchains = PathBuf::from(home).join(".rustup/toolchains");
+    std::fs::read_dir(toolchains)
+        .ok()?
+        .flatten()
+        .map(|entry| {
+            entry
+                .path()
+                .join("lib/rustlib/src/rust/library")
+                .join(relative)
+        })
+        .find(|path| path.is_file())
+}
+
 fn std_type_declaration(path: &Path, ty: &str) -> Option<Declaration> {
     let source = std::fs::read_to_string(path).ok()?;
     let tree = parse_tree(&source)?;
@@ -3984,6 +4479,61 @@ fn member_declarations(path: &Path, text: &str, ty: &str, name: &str) -> Vec<Dec
     }
     members.extend(struct_field_declarations(path, text, ty, name));
     members
+}
+
+fn enum_variant_declarations(
+    declaration: &Declaration,
+    text: &str,
+    name: &str,
+) -> Vec<Declaration> {
+    let Some(tree) = parse_tree(text) else {
+        return Vec::new();
+    };
+    let mut stack = vec![tree.root_node()];
+    let mut variants = Vec::new();
+    while let Some(node) = stack.pop() {
+        if node.kind() == "enum_item"
+            && node
+                .child_by_field_name("name")
+                .and_then(|name| name.utf8_text(text.as_bytes()).ok())
+                == Some(declaration.name.as_str())
+        {
+            let mut descendants = vec![node];
+            while let Some(descendant) = descendants.pop() {
+                if descendant.kind() == "enum_variant" {
+                    let Some(variant) = descendant.child_by_field_name("name") else {
+                        continue;
+                    };
+                    if variant.utf8_text(text.as_bytes()).ok() != Some(name) {
+                        continue;
+                    }
+                    let point = variant.start_position();
+                    variants.push(Declaration {
+                        name: name.to_owned(),
+                        crate_name: declaration.crate_name.clone(),
+                        module: declaration.module.clone(),
+                        visibility: declaration.visibility.clone(),
+                        kind: ItemKind::Enum,
+                        path: declaration.path.clone(),
+                        line: point.row as u32,
+                        column: utf16_column(text, variant.start_byte()),
+                        scope_depth: 0,
+                        signature: descendant
+                            .utf8_text(text.as_bytes())
+                            .unwrap_or(name)
+                            .to_owned(),
+                    });
+                    continue;
+                }
+                let mut cursor = descendant.walk();
+                descendants.extend(descendant.named_children(&mut cursor));
+            }
+            continue;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    variants
 }
 
 fn struct_field_declarations(path: &Path, text: &str, ty: &str, name: &str) -> Vec<Declaration> {
@@ -4113,20 +4663,22 @@ fn std_type_completion(name: &str, text: &str) -> Completion {
         line.starts_with("use ") && line.contains(module) && line.contains(name)
     });
     if !already_imported {
-        let line = text
-            .lines()
-            .take_while(|line| {
-                let line = line.trim();
-                line.is_empty() || line.starts_with("#![") || line.starts_with("//!")
-            })
-            .count() as u32;
         item.extra.push(Insertion {
-            line,
+            line: import_insertion_line(text),
             column: 0,
             text: format!("use {module}::{name};\n"),
         });
     }
     item
+}
+
+fn import_insertion_line(text: &str) -> u32 {
+    text.lines()
+        .take_while(|line| {
+            let line = line.trim();
+            line.is_empty() || line.starts_with("#![") || line.starts_with("//!")
+        })
+        .count() as u32
 }
 
 fn call_at(text: &str, byte: usize) -> Option<(String, u32)> {
@@ -5050,6 +5602,61 @@ mod tests {
     }
 
     #[test]
+    fn member_completion_and_definition_infer_function_return_type() {
+        let path = Path::new("/tmp/lib.rs");
+        let source = "struct Coffee;\nimpl Coffee { fn brew(&self) {} }\nfn make_coffee() -> Coffee { Coffee }\nfn main() { let coffee = make_coffee(); coffee.br; coffee.brew(); }";
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        engine.install(Built::default());
+        let line = source.lines().nth(3).unwrap();
+        let completion_column = line.find(".br;").unwrap() as u32 + 3;
+
+        assert!(
+            engine
+                .complete(path, source, 3, completion_column)
+                .iter()
+                .any(|item| item.label == "brew")
+        );
+        let column = line.rfind("brew").unwrap() as u32 + 1;
+        let definitions = engine.definition(path, source, 3, column);
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0].line, 1);
+    }
+
+    #[test]
+    fn project_completion_adds_import_for_public_item() {
+        let root = Path::new("/project/src");
+        let path = Path::new("/project/src/lib.rs");
+        let target = PathBuf::from("/project/src/models.rs");
+        let mut engine = RustEngine::pending(Path::new("/project"));
+        engine.install(Built {
+            declarations: vec![Declaration {
+                name: "Coffee".to_owned(),
+                crate_name: String::new(),
+                module: vec!["models".to_owned()],
+                visibility: Visibility::Public,
+                kind: ItemKind::Class,
+                path: target.clone(),
+                line: 0,
+                column: 11,
+                scope_depth: 0,
+                signature: "pub struct Coffee;".to_owned(),
+            }],
+            files: vec![target],
+            source_roots: vec![root.to_path_buf()],
+            ..Built::default()
+        });
+
+        let item = engine
+            .complete(path, "//! docs\nfn main() { Coff }", 1, 20)
+            .into_iter()
+            .find(|item| item.label == "Coffee")
+            .unwrap();
+        assert_eq!(item.extra.len(), 1);
+        assert_eq!(item.extra[0].line, 1);
+        assert_eq!(item.extra[0].text, "use crate::models::Coffee;\n");
+    }
+
+    #[test]
     fn std_string_members_complete_and_goto_definition() {
         let path = Path::new("/tmp/std.rs");
         let source = "fn main() { let text = String::; String::new(); }";
@@ -5865,6 +6472,40 @@ mod tests {
     }
 
     #[test]
+    fn child_glob_import_resolves_parent_private_reexport() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src/parent")).unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"app\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("src/lib.rs"), "mod parent;\n").unwrap();
+        std::fs::write(
+            root.path().join("src/parent.rs"),
+            "mod ambient;\nmod syntax;\nuse self::syntax::*;\n",
+        )
+        .unwrap();
+        let syntax = root.path().join("src/parent/syntax.rs");
+        std::fs::write(&syntax, "pub(super) fn language_for_path() {}\n").unwrap();
+        let ambient = root.path().join("src/parent/ambient.rs");
+        let source = "use super::*;\nfn ambient() { language_for_path(); }\n";
+        std::fs::write(&ambient, source).unwrap();
+
+        let mut engine = RustEngine::pending(root.path());
+        engine.install(RustEngine::build(root.path()));
+        let definitions = definition_at(&mut engine, &ambient, source, "language_for_path");
+        assert_eq!(definitions.len(), 1);
+        assert_eq!(definitions[0].path, syntax.canonicalize().unwrap());
+        assert!(
+            engine
+                .diagnostics(&ambient, source)
+                .iter()
+                .all(|problem| !problem.message.contains("language_for_path"))
+        );
+    }
+
+    #[test]
     fn parses_all_bounded_visibility_forms() {
         let declarations = parse_declarations(
             Path::new("/project/src/lib.rs"),
@@ -5996,6 +6637,143 @@ mod tests {
     }
 
     #[test]
+    fn enum_variant_definition_resolves_through_parent_glob_import() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src/parent")).unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"app\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("src/lib.rs"), "mod parent;\n").unwrap();
+        std::fs::write(
+            root.path().join("src/parent.rs"),
+            "mod syntax;\npub enum DocumentLanguage { TypeScript, Tsx }\n",
+        )
+        .unwrap();
+        let syntax = root.path().join("src/parent/syntax.rs");
+        let source = "use super::*;\nfn language(value: DocumentLanguage) { match value { DocumentLanguage::TypeScript => {} } }\n";
+        std::fs::write(&syntax, source).unwrap();
+        let mut engine = RustEngine::pending(root.path());
+        engine.install(RustEngine::build(root.path()));
+
+        let column = source.lines().nth(1).unwrap().find("TypeScript").unwrap() as u32 + 1;
+        let target = engine.definition(&syntax, source, 1, column);
+        assert_eq!(target.len(), 1);
+        assert_eq!(
+            target[0].path,
+            root.path().join("src/parent.rs").canonicalize().unwrap()
+        );
+        assert_eq!((target[0].line, target[0].column), (1, 28));
+    }
+
+    #[test]
+    fn definition_resolves_dependency_constant_and_into_trait_method() {
+        let root = tempfile::tempdir().unwrap();
+        let dependency = root.path().join("tree-sitter-typescript");
+        let app = root.path().join("app");
+        std::fs::create_dir_all(dependency.join("src")).unwrap();
+        std::fs::create_dir_all(app.join("src")).unwrap();
+        std::fs::write(
+            dependency.join("Cargo.toml"),
+            "[package]\nname = \"tree-sitter-typescript\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dependency.join("src/lib.rs"),
+            "pub const LANGUAGE_TYPESCRIPT: u8 = 1;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[dependencies]\ntree-sitter-typescript.workspace = true\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"app\", \"tree-sitter-typescript\"]\n[workspace.dependencies]\ntree-sitter-typescript = { path = \"tree-sitter-typescript\" }\n",
+        )
+        .unwrap();
+        let source =
+            "fn language() { let _ = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(); }\n";
+        let path = app.join("src/lib.rs");
+        std::fs::write(&path, source).unwrap();
+        let mut engine = RustEngine::pending(root.path());
+        engine.install(RustEngine::build(root.path()));
+
+        let crate_column = source.find("tree_sitter_typescript").unwrap() as u32 + 1;
+        let crate_target = engine.definition(&path, source, 0, crate_column);
+        assert_eq!(crate_target.len(), 1);
+        assert_eq!(
+            crate_target[0].path,
+            dependency.join("src/lib.rs").canonicalize().unwrap()
+        );
+        assert_eq!((crate_target[0].line, crate_target[0].column), (0, 0));
+
+        let constant_column = source.find("LANGUAGE_TYPESCRIPT").unwrap() as u32 + 1;
+        let constant = engine.definition(&path, source, 0, constant_column);
+        assert_eq!(constant.len(), 1);
+        assert_eq!(
+            constant[0].path,
+            dependency.join("src/lib.rs").canonicalize().unwrap()
+        );
+        assert_eq!((constant[0].line, constant[0].column), (0, 10));
+
+        if rust_source_file("core/src/convert/mod.rs").is_some() {
+            let into_column = source.find("into").unwrap() as u32 + 1;
+            let into = engine.definition(&path, source, 0, into_column);
+            assert_eq!(into.len(), 1);
+            assert!(into[0].path.ends_with("core/src/convert/mod.rs"));
+            assert_eq!(into[0].line, 457);
+        }
+    }
+
+    #[test]
+    fn real_workspace_definition_resolves_tree_sitter_registry_dependency() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let path = root.join("src/typescript/syntax.rs");
+        let source = std::fs::read_to_string(&path).unwrap();
+        let mut engine = RustEngine::pending(&root);
+        engine.install(RustEngine::build(&root));
+        assert!(
+            engine
+                .packages
+                .iter()
+                .any(|package| package.name == "tree_sitter_javascript"),
+            "indexed packages: {:?}",
+            engine
+                .packages
+                .iter()
+                .map(|package| package.name.as_str())
+                .collect::<Vec<_>>()
+        );
+        let line = source
+            .lines()
+            .position(|line| line.contains("tree_sitter_javascript::LANGUAGE.into()"))
+            .unwrap() as u32;
+        let text = source.lines().nth(line as usize).unwrap();
+
+        let crate_column = text.find("tree_sitter_javascript").unwrap() as u32 + 1;
+        let crate_target = engine.definition(&path, &source, line, crate_column);
+        assert_eq!(crate_target.len(), 1);
+        assert!(
+            crate_target[0]
+                .path
+                .ends_with("tree-sitter-javascript-0.25.0/bindings/rust/lib.rs")
+        );
+
+        let constant_column = text.find("LANGUAGE").unwrap() as u32 + 1;
+        let constant = engine.definition(&path, &source, line, constant_column);
+        assert_eq!(constant.len(), 1);
+        assert!(
+            constant[0]
+                .path
+                .ends_with("tree-sitter-javascript-0.25.0/bindings/rust/lib.rs")
+        );
+        assert_eq!(constant[0].line, 30);
+    }
+
+    #[test]
     fn member_completion_infers_receiver_type_from_function_parameter() {
         let path = Path::new("/tmp/lib.rs");
         let source = "struct Coffee { beans: u8 }\nimpl Coffee { fn brew(&self) {} }\nfn serve(coffee: &Coffee) { coffee.br }";
@@ -6024,12 +6802,15 @@ mod tests {
     }
 
     #[test]
-    fn offers_unused_import_removal_without_name_heuristic_diagnostics() {
+    fn offers_unused_import_removal_with_unresolved_call_diagnostic() {
         let path = Path::new("/tmp/lib.rs");
         let source = "use crate::models::Coffee;\nfn main() { missing(); }\n";
         let mut engine = RustEngine::pending(Path::new("/tmp"));
         engine.install(Built::default());
-        assert!(engine.diagnostics(path, source).is_empty());
+        assert_eq!(
+            engine.diagnostics(path, source)[0].message,
+            "cannot resolve `missing`"
+        );
         let actions = engine.actions(path, source, 0, 0);
         assert_eq!(actions[0].title, "Remove unused import `Coffee`");
     }
@@ -6070,13 +6851,14 @@ mod tests {
     }
 
     #[test]
-    fn diagnostics_do_not_report_pattern_or_unknown_names() {
+    fn diagnostics_report_only_the_direct_unresolved_call() {
         let path = Path::new("/tmp/lib.rs");
         let source = "fn inspect(project: Option<&str>) {\n    if let Some(comment) = project {\n        for child in comment.chars() {\n            let _ = child;\n        }\n    } else {\n        missing();\n    }\n}\n";
         let mut engine = RustEngine::pending(Path::new("/tmp"));
         engine.install(Built::default());
         let diagnostics = engine.diagnostics(path, source);
-        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].message, "cannot resolve `missing`");
     }
 
     #[test]

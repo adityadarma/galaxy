@@ -422,7 +422,11 @@ final class TerminalView: NSView {
             modifier > 1 ? "\u{1b}[\(code);\(modifier)~" : "\u{1b}[\(code)~"
         }
         switch event.keyCode {
-        case 36, 76: return option ? "\u{1b}\r" : "\r"
+        case 36, 76:
+            // Modern terminal UIs use CSI-u to distinguish a requested newline
+            // from Enter, which submits the current prompt.
+            if shift { return "\u{1b}[13;2u" }
+            return option ? "\u{1b}\r" : "\r"
         case 48: return shift ? "\u{1b}[Z" : "\t"
         case 51: return option ? "\u{1b}\u{7f}" : (control ? "\u{08}" : "\u{7f}")
         case 53: return "\u{1b}"

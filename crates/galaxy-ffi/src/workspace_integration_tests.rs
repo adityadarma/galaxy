@@ -390,6 +390,7 @@ fn workspace_rust_diagnostics_include_unopened_sources() {
         dir.path(),
         &["src/unopened.rs".into()],
         &engines,
+        &None,
     );
 
     let analysis = analysis.lock().unwrap();
@@ -399,6 +400,14 @@ fn workspace_rust_diagnostics_include_unopened_sources() {
             .iter()
             .any(|problem| problem.uri == file_uri(&path))
     );
+    drop(analysis);
+    let engine = engines
+        .lock()
+        .unwrap()
+        .get(dir.path())
+        .cloned()
+        .expect("Rust engine");
+    assert_eq!(engine.lock().unwrap().index_stats().source_bytes, 0);
 }
 
 #[test]
@@ -409,7 +418,13 @@ fn workspace_typescript_refresh_keeps_rust_diagnostics() {
     std::fs::write(&rust_path, "fn run() { let x = ; }\n").unwrap();
     let analysis = Arc::new(Mutex::new(BuiltinStore::default()));
     let engines = Arc::new(Mutex::new(HashMap::new()));
-    publish_workspace_rust_diagnostics(&analysis, dir.path(), &["src/lib.rs".into()], &engines);
+    publish_workspace_rust_diagnostics(
+        &analysis,
+        dir.path(),
+        &["src/lib.rs".into()],
+        &engines,
+        &None,
+    );
 
     let typescript = TypeScriptWorkspaceExports::build(dir.path(), &[]);
     for (uri, diagnostics) in typescript.diagnostics() {

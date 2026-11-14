@@ -180,6 +180,7 @@ pub struct Workspace {
     root: PathBuf,
     /// `files.exclude` globs, relative to the root. Shared between clones.
     explorer_excludes: Arc<RwLock<Vec<String>>>,
+    indexed_paths: Arc<RwLock<Vec<String>>>,
     /// The volume ignores letter case in names (the macOS default), so git
     /// matches `AGENTS.MD` in a `.gitignore` against `AGENTS.md`. Ignore
     /// rules are then matched the same way.
@@ -297,6 +298,7 @@ impl Workspace {
             case_insensitive: volume_ignores_case(&root),
             root,
             explorer_excludes: Arc::default(),
+            indexed_paths: Arc::default(),
         })
     }
 
@@ -590,6 +592,15 @@ impl Workspace {
         options: &SearchOptions,
         limit: usize,
     ) -> io::Result<Vec<SearchMatch>> {
+        let indexed_paths = self.indexed_paths.read().unwrap_or_else(|e| e.into_inner());
+        if !indexed_paths.is_empty() {
+            return self.search_paths(
+                indexed_paths.iter().map(String::as_str),
+                query,
+                options,
+                limit,
+            );
+        }
         if query.is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
@@ -675,6 +686,81 @@ impl Workspace {
             }
         }
         Ok(results)
+    }
+
+    pub fn search_paths<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a str>,
+        query: &str,
+        options: &SearchOptions,
+        limit: usize,
+    ) -> io::Result<Vec<SearchMatch>> {
+        if query.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let pattern = if options.regex {
+            query.to_string()
+        } else {
+            regex::escape(query)
+        };
+        let pattern = if options.whole_word {
+            format!(r"\b(?:{pattern})\b")
+        } else {
+            pattern
+        };
+        let regex = RegexBuilder::new(&pattern)
+            .case_insensitive(!options.case_sensitive)
+            .build()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        let includes = split_globs(&options.include);
+        let excludes = split_globs(&options.exclude);
+        let mut results = Vec::new();
+        for rel_path in paths {
+            if results.len() >= limit {
+                break;
+            }
+            if !includes.is_empty() && !includes.iter().any(|glob| glob_matches(glob, rel_path)) {
+                continue;
+            }
+            if excludes.iter().any(|glob| glob_matches(glob, rel_path)) {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(self.root.join(rel_path)) else {
+                continue;
+            };
+            let lines: Vec<&str> = text.lines().collect();
+            for (line, content) in lines.iter().enumerate() {
+                for found in regex.find_iter(content) {
+                    if results.len() >= limit {
+                        break;
+                    }
+                    results.push(SearchMatch {
+                        rel_path: rel_path.to_owned(),
+                        line,
+                        column: content[..found.start()].encode_utf16().count(),
+                        text: (*content).to_owned(),
+                        context_before: line
+                            .checked_sub(1)
+                            .and_then(|index| lines.get(index))
+                            .map_or_else(String::new, |line| (*line).to_owned()),
+                        context_after: lines
+                            .get(line + 1)
+                            .map_or_else(String::new, |line| (*line).to_owned()),
+                    });
+                }
+                if results.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(results)
+    }
+
+    pub fn set_indexed_paths(&self, paths: Vec<String>) {
+        *self
+            .indexed_paths
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = paths;
     }
 
     /// Works out how the file index changes after `changed` (relative
@@ -1296,6 +1382,22 @@ mod tests {
             "links are not followed"
         );
         assert!(paths.iter().any(|p| p == "main-link.rs"));
+    }
+
+    #[test]
+    fn search_uses_installed_workspace_paths_without_walking_again() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("indexed.txt"), "needle indexed\n").unwrap();
+        let workspace = Workspace::open(root.path()).unwrap();
+        let paths = workspace.build_file_index().paths().collect();
+        workspace.set_indexed_paths(paths);
+        std::fs::write(root.path().join("late.txt"), "needle late\n").unwrap();
+
+        let matches = workspace
+            .search("needle", &SearchOptions::default(), 10)
+            .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].rel_path, "indexed.txt");
     }
 
     #[test]

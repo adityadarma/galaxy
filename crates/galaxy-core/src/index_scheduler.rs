@@ -66,7 +66,7 @@ impl IndexScheduler {
         self.map_ordered_with_progress_limited(inputs, usize::MAX, operation, progress)
     }
 
-    fn map_ordered_with_progress_limited<I, O, F, P>(
+    pub fn map_ordered_with_progress_limited<I, O, F, P>(
         &self,
         inputs: Vec<I>,
         max_workers: usize,

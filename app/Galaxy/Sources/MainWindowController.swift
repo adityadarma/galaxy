@@ -478,6 +478,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             case let .workspaceIndexProgress(root, completed, total):
                 self?.workspaceIndexState = (root, completed, total)
                 self?.statusBar.workspaceIndexProgress(root: root, completed: completed, total: total)
+            case let .workspaceIndexPhase(root, phase, completed, total):
+                self?.statusBar.workspaceIndexPhase(
+                    root: root,
+                    phase: phase,
+                    completed: completed,
+                    total: total
+                )
             case let .workspaceIndexFinished(root, total, changed):
                 if self?.workspaceIndexState?.root == root { self?.workspaceIndexState = nil }
                 self?.statusBar.workspaceIndexFinished(root: root, total: total, changed: changed)

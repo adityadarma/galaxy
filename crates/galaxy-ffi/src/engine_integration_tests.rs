@@ -97,6 +97,112 @@ fn rust_definition_comes_from_the_engine() {
 }
 
 #[test]
+fn rust_navigation_resolves_dependency_constant_and_into_at_editor_positions() {
+    let dir = tempfile::tempdir().unwrap();
+    let dependency = dir.path().join("tree-sitter-typescript");
+    let app = dir.path().join("app");
+    std::fs::create_dir_all(dependency.join("src")).unwrap();
+    std::fs::create_dir_all(app.join("src")).unwrap();
+    std::fs::write(
+        dependency.join("Cargo.toml"),
+        "[package]\nname = \"tree-sitter-typescript\"\nversion = \"0.1.0\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dependency.join("src/lib.rs"),
+        "pub const LANGUAGE_TYPESCRIPT: u8 = 1;\n",
+    )
+    .unwrap();
+    std::fs::write(
+        app.join("Cargo.toml"),
+        "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[dependencies]\ntree-sitter-typescript.workspace = true\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[workspace]\nmembers = [\"app\", \"tree-sitter-typescript\"]\n[workspace.dependencies]\ntree-sitter-typescript = { path = \"tree-sitter-typescript\" }\n",
+    )
+    .unwrap();
+    let source = "fn language() { let _ = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(); }\n";
+    let path = app.join("src/lib.rs");
+    std::fs::write(&path, source).unwrap();
+    let core = Core::new();
+    let document = core
+        .open_document(path.to_string_lossy().into_owned())
+        .unwrap();
+
+    let into = source.find("into").unwrap() as u64;
+    for column in into..=into + 4 {
+        until("Rust Into definition", || {
+            core.request_definition_for_navigation(document.clone(), 0, column, "definition".into())
+        });
+        let found = core.definition_locations(document.clone());
+        assert_eq!(found.len(), 1, "column {column}");
+        assert!(
+            found[0].uri.ends_with("core/src/convert/mod.rs"),
+            "column {column}: {}",
+            found[0].uri
+        );
+    }
+}
+
+#[test]
+fn rust_navigation_resolves_into_before_workspace_index_is_ready() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("main.rs");
+    let source = "fn language(value: u8) { let _ = value.into(); }\n";
+    std::fs::write(&path, source).unwrap();
+    let core = Core::new();
+    let document = core
+        .open_document(path.to_string_lossy().into_owned())
+        .unwrap();
+    let root = rust::project_root(&path);
+    core.rust.lock().unwrap().insert(
+        root.clone(),
+        Arc::new(Mutex::new(RustEngine::pending(&root))),
+    );
+
+    let column = source.find("into").unwrap() as u64 + 4;
+    assert!(core.request_definition_for_navigation(
+        document.clone(),
+        0,
+        column,
+        "definition".into(),
+    ));
+    let found = core.definition_locations(document);
+    assert_eq!(found.len(), 1);
+    assert!(found[0].uri.ends_with("core/src/convert/mod.rs"));
+}
+
+#[test]
+fn rust_navigation_resolves_real_tree_sitter_dependency() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../galaxy-core");
+    let path = root.join("src/typescript/syntax.rs");
+    let source = std::fs::read_to_string(&path).unwrap();
+    let line = source
+        .lines()
+        .position(|line| line.contains("tree_sitter_javascript::LANGUAGE.into()"))
+        .unwrap() as u64;
+    let text = source.lines().nth(line as usize).unwrap();
+    let column = text.find("tree_sitter_javascript").unwrap() as u64 + 1;
+    let core = Core::new();
+    let document = core
+        .open_document(path.to_string_lossy().into_owned())
+        .unwrap();
+
+    until("real Rust dependency definition", || {
+        core.request_definition_for_navigation(document.clone(), line, column, "definition".into())
+    });
+    let found = core.definition_locations(document);
+    assert_eq!(found.len(), 1);
+    assert!(
+        found[0]
+            .uri
+            .ends_with("tree-sitter-javascript-0.25.0/bindings/rust/lib.rs")
+    );
+}
+
+#[test]
 fn rust_diagnostics_are_rechecked_only_after_a_document_edit() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("main.rs");
