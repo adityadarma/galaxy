@@ -199,25 +199,33 @@ extension MainWindowController {
 
     func showGitBranchPicker() {
         guard let workspace else { return }
+        closeOverlays()
         let picker = loadedGitPicker ?? GitBranchPicker()
         if loadedGitPicker == nil {
+            guard let contentView = window?.contentView else { return }
             picker.onClose = { [weak self] in self?.closeGitBranchPicker() }
             picker.onCheckout = { [weak self] name in self?.checkoutGitBranch(name) }
             picker.onCreate = { [weak self] in self?.createGitBranch() }
-            window?.contentView?.addSubview(picker)
+            picker.onCreateFrom = { [weak self] in self?.createGitBranchFrom() }
+            picker.onCheckoutDetached = { [weak self] in self?.checkoutDetached() }
+            contentView.addSubview(picker)
+            let preferred = picker.widthAnchor.constraint(equalToConstant: 620)
+            preferred.priority = .defaultHigh
             NSLayoutConstraint.activate([
-                picker.topAnchor.constraint(equalTo: detailView.topAnchor, constant: Theme.tabHeight + 8),
-                picker.centerXAnchor.constraint(equalTo: detailView.centerXAnchor),
-                picker.widthAnchor.constraint(equalToConstant: 620),
+                picker.topAnchor.constraint(equalTo: titleBar.topAnchor, constant: 6),
+                picker.centerXAnchor.constraint(equalTo: titleBar.centerXAnchor),
+                picker.widthAnchor.constraint(lessThanOrEqualTo: titleBar.widthAnchor, constant: -24),
+                preferred,
             ])
             loadedGitPicker = picker
         }
-        picker.reset(branches: bridge.gitBranches(workspace: workspace))
+        picker.reset(branches: bridge.gitBranches(workspace: workspace),
+                     commits: bridge.gitLogGraph(workspace: workspace))
         picker.isHidden = false
-        window?.makeFirstResponder(picker)
+        picker.focus()
     }
 
-    private func closeGitBranchPicker() {
+    func closeGitBranchPicker() {
         loadedGitPicker?.isHidden = true
         window?.makeFirstResponder(activeTab == nil ? explorer.outlineView : editorView)
     }
@@ -250,6 +258,52 @@ extension MainWindowController {
         closeGitBranchPicker()
         refreshGitStatus()
         statusLabel.stringValue = ""
+    }
+
+    private func createGitBranchFrom() {
+        let alert = NSAlert()
+        alert.messageText = "Create new branch from a commit"
+        let name = NSTextField(string: "")
+        name.placeholderString = "New branch name"
+        let source = NSTextField(string: "")
+        source.placeholderString = "Branch, tag, or commit"
+        let fields = NSStackView(views: [name, source])
+        fields.orientation = .vertical
+        fields.spacing = 8
+        fields.frame = NSRect(x: 0, y: 0, width: 320, height: 56)
+        alert.accessoryView = fields
+        alert.addButton(withTitle: "Create")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn, let workspace else { return }
+        do {
+            try workspace.gitCreateBranchAt(name: name.stringValue, hash: source.stringValue)
+            closeGitBranchPicker()
+            refreshGitStatus()
+            statusLabel.stringValue = ""
+        } catch {
+            statusLabel.stringValue = "Could not create branch from \(source.stringValue)."
+        }
+    }
+
+    private func checkoutDetached() {
+        let alert = NSAlert()
+        alert.messageText = "Checkout detached"
+        alert.informativeText = "Enter a branch, tag, or commit hash."
+        let source = NSTextField(string: "")
+        source.placeholderString = "Branch, tag, or commit"
+        source.frame = NSRect(x: 0, y: 0, width: 320, height: 24)
+        alert.accessoryView = source
+        alert.addButton(withTitle: "Checkout")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn, let workspace else { return }
+        do {
+            try workspace.gitCheckoutCommit(hash: source.stringValue)
+            closeGitBranchPicker()
+            refreshGitStatus()
+            statusLabel.stringValue = ""
+        } catch {
+            statusLabel.stringValue = "Could not checkout \(source.stringValue)."
+        }
     }
 
     func refreshGitDiff() {

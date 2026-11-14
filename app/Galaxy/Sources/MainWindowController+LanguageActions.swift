@@ -69,7 +69,7 @@ extension MainWindowController {
         guard let path = URL(string: location.uri)?.path else { return }
         let target = NavLocation(key: path, line: location.line, col: location.column)
         if let current = activeTab.map(location(of:)) { _ = navHistory.recordJump(from: current, to: target); refreshNavigationButtons() }
-        _ = show(target)
+        _ = show(target, centered: true)
     }
 
     /// True when `location` starts on the identifier under `position` in `document`.

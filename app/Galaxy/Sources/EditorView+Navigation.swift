@@ -816,13 +816,13 @@ extension EditorView {
 
     /// Scrolls `line` to the middle of the view if it is not on screen
     /// (Go to Line, back/forward), as VSCode does. A visible line stays put.
-    func revealLine(_ line: Int) {
+    func revealLine(_ line: Int, centered: Bool = false) {
         guard let scrollView = enclosingScrollView else { return }
         let clip = scrollView.contentView
         let height = metrics.lineHeight
         let top = rowTop(of: UInt64(line))
         let visible = clip.bounds
-        if top >= visible.minY, top + height <= visible.maxY { return }
+        if !centered, top >= visible.minY, top + height <= visible.maxY { return }
         let inset = scrollView.contentInsets.top
         let maxY = max(-inset, frame.height - visible.height)
         let y = min(max(top + height / 2 - visible.height / 2, -inset), maxY)

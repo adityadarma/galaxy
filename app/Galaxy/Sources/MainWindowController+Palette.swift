@@ -106,6 +106,7 @@ extension MainWindowController {
         if isGoToLineVisible { closeGoToLine() }
         if isPHPVersionPickerVisible { closePHPVersionPicker() }
         if isIndentationPickerVisible { closeIndentationPicker() }
+        if loadedGitPicker?.isHidden == false { closeGitBranchPicker() }
         if isCommandPaletteVisible {
             commandPalette.isHidden = true
         }
@@ -117,24 +118,30 @@ extension MainWindowController {
             [weak self] event in
             let windowNumber = event.windowNumber
             let location = event.locationInWindow
+            var consume = false
             MainActor.assumeIsolated {
                 guard let self, windowNumber == self.window?.windowNumber else { return }
+                let branchPickerOpen = self.loadedGitPicker?.isHidden == false
                 let overlays: [NSView] = [
                     self.loadedPalette,
                     self.loadedPHPVersionPicker,
                     self.loadedIndentationPicker,
+                    self.loadedGitPicker,
                 ].compactMap { $0 }.filter { !$0.isHidden }
                 guard !overlays.isEmpty else { return }
 
                 // Let the status items receive their click so a second click toggles
                 // their picker closed instead of closing and immediately reopening it.
-                let triggers = [self.statusBar.language, self.statusBar.indent]
+                let triggers = [self.statusBar.language, self.statusBar.indent, self.statusBar.git]
                 let isInside = (overlays + triggers).contains { view in
                     view.bounds.contains(view.convert(location, from: nil))
                 }
-                if !isInside { self.closeOverlays() }
+                if !isInside {
+                    self.closeOverlays()
+                    consume = branchPickerOpen
+                }
             }
-            return event
+            return consume ? nil : event
         }
     }
 }

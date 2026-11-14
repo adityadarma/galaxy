@@ -88,6 +88,41 @@ final class GitGraphPanelTests: XCTestCase {
                        ["PROBLEMS", "OUTPUT", "DEBUG CONSOLE", "TEST RESULTS", "TERMINAL", "PORTS"])
     }
 
+    func testBranchPickerIsCenteredInTheWholeWindow() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("branch-picker-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let controller = MainWindowController(bridge: CoreBridge())
+        controller.window?.setContentSize(NSSize(width: 1_200, height: 800))
+        controller.showWindow(nil)
+        defer { controller.window?.orderOut(nil) }
+        try controller.openWorkspace(at: root)
+
+        controller.showGitBranchPicker()
+        controller.window?.contentView?.layoutSubtreeIfNeeded()
+
+        let content = try XCTUnwrap(controller.window?.contentView)
+        let picker = try XCTUnwrap(controller.loadedGitPicker)
+        XCTAssertEqual(picker.frame.midX, content.bounds.midX, accuracy: 1)
+        XCTAssertNotEqual(picker.frame.midX, controller.detailView.frame.midX, accuracy: 1)
+        XCTAssertGreaterThan(picker.frame.height, 150, "the picker includes all branch actions")
+        XCTAssertLessThan(picker.frame.height, 300, "the picker hugs its short result list")
+
+        let click = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .leftMouseDown,
+            location: NSPoint(x: 20, y: 300),
+            modifierFlags: [],
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: controller.window?.windowNumber ?? 0,
+            context: nil,
+            eventNumber: 0,
+            clickCount: 1,
+            pressure: 1
+        ))
+        NSApp.sendEvent(click)
+        XCTAssertTrue(picker.isHidden, "clicking outside dismisses the branch picker")
+    }
+
     func testContextMenuOffersCommitActionsAndBranchCheckout() {
         let panel = GitGraphPanel()
         let tagged = GitCommitInfo(

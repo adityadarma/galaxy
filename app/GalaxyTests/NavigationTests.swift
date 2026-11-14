@@ -74,6 +74,20 @@ final class NavigationTests: XCTestCase {
         XCTAssertLessThan(selection(v).0, Int(v.document!.lenUtf16()) - 20)
     }
 
+    func testCenteredNavigationPlacesTargetInViewportMiddle() throws {
+        let lines = (0..<200).map { "line \($0)" }.joined(separator: "\n")
+        let controller = try makeController(text: lines)
+        controller.window?.setContentSize(NSSize(width: 900, height: 600))
+        controller.window?.contentView?.layoutSubtreeIfNeeded()
+        let tab = try XCTUnwrap(controller.activeTab)
+
+        controller.move(tab, toLine: 120, col: 0, centered: true)
+
+        let visible = controller.editorView.enclosingScrollView!.contentView.bounds
+        let targetMiddle = controller.editorView.rowTop(of: 120) + controller.editorView.metrics.lineHeight / 2
+        XCTAssertEqual(targetMiddle, visible.midY, accuracy: controller.editorView.metrics.lineHeight)
+    }
+
     func testTypingAfterMovingInsertsAtTheCaret() throws {
         let c = try makeController(text: "abc")
         let v = c.editorView

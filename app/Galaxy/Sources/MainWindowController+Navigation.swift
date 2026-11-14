@@ -76,7 +76,7 @@ extension MainWindowController {
     }
 
     /// Shows `loc`, reopening its file if its tab was closed.
-    func show(_ loc: NavLocation) -> Bool {
+    func show(_ loc: NavLocation, centered: Bool = false) -> Bool {
         isNavigating = true
         defer { isNavigating = false }
         let key = Self.fileKey(loc.key) ?? loc.key
@@ -92,14 +92,14 @@ extension MainWindowController {
             }
         }
         guard let tab = activeTab, tab.navKey == key else { return false }
-        move(tab, toLine: loc.line, col: loc.col)
+        move(tab, toLine: loc.line, col: loc.col, centered: centered)
         return true
     }
 
-    func move(_ tab: EditorTab, toLine line: UInt64, col: UInt64?) {
+    func move(_ tab: EditorTab, toLine line: UInt64, col: UInt64?, centered: Bool = false) {
         tab.doc.goToLine(line: line, col: col)
         editorView.didChangeSelection()
-        editorView.revealLine(Int(min(line, tab.doc.lineCount() - 1)))
+        editorView.revealLine(Int(min(line, tab.doc.lineCount() - 1)), centered: centered)
         window?.makeFirstResponder(editorView)
     }
 
