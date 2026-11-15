@@ -360,6 +360,7 @@ pub struct OutlineSymbol {
     pub kind: String,
     pub line: u64,
     pub column: u64,
+    pub depth: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
@@ -369,6 +370,7 @@ pub struct LspOutlineSymbol {
     pub kind: String,
     pub line: u64,
     pub column: u64,
+    pub depth: u64,
 }
 
 /// Parses Go to Line input (`42`, `42:7`, `-1`). `None` if it is not one.
@@ -1922,6 +1924,7 @@ impl Core {
         fn flatten(
             source: &[galaxy_core::analysis::DocumentSymbolInfo],
             output: &mut Vec<LspOutlineSymbol>,
+            depth: u64,
         ) {
             for symbol in source {
                 output.push(LspOutlineSymbol {
@@ -1930,13 +1933,14 @@ impl Core {
                     kind: symbol.kind.to_string(),
                     line: symbol.range.start_line,
                     column: symbol.range.start_character,
+                    depth,
                 });
-                flatten(&symbol.children, output);
+                flatten(&symbol.children, output, depth + 1);
             }
         }
         let mut output = Vec::new();
         let analysis = self.analysis.lock().unwrap_or_else(|e| e.into_inner());
-        flatten(analysis.document_symbols(&uri), &mut output);
+        flatten(analysis.document_symbols(&uri), &mut output, 0);
         output
     }
 
@@ -7355,6 +7359,7 @@ impl DocumentHandle {
                 kind: symbol.kind,
                 line: symbol.line as u64,
                 column: symbol.column_utf16 as u64,
+                depth: 0,
             })
             .collect()
     }

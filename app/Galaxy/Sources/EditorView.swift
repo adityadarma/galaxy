@@ -444,8 +444,10 @@ final class EditorView: NSView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
-    override var isFlipped: Bool { true }
-    override var isOpaque: Bool { true }
+    // AppKit asks these through Objective-C during hit testing. Constant
+    // answers must avoid the main-actor thunk, whose executor check can crash.
+    nonisolated override var isFlipped: Bool { true }
+    nonisolated override var isOpaque: Bool { true }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()

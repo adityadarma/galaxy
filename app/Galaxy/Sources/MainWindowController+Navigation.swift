@@ -147,7 +147,10 @@ extension MainWindowController {
     func refreshDocumentSymbols() {
         if let document = activeTab?.doc {
             let symbols = bridge.documentSymbols(document: document)
-            documentSymbols = symbols.map { OutlineSymbol(uri: $0.uri, name: $0.name, kind: $0.kind, line: $0.line, column: $0.column) }
+            documentSymbols = symbols.map {
+                OutlineSymbol(uri: $0.uri, name: $0.name, kind: $0.kind,
+                              line: $0.line, column: $0.column, depth: $0.depth)
+            }
             let line = editorView.document?.primaryCursor().line ?? 0
             pathBar.show(symbols: documentSymbols, atLine: line)
         } else {
@@ -159,7 +162,10 @@ extension MainWindowController {
         let symbols = bridge.documentSymbols(document: document)
         guard !symbols.isEmpty else { return }
         outlineRequest = nil
-        outlinePicker.reset(symbols: symbols.map { OutlineSymbol(uri: $0.uri, name: $0.name, kind: $0.kind, line: $0.line, column: $0.column) })
+        outlinePicker.reset(symbols: symbols.map {
+            OutlineSymbol(uri: $0.uri, name: $0.name, kind: $0.kind,
+                          line: $0.line, column: $0.column, depth: $0.depth)
+        })
     }
 
     /// Pins the header lines of the blocks around the top of the view.

@@ -23,7 +23,7 @@ final class PathBar: NSView {
     var menuForComponent: ((Int) -> NSMenu?)?
     private let pathRow = NSStackView()
     private var visibleSymbols: [OutlineSymbol] = []
-    private var symbolButtons: [NSButton] = []
+    private var symbolViews: [NSView] = []
     private var heightConstraint: NSLayoutConstraint!
     /// Off: hide the entire breadcrumb row, including the file path.
     var isEnabled = true {
@@ -147,14 +147,19 @@ final class PathBar: NSView {
     /// Appends the active symbol scope after the file name, matching editor
     /// breadcrumbs: path, file, namespace/class, then the current member.
     func show(symbols: [OutlineSymbol], atLine line: UInt64) {
-        symbolButtons.forEach { button in
-            pathRow.removeArrangedSubview(button)
-            button.removeFromSuperview()
+        symbolViews.forEach { view in
+            pathRow.removeArrangedSubview(view)
+            view.removeFromSuperview()
         }
-        visibleSymbols = symbols
-            .filter { $0.line <= line }
-            .sorted { $0.line == $1.line ? $0.column < $1.column : $0.line < $1.line }
-        symbolButtons = []
+        var active: [OutlineSymbol] = []
+        for symbol in symbols where symbol.line <= line {
+            let depth = Int(symbol.depth)
+            if active.count > depth { active.removeSubrange(depth...) }
+            guard active.count == depth else { continue }
+            active.append(symbol)
+        }
+        visibleSymbols = active
+        symbolViews = []
         for (index, symbol) in visibleSymbols.enumerated() {
             let separator = NSTextField(labelWithString: "›")
             separator.font = .systemFont(ofSize: 13)
@@ -162,6 +167,7 @@ final class PathBar: NSView {
             separator.alignment = .center
             separator.widthAnchor.constraint(equalToConstant: 10).isActive = true
             pathRow.addArrangedSubview(separator)
+            symbolViews.append(separator)
 
             let button = NSButton(title: symbol.name, target: self, action: #selector(selectSymbol(_:)))
             button.tag = index
@@ -171,7 +177,7 @@ final class PathBar: NSView {
             button.contentTintColor = index == visibleSymbols.count - 1 ? .labelColor : Self.folderColor
             button.setAccessibilityIdentifier("breadcrumb-symbol-\(index)")
             pathRow.addArrangedSubview(button)
-            symbolButtons.append(button)
+            symbolViews.append(button)
         }
     }
 

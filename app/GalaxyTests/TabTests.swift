@@ -173,6 +173,47 @@ final class TabTests: XCTestCase {
         XCTAssertEqual(c.pathBar.label.accessibilityLabel(), c.pathBar.components.joined(separator: " / "))
     }
 
+    func testRefreshingSymbolBreadcrumbsDoesNotAccumulateSeparators() {
+        let bar = PathBar(frame: NSRect(x: 0, y: 0, width: 600, height: PathBar.height))
+        bar.show(["src", "network.ts"])
+        let symbols = [
+            OutlineSymbol(uri: nil, name: "Network", kind: "class", line: 1, column: 0, depth: 0),
+            OutlineSymbol(uri: nil, name: "findConflict", kind: "function", line: 5, column: 0, depth: 1),
+        ]
+        func descendants(of view: NSView) -> [NSView] {
+            view.subviews + view.subviews.flatMap { descendants(of: $0) }
+        }
+
+        bar.show(symbols: symbols, atLine: 10)
+        let initialCount = descendants(of: bar).count
+        for _ in 0..<20 { bar.show(symbols: symbols, atLine: 10) }
+
+        XCTAssertEqual(descendants(of: bar).count, initialCount)
+    }
+
+    func testSymbolBreadcrumbShowsOnlyTheActiveScopeChain() {
+        let bar = PathBar(frame: NSRect(x: 0, y: 0, width: 600, height: PathBar.height))
+        bar.show(["network.ts"])
+        let symbols = [
+            OutlineSymbol(uri: nil, name: "parseCidr", kind: "function", line: 10, column: 0, depth: 0),
+            OutlineSymbol(uri: nil, name: "Network", kind: "class", line: 30, column: 0, depth: 0),
+            OutlineSymbol(uri: nil, name: "findConflict", kind: "method", line: 35, column: 2, depth: 1),
+            OutlineSymbol(uri: nil, name: "computeRoutes", kind: "function", line: 60, column: 0, depth: 0),
+        ]
+        func symbolTitles(in view: NSView) -> [String] {
+            view.subviews.compactMap { $0 as? NSButton }
+                .filter { $0.title != "network.ts" }
+                .map(\.title)
+                + view.subviews.flatMap { symbolTitles(in: $0) }
+        }
+
+        bar.show(symbols: symbols, atLine: 40)
+        XCTAssertEqual(symbolTitles(in: bar), ["Network", "findConflict"])
+
+        bar.show(symbols: symbols, atLine: 70)
+        XCTAssertEqual(symbolTitles(in: bar), ["computeRoutes"])
+    }
+
     func testUndoingBackToTheSavedTextClearsTheDots() throws {
         let c = makeController()
         defer { c.window?.orderOut(nil) }
