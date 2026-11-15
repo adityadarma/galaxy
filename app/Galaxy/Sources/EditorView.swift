@@ -494,7 +494,20 @@ final class EditorView: NSView {
 
     override func flagsChanged(with event: NSEvent) {
         super.flagsChanged(with: event)
-        updateDefinitionLink(commandHeld: event.modifierFlags.contains(.command))
+        updateDefinitionLinkAtWindowMouse(commandHeld: event.modifierFlags.contains(.command))
+    }
+
+    /// Modifier events follow the first responder, which may be another view
+    /// while the pointer remains over the editor. Re-read the window mouse
+    /// position so Cmd-hover does not require an extra mouse movement.
+    func updateDefinitionLinkAtWindowMouse(commandHeld: Bool) {
+        guard let window else {
+            updateDefinitionLink(commandHeld: false)
+            return
+        }
+        let point = convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        lastMousePoint = bounds.contains(point) ? point : nil
+        updateDefinitionLink(commandHeld: commandHeld)
     }
 
     override func scrollWheel(with event: NSEvent) {

@@ -87,7 +87,17 @@ extension MainWindowController {
     /// equivalent cannot match (⌃⇧- arrives as `_`), and extra keys from
     /// `keybindings.json`.
     func installKeyMonitor() {
-        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] event in
+            if event.type == .flagsChanged {
+                let windowNumber = event.windowNumber
+                MainActor.assumeIsolated {
+                    guard let self, windowNumber == self.window?.windowNumber else { return }
+                    self.editorView.updateDefinitionLinkAtWindowMouse(
+                        commandHeld: event.modifierFlags.contains(.command)
+                    )
+                }
+                return event
+            }
             // Only plain values cross into the main-actor closure.
             guard let id = Keybindings.keyID(for: event) else { return event }
             let windowNumber = event.windowNumber

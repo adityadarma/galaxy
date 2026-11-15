@@ -2197,10 +2197,9 @@ impl Engine {
             }
             Engine::Rust(engine) => {
                 let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
-                engine
-                    .is_ready()
-                    .then(|| engine.hover(path, text, line, column))
-                    .flatten()
+                // Rust standard-library types and members resolve directly
+                // from rust-src and must work while workspace indexing runs.
+                engine.hover(path, text, line, column)
             }
         }
     }
@@ -6079,6 +6078,7 @@ impl Workspace {
             listener.on_changes(WatchBatch {
                 paths: batch.paths,
                 rescan: batch.rescan,
+                git_changed: batch.git_changed,
             });
         })?;
         Ok(Arc::new(WorkspaceWatch {
@@ -6517,6 +6517,8 @@ pub struct WatchBatch {
     pub paths: Vec<String>,
     /// Events were lost: treat everything as changed.
     pub rescan: bool,
+    /// Repository metadata changed; refresh branch, upstream, and status.
+    pub git_changed: bool,
 }
 
 /// Implemented in Swift. Called on the watcher thread.

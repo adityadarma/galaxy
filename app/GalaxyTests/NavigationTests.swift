@@ -271,6 +271,41 @@ final class NavigationTests: XCTestCase {
         XCTAssertEqual(v.definitionLink?.end, 18)
     }
 
+    func testCommandHoverUnderlinesRustStandardTypesInReturnPosition() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-rust-link-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let file = dir.appendingPathComponent("lib.rs")
+        let types = ["String", "Vec", "Option", "Result", "Box", "Rc", "Arc", "HashMap", "HashSet"]
+        let lines = types.enumerated().map { "fn value_\($0.offset)() -> \($0.element) { todo!() }" }
+        try lines.joined(separator: "\n").write(to: file, atomically: true, encoding: .utf8)
+
+        let c = MainWindowController(bridge: CoreBridge())
+        c.showWindow(nil)
+        defer { c.window?.orderOut(nil) }
+        try c.openFile(at: file)
+        let v = c.editorView
+        v.onDefinitionClick = { _ in true }
+
+        func link(line: Int, word: String) -> (line: UInt64, start: UInt64, end: UInt64)? {
+            let text = lines[line]
+            let range = (text as NSString).range(of: word)
+            v.lastMousePoint = NSPoint(
+                x: v.textOriginX + v.xOffset(in: text, column: UInt64(range.location + 1)) + 0.5,
+                y: CGFloat(line) * v.metrics.lineHeight + v.metrics.lineHeight / 2
+            )
+            v.updateDefinitionLink(commandHeld: true)
+            return v.definitionLink
+        }
+
+        for (line, type) in types.enumerated() {
+            let expected = (lines[line] as NSString).range(of: type)
+            let found = link(line: line, word: type)
+            XCTAssertEqual(found?.start, UInt64(expected.location), "missing link for \(type)")
+            XCTAssertEqual(found?.end, UInt64(expected.location + expected.length), "wrong link for \(type)")
+        }
+    }
+
     func testCommandHoverUnderlinesTypeScriptMemberInTemplateInterpolation() throws {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-template-link-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

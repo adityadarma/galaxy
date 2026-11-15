@@ -1247,10 +1247,14 @@ impl RustEngine {
     ) -> Option<HoverResult> {
         self.sync_document(path, text);
         let (name, start, end) = identifier_range(text, line, column)?;
-        let declaration = self
-            .resolve(path, &name, cursor_byte(text, line, column))
-            .into_iter()
-            .next()?;
+        let byte = cursor_byte(text, line, column);
+        let declaration = if STD_TYPES.contains(&name.as_str()) {
+            std_type_source(&name).and_then(|path| std_type_declaration(&path, &name))
+        } else if let Some((ty, _)) = std_member_access(text, byte, &name) {
+            self.resolve_std_member(&ty, &name).into_iter().next()
+        } else {
+            self.resolve(path, &name, byte).into_iter().next()
+        }?;
         Some(HoverResult {
             markdown: format!("```rust\n{}\n```", declaration.signature),
             line,
@@ -4408,51 +4412,68 @@ fn std_type_declaration(path: &Path, ty: &str) -> Option<Declaration> {
     let tree = parse_tree(&source)?;
     let mut stack = vec![tree.root_node()];
     while let Some(node) = stack.pop() {
-        if node.kind() == "struct_item"
+        if matches!(node.kind(), "struct_item" | "enum_item")
             && node
                 .child_by_field_name("name")
                 .and_then(|name| name.utf8_text(source.as_bytes()).ok())
                 == Some(ty)
         {
-            return Some(Declaration {
-                name: ty.to_owned(),
-                crate_name: String::new(),
-                module: vec!["alloc".to_owned()],
-                visibility: Visibility::Public,
-                kind: ItemKind::Class,
-                path: path.to_path_buf(),
-                line: node.start_position().row as u32,
-                column: node.start_position().column as u32,
-                scope_depth: 0,
-                signature: source[node.start_byte()..node.end_byte()]
+            return Some(std_type_target(
+                path,
+                ty,
+                node.start_position().row,
+                source[node.start_byte()..node.end_byte()]
                     .lines()
                     .next()
-                    .unwrap_or(ty)
-                    .to_owned(),
-            });
+                    .unwrap_or(ty),
+            ));
         }
         let mut cursor = node.walk();
         stack.extend(node.named_children(&mut cursor));
     }
-    None
+    source.lines().enumerate().find_map(|(line, signature)| {
+        let declaration = signature.trim_start();
+        ["pub struct ", "pub enum "].into_iter().find_map(|prefix| {
+            declaration
+                .strip_prefix(prefix)
+                .filter(|rest| {
+                    rest.strip_prefix(ty)
+                        .is_some_and(|tail| tail.starts_with(['<', ' ', '{']))
+                })
+                .map(|_| std_type_target(path, ty, line, signature))
+        })
+    })
+}
+
+fn std_type_target(path: &Path, ty: &str, line: usize, signature: &str) -> Declaration {
+    Declaration {
+        name: ty.to_owned(),
+        crate_name: String::new(),
+        module: Vec::new(),
+        visibility: Visibility::Public,
+        kind: ItemKind::Class,
+        path: path.to_path_buf(),
+        line: line as u32,
+        column: signature.find(ty).unwrap_or(0) as u32,
+        scope_depth: 0,
+        signature: signature.to_owned(),
+    }
 }
 
 fn std_type_source(ty: &str) -> Option<PathBuf> {
-    if ty != "String" {
-        return None;
-    }
-    let home = std::env::var_os("HOME")?;
-    let toolchains = PathBuf::from(home).join(".rustup/toolchains");
-    let entries = std::fs::read_dir(toolchains).ok()?;
-    for entry in entries.flatten() {
-        let path = entry
-            .path()
-            .join("lib/rustlib/src/rust/library/alloc/src/string.rs");
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    None
+    let relative = match ty {
+        "String" => "alloc/src/string.rs",
+        "Vec" => "alloc/src/vec/mod.rs",
+        "Option" => "core/src/option.rs",
+        "Result" => "core/src/result.rs",
+        "Box" => "alloc/src/boxed.rs",
+        "Rc" => "alloc/src/rc.rs",
+        "Arc" => "alloc/src/sync.rs",
+        "HashMap" => "std/src/collections/hash/map.rs",
+        "HashSet" => "std/src/collections/hash/set.rs",
+        _ => return None,
+    };
+    rust_source_file(relative)
 }
 
 fn member_declarations(path: &Path, text: &str, ty: &str, name: &str) -> Vec<Declaration> {
@@ -4626,11 +4647,7 @@ fn impl_for_member(node: Node<'_>, text: &str) -> Option<String> {
     while let Some(parent) = current {
         if parent.kind() == "impl_item" {
             let ty = parent.child_by_field_name("type")?;
-            return ty.utf8_text(text.as_bytes()).ok().map(str::trim).map(|ty| {
-                ty.trim_start_matches('&')
-                    .trim_start_matches("mut ")
-                    .to_owned()
-            });
+            return named_type(ty.utf8_text(text.as_bytes()).ok()?);
         }
         current = parent.parent();
     }
@@ -5674,6 +5691,61 @@ mod tests {
                 .path
                 .ends_with("lib/rustlib/src/rust/library/alloc/src/string.rs")
         );
+    }
+
+    #[test]
+    fn standard_library_types_goto_definition() {
+        let path = Path::new("/tmp/std-return.rs");
+        let cases = [
+            ("String", "library/alloc/src/string.rs"),
+            ("Vec", "library/alloc/src/vec/mod.rs"),
+            ("Option", "library/core/src/option.rs"),
+            ("Result", "library/core/src/result.rs"),
+            ("Box", "library/alloc/src/boxed.rs"),
+            ("Rc", "library/alloc/src/rc.rs"),
+            ("Arc", "library/alloc/src/sync.rs"),
+            ("HashMap", "library/std/src/collections/hash/map.rs"),
+            ("HashSet", "library/std/src/collections/hash/set.rs"),
+        ];
+        let source = cases
+            .iter()
+            .enumerate()
+            .map(|(index, (ty, _))| format!("fn value_{index}() -> {ty} {{ todo!() }}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        engine.install(Built::default());
+
+        for (line, (ty, expected)) in cases.iter().enumerate() {
+            let column = source.lines().nth(line).unwrap().find(ty).unwrap() as u32 + 1;
+            let targets = engine.definition(path, &source, line as u32, column);
+            assert_eq!(targets.len(), 1, "{ty} targets: {targets:?}");
+            assert!(
+                targets[0].path.ends_with(expected),
+                "unexpected {ty} target: {:?}",
+                targets[0].path
+            );
+        }
+
+        let source = "fn problems() -> Vec<Problem> { Vec::new() }";
+        let vec_type = engine.definition(path, source, 0, 18);
+        assert_eq!(vec_type.len(), 1, "return Vec targets: {vec_type:?}");
+        assert!(vec_type[0].path.ends_with("library/alloc/src/vec/mod.rs"));
+
+        let new = engine.definition(path, source, 0, 39);
+        assert_eq!(new.len(), 1, "Vec::new targets: {new:?}");
+        assert!(new[0].path.ends_with("library/alloc/src/vec/mod.rs"));
+        assert_eq!(new[0].line, 438);
+
+        let option_hover = engine.hover(path, "fn hover() -> Option<HoverResult> { todo!() }", 0, 15).unwrap();
+        assert!(option_hover.markdown.contains("enum Option"), "{}", option_hover.markdown);
+
+        let vec_hover = engine.hover(path, source, 0, 18).unwrap();
+        assert!(vec_hover.markdown.contains("struct Vec"), "{}", vec_hover.markdown);
+
+        let new_hover = engine.hover(path, source, 0, 39).unwrap();
+        assert!(new_hover.markdown.contains("fn new()"), "{}", new_hover.markdown);
+        assert!(!new_hover.markdown.contains("root: &Path"), "{}", new_hover.markdown);
     }
 
     #[test]

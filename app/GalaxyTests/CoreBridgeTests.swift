@@ -70,6 +70,43 @@ final class CoreBridgeTests: XCTestCase {
     }
 
     @MainActor
+    func testRustVecDefinitionThroughFFI() throws {
+        let source = FileManager.default.temporaryDirectory
+            .appendingPathComponent("galaxy-\(UUID().uuidString).rs")
+        try "struct Problem;\nfn problems() -> Vec<Problem> { Vec::new() }\n"
+            .write(to: source, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: source) }
+
+        let bridge = CoreBridge()
+        let document = try bridge.openDocument(path: source.path)
+        for character in [17, 38] {
+            bridge.requestDefinition(document: document, line: 1, character: UInt64(character))
+            let locations = bridge.definitionLocations(document: document)
+            XCTAssertEqual(locations.count, 1, "Vec at column \(character)")
+            XCTAssertTrue(locations[0].uri.hasSuffix("/library/alloc/src/vec/mod.rs"))
+        }
+    }
+
+    @MainActor
+    func testRustStandardTypeHoverThroughFFI() throws {
+        let source = FileManager.default.temporaryDirectory
+            .appendingPathComponent("galaxy-\(UUID().uuidString).rs")
+        try "struct Problem;\nfn hover() -> Option<Problem> { None }\nfn problems() -> Vec<Problem> { Vec::new() }\n"
+            .write(to: source, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: source) }
+
+        let bridge = CoreBridge()
+        let document = try bridge.openDocument(path: source.path)
+        for (line, character, expected) in [(1, 15, "enum Option"), (2, 18, "struct Vec"), (2, 39, "fn new()")]
+        {
+            XCTAssertTrue(bridge.requestHover(document: document, line: UInt64(line), character: UInt64(character)))
+            let markdown = bridge.hover(document: document)?.contents ?? ""
+            XCTAssertTrue(markdown.contains(expected), "cursor \(line):\(character): \(markdown)")
+            XCTAssertFalse(markdown.contains("root: &Path"), "cursor \(line):\(character): \(markdown)")
+        }
+    }
+
+    @MainActor
     func testDefinitionRequestRetriesWhilePHPIndexBuilds() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("galaxy-\(UUID().uuidString)")

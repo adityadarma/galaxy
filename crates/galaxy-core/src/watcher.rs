@@ -7,10 +7,11 @@
 //! a few batches instead of thousands of callbacks.
 //!
 //! Paths in a batch are relative to the root, `/` separated, sorted and
-//! deduplicated. Changes inside `.git` and inside the built-in excluded
-//! folders (`node_modules`, `target`, ...) are dropped here; `.gitignore`
-//! rules are applied later by `Workspace::index_delta`, which checks the
-//! disk anyway. When events may have been lost (FSEvents asks for a
+//! deduplicated. Changes inside `.git` are reduced to a `git_changed` signal;
+//! changes inside built-in excluded folders (`node_modules`, `target`, ...)
+//! are dropped here. `.gitignore` rules are applied later by
+//! `Workspace::index_delta`, which checks the disk anyway. When events may
+//! have been lost (FSEvents asks for a
 //! rescan, the root itself changed, or a batch grows past
 //! `MAX_BATCH_PATHS`), the batch carries `rescan` instead of paths.
 
@@ -42,6 +43,8 @@ pub struct ChangeBatch {
     pub paths: Vec<String>,
     /// Anything may have changed: re-read everything.
     pub rescan: bool,
+    /// Git metadata changed without exposing `.git` paths to workspace consumers.
+    pub git_changed: bool,
 }
 
 /// Collects events into one batch. Separate from the thread so it can be
@@ -53,6 +56,7 @@ pub(crate) struct Batcher {
     roots: Vec<PathBuf>,
     paths: BTreeSet<String>,
     rescan: bool,
+    git_changed: bool,
 }
 
 impl Batcher {
@@ -67,6 +71,7 @@ impl Batcher {
             roots,
             paths: BTreeSet::new(),
             rescan: false,
+            git_changed: false,
         }
     }
 
@@ -98,6 +103,10 @@ impl Batcher {
             // The root itself was renamed, deleted or replaced.
             return self.set_rescan();
         }
+        if rel == ".git" || rel.starts_with(".git/") {
+            self.git_changed = true;
+            return;
+        }
         if !is_relevant(&rel) {
             return;
         }
@@ -108,13 +117,14 @@ impl Batcher {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        !self.rescan && self.paths.is_empty()
+        !self.rescan && self.paths.is_empty() && !self.git_changed
     }
 
     pub(crate) fn take(&mut self) -> ChangeBatch {
         ChangeBatch {
             paths: std::mem::take(&mut self.paths).into_iter().collect(),
             rescan: std::mem::take(&mut self.rescan),
+            git_changed: std::mem::take(&mut self.git_changed),
         }
     }
 
@@ -247,14 +257,15 @@ mod tests {
             b.take(),
             ChangeBatch {
                 paths: vec!["a.txt".into(), "src/b.rs".into()],
-                rescan: false
+                rescan: false,
+                git_changed: false,
             }
         );
         assert!(b.is_empty(), "take starts a new batch");
     }
 
     #[test]
-    fn git_excluded_folders_and_save_temp_files_are_dropped() {
+    fn git_changes_are_signalled_while_excluded_paths_are_dropped() {
         let mut b = batcher();
         for p in [
             "/w/.git/index",
@@ -265,7 +276,9 @@ mod tests {
         ] {
             b.push(Path::new(p));
         }
-        assert!(b.is_empty());
+        let batch = b.take();
+        assert!(batch.paths.is_empty());
+        assert!(batch.git_changed);
         // A file named like an excluded folder is still a file.
         b.push(Path::new("/w/build"));
         b.push(Path::new("/w/src/.galaxy-notes.md"));
@@ -281,7 +294,8 @@ mod tests {
             b.take(),
             ChangeBatch {
                 paths: vec![],
-                rescan: true
+                rescan: true,
+                git_changed: false,
             }
         );
 
@@ -354,6 +368,19 @@ mod tests {
         let (seen, _) = collect(&rx, |s| s.contains("src/new.rs") && s.contains("old.txt"));
         assert!(seen.contains("src/new.rs"), "{seen:?}");
         assert!(seen.contains("old.txt"), "{seen:?}");
+    }
+
+    #[test]
+    fn reports_git_metadata_without_exposing_git_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join(".git")).unwrap();
+        let (_w, rx) = start(dir.path());
+
+        fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        let batch = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(batch.git_changed);
+        assert!(batch.paths.is_empty());
+        assert!(!batch.rescan);
     }
 
     #[test]
