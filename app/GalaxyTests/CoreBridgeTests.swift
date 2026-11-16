@@ -187,12 +187,17 @@ final class CoreBridgeTests: XCTestCase {
 
         let bridge = CoreBridge()
         let document = try bridge.openDocument(path: source.path)
-        for (line, character, expectedLine) in [(2, 34, 55), (2, 59, 53), (6, 21, 89)] {
+        for (line, character, expectedName) in [(2, 34, "startsWith"), (2, 59, "slice"), (6, 21, "map")] {
             bridge.requestDefinition(document: document, line: UInt64(line), character: UInt64(character))
             let locations = bridge.definitionLocations(document: document)
             XCTAssertEqual(locations.count, 1)
-            XCTAssertTrue(locations[0].uri.hasSuffix("ecmascript.d.ts"))
-            XCTAssertEqual(locations[0].line, UInt64(expectedLine))
+            XCTAssertTrue(locations[0].uri.contains("/typescript-lib/lib."))
+            let target = try String(contentsOf: URL(string: locations[0].uri)!, encoding: .utf8)
+            let targetLine = target.split(separator: "\n", omittingEmptySubsequences: false)[Int(locations[0].line)]
+            XCTAssertEqual(
+                String(targetLine.dropFirst(Int(locations[0].column)).prefix(expectedName.count)),
+                expectedName
+            )
         }
     }
 

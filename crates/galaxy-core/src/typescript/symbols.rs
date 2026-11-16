@@ -104,6 +104,10 @@ pub(super) fn unresolved_references(
     let mut references = Vec::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
+        // `Operations & Automation` in JSX: the words are text, not names.
+        if is_bare_jsx_ampersand(text, node) {
+            continue;
+        }
         match node.kind() {
             // `<T>` and `infer T` introduce names the scope walk does not track.
             "type_parameter" | "infer_type" => {

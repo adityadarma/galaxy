@@ -112,6 +112,7 @@ fn blade_templates_get_laravel_names_from_the_engine() {
         std::fs::write(path, text).unwrap();
     };
     write("artisan", "<?php");
+    write("bootstrap/app.php", "<?php");
     write(
         "composer.json",
         r#"{"autoload":{"psr-4":{"App\\":"app/"}}}"#,
@@ -127,19 +128,15 @@ fn blade_templates_get_laravel_names_from_the_engine() {
     let core = Core::new();
     let doc = core.open_document(page_path.clone()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
-    let items = loop {
+    let item = loop {
         core.request_completion(doc.clone(), 0, 13);
         let items = core.completions(doc.clone());
-        if !items.is_empty() {
-            break items;
+        if let Some(item) = items.into_iter().find(|item| item.label == "welcome") {
+            break item;
         }
         assert!(Instant::now() < deadline, "engine never became ready");
         std::thread::sleep(Duration::from_millis(20));
     };
-    let item = items
-        .iter()
-        .find(|i| i.label == "welcome")
-        .expect("welcome");
     assert_eq!(item.replace_from, Some(10));
 
     // A view that does not exist is reported, with a fix creating it.

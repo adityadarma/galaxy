@@ -16,7 +16,9 @@ mod enums;
 mod framework;
 mod imports;
 mod inheritance;
+mod lib_files;
 mod members;
+pub mod stdlib;
 mod symbols;
 mod syntax;
 
@@ -434,7 +436,9 @@ impl DocumentIndex {
         type_member_uses.extend(enum_uses);
         type_member_uses.extend(framework_uses);
 
-        let type_diagnostics = type_diagnostics(&path, text, root, &locations);
+        let unresolved_references = unresolved_references(text, root, &locations);
+        let type_diagnostics =
+            type_diagnostics(&path, text, root, &locations, &unresolved_references);
         Self {
             path,
             language,
@@ -442,9 +446,9 @@ impl DocumentIndex {
             imports,
             dynamic_imports,
             exports,
-            diagnostics: diagnostics(root, &locations),
+            diagnostics: diagnostics(root, text, &locations),
             type_diagnostics,
-            unresolved_references: unresolved_references(text, root, &locations),
+            unresolved_references,
             global_names: collect_global_names(root, text),
             ambient_module_exports: collect_ambient_module_exports(root, text, &locations),
             export_assignment,

@@ -460,9 +460,7 @@ pub(in crate::php) fn mass_assignment_site_at(text: &str, byte: usize) -> Option
     let paren = found.paren?;
     let array = found.array?;
     let call = callee(text, paren)?;
-    if call.operator.is_none() {
-        return None;
-    }
+    call.operator?;
     let (arguments, max_array_depth): (&[usize], i32) = match call.name.as_str() {
         "insert" | "insertorignore" => (&[0], 1),
         "create" | "forcecreate" | "update" | "fill" | "forcefill" => (&[0], 0),

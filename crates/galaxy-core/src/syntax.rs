@@ -651,6 +651,8 @@ const JSX_COMPONENT_HIGHLIGHTS: &str = r#"
 (jsx_opening_element name: (member_expression property: (property_identifier) @type))
 (jsx_closing_element name: (member_expression property: (property_identifier) @type))
 (jsx_self_closing_element name: (member_expression property: (property_identifier) @type))
+; `<` and `>` are already operators; the JSX-only `</` and `/>` match them.
+["</" "/>"] @operator
 "#;
 
 fn tsx_highlights() -> &'static str {
@@ -718,6 +720,8 @@ const TYPESCRIPT_HIGHLIGHTS: &str = r#"
 [
    ";" "." "," "(" ")" "[" "]" "{" "}" ":" "?" "..." "=>" "++" "--"
  ] @punctuation
+; `${` opens a bracket pair with the substitution's `}`.
+(template_substitution "${" @punctuation)
  [
    "=" "+" "-" "*" "/" "%" "**" "==" "===" "!=" "!==" ">" ">=" ">>" ">>>" "<" "<=" "<<"
   "&&" "||" "??" "!" "&" "|" "^" "~" "+=" "-=" "*=" "/=" "%=" "**=" "<<=" ">>=" ">>>=" "&=" "|=" "^=" "&&=" "||=" "??="
@@ -742,6 +746,7 @@ const JAVASCRIPT_HIGHLIGHTS: &str = r#"
 (meta_property ["meta" "target"] @keyword)
 [("=") ("+") ("-") ("*") ("/") ("%") ("**") ("==") ("===") ("!=") ("!==") (">") (">=") (">>") (">>=") (">>>") (">>>=") ("<") ("<=") ("<<") ("<<=") ("&&") ("||") ("??") ("!") ("&") ("|") ("^") ("~") ("+=") ("-=") ("*=") ("/=") ("%=") ("**=") ("&=") ("|=") ("^=") ("&&=") ("||=") ("??=")] @operator
 [("(") (")") ("[") ("]") ("{") ("}") (",") (";") (".") (":") ("?") ("=>") ("++") ("--")] @punctuation
+(template_substitution "${" @punctuation)
 (optional_chain) @punctuation
 "#;
 
@@ -1021,6 +1026,14 @@ fn collect_style_spans(
     if language == SyntaxLanguage::Php && tree.root_node().has_error() {
         recover_php_errors(rope, tree, start_byte, end_byte, &mut spans);
     }
+    if matches!(language, SyntaxLanguage::Tsx | SyntaxLanguage::JavaScript)
+        && tree.root_node().has_error()
+    {
+        let claimed = bare_jsx_ampersand_ranges(rope, tree, start_byte, end_byte);
+        if !claimed.is_empty() {
+            spans = crate::php::framework::laravel::blade::subtract(spans, &claimed);
+        }
+    }
     if matches!(language, SyntaxLanguage::Vue | SyntaxLanguage::Svelte) {
         // Component tags (`<UserCard>`, Vue `<user-card>`) take the class
         // color, like JSX components; plain HTML tags keep the tag color.
@@ -1034,6 +1047,45 @@ fn collect_style_spans(
         }
     }
     spans
+}
+
+/// `Operations & Automation` between JSX tags. The grammar only accepts
+/// `&name;` there and wraps the rest in `ERROR`, whose words then match
+/// `@variable` and `@operator`. TypeScript reads it as text, so these ranges
+/// drop their captures and render like the text around them. Sorted and
+/// non-overlapping, as `subtract` requires.
+fn bare_jsx_ampersand_ranges(
+    rope: &Rope,
+    tree: &Tree,
+    window_start: usize,
+    window_end: usize,
+) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if node.end_byte() <= window_start || node.start_byte() >= window_end {
+            continue;
+        }
+        if node.is_error() {
+            let in_jsx = node
+                .parent()
+                .is_some_and(|parent| matches!(parent.kind(), "jsx_element" | "jsx_fragment"));
+            if in_jsx
+                && text_between(rope, node.start_byte(), node.end_byte()).is_some_and(|source| {
+                    source.starts_with('&') && !source.contains(['<', '>', '{', '}'])
+                })
+            {
+                ranges.push((node.start_byte(), node.end_byte()));
+            }
+            continue;
+        }
+        if node.has_error() {
+            let mut cursor = node.walk();
+            stack.extend(node.children(&mut cursor));
+        }
+    }
+    ranges.sort_unstable();
+    ranges
 }
 
 /// `<Button>` in any template language, and `<my-card>` in Vue, where a
@@ -1270,7 +1322,9 @@ fn rainbow_brackets(
             let bracket = match token.as_str() {
                 "(" => Some((b')', true)),
                 "[" => Some((b']', true)),
-                "{" => Some((b'}', true)),
+                // `${` in a template string closes with `}`; without it the
+                // `}` pairs with an outer `{` (JSX `className={`...`}`).
+                "{" | "${" => Some((b'}', true)),
                 ")" | "]" | "}" => Some((token.as_bytes()[0], false)),
                 _ => None,
             };
@@ -1347,7 +1401,7 @@ fn open_brackets_before(
             match child.kind() {
                 "(" => stack.push(b')'),
                 "[" => stack.push(b']'),
-                "{" => stack.push(b'}'),
+                "{" | "${" => stack.push(b'}'),
                 kind @ (")" | "]" | "}") => {
                     if stack.last() == Some(&kind.as_bytes()[0]) {
                         stack.pop();
@@ -3124,6 +3178,75 @@ mod tests {
         let tree = parser.parse(old, None).unwrap();
         let doc = Document::from_text("const a = f(1);\nconst b = 'éé(';\n");
         let _ = style_runs_for_viewport(&doc, &tree, language, 0, doc.line_count());
+    }
+
+    /// Every bracket of a JSX tag has a color; `</` and `/>` used to be plain.
+    #[test]
+    fn jsx_tag_brackets_are_all_colored() {
+        for language in [SyntaxLanguage::Tsx, SyntaxLanguage::JavaScript] {
+            let src = "const v = (\n<div>\n<Plus className=\"m\" />\n</div>\n);\n";
+            let runs = runs_for(language, src);
+            for (line, token) in [(1, "<"), (1, ">"), (2, "<"), (2, "/>"), (3, "</"), (3, ">")] {
+                assert!(
+                    scopes_of(&runs, src, line, token).contains(&HighlightScope::Operator),
+                    "{language:?} line {line} {token}: {runs:?}"
+                );
+            }
+        }
+    }
+
+    /// `Operations & Automation` in JSX is text: the words after `&` must
+    /// not take the variable or operator color.
+    #[test]
+    fn bare_ampersand_in_jsx_text_stays_text() {
+        for language in [SyntaxLanguage::Tsx, SyntaxLanguage::JavaScript] {
+            let src = "const v = (\n<span className=\"x\">\nOperations & Automation\n</span>\n);\n";
+            let runs = runs_for(language, src);
+            let text = scopes_of(&runs, src, 2, "Operations");
+            assert_eq!(scopes_of(&runs, src, 2, "&"), text, "{language:?} {runs:?}");
+            assert_eq!(
+                scopes_of(&runs, src, 2, "Automation"),
+                text,
+                "{language:?} {runs:?}"
+            );
+            // Only the text loses its captures; the tags around it keep theirs.
+            assert!(!scopes_of(&runs, src, 1, "span").is_empty(), "{runs:?}");
+            assert!(!scopes_of(&runs, src, 3, "span").is_empty(), "{runs:?}");
+        }
+    }
+
+    /// `className={`a ${x}`}`: `${` pairs with the template's `}`, so the
+    /// outer `}` takes the color of the JSX `{`.
+    #[test]
+    fn template_substitution_brackets_pair_with_their_own_close() {
+        for language in [SyntaxLanguage::Tsx, SyntaxLanguage::JavaScript] {
+            let src = "const v = <div className={`a b ${\n  s === 'open'\n    ? 'x'\n    : 'y'\n}`}>t</div>;\n";
+            let runs = runs_for(language, src);
+            let scope_at = |line: usize, start: usize, end: usize| {
+                runs.iter()
+                    .filter(|r| r.line == line && r.start == start && r.end == end)
+                    .map(|r| r.scope)
+                    .collect::<Vec<_>>()
+            };
+            let outer_open = scope_at(0, 25, 26);
+            let substitution_open = scope_at(0, 31, 33);
+            assert_eq!(
+                outer_open,
+                [HighlightScope::PunctuationBracket1],
+                "{language:?} {runs:?}"
+            );
+            assert_eq!(
+                substitution_open,
+                [HighlightScope::PunctuationBracket2],
+                "{language:?} {runs:?}"
+            );
+            assert_eq!(
+                scope_at(4, 0, 1),
+                substitution_open,
+                "{language:?} {runs:?}"
+            );
+            assert_eq!(scope_at(4, 2, 3), outer_open, "{language:?} {runs:?}");
+        }
     }
 
     fn runs_for(language: SyntaxLanguage, source: &str) -> Vec<StyleRun> {

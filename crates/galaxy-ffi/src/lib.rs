@@ -46,7 +46,7 @@ use galaxy_core::selection::{Selection, SelectionSet};
 use galaxy_core::snippets;
 use galaxy_core::syntax::{self, SyntaxLanguage, SyntaxService, SyntaxSnapshot};
 use galaxy_core::terminal::TerminalSession;
-use galaxy_core::typescript::DocumentIndex;
+use galaxy_core::typescript::{DocumentIndex, stdlib::StdLib};
 use galaxy_core::viewport;
 use galaxy_core::watcher::WorkspaceWatcher;
 use galaxy_core::workspace::{
@@ -1216,6 +1216,10 @@ impl Core {
             self.php_engine_any(Path::new(&path)).map(Engine::Php)
         };
         if let Some(engine) = engine {
+            if matches!(&engine, Engine::Php(engine) if !engine.lock().unwrap_or_else(|e| e.into_inner()).is_ready())
+            {
+                return false;
+            }
             let text = document.lock().editor.doc.text();
             let found = engine.hover(Path::new(&path), &text, line as u32, character as u32);
             let hover = found.map(|hover| LspHoverInfo {
@@ -2929,10 +2933,11 @@ impl Core {
             let reports_unknown_names = !component
                 && typescript_reports_unknown_names(&path)
                 && index.diagnostics.is_empty();
+            let stdlib = StdLib::for_file(Path::new(&path));
             diagnostics.extend(index.unresolved_references.iter().filter_map(|(name, range)| {
                 // TypeScript's standard library provides these names. Do not
                 // mistake an unrelated workspace export for a missing import.
-                if ecmascript_builtin_name(name) {
+                if stdlib.has_global(name) {
                     return None;
                 }
                 if let Some(specifier) = suggestions.get(name) {
@@ -3274,8 +3279,12 @@ impl Core {
             .unwrap_or_default();
         }
         if locations.is_empty()
-            && let Some(location) =
-                ecmascript_primitive_type_definition(text, line as usize, character as usize)
+            && let Some(location) = ecmascript_primitive_type_definition(
+                Path::new(path),
+                text,
+                line as usize,
+                character as usize,
+            )
         {
             locations.push(location);
         }
@@ -3483,8 +3492,12 @@ impl Core {
             locations.push(location);
         }
         if locations.is_empty()
-            && let Some(location) =
-                ecmascript_builtin_definition(text, line as usize, character as usize)
+            && let Some(location) = ecmascript_builtin_definition(
+                Path::new(path),
+                text,
+                line as usize,
+                character as usize,
+            )
         {
             locations.push(location);
         }
@@ -3989,8 +4002,6 @@ fn is_php_path(path: &Path) -> bool {
     name.ends_with(".php") && !name.ends_with(".blade.php")
 }
 
-const ECMASCRIPT_BUILTINS: &str = include_str!("../../galaxy-core/stubs/ecmascript.d.ts");
-
 /// Byte span of the identifier touching UTF-16 `character` in `line_text`.
 fn identifier_span_utf16(line_text: &str, character: usize) -> Option<(usize, usize)> {
     let is_word = |ch: char| ch.is_alphanumeric() || ch == '_' || ch == '$';
@@ -4273,6 +4284,7 @@ fn interface_member_range(file: &Path, interface: &str, member: &str) -> Option<
 }
 
 fn ecmascript_builtin_definition(
+    path: &Path,
     text: &str,
     line: usize,
     character: usize,
@@ -4317,48 +4329,58 @@ fn ecmascript_builtin_definition(
             .collect::<String>()
             .into()
     });
-    let needle = match owner.as_deref() {
-        Some(owner)
-            if ecmascript_builtin_name(owner)
-                || ecmascript_builtin_receiver(text, line_text, owner) =>
-        {
-            [format!("  {token}("), format!("  {token}<")]
+    let library = StdLib::for_file(path);
+    let location = match owner.as_deref() {
+        Some(owner) if library.has_global(owner) => library
+            .value_member(owner, token)
+            .or_else(|| library.type_member(owner, token))?
+            .locations
+            .into_iter()
+            .next()?,
+        Some(owner) if ecmascript_builtin_receiver(text, line_text, owner) => {
+            let type_name = receiver_library_type(text, owner)?;
+            library
+                .type_member(type_name, token)?
+                .locations
                 .into_iter()
-                .find(|needle| ECMASCRIPT_BUILTINS.contains(needle))?
+                .next()?
         }
-        None if ecmascript_primitive_type(token) => {
-            format!("interface {}", ecmascript_primitive_interface(token))
-        }
-        None if ecmascript_builtin_name(token) => ecmascript_declaration(token),
+        None if ecmascript_primitive_type(token) => library
+            .type_locations(ecmascript_primitive_interface(token))
+            .into_iter()
+            .next()?,
+        None => library
+            .value_locations(token)
+            .into_iter()
+            .next()
+            .or_else(|| library.type_locations(token).into_iter().next())?,
         _ => return None,
     };
-    let offset = ECMASCRIPT_BUILTINS.find(&needle)?;
-    let prefix = &ECMASCRIPT_BUILTINS[..offset];
-    let declaration_line = prefix.bytes().filter(|byte| *byte == b'\n').count() as u64;
-    let declaration_column = prefix
-        .rsplit_once('\n')
-        .map_or(prefix.len(), |(_, tail)| tail.len())
-        + needle.find(token).unwrap_or(0);
+    let source = library
+        .source_directory()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../galaxy-core/stubs/typescript-lib")
+        })
+        .join(&location.file_name);
     Some(LspDefinitionLocation {
-        uri: file_uri(Path::new(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../galaxy-core/stubs/ecmascript.d.ts"
-        ))),
+        uri: file_uri(&source),
         range: LspRange {
-            start_line: declaration_line,
-            start_character: declaration_column as u64,
-            end_line: declaration_line,
-            end_character: declaration_column as u64 + token.len() as u64,
+            start_line: location.range.start.line as u64,
+            start_character: location.range.start.col as u64,
+            end_line: location.range.end.line as u64,
+            end_character: location.range.end.col as u64,
         },
     })
 }
 
 fn ecmascript_primitive_type_definition(
+    path: &Path,
     text: &str,
     line: usize,
     character: usize,
 ) -> Option<LspDefinitionLocation> {
-    let location = ecmascript_builtin_definition(text, line, character)?;
+    let location = ecmascript_builtin_definition(path, text, line, character)?;
     let line_text = text.lines().nth(line)?;
     let token = token_at_utf16_position(line_text, character)?;
     ecmascript_primitive_type(token).then_some(location)
@@ -4390,15 +4412,39 @@ fn token_at_utf16_position(line_text: &str, character: usize) -> Option<&str> {
 }
 
 fn ecmascript_builtin_receiver(text: &str, _line_text: &str, receiver: &str) -> bool {
-    ["string", "number", "boolean"].iter().any(|type_name| {
-        text.lines().any(|line| {
-            line.contains(&format!("{receiver}: {type_name}"))
-                || line.contains(&format!("{receiver}?: {type_name}"))
-                || line.contains(&format!("{receiver}: readonly {type_name}"))
-        })
-    }) || text.lines().any(|line| {
+    receiver_library_type(text, receiver).is_some()
+}
+
+fn receiver_library_type<'a>(text: &str, receiver: &str) -> Option<&'a str> {
+    if text.lines().any(|line| {
         line.contains(&format!("{receiver}: ")) && (line.contains("[]") || line.contains("Array<"))
-    })
+    }) {
+        return Some("Array");
+    }
+    for (annotation, type_name) in [
+        ("string", "String"),
+        ("number", "Number"),
+        ("boolean", "Boolean"),
+    ] {
+        let annotations = [
+            format!("{receiver}: {annotation}"),
+            format!("{receiver}?: {annotation}"),
+            format!("{receiver}: readonly {annotation}"),
+        ];
+        if text.lines().any(|line| {
+            annotations.iter().any(|written| {
+                line.find(written).is_some_and(|start| {
+                    line[start + written.len()..]
+                        .chars()
+                        .next()
+                        .is_none_or(|next| !matches!(next, '[' | '<'))
+                })
+            })
+        }) {
+            return Some(type_name);
+        }
+    }
+    None
 }
 
 fn ecmascript_primitive_type(name: &str) -> bool {
@@ -4411,70 +4457,6 @@ fn ecmascript_primitive_interface(name: &str) -> &str {
         "number" => "Number",
         "boolean" => "Boolean",
         _ => unreachable!("primitive type was checked before conversion"),
-    }
-}
-
-fn ecmascript_builtin_name(name: &str) -> bool {
-    matches!(
-        name,
-        "Array"
-            | "Boolean"
-            | "Date"
-            | "Error"
-            | "JSON"
-            | "Map"
-            | "Math"
-            | "Number"
-            | "Object"
-            | "Promise"
-            | "RegExp"
-            | "Set"
-            | "String"
-            | "WeakMap"
-            | "WeakSet"
-            | "Awaited"
-            | "Exclude"
-            | "Extract"
-            | "InstanceType"
-            | "NonNullable"
-            | "Omit"
-            | "Parameters"
-            | "Partial"
-            | "Pick"
-            | "PropertyKey"
-            | "Readonly"
-            | "Record"
-            | "Required"
-            | "ReturnType"
-    )
-}
-
-fn ecmascript_declaration(name: &str) -> String {
-    if matches!(
-        name,
-        "Awaited"
-            | "Exclude"
-            | "Extract"
-            | "InstanceType"
-            | "NonNullable"
-            | "Omit"
-            | "Parameters"
-            | "Partial"
-            | "Pick"
-            | "PropertyKey"
-            | "Readonly"
-            | "Record"
-            | "Required"
-            | "ReturnType"
-    ) {
-        format!("declare type {name}")
-    } else if matches!(
-        name,
-        "Map" | "Set" | "WeakMap" | "WeakSet" | "Error" | "RegExp"
-    ) {
-        format!("declare class {name}")
-    } else {
-        format!("declare const {name}")
     }
 }
 

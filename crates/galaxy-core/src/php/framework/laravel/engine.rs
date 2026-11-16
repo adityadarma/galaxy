@@ -509,6 +509,8 @@ impl PhpEngine {
         let constructor = CONSTRUCTOR.get_or_init(|| {
             Regex::new(r#"(?s)function\s+__construct\s*\((.*?)\)"#).expect("valid")
         });
+        let parameter_pattern =
+            PARAMETER.get_or_init(|| Regex::new(r#"(?m)([\\\w]+)\s+\$(\w+)\b"#).expect("valid"));
         for source_path in walk(&self.root().join("app")) {
             if source_path.extension().is_none_or(|ext| ext != "php") {
                 continue;
@@ -553,10 +555,7 @@ impl PhpEngine {
                         .ok()?;
                         let parameter = assignment.captures(&source)?.get(1)?.as_str();
                         let params = constructor.captures(&source)?.get(1)?.as_str();
-                        let parameter = PARAMETER
-                            .get_or_init(|| {
-                                Regex::new(r#"(?m)([\\\w]+)\s+\$(\w+)\b"#).expect("valid")
-                            })
+                        let parameter = parameter_pattern
                             .captures_iter(params)
                             .find(|caps| &caps[2] == parameter)?;
                         let expression = format!("new {}(){}", &parameter[1], &service[2]);

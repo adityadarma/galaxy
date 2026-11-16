@@ -1988,9 +1988,11 @@ impl RustEngine {
         resolved.dedup_by(|left, right| {
             left.path == right.path && left.line == right.line && left.column == right.column
         });
-        (resolved.len() == 1)
-            .then_some(resolved)
-            .unwrap_or_default()
+        if resolved.len() == 1 {
+            resolved
+        } else {
+            Vec::new()
+        }
     }
 
     fn declarations_in_module(&self, path: &Path, target: &[String]) -> Vec<Declaration> {
@@ -2394,9 +2396,11 @@ fn cargo_package_with_requested(
             root,
         })
         .collect();
-    let default_features = (!requested_features.contains(NO_DEFAULT_FEATURES))
-        .then(|| cargo_default_features(&contents))
-        .unwrap_or_default();
+    let default_features = if requested_features.contains(NO_DEFAULT_FEATURES) {
+        HashSet::new()
+    } else {
+        cargo_default_features(&contents)
+    };
     let features = cargo_features(&contents);
     let selected_features = selected_features(&default_features, &features, &requested_features);
     Some(CargoPackage {
@@ -2978,6 +2982,7 @@ fn discover_static_module(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn discover_static_items(
     path: &Path,
     text: &str,
@@ -5306,7 +5311,10 @@ mod tests {
         let diagnostics = parse_compiler_diagnostics(dir.path(), json.as_bytes());
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].code.as_deref(), Some("E0382"));
-        assert_eq!(diagnostics[0].message, "borrow of moved value");
+        assert_eq!(
+            diagnostics[0].message,
+            "borrow of moved value\nvalue moved here"
+        );
         assert_eq!(diagnostics[0].actions[0].edits[0].new_text, "café.clone()");
         assert_eq!(diagnostics[0].range.start_character, 16);
     }

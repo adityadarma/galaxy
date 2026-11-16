@@ -45,25 +45,22 @@ fn doc_at(path: &str, text: &str, caret_utf16: u64) -> Arc<DocumentHandle> {
 }
 
 fn ecmascript_declaration_position(name: &str) -> (u64, u64) {
-    let declaration_prefixes = [
-        format!("declare const {name}"),
-        format!("declare class {name}"),
-        format!("declare function {name}"),
-        format!("declare type {name}"),
-        format!("interface {name}"),
-        format!("{name}("),
-        format!("{name}<"),
-    ];
-    let (line, declaration) = declaration_prefixes
-        .iter()
-        .find_map(|prefix| {
-            ECMASCRIPT_BUILTINS
-                .lines()
-                .enumerate()
-                .find(|(_, line)| line.trim_start().starts_with(prefix))
-        })
-        .unwrap_or_else(|| panic!("missing ECMAScript declaration for {name}"));
-    (line as u64, declaration.find(name).unwrap() as u64)
+    let library = StdLib::bundled_default();
+    let location = match name {
+        "keys" => library.value_member("Object", name),
+        "stringify" => library.value_member("JSON", name),
+        "startsWith" | "slice" => library.type_member("String", name),
+        "map" => library.type_member("Array", name),
+        _ => None,
+    }
+    .and_then(|member| member.locations.into_iter().next())
+    .or_else(|| library.value_locations(name).into_iter().next())
+    .or_else(|| library.type_locations(name).into_iter().next())
+    .unwrap_or_else(|| panic!("missing TypeScript library declaration for {name}"));
+    (
+        location.range.start.line as u64,
+        location.range.start.col as u64,
+    )
 }
 
 #[test]
@@ -2117,7 +2114,7 @@ fn typescript_and_javascript_definitions_resolve_ecmascript_globals_and_methods(
             );
             let locations = core.definition_locations(document.clone());
             assert_eq!(locations.len(), 1);
-            assert!(locations[0].uri.ends_with("ecmascript.d.ts"));
+            assert!(locations[0].uri.contains("/typescript-lib/lib."));
             assert_eq!(
                 (locations[0].line, locations[0].column),
                 ecmascript_declaration_position(declaration),
@@ -2156,7 +2153,7 @@ fn typescript_definitions_resolve_each_ecmascript_global_declaration() {
         );
         let locations = core.definition_locations(document.clone());
         assert_eq!(locations.len(), 1, "{name}");
-        assert!(locations[0].uri.ends_with("ecmascript.d.ts"), "{name}");
+        assert!(locations[0].uri.contains("/typescript-lib/lib."), "{name}");
         assert_eq!(
             (locations[0].line, locations[0].column),
             ecmascript_declaration_position(name),
@@ -2182,7 +2179,7 @@ fn typescript_definition_resolves_instance_methods_on_primitive_parameters() {
     assert!(core.request_definition(document.clone(), 3, 31));
     let locations = core.definition_locations(document.clone());
     assert_eq!(locations.len(), 1);
-    assert!(locations[0].uri.ends_with("ecmascript.d.ts"));
+    assert!(locations[0].uri.contains("/typescript-lib/lib."));
     assert_eq!(
         (locations[0].line, locations[0].column),
         ecmascript_declaration_position("startsWith")
@@ -2191,7 +2188,7 @@ fn typescript_definition_resolves_instance_methods_on_primitive_parameters() {
     assert!(core.request_definition(document.clone(), 3, 58));
     let locations = core.definition_locations(document.clone());
     assert_eq!(locations.len(), 1);
-    assert!(locations[0].uri.ends_with("ecmascript.d.ts"));
+    assert!(locations[0].uri.contains("/typescript-lib/lib."));
     assert_eq!(
         (locations[0].line, locations[0].column),
         ecmascript_declaration_position("slice")
@@ -2220,7 +2217,7 @@ fn typescript_definition_resolves_array_methods_on_array_parameters() {
     assert!(core.request_definition(document.clone(), 0, 55));
     let locations = core.definition_locations(document);
     assert_eq!(locations.len(), 1);
-    assert!(locations[0].uri.ends_with("ecmascript.d.ts"));
+    assert!(locations[0].uri.contains("/typescript-lib/lib."));
     assert_eq!(
         (locations[0].line, locations[0].column),
         ecmascript_declaration_position("map")
@@ -2277,7 +2274,7 @@ fn typescript_definition_resolves_primitive_type_keywords() {
         );
         let locations = core.definition_locations(document.clone());
         assert_eq!(locations.len(), 1);
-        assert!(locations[0].uri.ends_with("ecmascript.d.ts"));
+        assert!(locations[0].uri.contains("/typescript-lib/lib."));
     }
 }
 
@@ -2301,8 +2298,57 @@ fn typescript_definitions_resolve_builtin_utility_types_and_classes() {
         );
         let locations = core.definition_locations(document.clone());
         assert_eq!(locations.len(), 1);
-        assert!(locations[0].uri.ends_with("ecmascript.d.ts"));
+        assert!(locations[0].uri.contains("/typescript-lib/lib."));
     }
+}
+
+#[test]
+fn typescript_definition_uses_project_local_library_and_respects_no_lib() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    let lib = project.join("node_modules/typescript/lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    std::fs::write(
+        project.join("tsconfig.json"),
+        r#"{ "compilerOptions": { "lib": ["ES5"] } }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        lib.join("lib.es5.d.ts"),
+        "/// <reference lib=\"decorators\" />\n/// <reference lib=\"decorators.legacy\" />\ninterface String { localOnly(): string; }\ndeclare var String: StringConstructor;\ninterface StringConstructor {}\n",
+    )
+    .unwrap();
+    std::fs::write(lib.join("lib.d.ts"), "/// <reference lib=\"es5\" />\n").unwrap();
+    std::fs::write(lib.join("lib.decorators.d.ts"), "").unwrap();
+    std::fs::write(lib.join("lib.decorators.legacy.d.ts"), "").unwrap();
+    let path = project.join("main.ts");
+    std::fs::write(&path, "String;\n").unwrap();
+    let core = Core::new();
+    let document = core
+        .open_document(path.to_string_lossy().into_owned())
+        .unwrap();
+
+    assert!(core.request_definition(document.clone(), 0, 1));
+    let locations = core.definition_locations(document);
+    assert_eq!(locations.len(), 1);
+    assert!(
+        locations[0]
+            .uri
+            .ends_with("node_modules/typescript/lib/lib.es5.d.ts"),
+        "{}",
+        locations[0].uri
+    );
+
+    std::fs::write(
+        project.join("tsconfig.json"),
+        r#"{ "compilerOptions": { "noLib": true } }"#,
+    )
+    .unwrap();
+    let core = Core::new();
+    let document = core
+        .open_document(path.to_string_lossy().into_owned())
+        .unwrap();
+    assert!(!core.request_definition(document, 0, 1));
 }
 
 #[test]

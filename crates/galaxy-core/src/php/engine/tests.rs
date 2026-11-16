@@ -176,7 +176,7 @@ fn treats_blade_named_files_as_php_without_laravel() {
     .unwrap();
     let path = dir.path().join("views/example.blade.php");
     let source = "<?php\nnamespace App;\nclass Page {\n    public function show(User $user) {\n        $user->na|\n    }\n}\n";
-    let (text, line, column) = marker(&source);
+    let (text, line, column) = marker(source);
     let mut engine = PhpEngine::new(dir.path());
 
     let items = engine.complete(&path, &text, line, column);
@@ -553,7 +553,7 @@ fn unsupported_pre_8_0_projects_do_not_expose_bundled_builtin_api() {
     .unwrap();
     let mut engine = PhpEngine::new(dir.path());
     let items = engine.complete(&dir.path().join("main.php"), "<?php\nstrle", 1, 5);
-    assert!(labels(&items).contains(&"strlen"));
+    assert!(!labels(&items).contains(&"strlen"));
 }
 
 #[test]

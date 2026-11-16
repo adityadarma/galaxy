@@ -366,6 +366,74 @@ fn permits_date_now_and_class_constructor_arguments() {
 }
 
 #[test]
+fn checks_official_library_signatures_and_keeps_globals_open() {
+    let index = DocumentIndex::parse(
+        "values.ts",
+        "Date.UTC();\n\
+         Date.UTC(1970, 0, 1, 0, 0, 0, 0, 1);\n\
+         const wrong: string = Date.now();\n\
+         Date.projectAugmentation();\n",
+    );
+
+    let codes: Vec<_> = index
+        .type_diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.code.as_str())
+        .collect();
+    assert_eq!(codes, ["TS2554", "TS2554", "TS2322"]);
+}
+
+#[test]
+fn library_calls_with_spread_arguments_fail_open() {
+    let index = DocumentIndex::parse(
+        "values.ts",
+        "const values: number[] = [];\nDate.UTC(...values);\n",
+    );
+
+    assert!(
+        index.type_diagnostics.is_empty(),
+        "{:?}",
+        index.type_diagnostics
+    );
+}
+
+#[test]
+fn local_values_shadow_library_globals() {
+    let index = DocumentIndex::parse(
+        "values.ts",
+        "const Date = { UTC() { return 'local' } };\nDate.UTC(1);\n",
+    );
+
+    assert_eq!(index.type_diagnostics.len(), 1);
+    assert_eq!(index.type_diagnostics[0].code, "TS2554");
+}
+
+#[test]
+fn checker_uses_the_project_selected_library() {
+    let dir = tempfile::tempdir().unwrap();
+    let dom = dir.path().join("dom/main.ts");
+    let no_lib = dir.path().join("none/main.ts");
+    std::fs::create_dir_all(dom.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(no_lib.parent().unwrap()).unwrap();
+    std::fs::write(
+        dom.parent().unwrap().join("tsconfig.json"),
+        r#"{ "compilerOptions": { "lib": ["DOM"] } }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        no_lib.parent().unwrap().join("tsconfig.json"),
+        r#"{ "compilerOptions": { "noLib": true } }"#,
+    )
+    .unwrap();
+
+    let dom_index = DocumentIndex::parse(&dom, "queueMicrotask();\n");
+    let no_lib_index = DocumentIndex::parse(&no_lib, "queueMicrotask();\n");
+    assert_eq!(dom_index.type_diagnostics.len(), 1);
+    assert_eq!(dom_index.type_diagnostics[0].code, "TS2554");
+    assert!(no_lib_index.type_diagnostics.is_empty());
+}
+
+#[test]
 fn permits_macros_for_all_macroable_subclasses() {
     let index = DocumentIndex::parse(
         "query_builder.ts",
@@ -1100,4 +1168,99 @@ fn global_names_come_from_scripts_and_global_blocks() {
         "export function f(): void;\nexport as namespace React;\n",
     );
     assert_eq!(namespaced.global_names, ["React"]);
+}
+
+#[test]
+fn accepts_bare_ampersand_in_jsx_text() {
+    let index = DocumentIndex::parse(
+        "hero.tsx",
+        "export function A() {\n  return (\n    <span className=\"x\">\n      Operations & Automation\n    </span>\n  )\n}\n",
+    );
+    assert!(index.diagnostics.is_empty(), "{:?}", index.diagnostics);
+    assert!(
+        index.unresolved_references.is_empty(),
+        "{:?}",
+        index.unresolved_references
+    );
+
+    let broken = DocumentIndex::parse("broken.tsx", "const a = <div>{</div>;\n");
+    assert!(!broken.diagnostics.is_empty());
+}
+
+#[test]
+fn accepts_date_utc_with_several_arguments() {
+    let index = DocumentIndex::parse(
+        "time.ts",
+        "function f(at: Date): number {\n  return Date.UTC(at.getUTCFullYear(), at.getUTCMonth(), at.getUTCDate())\n}\n",
+    );
+    assert!(
+        index.type_diagnostics.is_empty(),
+        "{:?}",
+        index.type_diagnostics
+    );
+
+    let none = DocumentIndex::parse("time.ts", "Date.UTC();\n");
+    assert_eq!(
+        none.type_diagnostics.len(),
+        1,
+        "{:?}",
+        none.type_diagnostics
+    );
+}
+
+#[test]
+fn skips_index_signature_object_types() {
+    let index = DocumentIndex::parse(
+        "knexfile.ts",
+        "import type { Knex } from 'knex'\nconst config: { [key: string]: Knex.Config } = {\n  development: { client: 'better-sqlite3', useNullAsDefault: true },\n}\n",
+    );
+    assert!(
+        index.type_diagnostics.is_empty(),
+        "{:?}",
+        index.type_diagnostics
+    );
+}
+
+#[test]
+fn narrows_nullable_union_after_early_return() {
+    let index = DocumentIndex::parse(
+        "cidr.ts",
+        "function ipToInt(ip: string): number | null { return null }\n\
+         function networkAddress(ipInt: number, prefix: number): number { return 0 }\n\
+         export function parse(addr: string, prefix: number) {\n\
+           const asInt: number | null = ipToInt(addr)\n\
+           if (asInt === null) return null\n\
+           return networkAddress(asInt, prefix)\n\
+         }\n\
+         function g(value: number | null) {\n\
+           let x: number | null = value\n\
+           if (x === null) { return }\n\
+           x = null\n\
+         }\n",
+    );
+    assert!(
+        index.type_diagnostics.is_empty(),
+        "{:?}",
+        index.type_diagnostics
+    );
+}
+
+#[test]
+fn early_return_narrowing_ends_with_its_block() {
+    let index = DocumentIndex::parse(
+        "scope.ts",
+        "function take(value: number) {}\n\
+         const maybe: number | null = null\n\
+         function inner() {\n\
+           if (maybe === null) return\n\
+           take(maybe)\n\
+         }\n\
+         take(maybe)\n",
+    );
+    let codes: Vec<_> = index
+        .type_diagnostics
+        .iter()
+        .map(|diagnostic| (diagnostic.code.as_str(), diagnostic.range.start.line))
+        .collect();
+    assert_eq!(codes, [("TS2322", 6)]);
 }

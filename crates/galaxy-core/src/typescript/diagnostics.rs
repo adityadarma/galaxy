@@ -2,10 +2,17 @@
 
 use super::*;
 
-pub(super) fn diagnostics(root: Node<'_>, locations: &Locations) -> Vec<ParseDiagnostic> {
+pub(super) fn diagnostics(
+    root: Node<'_>,
+    text: &str,
+    locations: &Locations,
+) -> Vec<ParseDiagnostic> {
     let mut diagnostics = Vec::new();
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
+        if is_bare_jsx_ampersand(text, node) {
+            continue;
+        }
         if node.is_error() || node.is_missing() {
             diagnostics.push(ParseDiagnostic {
                 message: if node.is_missing() {
@@ -25,6 +32,18 @@ pub(super) fn diagnostics(root: Node<'_>, locations: &Locations) -> Vec<ParseDia
     diagnostics
 }
 
+/// `Operations & Automation` between JSX tags. The grammar only accepts
+/// `&name;` references there, but TypeScript and Babel read a bare `&` as
+/// text, so the `ERROR` it produces is not a real error.
+pub(super) fn is_bare_jsx_ampersand(text: &str, node: Node<'_>) -> bool {
+    node.is_error()
+        && node
+            .parent()
+            .is_some_and(|parent| matches!(parent.kind(), "jsx_element" | "jsx_fragment"))
+        && node_text(text, node)
+            .is_some_and(|source| source.starts_with('&') && !source.contains(['<', '>', '{', '}']))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Type {
     Unknown,
@@ -35,11 +54,17 @@ pub(super) enum Type {
     Function(Vec<Type>, usize, Box<Type>, Vec<String>),
     Named(String, Vec<Type>),
     Union(Vec<Type>),
+    LibraryValue(String),
+    LibraryCallable(Vec<stdlib::LibSignature>),
 }
 
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub(super) struct TypeState {
     values: std::collections::HashMap<String, Type>,
+    /// Annotated types of `let x: T` bindings. Narrowing changes `values`,
+    /// but assignments are still checked against the declared type, so
+    /// `x = null` stays valid after `if (x === null) return`.
+    declared: std::collections::HashMap<String, Type>,
     aliases: std::collections::HashMap<String, (Vec<String>, Type)>,
     /// Local classes: the only declarations collected here that also create a
     /// runtime value. Interfaces and type aliases name types only, so an
@@ -47,7 +72,23 @@ pub(super) struct TypeState {
     /// or `declare global { interface String {} }` must not replace the
     /// imported or global value in expressions like `Vine.macro`.
     classes: std::collections::HashSet<String>,
+    unresolved: std::collections::HashSet<String>,
+    stdlib: std::sync::Arc<stdlib::StdLib>,
     diagnostics: Vec<TypeDiagnostic>,
+}
+
+impl TypeState {
+    fn new(path: &std::path::Path, unresolved: &[(String, Utf16Range)]) -> Self {
+        Self {
+            values: Default::default(),
+            declared: Default::default(),
+            aliases: Default::default(),
+            classes: Default::default(),
+            unresolved: unresolved.iter().map(|(name, _)| name.clone()).collect(),
+            stdlib: std::sync::Arc::new(stdlib::StdLib::for_file(path)),
+            diagnostics: Vec::new(),
+        }
+    }
 }
 
 pub(super) fn type_diagnostics(
@@ -55,8 +96,9 @@ pub(super) fn type_diagnostics(
     text: &str,
     root: Node<'_>,
     locations: &Locations,
+    unresolved: &[(String, Utf16Range)],
 ) -> Vec<TypeDiagnostic> {
-    let mut state = TypeState::default();
+    let mut state = TypeState::new(path, unresolved);
     // First collect named declarations so forward references and aliases are stable.
     collect_type_declarations(text, root, &mut state);
     let mut cursor = root.walk();
@@ -207,6 +249,14 @@ pub(super) fn check_type_node(
                         state,
                     );
                 }
+                match &declared {
+                    Some(declared) => {
+                        state.declared.insert(name.to_owned(), declared.clone());
+                    }
+                    None => {
+                        state.declared.remove(name);
+                    }
+                }
                 state
                     .values
                     .insert(name.to_owned(), declared.or(value).unwrap_or(Type::Unknown));
@@ -231,7 +281,9 @@ pub(super) fn check_type_node(
                 let actual = infer_type(text, right, state);
                 if left.kind() == "identifier"
                     && let Some(expected) = node_text(text, left)
-                        .and_then(|name| state.values.get(name))
+                        .and_then(|name| {
+                            state.declared.get(name).or_else(|| state.values.get(name))
+                        })
                         .cloned()
                 {
                     report_mismatch(&expected, &actual, locations.range(right), state);
@@ -262,7 +314,9 @@ pub(super) fn check_type_node(
                 .map(|n| infer_type(text, n, state))
                 .unwrap_or(Type::Unknown);
             let property = node.child_by_field_name("property");
-            if let (Type::Object(fields), Some(property)) = (resolve(&object, state), property) {
+            if let Some(property) = property
+                && let Type::Object(fields) = resolve(&object, state)
+            {
                 let name = node_text(text, property).unwrap_or("");
                 if !fields.contains_key(name) {
                     state.diagnostics.push(TypeDiagnostic {
@@ -276,9 +330,89 @@ pub(super) fn check_type_node(
         _ => {}
     }
     let mut cursor = node.walk();
+    let mut narrowed = Vec::new();
     for child in node.named_children(&mut cursor) {
         check_type_node(text, child, locations, state);
+        narrowed.extend(narrow_after_early_exit(text, child, state));
     }
+    // The narrowing only holds for the rest of this block. Restore in
+    // reverse so a name narrowed twice gets its original type back.
+    for (name, previous) in narrowed.into_iter().rev() {
+        state.values.insert(name, previous);
+    }
+}
+
+/// `if (x === null) return` leaves `x` without `null` for the statements
+/// after it in the same block. Only exits without an `else` are handled.
+/// Returns the name and its type before narrowing.
+fn narrow_after_early_exit(
+    text: &str,
+    node: Node<'_>,
+    state: &mut TypeState,
+) -> Option<(String, Type)> {
+    if node.kind() != "if_statement" || node.child_by_field_name("alternative").is_some() {
+        return None;
+    }
+    let (Some(condition), Some(consequence)) = (
+        node.child_by_field_name("condition"),
+        node.child_by_field_name("consequence"),
+    ) else {
+        return None;
+    };
+    let exit = if consequence.kind() == "statement_block" {
+        let count = consequence.named_child_count();
+        count
+            .checked_sub(1)
+            .and_then(|last| consequence.named_child(last))
+    } else {
+        Some(consequence)
+    };
+    if !exit.is_some_and(|exit| {
+        matches!(
+            exit.kind(),
+            "return_statement" | "throw_statement" | "continue_statement" | "break_statement"
+        )
+    }) {
+        return None;
+    }
+    let condition = node_text(text, condition)
+        .unwrap_or("")
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .trim();
+    let (name, value, loose) = condition
+        .split_once("===")
+        .map(|(name, value)| (name, value, false))
+        .or_else(|| {
+            condition
+                .split_once("==")
+                .map(|(name, value)| (name, value, true))
+        })?;
+    let removed: &[Type] = match (value.trim(), loose) {
+        ("null", false) => &[Type::Null],
+        ("undefined", false) => &[Type::Undefined],
+        ("null" | "undefined", true) => &[Type::Null, Type::Undefined],
+        _ => return None,
+    };
+    let name = name.trim();
+    let Some(Type::Union(items)) = state.values.get(name) else {
+        return None;
+    };
+    let mut items: Vec<_> = items
+        .iter()
+        .filter(|item| !removed.contains(item))
+        .cloned()
+        .collect();
+    let narrowed = match items.len() {
+        0 => return None,
+        1 => items.remove(0),
+        _ => Type::Union(items),
+    };
+    state
+        .values
+        .insert(name.to_owned(), narrowed)
+        .map(|previous| (name.to_owned(), previous))
 }
 
 pub(super) fn infer_type(text: &str, node: Node<'_>, state: &mut TypeState) -> Type {
@@ -291,8 +425,8 @@ pub(super) fn infer_type(text: &str, node: Node<'_>, state: &mut TypeState) -> T
         "identifier" => node_text(text, node)
             .map(|name| {
                 state.values.get(name).cloned().unwrap_or_else(|| {
-                    if let Some(global) = ecmascript_global(name) {
-                        global
+                    if state.unresolved.contains(name) && state.stdlib.has_global(name) {
+                        global_library_type(name, state)
                     } else if state.classes.contains(name) && state.aliases.contains_key(name) {
                         Type::Named(name.to_owned(), Vec::new())
                     } else {
@@ -356,6 +490,11 @@ pub(super) fn infer_type(text: &str, node: Node<'_>, state: &mut TypeState) -> T
                 .unwrap_or("");
             match resolve(&object, state) {
                 Type::Object(fields) => fields.get(property).cloned().unwrap_or(Type::Unknown),
+                Type::LibraryValue(owner) => state
+                    .stdlib
+                    .value_member(&owner, property)
+                    .map(|member| library_member_type(&member))
+                    .unwrap_or(Type::Unknown),
                 _ => Type::Unknown,
             }
         }
@@ -370,9 +509,18 @@ pub(super) fn infer_type(text: &str, node: Node<'_>, state: &mut TypeState) -> T
             let Some(callee) = callee else {
                 return Type::Unknown;
             };
-            let Type::Function(_, _, result, parameters) =
-                resolve(&infer_type(text, callee, state), state)
-            else {
+            let callee_type = resolve(&infer_type(text, callee, state), state);
+            if let Type::LibraryCallable(signatures) = callee_type {
+                return library_return_type(&signatures);
+            }
+            if let Type::LibraryValue(owner) = callee_type {
+                return library_return_type(&library_value_signatures(
+                    &owner,
+                    node.kind() == "new_expression",
+                    state,
+                ));
+            }
+            let Type::Function(_, _, result, parameters) = callee_type else {
                 return Type::Unknown;
             };
             let args = node
@@ -392,39 +540,59 @@ pub(super) fn infer_type(text: &str, node: Node<'_>, state: &mut TypeState) -> T
     }
 }
 
-fn ecmascript_global(name: &str) -> Option<Type> {
-    (name == "Date").then(|| {
-        Type::Object(std::collections::BTreeMap::from([
-            (
-                "now".to_owned(),
-                Type::Function(
-                    Vec::new(),
-                    0,
-                    Box::new(Type::Primitive("number")),
-                    Vec::new(),
-                ),
-            ),
-            (
-                "parse".to_owned(),
-                Type::Function(
-                    vec![Type::Primitive("string")],
-                    1,
-                    Box::new(Type::Primitive("number")),
-                    Vec::new(),
-                ),
-            ),
-            (
-                "UTC".to_owned(),
-                Type::Function(
-                    vec![Type::Primitive("number")],
-                    1,
-                    Box::new(Type::Primitive("number")),
-                    Vec::new(),
-                ),
-            ),
-            ("prototype".to_owned(), Type::Unknown),
-        ]))
-    })
+fn global_library_type(name: &str, _state: &TypeState) -> Type {
+    Type::LibraryValue(name.to_owned())
+}
+
+fn library_value_signatures(
+    owner: &str,
+    construct: bool,
+    state: &TypeState,
+) -> Vec<stdlib::LibSignature> {
+    let mut signatures = state.stdlib.value_signatures(owner).to_vec();
+    if let Some(type_name) = state.stdlib.value_type(owner) {
+        signatures.extend_from_slice(if construct {
+            state.stdlib.construct_signatures(type_name)
+        } else {
+            state.stdlib.call_signatures(type_name)
+        });
+    }
+    signatures
+}
+
+fn library_member_type(member: &stdlib::LibMember) -> Type {
+    if !member.signatures.is_empty() {
+        Type::LibraryCallable(member.signatures.clone())
+    } else {
+        member
+            .type_name
+            .as_deref()
+            .map(library_type)
+            .unwrap_or(Type::Unknown)
+    }
+}
+
+fn library_type(name: &str) -> Type {
+    let parsed = parse_type_text(name);
+    match parsed {
+        Type::Primitive(_) | Type::Null | Type::Undefined | Type::Union(_) => parsed,
+        _ => Type::Unknown,
+    }
+}
+
+fn library_return_type(signatures: &[stdlib::LibSignature]) -> Type {
+    let mut returns = signatures
+        .iter()
+        .filter_map(|signature| signature.return_type.as_deref())
+        .map(library_type);
+    let Some(first) = returns.next() else {
+        return Type::Unknown;
+    };
+    if returns.all(|return_type| return_type == first) {
+        first
+    } else {
+        Type::Unknown
+    }
 }
 
 fn class_constructor(text: &str, class: Node<'_>) -> Option<Type> {
@@ -484,8 +652,14 @@ pub(super) fn check_call(text: &str, node: Node<'_>, locations: &Locations, stat
     if matches!(node.kind(), "new_expression") {
         callee = resolve(&callee, state);
     }
-    let Type::Function(parameters, required_parameters, _, generic_parameters) = callee else {
-        return;
+    let library_signatures = match &callee {
+        Type::LibraryCallable(signatures) => Some(signatures.clone()),
+        Type::LibraryValue(owner) => Some(library_value_signatures(
+            owner,
+            node.kind() == "new_expression",
+            state,
+        )),
+        _ => None,
     };
     let explicit_arguments = node
         .child_by_field_name("type_arguments")
@@ -498,10 +672,6 @@ pub(super) fn check_call(text: &str, node: Node<'_>, locations: &Locations, stat
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let parameters: Vec<_> = parameters
-        .iter()
-        .map(|ty| substitute(ty, &generic_parameters, &explicit_arguments))
-        .collect();
     let arguments = node.child_by_field_name("arguments");
     let args: Vec<_> = arguments
         .into_iter()
@@ -509,6 +679,48 @@ pub(super) fn check_call(text: &str, node: Node<'_>, locations: &Locations, stat
             let mut cursor = list.walk();
             list.named_children(&mut cursor).collect::<Vec<_>>()
         })
+        .collect();
+    if args
+        .iter()
+        .any(|argument| argument.kind() == "spread_element")
+    {
+        return;
+    }
+    if let Some(signatures) = library_signatures {
+        if signatures.iter().any(|signature| {
+            args.len() >= signature.required_parameters
+                && signature
+                    .maximum_parameters
+                    .is_none_or(|maximum| args.len() <= maximum)
+        }) {
+            return;
+        }
+        let required = signatures
+            .iter()
+            .map(|signature| signature.required_parameters)
+            .min()
+            .unwrap_or(0);
+        let maximum = signatures
+            .iter()
+            .filter_map(|signature| signature.maximum_parameters)
+            .max();
+        state.diagnostics.push(TypeDiagnostic {
+            code: "TS2554".into(),
+            message: format!(
+                "Expected {} arguments, but got {}",
+                maximum.unwrap_or(required),
+                args.len()
+            ),
+            range: locations.range(node),
+        });
+        return;
+    }
+    let Type::Function(parameters, required_parameters, _, generic_parameters) = callee else {
+        return;
+    };
+    let parameters: Vec<_> = parameters
+        .iter()
+        .map(|ty| substitute(ty, &generic_parameters, &explicit_arguments))
         .collect();
     if args.len() < required_parameters || args.len() > parameters.len() {
         state.diagnostics.push(TypeDiagnostic {
@@ -548,6 +760,10 @@ pub(super) fn report_mismatch(
 pub(super) fn assignable(expected: &Type, actual: &Type, state: &TypeState) -> bool {
     match (resolve(expected, state), resolve(actual, state)) {
         (Type::Unknown, _) | (_, Type::Unknown) => true,
+        // `number | null` fits `number | null`: every member must fit.
+        (expected, Type::Union(actual)) => actual
+            .iter()
+            .all(|member| assignable(&expected, member, state)),
         (Type::Union(types), actual) => types.iter().any(|ty| assignable(ty, &actual, state)),
         (Type::Primitive(a), Type::Primitive(b)) => a == b,
         (Type::Null, Type::Null) | (Type::Undefined, Type::Undefined) => true,
@@ -601,6 +817,7 @@ pub(super) fn substitute(ty: &Type, parameters: &[String], args: &[Type]) -> Typ
             Box::new(substitute(result, parameters, args)),
             generic.clone(),
         ),
+        Type::LibraryValue(_) | Type::LibraryCallable(_) => ty.clone(),
         _ => ty.clone(),
     }
 }
@@ -664,6 +881,15 @@ pub(super) fn parse_type_text(text: &str) -> Type {
         "void" => Type::Primitive("void"),
         "null" => Type::Null,
         "undefined" => Type::Undefined,
+        // Index signatures (`{ [key: string]: T }`), nested objects and
+        // function members are beyond this checker; splitting on `;` and `:`
+        // would invent required fields such as `[key`.
+        _ if text.starts_with('{')
+            && text.ends_with('}')
+            && text[1..text.len() - 1].contains(['[', '{', '(']) =>
+        {
+            Type::Unknown
+        }
         _ if text.starts_with('{') && text.ends_with('}') => Type::Object(
             text[1..text.len() - 1]
                 .split(';')

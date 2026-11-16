@@ -177,10 +177,12 @@ impl PhpEngine {
             return self.member_type(ctx, &relation, "getResults", Some(""));
         };
         let parts = args.map(split_args).unwrap_or_default();
-        if !call && member.kind == MemberKind::Property && member.ty.is_none() {
-            if let Some(ty) = self.constructor_property_type(ctx, &chain[0].0, name) {
-                return Some(ty);
-            }
+        if !call
+            && member.kind == MemberKind::Property
+            && member.ty.is_none()
+            && let Some(ty) = self.constructor_property_type(ctx, &chain[0].0, name)
+        {
+            return Some(ty);
         }
         if let Some(index) = member.class_arg {
             return self.class_from_class_const(ctx, parts.get(index)?);
@@ -403,11 +405,7 @@ impl PhpEngine {
                 current = Some(narrowed);
                 continue;
             }
-            let class = if s[..start].trim() == "$this->" {
-                current.take()?
-            } else {
-                current.take()?
-            };
+            let class = current.take()?;
             current = self.member_type(ctx, &class, name, args);
         }
         if !s[pos..].trim().is_empty() {

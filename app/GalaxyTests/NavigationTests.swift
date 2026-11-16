@@ -619,14 +619,13 @@ final class NavigationTests: XCTestCase {
         click(view, line: 2, utf16Col: startsWith.location + 1, flags: .command)
 
         let deadline = Date().addingTimeInterval(2)
-        while !(view.document?.path().hasSuffix("ecmascript.d.ts") ?? false)
-                || view.document?.primaryCursor().line != 55,
-              Date() < deadline {
+        while !(view.document?.path().contains("/typescript-lib/lib.") ?? false), Date() < deadline {
             RunLoop.main.run(until: Date().addingTimeInterval(0.05))
         }
-        XCTAssertTrue(view.document?.path().hasSuffix("ecmascript.d.ts") ?? false)
-        XCTAssertGreaterThan(view.document?.lineCount() ?? 0, 55)
-        XCTAssertEqual(view.document?.primaryCursor().line, 55)
+        XCTAssertTrue(view.document?.path().contains("/typescript-lib/lib.") ?? false)
+        let cursor = try XCTUnwrap(view.document?.primaryCursor())
+        let declaration = view.document?.lines(first: cursor.line, count: 1).first ?? ""
+        XCTAssertTrue(declaration.contains("startsWith"))
     }
 
     func testCommandHoverSkipsPrimitiveTypesOutsidePHPToo() throws {

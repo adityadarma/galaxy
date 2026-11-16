@@ -131,7 +131,21 @@ impl TypeScriptProject {
             .map(|dir| dir.join("tsconfig.json"))
             .find(|config| config.is_file())
         {
-            return Self::from_tsconfig(config, package_root);
+            let project = Self::from_tsconfig(config.clone(), package_root.clone())?;
+            if project.paths.is_empty() && project.base_url.is_none() {
+                // A solution config (`"files": []` plus `references`, as Vite
+                // and Next templates write) keeps `paths` in the referenced
+                // `tsconfig.app.json`. Use the reference that covers `path`.
+                if let Some(referenced) = referenced_tsconfig_for(&config, path)
+                    && let Some(found) = Self::from_tsconfig(referenced, package_root)
+                {
+                    return Some(Self {
+                        root: project.root,
+                        ..found
+                    });
+                }
+            }
+            return Some(project);
         }
         let root = package_root?;
         Some(Self {
@@ -459,6 +473,71 @@ fn load_tsconfig_chain(
     }
     configs.push((path, value));
     Some(())
+}
+
+/// The `references` entry of `config` whose `include` covers `file`, or the
+/// first one defining `paths`/`baseUrl` when none lists `include`. Each
+/// reference is a config file or a directory holding `tsconfig.json`.
+pub(crate) fn referenced_tsconfig_for(config: &Path, file: &Path) -> Option<PathBuf> {
+    let directory = config.parent()?;
+    let source = std::fs::read_to_string(config).ok()?;
+    let value = jsonc::parse(&source).ok()?;
+    let JsoncValue::Array(references) = value.get("references")? else {
+        return None;
+    };
+    let file = lexical_normalize(file);
+    let mut fallback = None;
+    for reference in references.iter().take(MAX_TSCONFIG_EXTENDS) {
+        let Some(path) = reference.get("path").and_then(JsoncValue::as_str) else {
+            continue;
+        };
+        if path.contains('\\') {
+            continue;
+        }
+        let target = lexical_normalize(&directory.join(path));
+        let target = if target.is_dir() {
+            target.join("tsconfig.json")
+        } else {
+            target
+        };
+        if !target.starts_with(directory) || !target.is_file() {
+            continue;
+        }
+        let Some(value) = std::fs::read_to_string(&target)
+            .ok()
+            .and_then(|source| jsonc::parse(&source).ok())
+        else {
+            continue;
+        };
+        let options = value.get("compilerOptions");
+        let has_aliases = options.is_some_and(|options| {
+            options.get("paths").is_some() || options.get("baseUrl").is_some()
+        });
+        let base = target.parent()?;
+        match value.get("include") {
+            Some(JsoncValue::Array(include)) => {
+                // `src`, `src/**/*`, `vite.config.ts`: the part before the
+                // first glob is a directory or file the importer must be in.
+                let covers = include
+                    .iter()
+                    .filter_map(JsoncValue::as_str)
+                    .any(|pattern| {
+                        let fixed = pattern
+                            .split('/')
+                            .take_while(|part| !part.contains('*'))
+                            .collect::<Vec<_>>()
+                            .join("/");
+                        file.starts_with(lexical_normalize(&base.join(fixed)))
+                    });
+                if covers {
+                    return Some(target);
+                }
+            }
+            _ if has_aliases && fallback.is_none() => fallback = Some(target),
+            _ => {}
+        }
+    }
+    fallback
 }
 
 fn local_tsconfig_path(directory: &Path, extends: &str) -> Option<PathBuf> {
@@ -829,7 +908,7 @@ fn append_suffix(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(format!("{}{suffix}", path.to_string_lossy()))
 }
 
-fn lexical_normalize(path: &Path) -> PathBuf {
+pub(crate) fn lexical_normalize(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
@@ -1842,6 +1921,47 @@ mod tests {
         assert_eq!(
             resolve_typescript_specifier(&detected, "exact", &from),
             Some(project.join("generated/exact.cts"))
+        );
+    }
+
+    /// Vite/Next monorepo app: `tsconfig.json` only lists `references`, and
+    /// `@/*` lives in `tsconfig.app.json`.
+    #[test]
+    fn resolves_paths_from_the_referenced_tsconfig_of_a_solution_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = dir.path().join("apps/web");
+        std::fs::create_dir_all(app.join("src/components/ui")).unwrap();
+        std::fs::create_dir_all(app.join("src/routes")).unwrap();
+        std::fs::write(dir.path().join("package.json"), "{}").unwrap();
+        std::fs::write(app.join("package.json"), "{}").unwrap();
+        std::fs::write(
+            app.join("tsconfig.json"),
+            r#"{ "files": [], "references": [ { "path": "./tsconfig.app.json" }, { "path": "./tsconfig.node.json" } ] }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("tsconfig.app.json"),
+            r#"{
+              /* Bundler mode */
+              "compilerOptions": { "baseUrl": ".", "paths": { "@/*": ["./src/*"] } },
+              "include": ["src"]
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("tsconfig.node.json"),
+            r#"{ "compilerOptions": {}, "include": ["vite.config.ts"] }"#,
+        )
+        .unwrap();
+        std::fs::write(app.join("src/components/ui/button.tsx"), "").unwrap();
+        let from = app.join("src/routes/index.tsx");
+        std::fs::write(&from, "").unwrap();
+
+        let detected = TypeScriptProject::detect(&from).unwrap();
+        assert_eq!(detected.root, app, "the project root stays the app folder");
+        assert_eq!(
+            resolve_typescript_specifier(&detected, "@/components/ui/button", &from),
+            Some(app.join("src/components/ui/button.tsx"))
         );
     }
 
