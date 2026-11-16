@@ -724,7 +724,7 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         return false
     }
 
-    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+    nonisolated func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
         24
     }
 

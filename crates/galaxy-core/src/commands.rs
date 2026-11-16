@@ -799,6 +799,18 @@ const BUILTIN: &[(&str, &str, &str, &[&str])] = &[
         "Copy Relative Path",
         &["clipboard"],
     ),
+    (
+        "filesExplorer.copy",
+        "Explorer",
+        "Copy",
+        &["clipboard", "duplicate"],
+    ),
+    (
+        "filesExplorer.paste",
+        "Explorer",
+        "Paste",
+        &["clipboard", "duplicate"],
+    ),
     ("renameFile", "Explorer", "Rename…", &["move", "name"]),
     (
         "deleteFile",
@@ -825,6 +837,12 @@ const BUILTIN: &[(&str, &str, &str, &[&str])] = &[
         &["performance", "benchmark"],
     ),
     ("galaxy.about", "Galaxy", "About", &["version"]),
+    (
+        "update.checkForUpdate",
+        "Galaxy",
+        "Check for Updates…",
+        &["upgrade", "version", "sparkle"],
+    ),
     (
         "galaxy.openSettings",
         "Galaxy",

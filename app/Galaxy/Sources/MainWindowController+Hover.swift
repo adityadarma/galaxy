@@ -13,7 +13,10 @@ extension MainWindowController {
         hoverShownPosition = nil
     }
 
-    func beginHover(at position: TextPos, point: NSPoint) {
+    /// Blame and diagnostic cards open on a plain hover. The symbol card
+    /// (type, docs, file) only opens while Cmd is held, so it does not pop
+    /// up under the pointer while reading code.
+    func beginHover(at position: TextPos, point: NSPoint, commandHeld: Bool) {
         if handleBlameHover(point: point) { return }
         guard position.line != UInt64.max, let document = activeTab?.doc else {
             dismissHover()
@@ -21,6 +24,10 @@ extension MainWindowController {
         }
         if let diagnostic = document.diagnosticAt(line: position.line, character: position.colUtf16) {
             showDiagnosticHover(diagnostic, at: position)
+            return
+        }
+        guard commandHeld else {
+            dismissHover()
             return
         }
         // Same spot: skip unless the last answer was empty (the server may
@@ -44,6 +51,21 @@ extension MainWindowController {
         if !bridge.requestHover(document: document, line: position.line, character: position.colUtf16) {
             hoverRequestPosition = nil
         }
+    }
+
+    /// Cmd pressed or released with the pointer still. Pressing opens the
+    /// symbol card under the pointer without needing a mouse move; releasing
+    /// closes it. A diagnostic card (no pending symbol request) stays.
+    func updateHover(commandHeld: Bool) {
+        guard commandHeld else {
+            if hoverDocument != nil { dismissHover() }
+            return
+        }
+        let view = editorView
+        guard let window = view.window else { return }
+        let point = view.convert(window.mouseLocationOutsideOfEventStream, from: nil)
+        guard view.bounds.contains(point) else { return }
+        beginHover(at: view.textPosition(at: point), point: point, commandHeld: true)
     }
 
     private func showDiagnosticHover(_ diagnostic: DiagnosticInfo, at position: TextPos) {

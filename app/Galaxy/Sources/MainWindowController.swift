@@ -420,8 +420,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                 to: NavLocation(key: tab.navKey, line: after.line, col: after.col))
             self.refreshNavigationButtons()
         }
-        editorView.onHover = { [weak self] position, point in
-            self?.beginHover(at: position, point: point)
+        editorView.onHover = { [weak self] position, point, commandHeld in
+            self?.beginHover(at: position, point: point, commandHeld: commandHeld)
         }
         editorView.onDefinitionClick = { [weak self] position in
             self?.requestDefinition(at: position) ?? false

@@ -36,7 +36,7 @@ extension MainWindowController {
             scrollView.postsFrameChangedNotifications = true
             let center = NotificationCenter.default
             center.addObserver(forName: NSView.boundsDidChangeNotification, object: scrollView.contentView, queue: .main) { [weak self] _ in
-                MainActor.assumeIsolated {
+                onAppKitMainThread {
                     self?.scheduleScrollDecorationUpdate()
                     self?.stickyScopeView.horizontalScrollChanged()
                 }
@@ -44,7 +44,7 @@ extension MainWindowController {
             // The scroll view is created empty and sized by its split view
             // later, so the map follows every resize.
             center.addObserver(forName: NSView.frameDidChangeNotification, object: scrollView, queue: .main) { [weak self] _ in
-                MainActor.assumeIsolated { self?.layoutMinimap() }
+                onAppKitMainThread { self?.layoutMinimap() }
             }
         }
         minimap.isHidden = !show

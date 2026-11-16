@@ -1,4 +1,4 @@
-import AppKit
+@preconcurrency import AppKit
 import CoreText
 
 /// Cursor movement, selection, mouse and clipboard (M1-11).
@@ -109,7 +109,11 @@ extension EditorView {
         return TextPos(line: line, colUtf16: UInt64(index))
     }
 
-    override func mouseDown(with event: NSEvent) {
+    nonisolated override func mouseDown(with event: NSEvent) {
+        onAppKitMainThread { handleMouseDown(with: event) }
+    }
+
+    private func handleMouseDown(with event: NSEvent) {
         guard let document else { return super.mouseDown(with: event) }
         window?.makeFirstResponder(self)
         if document.hasMarkedText() { inputContext?.discardMarkedText() }

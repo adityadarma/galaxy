@@ -119,7 +119,7 @@ extension MainWindowController {
             let windowNumber = event.windowNumber
             let location = event.locationInWindow
             var consume = false
-            MainActor.assumeIsolated {
+            onAppKitMainThread {
                 guard let self, windowNumber == self.window?.windowNumber else { return }
                 let branchPickerOpen = self.loadedGitPicker?.isHidden == false
                 let overlays: [NSView] = [

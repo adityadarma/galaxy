@@ -143,10 +143,10 @@ final class LatencyBench {
         startRevision = doc.revision()
         // About two frames apart, so every key gets its own frame.
         timer = Timer.scheduledTimer(withTimeInterval: 0.03, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.tick() }
+            onAppKitMainThread { self?.tick() }
         }
         deadline = Timer.scheduledTimer(withTimeInterval: Double(count) * 0.1 + 10, repeats: false) { [weak self] _ in
-            MainActor.assumeIsolated { self?.finish() }
+            onAppKitMainThread { self?.finish() }
         }
     }
 

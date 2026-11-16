@@ -653,7 +653,7 @@ extension MainWindowController {
             NotificationCenter.default.addObserver(
                 forName: NSView.boundsDidChangeNotification, object: view.contentView, queue: .main
             ) { [weak self] _ in
-                MainActor.assumeIsolated {
+                onAppKitMainThread {
                     self?.syncDiffScroll(fromPrimary: isPrimary)
                     if isPrimary { self?.syncPreviewToEditor() }
                 }

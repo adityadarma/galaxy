@@ -5737,15 +5737,33 @@ mod tests {
         assert!(new[0].path.ends_with("library/alloc/src/vec/mod.rs"));
         assert_eq!(new[0].line, 438);
 
-        let option_hover = engine.hover(path, "fn hover() -> Option<HoverResult> { todo!() }", 0, 15).unwrap();
-        assert!(option_hover.markdown.contains("enum Option"), "{}", option_hover.markdown);
+        let option_hover = engine
+            .hover(path, "fn hover() -> Option<HoverResult> { todo!() }", 0, 15)
+            .unwrap();
+        assert!(
+            option_hover.markdown.contains("enum Option"),
+            "{}",
+            option_hover.markdown
+        );
 
         let vec_hover = engine.hover(path, source, 0, 18).unwrap();
-        assert!(vec_hover.markdown.contains("struct Vec"), "{}", vec_hover.markdown);
+        assert!(
+            vec_hover.markdown.contains("struct Vec"),
+            "{}",
+            vec_hover.markdown
+        );
 
         let new_hover = engine.hover(path, source, 0, 39).unwrap();
-        assert!(new_hover.markdown.contains("fn new()"), "{}", new_hover.markdown);
-        assert!(!new_hover.markdown.contains("root: &Path"), "{}", new_hover.markdown);
+        assert!(
+            new_hover.markdown.contains("fn new()"),
+            "{}",
+            new_hover.markdown
+        );
+        assert!(
+            !new_hover.markdown.contains("root: &Path"),
+            "{}",
+            new_hover.markdown
+        );
     }
 
     #[test]

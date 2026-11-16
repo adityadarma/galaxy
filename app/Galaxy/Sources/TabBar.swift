@@ -1,4 +1,13 @@
-import AppKit
+@preconcurrency import AppKit
+
+/// AppKit invokes these callbacks on its main thread, but Swift's executor
+/// query crashes on this OS before it can confirm that fact.
+nonisolated func onAppKitMainThread<Result>(_ body: @MainActor () -> Result) -> Result {
+    precondition(Thread.isMainThread)
+    return withoutActuallyEscaping(body) { body in
+        unsafeBitCast(body, to: (() -> Result).self)()
+    }
+}
 
 /// One open document (M2-06).
 @MainActor
@@ -86,7 +95,11 @@ final class EditorTab {
 /// trackpad both move it sideways, as in VSCode.
 @MainActor
 final class TabScrollView: NSScrollView {
-    override func scrollWheel(with event: NSEvent) {
+    nonisolated override func scrollWheel(with event: NSEvent) {
+        onAppKitMainThread { scrollWheelOnMainActor(with: event) }
+    }
+
+    private func scrollWheelOnMainActor(with event: NSEvent) {
         let dx = event.scrollingDeltaX, dy = event.scrollingDeltaY
         var delta = abs(dx) >= abs(dy) ? dx : dy
         if !event.hasPreciseScrollingDeltas { delta *= 12 }
@@ -266,10 +279,21 @@ final class TabBar: NSView {
         max(tab.intrinsicContentSize.width, minTabWidth)
     }
 
-    override func layout() {
+    nonisolated override func layout() {
+        onAppKitMainThread { layoutOnMainActor() }
+    }
+
+    private func layoutOnMainActor() {
         super.layout()
-        let widths = tabViews.map(Self.width(of:))
-        contentWidth = widths.reduce(0, +)
+        var widths: [CGFloat] = []
+        widths.reserveCapacity(tabViews.count)
+        var totalWidth: CGFloat = 0
+        for tabView in tabViews {
+            let width = Self.width(of: tabView)
+            widths.append(width)
+            totalWidth += width
+        }
+        contentWidth = totalWidth
         strip.setFrameSize(NSSize(width: max(contentWidth, 1), height: bounds.height))
         // The scroll view only covers the tabs, so the empty strip after them
         // stays a title bar to drag the window by.
@@ -281,7 +305,8 @@ final class TabBar: NSView {
         scrollView.scroll(toX: scrollView.contentView.bounds.origin.x)
         if needsReveal, let selectedIndex, widths.indices.contains(selectedIndex) {
             needsReveal = false
-            let left = widths[..<selectedIndex].reduce(0, +)
+            var left: CGFloat = 0
+            for index in 0..<selectedIndex { left += widths[index] }
             let right = left + widths[selectedIndex]
             let origin = scrollView.contentView.bounds.origin.x
             let visible = scrollView.contentView.bounds.width
@@ -296,7 +321,11 @@ final class TabBar: NSView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
-    override func draw(_ dirtyRect: NSRect) {
+    nonisolated override func draw(_ dirtyRect: NSRect) {
+        onAppKitMainThread { drawOnMainActor(dirtyRect) }
+    }
+
+    private func drawOnMainActor(_ dirtyRect: NSRect) {
         Theme.chrome.setFill()
         dirtyRect.intersection(bounds).fill()
     }
@@ -304,11 +333,19 @@ final class TabBar: NSView {
     /// Set by the window: the empty strip after the tabs acts as title bar.
     weak var titleBar: TitleBar?
 
-    override func mouseDown(with event: NSEvent) {
+    nonisolated override func mouseDown(with event: NSEvent) {
+        onAppKitMainThread { mouseDownOnMainActor(with: event) }
+    }
+
+    private func mouseDownOnMainActor(with event: NSEvent) {
         if event.clickCount == 1 { window?.performDrag(with: event) }
     }
 
-    override func mouseUp(with event: NSEvent) {
+    nonisolated override func mouseUp(with event: NSEvent) {
+        onAppKitMainThread { mouseUpOnMainActor(with: event) }
+    }
+
+    private func mouseUpOnMainActor(with event: NSEvent) {
         if let titleBar { titleBar.mouseUp(with: event) } else { super.mouseUp(with: event) }
     }
 
@@ -498,12 +535,18 @@ final class TabItemView: NSView {
     var showsEditedDot: Bool { item.isEdited && !isHovered }
 
     /// Width the tab wants: the whole title plus room for the close button.
-    override var intrinsicContentSize: NSSize {
-        NSSize(width: Self.leadingInset + ceil(label.intrinsicContentSize.width) + Self.trailingInset,
-               height: NSView.noIntrinsicMetric)
+    nonisolated override var intrinsicContentSize: NSSize {
+        onAppKitMainThread {
+            NSSize(width: Self.leadingInset + ceil(label.intrinsicContentSize.width) + Self.trailingInset,
+                   height: NSView.noIntrinsicMetric)
+        }
     }
 
-    override func layout() {
+    nonisolated override func layout() {
+        onAppKitMainThread { layoutOnMainActor() }
+    }
+
+    private func layoutOnMainActor() {
         super.layout()
         let needed = Self.leadingInset + ceil(label.intrinsicContentSize.width) + Self.trailingInset
         closeIsInline = bounds.width >= needed
@@ -578,7 +621,11 @@ final class TabItemView: NSView {
         needsDisplay = true
     }
 
-    override func draw(_ dirtyRect: NSRect) {
+    nonisolated override func draw(_ dirtyRect: NSRect) {
+        onAppKitMainThread { drawOnMainActor(dirtyRect) }
+    }
+
+    private func drawOnMainActor(_ dirtyRect: NSRect) {
         if isSelected {
             Theme.editorBackground.resolved(for: effectiveAppearance).setFill()
             bounds.fill()
@@ -593,33 +640,45 @@ final class TabItemView: NSView {
         NSRect(x: bounds.maxX - 1, y: 0, width: 1, height: bounds.height).fill()
     }
 
-    override var isFlipped: Bool { false }
+    nonisolated override var isFlipped: Bool { false }
 
-    override func updateTrackingAreas() {
+    nonisolated override func updateTrackingAreas() {
+        onAppKitMainThread { updateTrackingAreasOnMainActor() }
+    }
+
+    private func updateTrackingAreasOnMainActor() {
         super.updateTrackingAreas()
         trackingAreas.forEach(removeTrackingArea)
         addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
                                        owner: self, userInfo: nil))
     }
 
-    override func mouseEntered(with event: NSEvent) { isHovered = true }
-    override func mouseExited(with event: NSEvent) { isHovered = false }
-
-    override func mouseDown(with event: NSEvent) {
-        bar?.track(tab: index, from: event)
+    nonisolated override func mouseEntered(with event: NSEvent) {
+        onAppKitMainThread { isHovered = true }
+    }
+    nonisolated override func mouseExited(with event: NSEvent) {
+        onAppKitMainThread { isHovered = false }
     }
 
-    override func menu(for event: NSEvent) -> NSMenu? {
-        bar?.menuForTab?(index) ?? super.menu(for: event)
+    nonisolated override func mouseDown(with event: NSEvent) {
+        onAppKitMainThread { bar?.track(tab: index, from: event) }
     }
 
-    override func otherMouseUp(with event: NSEvent) {
-        if event.buttonNumber == 2 { bar?.onClose?(index) }
+    nonisolated override func menu(for event: NSEvent) -> NSMenu? {
+        onAppKitMainThread { bar?.menuForTab?(index) ?? super.menu(for: event) }
     }
 
-    override func accessibilityPerformPress() -> Bool {
-        bar?.onSelect?(index)
-        return true
+    nonisolated override func otherMouseUp(with event: NSEvent) {
+        onAppKitMainThread {
+            if event.buttonNumber == 2 { bar?.onClose?(index) }
+        }
+    }
+
+    nonisolated override func accessibilityPerformPress() -> Bool {
+        onAppKitMainThread {
+            bar?.onSelect?(index)
+            return true
+        }
     }
 
     @objc private func closeClicked(_ sender: Any?) {

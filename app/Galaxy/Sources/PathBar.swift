@@ -89,6 +89,10 @@ final class PathBar: NSView {
             pathRow.removeArrangedSubview(view)
             view.removeFromSuperview()
         }
+        // The loop above also removed the symbol views; forget them so
+        // `show(symbols:atLine:)` does not remove them a second time.
+        symbolViews = []
+        visibleSymbols = []
         let font = NSFont.systemFont(ofSize: 13)
         let text = NSMutableAttributedString()
         defer {
@@ -147,8 +151,10 @@ final class PathBar: NSView {
     /// Appends the active symbol scope after the file name, matching editor
     /// breadcrumbs: path, file, namespace/class, then the current member.
     func show(symbols: [OutlineSymbol], atLine line: UInt64) {
-        symbolViews.forEach { view in
-            pathRow.removeArrangedSubview(view)
+        // NSStackView asserts when asked to remove a view it no longer arranges.
+        let arranged = Set(pathRow.arrangedSubviews.map(ObjectIdentifier.init))
+        for view in symbolViews {
+            if arranged.contains(ObjectIdentifier(view)) { pathRow.removeArrangedSubview(view) }
             view.removeFromSuperview()
         }
         var active: [OutlineSymbol] = []

@@ -34,7 +34,7 @@ extension MainWindowController {
         }
         testScanItem?.cancel()
         let item = DispatchWorkItem { [weak self] in
-            MainActor.assumeIsolated { self?.refreshTestMarkers() }
+            onAppKitMainThread { self?.refreshTestMarkers() }
         }
         testScanItem = item
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.testScanDelay, execute: item)

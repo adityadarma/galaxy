@@ -200,7 +200,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         // transitions to end, then leave for a regular desktop.
         if pendingWindowSessions[0].fullScreen != true, fullScreenPending != nil || !fullScreenQueue.isEmpty {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-                MainActor.assumeIsolated { self?.restoreNextPendingWindow() }
+                onAppKitMainThread { self?.restoreNextPendingWindow() }
             }
             return
         }
@@ -238,13 +238,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         fullScreenObserver = NotificationCenter.default.addObserver(
             forName: NSWindow.didEnterFullScreenNotification, object: window, queue: .main
         ) { [weak self, weak window] _ in
-            MainActor.assumeIsolated {
+            onAppKitMainThread {
                 if let window { self?.finishFullScreen(of: window) }
             }
         }
         // If the transition never reports, do not lose the other windows.
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self, weak window] in
-            MainActor.assumeIsolated {
+            onAppKitMainThread {
                 if let window { self?.finishFullScreen(of: window) }
             }
         }
@@ -332,13 +332,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
                 forName: NSWindow.didExitFullScreenNotification, object: window, queue: .main
             ) { _ in
                 if let exitToken { NotificationCenter.default.removeObserver(exitToken) }
-                MainActor.assumeIsolated { finish.run() }
+                onAppKitMainThread { finish.run() }
             }
-            MainActor.assumeIsolated { window.toggleFullScreen(nil) }
+            onAppKitMainThread { window.toggleFullScreen(nil) }
         }
         // If a transition never reports, do not stall the windows behind it.
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
-            MainActor.assumeIsolated { finish.run() }
+            onAppKitMainThread { finish.run() }
         }
         window.toggleFullScreen(nil)
     }

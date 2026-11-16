@@ -120,20 +120,23 @@ final class CoreBridgeTests: XCTestCase {
         try "<?php\nnamespace App;\nclass Order { public function total(): int { return 1; } }\n"
             .write(to: app.appendingPathComponent("Order.php"), atomically: true, encoding: .utf8)
         let report = app.appendingPathComponent("Report.php")
-        try "<?php\nnamespace App;\nclass Report { public function run(Order $order): int { return $order->total(); } }\n"
+        let reportLine = "class Report { public function run(Order $order): int { return $order->total(); } }"
+        try "<?php\nnamespace App;\n\(reportLine)\n"
             .write(to: report, atomically: true, encoding: .utf8)
+        // Inside `total`, not on the `->` before it.
+        let character = UInt64((reportLine as NSString).range(of: "total").location + 1)
 
         let bridge = CoreBridge()
         let document = try bridge.openDocument(path: report.path)
         let deadline = Date().addingTimeInterval(10)
         repeat {
-            bridge.requestDefinition(document: document, line: 2, character: 70)
+            bridge.requestDefinition(document: document, line: 2, character: character)
             if !bridge.definitionLocations(document: document).isEmpty { break }
             RunLoop.current.run(until: Date().addingTimeInterval(0.02))
         } while Date() < deadline
         let locations = bridge.definitionLocations(document: document)
         XCTAssertEqual(locations.count, 1)
-        XCTAssertTrue(locations[0].uri.hasSuffix("/Order.php"))
+        XCTAssertTrue(locations.first?.uri.hasSuffix("/Order.php") == true)
     }
 
     @MainActor

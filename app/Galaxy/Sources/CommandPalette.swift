@@ -142,6 +142,7 @@ final class CommandPaletteView: NSView, NSTextFieldDelegate, NSTableViewDataSour
         "workbench.files.action.collapseExplorerFolders": #selector(MainWindowController.collapseExplorerFolders(_:)),
         "galaxy.showTypingLatency": #selector(MainWindowController.showTypingLatency(_:)),
         "galaxy.about": #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
+        "update.checkForUpdate": #selector(AppDelegate.checkForUpdates(_:)),
         "workbench.action.quit": #selector(NSApplication.terminate(_:)),
     ]
 

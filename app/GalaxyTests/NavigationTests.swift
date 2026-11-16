@@ -255,6 +255,79 @@ final class NavigationTests: XCTestCase {
         XCTAssertNil(v.definitionLink)
     }
 
+    /// The symbol card (kind, name, file) opens only while Cmd is held.
+    func testSymbolHoverCardNeedsCommand() throws {
+        let c = try makeController(text: "function intToIp(n: number) { return n }\nintToIp(1)\n")
+        defer { c.window?.orderOut(nil) }
+        let v = c.editorView
+        v.document?.setPath(path: "/tmp/galaxy-hover-\(UUID().uuidString).ts")
+        let position = TextPos(line: 1, colUtf16: 2)  // inside `intToIp`
+        let point = NSPoint(x: v.textOriginX + 4, y: v.metrics.lineHeight * 1.5)
+
+        v.onHover?(position, point, false)
+        c.refreshHover()
+        XCTAssertTrue(c.hoverPopover.isHidden, "a plain hover shows nothing")
+        XCTAssertNil(c.hoverRequestPosition, "and sends no request")
+
+        v.onHover?(position, point, true)
+        c.refreshHover()
+        XCTAssertFalse(c.hoverPopover.isHidden, "Cmd-hover shows the card")
+        XCTAssertTrue(c.hoverPopover.renderedText.contains("intToIp"))
+
+        c.updateHover(commandHeld: false)
+        XCTAssertTrue(c.hoverPopover.isHidden, "releasing Cmd closes it")
+    }
+
+    /// The bridge AppKit callbacks use instead of `MainActor.assumeIsolated`.
+    func testAppKitMainThreadBridgeRunsBodyAndReturnsItsValue() {
+        var ran = false
+        let value = onAppKitMainThread { () -> Int in
+            ran = true
+            return 42
+        }
+        XCTAssertTrue(ran)
+        XCTAssertEqual(value, 42)
+    }
+
+    /// Pressing Cmd re-reads the window mouse position. A view outside any
+    /// window has no mouse position, so it must clear the link, not keep a
+    /// stale one.
+    func testCommandPressWithoutWindowClearsDefinitionLink() throws {
+        let c = try makeController(text: "<?php\nuse Foo\\BarService;\nsecond")
+        let v = c.editorView
+        v.document?.setPath(path: "/tmp/Foo.php")
+        v.onDefinitionClick = { _ in true }
+        let text = "use Foo\\BarService;"
+        let column = (text as NSString).range(of: "BarService").location + 2
+        let x = v.textOriginX + v.xOffset(in: text, column: UInt64(column)) + 0.5
+        v.lastMousePoint = NSPoint(x: x, y: v.metrics.lineHeight * 1.5)
+        v.updateDefinitionLink(commandHeld: true)
+        XCTAssertNotNil(v.definitionLink, "precondition: the word is a link")
+
+        let superview = v.superview
+        v.removeFromSuperview()
+        defer { superview?.addSubview(v) }
+        v.updateDefinitionLinkAtWindowMouse(commandHeld: true)
+        XCTAssertNil(v.definitionLink)
+    }
+
+    /// Releasing Cmd clears the link whatever the mouse position is.
+    func testCommandReleaseAtWindowMouseClearsDefinitionLink() throws {
+        let c = try makeController(text: "<?php\nuse Foo\\BarService;\nsecond")
+        let v = c.editorView
+        v.document?.setPath(path: "/tmp/Foo.php")
+        v.onDefinitionClick = { _ in true }
+        let text = "use Foo\\BarService;"
+        let column = (text as NSString).range(of: "BarService").location + 2
+        let x = v.textOriginX + v.xOffset(in: text, column: UInt64(column)) + 0.5
+        v.lastMousePoint = NSPoint(x: x, y: v.metrics.lineHeight * 1.5)
+        v.updateDefinitionLink(commandHeld: true)
+        XCTAssertNotNil(v.definitionLink)
+
+        v.updateDefinitionLinkAtWindowMouse(commandHeld: false)
+        XCTAssertNil(v.definitionLink)
+    }
+
     func testCommandHoverUnderlinesTypeScriptBuilderMethod() throws {
         let text = "      table.string('name').notNullable()"
         let c = try makeController(text: text)

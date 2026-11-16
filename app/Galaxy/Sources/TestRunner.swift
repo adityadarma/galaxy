@@ -293,11 +293,11 @@ final class TestRunner {
             while true {
                 let data = handle.availableData
                 if data.isEmpty { break }
-                DispatchQueue.main.async { MainActor.assumeIsolated { self?.received(data, for: record) } }
+                DispatchQueue.main.async { onAppKitMainThread { self?.received(data, for: record) } }
             }
             process.waitUntilExit()
             let code = process.terminationStatus
-            DispatchQueue.main.async { MainActor.assumeIsolated { self?.finished(record, code: code) } }
+            DispatchQueue.main.async { onAppKitMainThread { self?.finished(record, code: code) } }
         }
         onChange?(record)
         return record

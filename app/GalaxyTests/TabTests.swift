@@ -64,6 +64,14 @@ final class TabTests: XCTestCase {
         XCTAssertEqual(titles(c), ["a.txt", "Untitled", "b.txt"])
     }
 
+    func testTabGeometryIsAvailableToAppKitLayout() {
+        let tab = laidOutTab(title: "Layout", width: 180)
+        XCTAssertFalse(tab.isFlipped)
+        XCTAssertTrue(tab.intrinsicContentSize.width.isFinite)
+        let insets = tab.alignmentRectInsets
+        XCTAssertTrue([insets.top, insets.left, insets.bottom, insets.right].allSatisfy(\.isFinite))
+    }
+
     func testStaticTabActionsMenuFollowsTheActiveTab() throws {
         let c = makeController()
         defer { c.window?.orderOut(nil) }
@@ -189,6 +197,29 @@ final class TabTests: XCTestCase {
         for _ in 0..<20 { bar.show(symbols: symbols, atLine: 10) }
 
         XCTAssertEqual(descendants(of: bar).count, initialCount)
+    }
+
+    /// Switching tabs calls `show(_:)`, which clears every arranged view,
+    /// before the new symbols arrive. Removing the old symbol views again
+    /// made NSStackView assert and abort the app.
+    func testSymbolBreadcrumbsSurviveAPathChangeBetweenUpdates() {
+        let bar = PathBar(frame: NSRect(x: 0, y: 0, width: 600, height: PathBar.height))
+        let symbols = [
+            OutlineSymbol(uri: nil, name: "Network", kind: "class", line: 1, column: 0, depth: 0),
+        ]
+        bar.show(["src", "a.ts"])
+        bar.show(symbols: symbols, atLine: 5)
+        bar.show(["src", "b.ts"])
+        bar.show(symbols: symbols, atLine: 5)
+
+        func buttonTitles(in view: NSView) -> [String] {
+            view.subviews.compactMap { ($0 as? NSButton)?.title }
+                + view.subviews.flatMap { buttonTitles(in: $0) }
+        }
+        let titles = buttonTitles(in: bar)
+        XCTAssertEqual(titles.filter { $0 == "Network" }.count, 1)
+        XCTAssertTrue(titles.contains("b.ts"))
+        XCTAssertFalse(titles.contains("a.ts"))
     }
 
     func testSymbolBreadcrumbShowsOnlyTheActiveScopeChain() {

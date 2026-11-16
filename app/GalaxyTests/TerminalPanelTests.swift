@@ -264,8 +264,11 @@ final class TerminalPanelTests: XCTestCase {
         c.selectTab(1)
         XCTAssertFalse(c.editorTerminalView.isHidden)
 
-        // Session and unsaved prompts skip the terminal tab.
-        XCTAssertEqual(c.currentSession().tabs.count, 1)
+        // The session keeps the terminal tab so it can restart its shell on
+        // restore; unsaved prompts still skip it.
+        let sessionTabs = c.currentSession().tabs
+        XCTAssertEqual(sessionTabs.count, 2)
+        XCTAssertEqual(sessionTabs.filter { $0.isTerminal == true }.count, 1)
         XCTAssertTrue(c.confirmDiscardChanges())
 
         // Back into the panel, still the same running shell.

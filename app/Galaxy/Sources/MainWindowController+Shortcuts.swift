@@ -89,19 +89,20 @@ extension MainWindowController {
     func installKeyMonitor() {
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] event in
             if event.type == .flagsChanged {
-                let windowNumber = event.windowNumber
-                MainActor.assumeIsolated {
-                    guard let self, windowNumber == self.window?.windowNumber else { return }
+                let commandHeld = event.modifierFlags.contains(.command)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.window?.isKeyWindow == true else { return }
                     self.editorView.updateDefinitionLinkAtWindowMouse(
-                        commandHeld: event.modifierFlags.contains(.command)
+                        commandHeld: commandHeld
                     )
+                    self.updateHover(commandHeld: commandHeld)
                 }
                 return event
             }
             // Only plain values cross into the main-actor closure.
             guard let id = Keybindings.keyID(for: event) else { return event }
             let windowNumber = event.windowNumber
-            let handled = MainActor.assumeIsolated { () -> Bool in
+            let handled = onAppKitMainThread { () -> Bool in
                 guard let self, windowNumber == self.window?.windowNumber else { return false }
                 if event.keyCode == 0x6F, event.modifierFlags.intersection(.deviceIndependentFlagsMask).isEmpty {
                     self.goToDefinition(self)

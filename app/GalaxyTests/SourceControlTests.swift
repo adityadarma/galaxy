@@ -7,6 +7,7 @@ final class SourceControlTests: XCTestCase {
         let sc = SourceControlController()
         sc.refresh(status: nil)
         XCTAssertEqual(sc.numberOfRows(in: NSTableView()), 2, "Should show CHANGES header and empty row 'No changes'")
+        XCTAssertEqual(sc.tableView(NSTableView(), heightOfRow: 0), 24)
     }
 
     func testSourceControlSectionsAndCollapsing() {
@@ -124,7 +125,10 @@ final class SourceControlTests: XCTestCase {
         let header = controller.sectionHeader
         let wired = [header.scmPullButton, header.scmBranchButton, header.scmCommitButton, header.scmRefreshButton, header.scmMoreButton]
         XCTAssertEqual(header.scmTools, wired, "every header icon has an action")
-        XCTAssertTrue(wired.allSatisfy { !$0.isHidden && $0.action != nil })
+        XCTAssertTrue(wired.allSatisfy { $0.action != nil })
+        // Like VSCode, only "…" shows until the pointer is over the header.
+        XCTAssertFalse(header.scmMoreButton.isHidden)
+        XCTAssertTrue(wired.filter { $0 !== header.scmMoreButton }.allSatisfy(\.isHidden))
 
         // Click Source Control in Activity Bar AGAIN -> toggles / collapses sidebar
         scButton?.performClick(nil)

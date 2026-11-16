@@ -24,7 +24,7 @@ final class HoverEndToEndTests: XCTestCase {
         let point = NSPoint(x: v.textOriginX + v.xOffset(in: text, column: UInt64(column)) + 0.5,
                             y: CGFloat(line) * v.metrics.lineHeight + v.metrics.lineHeight / 2)
         let event = try XCTUnwrap(NSEvent.mouseEvent(
-            with: .mouseMoved, location: v.convert(point, to: nil), modifierFlags: [], timestamp: 0,
+            with: .mouseMoved, location: v.convert(point, to: nil), modifierFlags: .command, timestamp: 0,
             windowNumber: v.window?.windowNumber ?? 0, context: nil, eventNumber: 0, clickCount: 0, pressure: 0))
 
         // Servers start and index asynchronously; re-hover until a card shows.

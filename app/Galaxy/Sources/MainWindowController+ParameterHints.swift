@@ -31,7 +31,7 @@ extension MainWindowController {
         guard inlineParameterHintsEnabled else { return }
         parameterHintsItem?.cancel()
         let item = DispatchWorkItem { [weak self] in
-            MainActor.assumeIsolated { self?.refreshParameterHints() }
+            onAppKitMainThread { self?.refreshParameterHints() }
         }
         parameterHintsItem = item
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)

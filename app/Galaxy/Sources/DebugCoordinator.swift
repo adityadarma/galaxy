@@ -91,7 +91,7 @@ final class DebugCoordinator {
         state = .running
         onOutput?("console", "Debugging \(target.program)\n")
         timer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.poll() }
+            onAppKitMainThread { self?.poll() }
         }
         onChange?()
     }

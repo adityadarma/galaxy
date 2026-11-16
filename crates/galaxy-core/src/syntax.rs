@@ -211,8 +211,9 @@ impl SyntaxLanguage {
     pub fn highlight_query(self) -> &'static str {
         match self {
             Self::Rust => rust_highlights(),
-            Self::TypeScript | Self::Tsx => TYPESCRIPT_HIGHLIGHTS,
-            Self::JavaScript => JAVASCRIPT_HIGHLIGHTS,
+            Self::TypeScript => TYPESCRIPT_HIGHLIGHTS,
+            Self::Tsx => tsx_highlights(),
+            Self::JavaScript => javascript_highlights(),
             Self::Json => json_highlights(),
             Self::Toml => tree_sitter_toml_ng::HIGHLIGHTS_QUERY,
             Self::Yaml => tree_sitter_yaml::HIGHLIGHTS_QUERY,
@@ -640,6 +641,28 @@ fn dart_highlights() -> &'static str {
     })
 }
 
+/// JSX component names (`<UserCard>`, `<Form.Item>`) take the class color.
+/// Only TSX and JavaScript have JSX nodes; the plain TypeScript grammar
+/// would reject these patterns.
+const JSX_COMPONENT_HIGHLIGHTS: &str = r#"
+(jsx_opening_element name: (identifier) @type (#match? @type "^[A-Z]"))
+(jsx_closing_element name: (identifier) @type (#match? @type "^[A-Z]"))
+(jsx_self_closing_element name: (identifier) @type (#match? @type "^[A-Z]"))
+(jsx_opening_element name: (member_expression property: (property_identifier) @type))
+(jsx_closing_element name: (member_expression property: (property_identifier) @type))
+(jsx_self_closing_element name: (member_expression property: (property_identifier) @type))
+"#;
+
+fn tsx_highlights() -> &'static str {
+    static QUERY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    QUERY.get_or_init(|| format!("{TYPESCRIPT_HIGHLIGHTS}\n{JSX_COMPONENT_HIGHLIGHTS}"))
+}
+
+fn javascript_highlights() -> &'static str {
+    static QUERY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    QUERY.get_or_init(|| format!("{JAVASCRIPT_HIGHLIGHTS}\n{JSX_COMPONENT_HIGHLIGHTS}"))
+}
+
 // These two grammar crates do not export their upstream query. Keep a small,
 // self-contained equivalent here rather than depending on Cargo registry paths.
 const TYPESCRIPT_HIGHLIGHTS: &str = r#"
@@ -998,7 +1021,26 @@ fn collect_style_spans(
     if language == SyntaxLanguage::Php && tree.root_node().has_error() {
         recover_php_errors(rope, tree, start_byte, end_byte, &mut spans);
     }
+    if matches!(language, SyntaxLanguage::Vue | SyntaxLanguage::Svelte) {
+        // Component tags (`<UserCard>`, Vue `<user-card>`) take the class
+        // color, like JSX components; plain HTML tags keep the tag color.
+        for (start, end, scope) in &mut spans {
+            if *scope == HighlightScope::Tag
+                && text_between(rope, *start, *end)
+                    .is_some_and(|name| is_component_tag(language, &name))
+            {
+                *scope = HighlightScope::Type;
+            }
+        }
+    }
     spans
+}
+
+/// `<Button>` in any template language, and `<my-card>` in Vue, where a
+/// hyphenated name is a registered component.
+fn is_component_tag(language: SyntaxLanguage, name: &str) -> bool {
+    name.chars().next().is_some_and(char::is_uppercase)
+        || (language == SyntaxLanguage::Vue && name.contains('-'))
 }
 
 /// Tree-sitter can put a long valid tail inside `ERROR` after one missing
@@ -1023,7 +1065,9 @@ fn recover_php_errors(
         ) {
             continue;
         }
-        let token = rope.byte_slice(*start..*end).to_string();
+        let Some(token) = text_between(rope, *start, *end) else {
+            continue;
+        };
         if KEYWORDS.contains(&token.as_str()) {
             *scope = HighlightScope::Keyword;
         }
@@ -1046,7 +1090,9 @@ fn recover_php_errors(
         }
     }
     for (start, end) in errors {
-        let text = rope.byte_slice(start..end).to_string();
+        let Some(text) = text_between(rope, start, end) else {
+            continue;
+        };
         let mut recovered = Vec::new();
         recover_php_range(&text, start, KEYWORDS, &mut recovered);
         // Pair brackets before clipping to the viewport. Otherwise a closing
@@ -1213,8 +1259,14 @@ fn rainbow_brackets(
         let punctuation = spans[index..next]
             .iter()
             .any(|span| span.2 == HighlightScope::Punctuation);
-        if punctuation {
-            let token = rope.byte_slice(start..end).to_string();
+        // The tree may be one edit behind the text (see `viewport`), so its
+        // offsets can split a multi-byte character. Skip such a token.
+        let token = if punctuation {
+            text_between(rope, start, end)
+        } else {
+            None
+        };
+        if let Some(token) = token {
             let bracket = match token.as_str() {
                 "(" => Some((b')', true)),
                 "[" => Some((b']', true)),
@@ -3044,6 +3096,91 @@ mod tests {
         }
     }
 
+    /// A tree one edit behind the text can hand back offsets inside a
+    /// multi-byte character (crash 2026-11-16 10:04, deleting a syntax error).
+    #[test]
+    fn stale_offsets_inside_a_character_do_not_panic() {
+        let rope = Rope::from_str("é(x)");
+        // Byte 1 sits inside `é` (bytes 0..2).
+        let mut spans = vec![
+            (1, 2, HighlightScope::Punctuation),
+            (2, 3, HighlightScope::Punctuation),
+            (4, 5, HighlightScope::Punctuation),
+        ];
+        rainbow_brackets(&rope, &mut spans, &[]);
+        assert_eq!(
+            spans[0].2,
+            HighlightScope::Punctuation,
+            "split token is left alone"
+        );
+        assert_eq!(spans[1].2, HighlightScope::PunctuationBracket1);
+
+        // The same edit through the viewport: parse, then change the text
+        // without re-parsing so the old tree's offsets are stale.
+        let language = SyntaxLanguage::Tsx;
+        let old = "const a = f(1));\nconst b = 'é';\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(old, None).unwrap();
+        let doc = Document::from_text("const a = f(1);\nconst b = 'éé(';\n");
+        let _ = style_runs_for_viewport(&doc, &tree, language, 0, doc.line_count());
+    }
+
+    fn runs_for(language: SyntaxLanguage, source: &str) -> Vec<StyleRun> {
+        let service = SyntaxService::for_syntax(language);
+        let doc = Document::from_text(source);
+        service.submit_document(&doc);
+        let snapshot = wait_for(&service);
+        style_runs_for_viewport(&doc, snapshot.tree(), language, 0, doc.line_count())
+    }
+
+    #[test]
+    fn component_tags_take_the_class_color() {
+        let tsx = "const v = <div>\n<UserCard id={1} />\n<Form.Item>x</Form.Item>\n</div>;\n";
+        let runs = runs_for(SyntaxLanguage::Tsx, tsx);
+        assert!(
+            scopes_of(&runs, tsx, 1, "UserCard").contains(&HighlightScope::Type),
+            "{runs:?}"
+        );
+        assert!(
+            scopes_of(&runs, tsx, 2, "Item").contains(&HighlightScope::Type),
+            "{runs:?}"
+        );
+        assert!(!scopes_of(&runs, tsx, 0, "div").contains(&HighlightScope::Type));
+
+        let jsx = "const v = (\n<Modal open>\n<span>a</span>\n</Modal>\n);\n";
+        let runs = runs_for(SyntaxLanguage::JavaScript, jsx);
+        assert!(
+            scopes_of(&runs, jsx, 1, "Modal").contains(&HighlightScope::Type),
+            "{runs:?}"
+        );
+        assert!(
+            scopes_of(&runs, jsx, 3, "Modal").contains(&HighlightScope::Type),
+            "{runs:?}"
+        );
+        assert!(!scopes_of(&runs, jsx, 2, "span").contains(&HighlightScope::Type));
+
+        let vue = "<template>\n<div>\n<UserCard />\n<user-card></user-card>\n</div>\n</template>\n";
+        let runs = runs_for(SyntaxLanguage::Vue, vue);
+        assert!(
+            scopes_of(&runs, vue, 2, "UserCard").contains(&HighlightScope::Type),
+            "{runs:?}"
+        );
+        assert!(
+            scopes_of(&runs, vue, 3, "user-card").contains(&HighlightScope::Type),
+            "{runs:?}"
+        );
+        assert!(scopes_of(&runs, vue, 1, "div").contains(&HighlightScope::Tag));
+
+        let svelte = "<script>\nlet a = 1;\n</script>\n<div>\n<UserCard {a} />\n</div>\n";
+        let runs = runs_for(SyntaxLanguage::Svelte, svelte);
+        assert!(
+            scopes_of(&runs, svelte, 4, "UserCard").contains(&HighlightScope::Type),
+            "{runs:?}"
+        );
+        assert!(scopes_of(&runs, svelte, 3, "div").contains(&HighlightScope::Tag));
+    }
+
     /// Runs of a Blade `source` as the editor sees them: the worker parses the
     /// masked text and the viewport adds the Blade overlay on top.
     fn blade_runs(source: &str) -> Vec<StyleRun> {
@@ -4555,7 +4692,8 @@ mod tests {
             );
         }
         assert!(at("14").contains(&HighlightScope::Number), "{runs:?}");
-        assert!(at("Languages").contains(&HighlightScope::Tag), "{runs:?}");
+        // A component tag takes the class color, not the HTML tag color.
+        assert!(at("Languages").contains(&HighlightScope::Type), "{runs:?}");
     }
 
     #[test]
@@ -4628,19 +4766,21 @@ mod tests {
             .unwrap();
         let tree = parser.parse(doc.text(), None).unwrap();
         let runs = style_runs_for_viewport(&doc, &tree, SyntaxLanguage::Svelte, 0, 8);
-        let tagged = |line: usize, text: &str| {
+        let styled = |line: usize, text: &str, scope: HighlightScope| {
             let lines: Vec<&str> = src.lines().collect();
             let start = lines[line].find(text).unwrap();
             runs.iter().any(|r| {
                 r.line == line
-                    && r.scope == HighlightScope::Tag
+                    && r.scope == scope
                     && r.start == start
                     && r.end == start + text.len()
             })
         };
+        let tagged = |line: usize, text: &str| styled(line, text, HighlightScope::Tag);
         assert!(tagged(0, "button"));
-        assert!(tagged(1, "Badge"));
-        assert!(tagged(3, "Badge"));
+        // Components take the class color.
+        assert!(styled(1, "Badge", HighlightScope::Type));
+        assert!(styled(3, "Badge", HighlightScope::Type));
         assert!(tagged(4, "button"));
         assert!(tagged(5, "img"));
     }

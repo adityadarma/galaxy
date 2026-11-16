@@ -182,7 +182,7 @@ final class EditorView: NSView {
         clipObserver = NotificationCenter.default.addObserver(
             forName: NSView.boundsDidChangeNotification, object: clip, queue: .main
         ) { [weak self] _ in
-            MainActor.assumeIsolated { self?.clipBoundsChanged() }
+            onAppKitMainThread { self?.clipBoundsChanged() }
         }
     }
 
@@ -365,7 +365,8 @@ final class EditorView: NSView {
     /// Primary caret before and after a plain click, so the window can
     /// record a far click in the back/forward history (M2-08).
     var onClickMove: ((CursorInfo, CursorInfo) -> Void)?
-    var onHover: ((TextPos, NSPoint) -> Void)?
+    /// Pointer moved: text position, point, and whether Cmd is held.
+    var onHover: ((TextPos, NSPoint, Bool) -> Void)?
     var onCompletionKey: ((NSEvent) -> Bool)?
     var onTextInput: ((String) -> Void)?
     var onSnippetInvalidated: (() -> Void)?
@@ -461,8 +462,9 @@ final class EditorView: NSView {
         lastMousePoint = point
         setPointerInGutter(point.x < gutterWidth + gutterShift)
         updateHoveredGitLine(at: point)
-        updateDefinitionLink(commandHeld: event.modifierFlags.contains(.command))
-        onHover?(textPosition(at: point), point)
+        let commandHeld = event.modifierFlags.contains(.command)
+        updateDefinitionLink(commandHeld: commandHeld)
+        onHover?(textPosition(at: point), point, commandHeld)
     }
 
     /// The pointer left the editor (the blame card uses it to close).
@@ -1936,7 +1938,7 @@ extension EditorView {
 extension EditorView: NSViewToolTipOwner {
     nonisolated func view(_ view: NSView, stringForToolTip tag: NSView.ToolTipTag,
                           point: NSPoint, userData data: UnsafeMutableRawPointer?) -> String {
-        MainActor.assumeIsolated {
+        onAppKitMainThread {
             guard let document, !wrapSuspended else { return "" }
             switch document.foldState(line: line(atY: point.y).line) {
             case .plain: return ""

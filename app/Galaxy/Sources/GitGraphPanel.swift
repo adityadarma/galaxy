@@ -463,7 +463,7 @@ final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, N
         timer?.invalidate()
         refresh(includeOrigin: true)
         timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.refresh() }
+            onAppKitMainThread { self?.refresh() }
         }
     }
 

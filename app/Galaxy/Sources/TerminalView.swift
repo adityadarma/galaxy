@@ -78,7 +78,7 @@ final class TerminalView: NSView {
         }
         timer?.invalidate()
         let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.tick() }
+            onAppKitMainThread { self?.tick() }
         }
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
