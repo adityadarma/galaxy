@@ -634,7 +634,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
         tabBar.onTogglePreview = { [weak self] in self?.toggleMarkdownPreview(nil) }
         syntaxEvictionTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
-            self?.evictInactiveSyntax(now: .now)
+            onAppKitMainThread { self?.evictInactiveSyntax(now: .now) }
         }
         lspTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in

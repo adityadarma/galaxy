@@ -336,7 +336,7 @@ final class ReferencesPanel: CardView, NSTableViewDataSource, NSTableViewDelegat
         return (result, ranges)
     }
 
-    static func lineRange(in text: String, line target: Int) -> NSRange {
+    nonisolated static func lineRange(in text: String, line target: Int) -> NSRange {
         let string = text as NSString
         var line = 0
         var start = 0

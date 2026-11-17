@@ -80,7 +80,9 @@ final class PortsPanel: NSView, NSTableViewDataSource, NSTableViewDelegate {
     func start() {
         timer?.invalidate()
         refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.refresh() }
+        timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
+            onAppKitMainThread { self?.refresh() }
+        }
     }
 
     func stop() { timer?.invalidate(); timer = nil }

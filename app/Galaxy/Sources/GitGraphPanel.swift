@@ -962,7 +962,7 @@ final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, N
         }
     }
 
-    private static func describe(_ error: Error) -> String {
+    private nonisolated static func describe(_ error: Error) -> String {
         if case CoreError.Io(let message) = error { return message }
         return "\(error)"
     }
