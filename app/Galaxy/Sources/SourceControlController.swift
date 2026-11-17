@@ -63,6 +63,16 @@ final class GenerateCommitIconButton: NSButton {
     }
     /// Lets other controls (the sidebar header button) mirror the state.
     var onGeneratingChanged: ((Bool) -> Void)?
+    /// False while no AI model is chosen: the button is dimmed, cannot be
+    /// clicked, and its tooltip says where to fix it.
+    var isAvailable = true {
+        didSet {
+            guard isAvailable != oldValue else { return }
+            isEnabled = isAvailable || isGenerating
+            updateIcon()
+            updateAppearance()
+        }
+    }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -97,7 +107,9 @@ final class GenerateCommitIconButton: NSButton {
         img?.isTemplate = true
         self.image = img
 
-        toolTip = description
+        toolTip = isAvailable || isGenerating
+            ? description
+            : "Choose a commit message model in Settings → AI to generate with AI"
         setAccessibilityLabel(description)
         setAccessibilityRole(.button)
     }
@@ -122,6 +134,9 @@ final class GenerateCommitIconButton: NSButton {
             // Stop state: accent-tinted square on a soft accent chip.
             contentTintColor = Theme.accent
             layer?.backgroundColor = Theme.accent.withAlphaComponent(isHovered ? 0.28 : 0.18).cgColor
+        } else if !isAvailable {
+            contentTintColor = .tertiaryLabelColor
+            layer?.backgroundColor = NSColor.clear.cgColor
         } else {
             contentTintColor = isHovered ? .labelColor : .secondaryLabelColor
             layer?.backgroundColor = isHovered
@@ -569,6 +584,10 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         messageContainer.onGenerate = { [weak self] in
             self?.generateCommitMessage()
         }
+        // The AI button follows the model choice made in Settings.
+        updateAIAvailability()
+        NotificationCenter.default.addObserver(self, selector: #selector(aiSettingsChanged(_:)),
+                                               name: UserDefaults.didChangeNotification, object: nil)
 
         splitCommitButton.translatesAutoresizingMaskIntoConstraints = false
         splitCommitButton.isEnabled = false
@@ -898,6 +917,20 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
             messageContainer.textView.toolTip = "⌘Enter to commit on '\(branch)'"
         } else {
             messageContainer.textView.toolTip = "⌘Enter to commit"
+        }
+    }
+
+    /// Posted on whichever thread wrote the default, so hop to main.
+    @objc nonisolated private func aiSettingsChanged(_ notification: Notification) {
+        DispatchQueue.main.async { [weak self] in
+            MainActor.assumeIsolated { self?.updateAIAvailability() }
+        }
+    }
+
+    private func updateAIAvailability() {
+        let available = AICommitService.shared.isConfigured
+        if messageContainer.generateButton.isAvailable != available {
+            messageContainer.generateButton.isAvailable = available
         }
     }
 

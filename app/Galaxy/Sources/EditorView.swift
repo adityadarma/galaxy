@@ -269,8 +269,36 @@ final class EditorView: NSView {
             line >= newStart && line < newStart + max(newLen, 1)
         }
     }
+    /// AI inline suggestion drawn as faded text at the caret. Its first line
+    /// continues the caret line; further lines get their own rows below it,
+    /// pushing the following source lines down until it is accepted or gone.
+    struct GhostText: Equatable {
+        var line: UInt64
+        /// UTF-16 column of the caret it was made for.
+        var column: UInt64
+        var text: String
+        var lines: [String] { text.components(separatedBy: "\n") }
+        var extraRows: Int { max(0, lines.count - 1) }
+    }
+    var ghostText: GhostText? {
+        didSet {
+            guard ghostText != oldValue else { return }
+            if (ghostText?.extraRows ?? 0) != (oldValue?.extraRows ?? 0) || ghostText?.line != oldValue?.line {
+                reloadDocument()
+            } else {
+                needsDisplay = true
+            }
+        }
+    }
+    static let ghostTextColor = NSColor.secondaryLabelColor.withAlphaComponent(0.6)
+
+    /// Height of the rows the ghost text adds below its line.
+    var ghostExtraHeight: CGFloat { CGFloat(ghostText?.extraRows ?? 0) * metrics.lineHeight }
+
     var inlineGitHunk: InlineGitHunk? {
         didSet {
+            // Both would claim the space under the same line.
+            if inlineGitHunk != nil { ghostText = nil }
             if inlineGitHunk != oldValue {
                 reloadDocument()
                 window?.invalidateCursorRects(for: self)
@@ -420,6 +448,7 @@ final class EditorView: NSView {
             if document !== oldValue {
                 oldValue?.setWrapHints(lines: [])
                 setInlineHints([:])
+                ghostText = nil
             }
             applyWrapColumns()
             syncTabSize()
@@ -608,7 +637,7 @@ final class EditorView: NSView {
         hasFolds = !wrapSuspended && (document?.hasFolds() ?? false)
         rowCount = (rowMapped ? Int(document?.totalRows() ?? 0) : lineCount)
             + diffSpacers.reduce(0) { $0 + $1.rows }
-        let inlineHeight = inlineGitHunk?.height(lineHeight: metrics.lineHeight) ?? 0
+        let inlineHeight = (inlineGitHunk?.height(lineHeight: metrics.lineHeight) ?? 0) + ghostExtraHeight
         let virtual = CGFloat(rowCount) * metrics.lineHeight + inlineHeight
         let visible = enclosingScrollView?.contentSize.height ?? 0
         setFrameSize(NSSize(width: frame.width, height: max(virtual, visible)))
@@ -719,11 +748,20 @@ final class EditorView: NSView {
         let spacerRows = diffSpacers
             .filter { $0.beforeLine <= Int(line) }
             .reduce(0) { $0 + $1.rows }
-        return (row + CGFloat(spacerRows)) * metrics.lineHeight + insertedHeight
+        let ghostHeight = (ghostText.map { line > $0.line } ?? false) ? ghostExtraHeight : 0
+        return (row + CGFloat(spacerRows)) * metrics.lineHeight + insertedHeight + ghostHeight
     }
 
     /// The line (and row within it) drawn at document-space `y`.
     func line(atY y: CGFloat) -> (line: UInt64, row: Int) {
+        var y = y
+        // Ghost rows belong to the ghost's line; below them, take them out.
+        if let ghost = ghostText, ghost.extraRows > 0, y.isFinite {
+            let rows = lineRows(ghost.line).count
+            let zoneStart = rowTop(of: ghost.line) + CGFloat(rows) * metrics.lineHeight
+            if y >= zoneStart, y < zoneStart + ghostExtraHeight { return (ghost.line, rows - 1) }
+            if y >= zoneStart { y -= ghostExtraHeight }
+        }
         var row = y.isFinite ? max(0, floor(y / metrics.lineHeight)) : 0
         if let hunk = inlineGitHunk {
             let anchor = rowMapped ? CGFloat(document?.rowOfLine(line: hunk.anchorLine) ?? hunk.anchorLine) : CGFloat(hunk.anchorLine)
@@ -1201,7 +1239,13 @@ final class EditorView: NSView {
             let sourceEnd = point(column: line.text.utf16.count, text: line.text, rows: rows,
                                   top: top, originX: originX)
             var trailingAnnotationEnd = sourceEnd.x + trailingHintExtent(text: line.text)
-            if let blame = blameAnnotation, blame.line == line.line {
+            let hasGhost = ghostText?.line == line.line
+            if let ghost = ghostText, hasGhost {
+                trailingAnnotationEnd = max(trailingAnnotationEnd,
+                                            drawGhostText(ghost, lineText: line.text, rows: rows, top: top,
+                                                          block: block, originX: originX, context: context))
+            }
+            if let blame = blameAnnotation, blame.line == line.line, !hasGhost {
                 let note = CTLineCreateWithAttributedString(NSAttributedString(
                     string: blame.text,
                     attributes: [.font: font, .foregroundColor: Self.blameTextColor]
@@ -1415,6 +1459,28 @@ final class EditorView: NSView {
             up.toggle()
         }
         context.strokePath()
+    }
+
+    /// Draws the suggestion: its first line at the caret, the rest on the
+    /// rows added below `block`. Returns the x where the first line ends.
+    private func drawGhostText(_ ghost: GhostText, lineText: String, rows: LineRows, top: CGFloat,
+                               block: CGFloat, originX: CGFloat, context: CGContext) -> CGFloat {
+        let tab = String(repeating: " ", count: max(1, tabSize))
+        func ghostLine(_ text: String) -> CTLine {
+            CTLineCreateWithAttributedString(NSAttributedString(
+                string: text.replacingOccurrences(of: "\t", with: tab),
+                attributes: [.font: font, .foregroundColor: Self.ghostTextColor]))
+        }
+        let lines = ghost.lines
+        let start = point(column: Int(ghost.column), text: lineText, rows: rows, top: top, originX: originX)
+        let first = ghostLine(lines[0])
+        context.textPosition = CGPoint(x: start.x, y: start.y + metrics.ascent)
+        CTLineDraw(first, context)
+        for (index, text) in lines.dropFirst().enumerated() where !text.isEmpty {
+            context.textPosition = CGPoint(x: originX, y: top + block + CGFloat(index) * metrics.lineHeight + metrics.ascent)
+            CTLineDraw(ghostLine(text), context)
+        }
+        return start.x + CGFloat(CTLineGetTypographicBounds(first, nil, nil, nil))
     }
 
     static let inlineHunkButtons: [(action: InlineHunkAction, symbol: String)] = [

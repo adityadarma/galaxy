@@ -160,6 +160,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     var snippetSession: SnippetSession?
     var snippetDocumentKey: String?
     var completionDismissed = false
+    /// AI inline suggestion (ghost text): debounce, request in flight, and
+    /// the document revision the shown suggestion belongs to.
+    var inlineSuggestionWork: DispatchWorkItem?
+    var inlineSuggestionTask: Task<Void, Never>?
+    var inlineSuggestionRevision: UInt64?
     /// Coalesces typing bursts before asking synchronous native completion.
     var completionRequestItem: DispatchWorkItem?
     /// After Ctrl+Space the request is repeated until the server answers with
@@ -390,6 +395,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             self?.refreshFindStatus()
             self?.bridge.pollAnalysis()
             self?.requestCompletionIfNeeded()
+            self?.inlineSuggestionDocumentChanged()
             self?.refreshGitDiff()
             if self?.isMarkdownPreviewShown == true { self?.updateMarkdownPreview() }
             self?.updateBlameAnnotation()
@@ -438,6 +444,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
                     self.snippetDocumentKey = nil
                 }
             }
+            self?.inlineSuggestionCursorMoved(primary)
             self?.statusBar.showCursor(primary: primary, count: count)
             self?.pathBar.show(symbols: self?.documentSymbols ?? [], atLine: primary.line)
             self?.updateBlameAnnotation()
@@ -914,8 +921,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         signaturePopup.isHidden = true
         completionPopup.onClose = { [weak self] in self?.closeCompletion() }
         completionPopup.onSelect = { [weak self] item in self?.acceptCompletion(item) }
-        editorView.onCompletionKey = { [weak self] event in self?.handleCompletionKey(event) ?? false }
+        editorView.onCompletionKey = { [weak self] event in
+            guard let self else { return false }
+            return self.handleInlineSuggestionKey(event) || self.handleCompletionKey(event)
+        }
         editorView.onTextInput = { [weak self] text in
+            self?.inlineSuggestionTextTyped(text)
             self?.completionDismissed = false
             self?.signatureHelpDocument = self?.activeTab.map { ObjectIdentifier($0.doc) }
         }
