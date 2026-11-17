@@ -1660,7 +1660,10 @@ mod tests {
     fn corrupt_workspace_cache_falls_back_to_fresh_parse() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("model.ts"), "export class Model {}\n").unwrap();
-        std::fs::write(typescript_cache_path(root.path()).unwrap(), b"not bincode").unwrap();
+        let cache = typescript_cache_path(root.path()).unwrap();
+        // A fresh HOME (as on CI) has no cache folder yet.
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        std::fs::write(cache, b"not bincode").unwrap();
 
         let built = TypeScriptWorkspaceExports::build(root.path(), &["model.ts".into()]);
 

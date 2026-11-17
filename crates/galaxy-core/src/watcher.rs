@@ -384,9 +384,17 @@ mod tests {
         let (_w, rx) = start(dir.path());
 
         fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
-        let batch = rx.recv_timeout(DELIVERY).unwrap();
-        assert!(batch.git_changed);
-        assert!(batch.paths.is_empty());
+        // FSEvents may first report the `.git` folder itself; wait for the
+        // batch that carries the git change.
+        let deadline = Instant::now() + DELIVERY;
+        let batch = loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let batch = rx.recv_timeout(left).expect("no git change reported");
+            if batch.git_changed {
+                break batch;
+            }
+        };
+        assert!(batch.paths.is_empty(), "{:?}", batch.paths);
         assert!(!batch.rescan);
     }
 
