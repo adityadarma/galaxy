@@ -63,7 +63,9 @@ final class StatusBarTests: XCTestCase {
         bar.workspaceIndexFinished(root: "/two", total: 1, changed: 1)
         XCTAssertTrue(bar.workspaceScan.isHidden)
         bar.phpIndexFinished(root: "/two", files: 49_260)
-        XCTAssertEqual(bar.workspaceScan.stringValue, "PHP Composer indexed 49.260 files")
+        // The grouping separator follows the system locale ("49.260" or "49,260").
+        let files = UInt64(49_260).formatted(.number.grouping(.automatic))
+        XCTAssertEqual(bar.workspaceScan.stringValue, "PHP Composer indexed \(files) files")
         XCTAssertFalse(bar.workspaceScan.isHidden)
         RunLoop.current.run(until: Date().addingTimeInterval(3.1))
         XCTAssertTrue(bar.workspaceScan.isHidden)

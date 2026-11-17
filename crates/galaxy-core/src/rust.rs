@@ -1817,12 +1817,16 @@ impl RustEngine {
             Some("crate" | "self" | "super") => {
                 (current_crate, self.module_target(context, target))
             }
-            Some(dependency) => {
-                let Some(dependency) = self.dependency_for(context, dependency) else {
-                    return Vec::new();
-                };
-                (dependency.package, target[1..].to_vec())
-            }
+            Some(first) => match self.dependency_for(context, first) {
+                Some(dependency) => (dependency.package, target[1..].to_vec()),
+                // Edition 2018 paths may start at a child module:
+                // `use helpers::*;` inside `engine.rs`.
+                None => {
+                    let mut module = self.module_for(context);
+                    module.extend_from_slice(target);
+                    (current_crate, module)
+                }
+            },
             None => return Vec::new(),
         };
         let key = (crate_name.clone(), module.clone(), name.to_owned());
@@ -3393,6 +3397,16 @@ fn collect_declaration(
     }
     let kind = match node.kind() {
         "function_item" => ItemKind::Function,
+        // `extern "C" { fn name(...); }` declares callable module items.
+        // Trait method signatures share the node kind but are not.
+        "function_signature_item"
+            if node
+                .parent()
+                .and_then(|list| list.parent())
+                .is_some_and(|block| block.kind() == "foreign_mod_item") =>
+        {
+            ItemKind::Function
+        }
         "struct_item" => ItemKind::Class,
         "enum_item" => ItemKind::Enum,
         "trait_item" => ItemKind::Interface,
@@ -3828,6 +3842,8 @@ fn collect_unresolved(
         && !is_attribute_argument(node)
         && let Ok(name) = node.utf8_text(text.as_bytes())
         && !is_prelude_name(name)
+        // `Self(...)` constructs the impl's own tuple struct.
+        && name != "Self"
         && !is_field_shorthand(node)
         && !is_lifetime_name(node, text)
         && !is_member_name(node, text)
@@ -6957,6 +6973,58 @@ mod tests {
         let diagnostics = engine.diagnostics(path, source);
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(diagnostics[0].message, "cannot resolve `missing`");
+    }
+
+    #[test]
+    fn self_constructors_and_extern_functions_are_not_unresolved() {
+        let path = Path::new("/tmp/lib.rs");
+        let source = concat!(
+            "pub struct Rng(u64);\n",
+            "impl Rng { pub fn new(seed: u64) -> Self { Self(seed) } }\n",
+            "unsafe extern \"C\" { fn malloc_size(ptr: *const u8) -> usize; }\n",
+            "fn main() { let _ = unsafe { malloc_size(std::ptr::null()) }; }\n",
+        );
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        engine.install(Built::default());
+        let diagnostics = engine.diagnostics(path, source);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn names_from_a_relative_glob_import_in_the_parent_module_resolve() {
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("src");
+        std::fs::create_dir_all(src.join("engine")).unwrap();
+        // Same-named public items elsewhere (as in dependencies) stop the
+        // "only one match" fallback, so the glob path itself has to resolve.
+        std::fs::write(src.join("lib.rs"), "mod engine;\npub mod other;\n").unwrap();
+        std::fs::write(
+            src.join("other.rs"),
+            "pub fn empty_tree() {}\npub fn offset() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("engine.rs"),
+            "mod helpers;\nmod navigate;\nuse helpers::*;\npub(crate) use helpers::offset;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            src.join("engine/helpers.rs"),
+            "pub(super) fn empty_tree() {}\npub(in crate::engine) fn offset() {}\n",
+        )
+        .unwrap();
+        let navigate = src.join("engine/navigate.rs");
+        let source = "use super::*;\nfn run() { empty_tree(); offset(); missing(); }\n";
+        std::fs::write(&navigate, source).unwrap();
+        let mut engine = RustEngine::pending(root.path());
+        engine.install(RustEngine::build(root.path()));
+
+        let messages: Vec<_> = engine
+            .diagnostics(&navigate, source)
+            .into_iter()
+            .map(|problem| problem.message)
+            .collect();
+        assert_eq!(messages, ["cannot resolve `missing`"]);
     }
 
     #[test]
