@@ -53,6 +53,7 @@ jobs:
         run: cargo test --workspace --locked
 
       - name: Import signing certificate
+        timeout-minutes: 5
         env:
           P12_BASE64: ${{ secrets.GALAXY_SELF_SIGN_P12_BASE64 }}
           P12_PASSWORD: ${{ secrets.GALAXY_SELF_SIGN_P12_PASSWORD }}
@@ -68,7 +69,9 @@ jobs:
           # A self-signed identity has no public CA chain. Trust its certificate
           # in this disposable CI keychain so codesign recognizes the identity.
           security find-certificate -c "Galaxy Self-Signed" -p "$KEYCHAIN" > "$RUNNER_TEMP/galaxy-signing.cer"
-          security add-trusted-cert -d -r trustRoot -k "$KEYCHAIN" "$RUNNER_TEMP/galaxy-signing.cer"
+          # Admin trust-domain writes need authorization; a headless runner
+          # would wait forever on a GUI prompt, so use passwordless sudo.
+          sudo security add-trusted-cert -d -r trustRoot -k "$KEYCHAIN" "$RUNNER_TEMP/galaxy-signing.cer"
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
           security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
           IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" | awk -F'"' '/Galaxy Self-Signed/ { print $1 }' | awk '{ print $2 }')"
