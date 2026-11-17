@@ -19,7 +19,7 @@ fn go_project() -> (tempfile::TempDir, String) {
 fn until(what: &str, mut ask: impl FnMut() -> bool) {
     // A ceiling, not a delay: CI runners index far slower than a laptop
     // while the rest of the suite runs in parallel.
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let deadline = Instant::now() + Duration::from_secs(240);
     while !ask() {
         assert!(Instant::now() < deadline, "{what}: engine never answered");
         std::thread::sleep(Duration::from_millis(20));
