@@ -287,7 +287,6 @@ final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, N
         NSLayoutConstraint.activate([
             toolbar.topAnchor.constraint(equalTo: topAnchor),
             toolbar.leadingAnchor.constraint(equalTo: leadingAnchor),
-            toolbar.trailingAnchor.constraint(equalTo: trailingAnchor),
             toolbar.heightAnchor.constraint(equalToConstant: Self.toolbarHeight),
             scroll.topAnchor.constraint(equalTo: toolbar.bottomAnchor),
             scroll.leadingAnchor.constraint(equalTo: leadingAnchor),
@@ -296,6 +295,12 @@ final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, N
             empty.centerXAnchor.constraint(equalTo: centerXAnchor),
             empty.centerYAnchor.constraint(equalTo: centerYAnchor),
         ])
+        // The toolbar fills the width when it fits. In a narrower panel it
+        // runs past the right edge rather than breaking its buttons' fixed
+        // widths, which logged an Auto Layout conflict on every layout pass.
+        let trailing = toolbar.trailingAnchor.constraint(equalTo: trailingAnchor)
+        trailing.priority = .init(999)
+        trailing.isActive = true
         rebuildChoices()
     }
 
@@ -327,7 +332,11 @@ final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, N
             popup.target = self
             popup.setContentHuggingPriority(.defaultLow, for: .horizontal)
             popup.widthAnchor.constraint(lessThanOrEqualToConstant: 220).isActive = true
-            popup.widthAnchor.constraint(greaterThanOrEqualToConstant: 110).isActive = true
+            // Not required: a panel narrower than the toolbar (zero width
+            // before its first layout, in tests) would otherwise conflict.
+            let minimum = popup.widthAnchor.constraint(greaterThanOrEqualToConstant: 110)
+            minimum.priority = .defaultHigh
+            minimum.isActive = true
         }
         branchPopup.action = #selector(branchChosen(_:))
         branchPopup.setAccessibilityLabel("Branches")

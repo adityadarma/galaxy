@@ -42,10 +42,30 @@ jobs:
       - name: Generate project
         working-directory: app
         run: xcodegen generate
+      # The full output (app logs included) goes to a file uploaded below;
+      # the step log keeps only errors, failures and the test summary, so
+      # GitHub does not truncate it.
       - name: Build and test
         run: |
+          # pipefail: the step fails when xcodebuild does. `|| true` keeps a
+          # grep without matches from failing it.
+          set -o pipefail
+          mkdir -p target
           xcodebuild -project app/Galaxy.xcodeproj -scheme Galaxy \
-            -configuration Debug -derivedDataPath app/build-test test
+            -configuration Debug -derivedDataPath app/build-test \
+            -resultBundlePath target/GalaxyTests.xcresult test 2>&1 \
+            | tee target/xcodebuild.log \
+            | { grep --line-buffered -E "error:|warning: .*\.swift|Test Case .*failed|XCTAssert|Executed [0-9]+ tests|\*\* (BUILD|TEST) " \
+                | grep --line-buffered -v "linkd.autoShortcut" || true; }
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcodebuild-log
+          path: |
+            target/xcodebuild.log
+            target/GalaxyTests.xcresult
+          retention-days: 7
 
   bench:
     name: Benchmarks
