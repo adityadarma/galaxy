@@ -573,6 +573,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             self.openWorkspaceDiff(workspace, relPath: relPath)
         }
         sourceControl.onRefresh = { [weak self] in self?.refreshGitStatus() }
+        sourceControl.onMessage = { [weak self] message in self?.statusLabel.stringValue = message }
         searchSidebar.onSearch = { [weak self] query, options in self?.searchSidebarWorkspace(query, options: options) }
         searchSidebar.onOpen = { [weak self] match in self?.openSearchSidebarMatch(match) }
         searchSidebar.onReplaceAll = { [weak self] query, replacement, options in

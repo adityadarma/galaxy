@@ -37,7 +37,8 @@ final class TerminalView: NSView {
     private var heldMouseButton: Int?
     private var lastMouseCell: (column: Int, row: Int)?
 
-    static let padding = NSEdgeInsets(top: 4, left: 20, bottom: 4, right: 12)
+    private var settings = TerminalSettings.current
+    private var padding: NSEdgeInsets { settings.padding }
 
     private var font: NSFont {
         let size = max(10, min(24, UserDefaults.standard.object(forKey: "TerminalFontSize") as? CGFloat ?? 12))
@@ -46,7 +47,7 @@ final class TerminalView: NSView {
         }
         return Theme.editorFont.withSize(size)
     }
-    private lazy var fonts = FontSet(font)
+    private lazy var fonts = FontSet(font, lineHeight: settings.lineHeight)
     private var cellWidth: CGFloat { fonts.cellWidth }
     private var lineHeight: CGFloat { fonts.lineHeight }
 
@@ -98,7 +99,10 @@ final class TerminalView: NSView {
 
     /// Follows the editor font settings when they change.
     func reloadFont() {
-        fonts = FontSet(font)
+        settings = TerminalSettings.current
+        cursorVisible = true
+        blinkTick = 0
+        fonts = FontSet(font, lineHeight: settings.lineHeight)
         lastSize = (0, 0)
         resizeTerminal()
         needsDisplay = true
@@ -107,6 +111,7 @@ final class TerminalView: NSView {
     private func tick() {
         poll()
         // Blink at ~1.9 Hz while focused, like VS Code's default.
+        guard settings.cursorBlink else { return }
         blinkTick += 1
         if blinkTick >= 32 {
             blinkTick = 0
@@ -146,15 +151,15 @@ final class TerminalView: NSView {
     // MARK: Geometry
 
     private func cellRect(row: Int, column: Int, width: Int = 1) -> NSRect {
-        NSRect(x: Self.padding.left + CGFloat(column) * cellWidth,
-               y: Self.padding.top + CGFloat(row) * lineHeight,
+        NSRect(x: padding.left + CGFloat(column) * cellWidth,
+               y: padding.top + CGFloat(row) * lineHeight,
                width: CGFloat(width) * cellWidth, height: lineHeight)
     }
 
     private func resizeTerminal() {
         guard let handle, bounds.width > 0, bounds.height > 0 else { return }
-        let usableWidth = bounds.width - Self.padding.left - Self.padding.right
-        let usableHeight = bounds.height - Self.padding.top - Self.padding.bottom
+        let usableWidth = bounds.width - padding.left - padding.right
+        let usableHeight = bounds.height - padding.top - padding.bottom
         let cols = UInt16(clamping: max(2, Int(usableWidth / cellWidth)))
         let rows = UInt16(clamping: max(1, Int(usableHeight / lineHeight)))
         guard (cols, rows) != lastSize else { return }
@@ -210,8 +215,8 @@ final class TerminalView: NSView {
         let point = convert(event.locationInWindow, from: nil)
         let columns = Int(screen?.columns ?? 1)
         let rows = screen?.lines.count ?? 1
-        let column = Int(((point.x - Self.padding.left) / cellWidth).rounded(.down))
-        let row = Int(((point.y - Self.padding.top) / lineHeight).rounded(.down))
+        let column = Int(((point.x - padding.left) / cellWidth).rounded(.down))
+        let row = Int(((point.y - padding.top) / lineHeight).rounded(.down))
         return (min(max(column, 0), columns - 1) + 1, min(max(row, 0), rows - 1) + 1)
     }
 
@@ -283,7 +288,7 @@ final class TerminalView: NSView {
         let point = convert(event.locationInWindow, from: nil)
         let wantsLink = event.clickCount == 2 || event.modifierFlags.contains(.command)
         guard wantsLink, let screen else { return }
-        let row = Int((point.y - Self.padding.top) / lineHeight)
+        let row = Int((point.y - padding.top) / lineHeight)
         guard screen.lines.indices.contains(row) else { return }
         if let link = Self.fileLink(in: screen.lines[row].text) {
             onOpenLink?(link.path, link.line, link.column)
@@ -482,17 +487,17 @@ final class TerminalView: NSView {
         }
         guard let screen, let context = NSGraphicsContext.current?.cgContext else { return }
 
-        let firstRow = max(0, Int((dirtyRect.minY - Self.padding.top) / lineHeight))
-        let lastRow = min(screen.lines.count - 1, Int((dirtyRect.maxY - Self.padding.top) / lineHeight))
+        let firstRow = max(0, Int((dirtyRect.minY - padding.top) / lineHeight))
+        let lastRow = min(screen.lines.count - 1, Int((dirtyRect.maxY - padding.top) / lineHeight))
         guard firstRow <= lastRow else { return drawScrollIndicator(screen, palette) }
 
         for row in firstRow...lastRow {
             let line = screen.lines[row]
-            let y = Self.padding.top + CGFloat(row) * lineHeight
+            let y = padding.top + CGFloat(row) * lineHeight
             for run in line.runs {
                 let colors = palette.colors(for: run)
                 let width = CGFloat(run.text.unicodeScalars.reduce(0) { $0 + Self.cellCount($1) })
-                let rect = NSRect(x: Self.padding.left + CGFloat(run.column) * cellWidth, y: y,
+                let rect = NSRect(x: padding.left + CGFloat(run.column) * cellWidth, y: y,
                                   width: width * cellWidth, height: lineHeight)
                 if let background = colors.background {
                     background.setFill()
@@ -672,8 +677,17 @@ final class TerminalView: NSView {
         let rect = cellRect(row: Int(cursor.row), column: Int(cursor.column))
         palette.cursor.set()
         if isFocused {
-            guard cursorVisible else { return }
-            rect.fill()
+            guard cursorVisible || !settings.cursorBlink else { return }
+            switch settings.cursorStyle {
+            case .bar:
+                NSRect(x: rect.minX, y: rect.minY, width: 2, height: rect.height).fill()
+                return
+            case .underline:
+                NSRect(x: rect.minX, y: rect.maxY - 2, width: rect.width, height: 2).fill()
+                return
+            case .block:
+                rect.fill()
+            }
             // The character under a block cursor, in the background color.
             if let character = character(at: cursor, in: screen), character != " ",
                let context = NSGraphicsContext.current?.cgContext {
@@ -727,6 +741,52 @@ final class TerminalView: NSView {
     }
 }
 
+/// Terminal look settings from UserDefaults (the Settings window's Terminal tab).
+struct TerminalSettings: Equatable {
+    enum CursorStyle: String, CaseIterable {
+        case block, bar, underline
+    }
+
+    static let lineHeightKey = "TerminalLineHeight"
+    static let cursorStyleKey = "TerminalCursorStyle"
+    static let cursorBlinkKey = "TerminalCursorBlink"
+    static let paddingHorizontalKey = "TerminalPaddingHorizontal"
+    static let paddingVerticalKey = "TerminalPaddingVertical"
+
+    static let lineHeightRange: ClosedRange<Double> = 1.0...1.5
+    static let paddingRange: ClosedRange<Double> = 0...40
+    static let defaultPaddingHorizontal: Double = 20
+    static let defaultPaddingVertical: Double = 4
+
+    var lineHeight: CGFloat
+    var cursorStyle: CursorStyle
+    var cursorBlink: Bool
+    var paddingHorizontal: CGFloat
+    var paddingVertical: CGFloat
+
+    /// Left gets the horizontal value and right 8 pt less, which keeps the
+    /// old 20 / 12 default; the scroll indicator sits in the right margin.
+    var padding: NSEdgeInsets {
+        NSEdgeInsets(top: paddingVertical, left: paddingHorizontal,
+                     bottom: paddingVertical, right: max(0, paddingHorizontal - 8))
+    }
+
+    static var current: TerminalSettings { load(from: .standard) }
+
+    static func load(from defaults: UserDefaults) -> TerminalSettings {
+        func clamp(_ key: String, _ range: ClosedRange<Double>, _ fallback: Double) -> CGFloat {
+            CGFloat(min(max(defaults.object(forKey: key) as? Double ?? fallback, range.lowerBound), range.upperBound))
+        }
+        return TerminalSettings(
+            lineHeight: clamp(lineHeightKey, lineHeightRange, 1.0),
+            cursorStyle: defaults.string(forKey: cursorStyleKey).flatMap(CursorStyle.init) ?? .block,
+            cursorBlink: defaults.object(forKey: cursorBlinkKey) as? Bool ?? true,
+            paddingHorizontal: clamp(paddingHorizontalKey, paddingRange, defaultPaddingHorizontal),
+            paddingVertical: clamp(paddingVerticalKey, paddingRange, defaultPaddingVertical)
+        )
+    }
+}
+
 /// The terminal font in its four styles, with the grid metrics.
 private struct FontSet {
     let regular: NSFont
@@ -741,7 +801,7 @@ private struct FontSet {
     let underlinePosition: CGFloat
     let xHeight: CGFloat
 
-    init(_ font: NSFont) {
+    init(_ font: NSFont, lineHeight multiplier: CGFloat = 1) {
         underlinePosition = font.underlinePosition
         xHeight = font.xHeight
         let manager = NSFontManager.shared
@@ -751,9 +811,9 @@ private struct FontSet {
         boldItalic = manager.convert(bold, toHaveTrait: .italicFontMask)
         asciiAdvance = ("M" as NSString).size(withAttributes: [.font: font]).width
         cellWidth = ceil(asciiAdvance * 2) / 2
-        // VS Code's default `terminal.integrated.lineHeight` is 1: rows
-        // as tall as the font, so TUIs stack their rows without gaps.
-        lineHeight = ceil(font.ascender - font.descender + font.leading)
+        // Like VS Code's `terminal.integrated.lineHeight`: 1 makes rows as
+        // tall as the font, so TUIs stack their rows without gaps.
+        lineHeight = ceil((font.ascender - font.descender + font.leading) * multiplier)
         ascent = font.ascender
         // Center the glyphs (ascender to descender) in the taller line.
         let natural = font.ascender - font.descender

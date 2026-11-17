@@ -1,5 +1,72 @@
 import AppKit
 
+struct GitTagDialogResult {
+    let name: String
+    let annotated: Bool
+    let message: String
+    let pushToOrigin: Bool
+}
+
+private final class GitTagDialogView: NSView {
+    let nameField = NSTextField()
+    let typePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    let messageField = NSTextField()
+    let pushCheckbox = NSButton(checkboxWithTitle: "Push to origin", target: nil, action: nil)
+
+    static let fieldWidth: CGFloat = 300
+
+    init(suggestion: GitVersionSuggestionInfo, canPush: Bool) {
+        super.init(frame: .zero)
+        nameField.stringValue = suggestion.version
+        nameField.placeholderString = "v1.0.0"
+        typePopup.addItems(withTitles: ["Annotated", "Lightweight"])
+        messageField.placeholderString = "Optional"
+        pushCheckbox.state = canPush ? .on : .off
+        pushCheckbox.isEnabled = canPush
+        pushCheckbox.toolTip = canPush ? "Push the new tag to origin" : "No origin remote is available"
+
+        let previous = suggestion.previousTag ?? "no previous SemVer tag"
+        let detail = NSTextField(wrappingLabelWithString: "Suggested from \(previous) and \(suggestion.commitCount) commit\(suggestion.commitCount == 1 ? "" : "s"). Unknown commit formats use a patch bump.")
+        detail.textColor = .secondaryLabelColor
+        detail.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+        detail.preferredMaxLayoutWidth = Self.fieldWidth
+
+        // The hint sits in the field column, right under the checkbox, so
+        // nothing is left floating between the form and the buttons.
+        let grid = NSGridView(views: [
+            [label("Name:"), nameField],
+            [label("Type:"), typePopup],
+            [label("Message:"), messageField],
+            [NSGridCell.emptyContentView, pushCheckbox],
+            [NSGridCell.emptyContentView, detail],
+        ])
+        grid.rowSpacing = 8
+        grid.columnSpacing = 8
+        grid.column(at: 0).xPlacement = .trailing
+        grid.column(at: 1).width = Self.fieldWidth
+        grid.row(at: 4).topPadding = -2
+        for row in 0..<3 { grid.row(at: row).rowAlignment = .firstBaseline }
+        grid.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(grid)
+        NSLayoutConstraint.activate([
+            grid.leadingAnchor.constraint(equalTo: leadingAnchor),
+            grid.trailingAnchor.constraint(equalTo: trailingAnchor),
+            grid.topAnchor.constraint(equalTo: topAnchor),
+            grid.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
+        // NSAlert lays out its accessory view by frame: hug the content.
+        setFrameSize(fittingSize)
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    private func label(_ title: String) -> NSTextField {
+        let field = NSTextField(labelWithString: title)
+        field.font = .systemFont(ofSize: NSFont.systemFontSize, weight: .medium)
+        return field
+    }
+}
+
 /// One table row: a commit, or the "Uncommitted Changes" entry on top.
 struct GitGraphRow: Equatable {
     var commit: GitCommitInfo?
@@ -94,6 +161,7 @@ final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, N
     private let headButton = NSButton()
     private let searchButton = NSButton()
     private let searchField = NSSearchField()
+    private let operationProgress = NSProgressIndicator()
     /// Branch the graph starts from; nil shows every ref.
     private(set) var branchFilter: String?
     /// Author the graph is limited to; nil shows everyone.
@@ -110,6 +178,7 @@ final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, N
     private var timer: Timer?
     private var loading = false
     private var loadingOrigin = false
+    private(set) var isPerformingOperation = false
     private var commits: [GitCommitInfo] = []
     private var uncommitted = 0
     /// Tags on origin as of the last successful read; nil when unknown.
@@ -287,6 +356,15 @@ final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, N
         searchField.setAccessibilityIdentifier("git-graph-search")
         searchField.widthAnchor.constraint(equalToConstant: 200).isActive = true
 
+        operationProgress.style = .spinning
+        operationProgress.controlSize = .small
+        operationProgress.isIndeterminate = true
+        operationProgress.isDisplayedWhenStopped = false
+        operationProgress.isHidden = true
+        operationProgress.setAccessibilityLabel("Git operation in progress")
+        operationProgress.widthAnchor.constraint(equalToConstant: 16).isActive = true
+        operationProgress.heightAnchor.constraint(equalToConstant: 16).isActive = true
+
         let spacer = NSView()
         spacer.setContentHuggingPriority(.init(1), for: .horizontal)
         spacer.setContentCompressionResistancePriority(.init(1), for: .horizontal)
@@ -298,7 +376,7 @@ final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, N
         toolbar.translatesAutoresizingMaskIntoConstraints = false
         toolbar.setAccessibilityRole(.toolbar)
         for view in [label("Branches:"), branchPopup, label("Authors:"), authorPopup, remoteCheckbox,
-                     spacer, searchField, headButton, searchButton, refreshButton] {
+                     spacer, searchField, operationProgress, headButton, searchButton, refreshButton] {
             toolbar.addArrangedSubview(view)
         }
     }
@@ -627,7 +705,7 @@ final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, N
             let entry = NSMenuItem(title: title, action: #selector(runMenuAction(_:)), keyEquivalent: "")
             entry.target = self
             entry.representedObject = action as AnyObject
-            entry.isEnabled = enabled
+            entry.isEnabled = enabled && !isPerformingOperation
             return entry
         }
         let short = String(commit.hash.prefix(8))
@@ -636,8 +714,7 @@ final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, N
         var items: [NSMenuItem] = []
 
         items.append(item("Add Tag…") { [weak self] in
-            guard let name = Self.promptName("Add Tag", "Tag name") else { return }
-            self?.perform("Created tag \(name)") { try $0.gitCreateTag(name: name, hash: commit.hash) }
+            self?.addTag(to: commit)
         })
         items.append(item("Create Branch…") { [weak self] in
             guard let name = Self.promptName("Create Branch", "Branch name") else { return }
@@ -799,16 +876,84 @@ final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, N
         return name.isEmpty ? nil : name
     }
 
+    private func addTag(to commit: GitCommitInfo) {
+        guard let workspace else { return }
+        let canPush = originTags != nil
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let suggestion: Result<GitVersionSuggestionInfo, Error> = Result {
+                try workspace.gitSuggestVersion(hash: commit.hash)
+            }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                switch suggestion {
+                case .failure(let error):
+                    self.onMessage?("Git: \(Self.describe(error))")
+                case .success(let suggestion):
+                    guard let result = Self.promptTag(
+                        commit: String(commit.hash.prefix(8)),
+                        suggestion: suggestion,
+                        canPush: canPush
+                    ) else { return }
+                    self.perform("Created tag \(result.name)", refreshOrigin: result.pushToOrigin) { workspace in
+                        if result.annotated {
+                            try workspace.gitCreateAnnotatedTag(
+                                name: result.name,
+                                hash: commit.hash,
+                                message: result.message
+                            )
+                        } else {
+                            try workspace.gitCreateTag(name: result.name, hash: commit.hash)
+                        }
+                        if result.pushToOrigin {
+                            try workspace.gitPushTag(name: result.name)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private static func promptTag(
+        commit: String,
+        suggestion: GitVersionSuggestionInfo,
+        canPush: Bool
+    ) -> GitTagDialogResult? {
+        let alert = NSAlert()
+        alert.messageText = "Add tag to commit \(commit)"
+        let form = GitTagDialogView(suggestion: suggestion, canPush: canPush)
+        alert.accessoryView = form
+        alert.addButton(withTitle: "Add Tag")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.initialFirstResponder = form.nameField
+        guard alert.runModal() == .alertFirstButtonReturn else { return nil }
+        let name = form.nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return nil }
+        return GitTagDialogResult(
+            name: name,
+            annotated: form.typePopup.indexOfSelectedItem == 0,
+            message: form.messageField.stringValue,
+            pushToOrigin: form.pushCheckbox.state == .on
+        )
+    }
+
     /// Runs a git operation off the main thread, then reports and reloads.
     /// `success` is the status-line text when it works.
     private func perform(_ success: String, refreshOrigin: Bool = false, _ operation: @escaping @Sendable (Workspace) throws -> Void) {
-        guard let workspace else { return }
+        guard let workspace, !isPerformingOperation else { return }
+        isPerformingOperation = true
+        operationProgress.isHidden = false
+        operationProgress.startAnimation(nil)
+        refreshButton.isEnabled = false
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let failure: String? = {
                 do { try operation(workspace); return nil } catch { return Self.describe(error) }
             }()
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                self.isPerformingOperation = false
+                self.operationProgress.stopAnimation(nil)
+                self.operationProgress.isHidden = true
+                self.refreshButton.isEnabled = true
                 self.onMessage?(failure.map { "Git: \($0)" } ?? success)
                 self.onRepositoryChanged?()
                 self.refreshChoices(authors: false)

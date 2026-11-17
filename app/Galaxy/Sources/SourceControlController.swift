@@ -350,6 +350,7 @@ final class CommitSplitButton: NSView {
     let dropdownButton = NSButton()
     private let divider = NSView()
     private let checkIcon = NSImageView()
+    private let progress = NSProgressIndicator()
     private let commitLabel = NSTextField(labelWithString: "Commit")
 
     var onCommit: (() -> Void)?
@@ -359,6 +360,17 @@ final class CommitSplitButton: NSView {
 
     private var dropdownWidth: NSLayoutConstraint?
     private var dividerWidth: NSLayoutConstraint?
+
+    private(set) var isLoading = false
+
+    func setLoading(_ loading: Bool, title: String? = nil) {
+        isLoading = loading
+        commitLabel.stringValue = title ?? (mode == .publish ? "Publish Branch" : "Commit")
+        checkIcon.isHidden = loading
+        progress.isHidden = !loading
+        if loading { progress.startAnimation(nil) } else { progress.stopAnimation(nil) }
+        mainButton.setAccessibilityLabel(commitLabel.stringValue)
+    }
 
     /// `.publish` swaps the label for "Publish Branch" and hides the dropdown.
     var mode: Mode = .commit {
@@ -399,12 +411,20 @@ final class CommitSplitButton: NSView {
         checkIcon.contentTintColor = .white
         checkIcon.translatesAutoresizingMaskIntoConstraints = false
 
+        progress.style = .spinning
+        progress.controlSize = .small
+        progress.isIndeterminate = true
+        progress.isDisplayedWhenStopped = false
+        progress.isHidden = true
+        progress.translatesAutoresizingMaskIntoConstraints = false
+        progress.setAccessibilityLabel("Git operation in progress")
+
         commitLabel.font = .systemFont(ofSize: 12, weight: .semibold)
         commitLabel.textColor = .white
         commitLabel.alignment = .center
         commitLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        let contentStack = NonInteractiveStackView(views: [checkIcon, commitLabel])
+        let contentStack = NonInteractiveStackView(views: [checkIcon, progress, commitLabel])
         contentStack.orientation = .horizontal
         contentStack.spacing = 3
         contentStack.alignment = .centerY
@@ -448,6 +468,8 @@ final class CommitSplitButton: NSView {
             contentStack.centerYAnchor.constraint(equalTo: mainButton.centerYAnchor),
             checkIcon.widthAnchor.constraint(equalToConstant: 14),
             checkIcon.heightAnchor.constraint(equalToConstant: 14),
+            progress.widthAnchor.constraint(equalToConstant: 14),
+            progress.heightAnchor.constraint(equalToConstant: 14),
 
             divider.topAnchor.constraint(equalTo: topAnchor),
             divider.bottomAnchor.constraint(equalTo: bottomAnchor),
@@ -516,9 +538,12 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
     private var isChangesCollapsed: Bool = false
     private var currentBranch: String?
     private var generateTask: Task<Void, Never>?
+    private var generationID = 0
+    private var draftBeforeGeneration: String?
     /// True when HEAD is on a branch with no upstream and a remote exists.
     private var isBranchUnpublished = false
     private var publishCheckTask: Task<Void, Never>?
+    private(set) var isPerformingGitOperation = false
 
     var workspace: Workspace?
     var onOpen: ((String) -> Void)?
@@ -526,12 +551,19 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
     /// (not new or deleted files) use it; the rest go to `onOpen`.
     var onOpenDiff: ((String) -> Void)?
     var onRefresh: (() -> Void)?
+    var onMessage: ((String) -> Void)?
 
     override init() {
         super.init()
         view.translatesAutoresizingMaskIntoConstraints = false
         messageContainer.placeholder = "Message (⌘Enter to commit)"
-        messageContainer.onTextChange = { [weak self] in self?.updateCommitButtonState() }
+        messageContainer.onTextChange = { [weak self] in
+            guard let self else { return }
+            if self.messageContainer.generateButton.isGenerating {
+                self.cancelCommitMessageGeneration(restoreDraft: false)
+            }
+            self.updateCommitButtonState()
+        }
         messageContainer.onCommandReturn = { [weak self] in self?.commit(nil) }
         messageContainer.translatesAutoresizingMaskIntoConstraints = false
         messageContainer.onGenerate = { [weak self] in
@@ -676,7 +708,7 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         // message offers "Publish Branch" in place of "Commit".
         let publish = isBranchUnpublished && stagedChanges.isEmpty && !hasMessage
         splitCommitButton.mode = publish ? .publish : .commit
-        splitCommitButton.isEnabled = publish || hasChanges
+        splitCommitButton.isEnabled = !isPerformingGitOperation && (publish || hasChanges)
     }
 
     /// Checks off the main thread whether the branch lacks an upstream.
@@ -701,15 +733,13 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
 
     func publishBranch() {
         guard let root = workspace?.root(), let branch = currentBranch, !branch.isEmpty else { return }
-        splitCommitButton.isEnabled = false
-        Task { [weak self] in
-            await Task.detached(priority: .userInitiated) {
-                let remotes = Self.runGit(root: root, args: ["remote"]).output
-                    .split(whereSeparator: \.isNewline).map(String.init)
-                guard let remote = remotes.contains("origin") ? "origin" : remotes.first else { return }
-                _ = Self.runGit(root: root, args: ["push", "-u", remote, branch])
-            }.value
-            self?.onRefresh?()
+        performGitOperation("Publishing…", success: "Published branch \(branch)") { _ in
+            let remotes = Self.runGit(root: root, args: ["remote"]).output
+                .split(whereSeparator: \.isNewline).map(String.init)
+            guard let remote = remotes.contains("origin") ? "origin" : remotes.first else {
+                return "No Git remote is configured"
+            }
+            return Self.gitFailure(Self.runGit(root: root, args: ["push", "-u", remote, branch]))
         }
     }
 
@@ -861,7 +891,9 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
 
     private func updatePlaceholderString() {
         // Short placeholder so it fits a narrow sidebar; the branch is in the tooltip.
-        messageContainer.placeholder = "Message (⌘↩ to commit)"
+        messageContainer.placeholder = messageContainer.generateButton.isGenerating
+            ? "Generating with AI…"
+            : "Message (⌘Enter to commit)"
         if let branch = currentBranch, !branch.isEmpty {
             messageContainer.textView.toolTip = "⌘Enter to commit on '\(branch)'"
         } else {
@@ -871,12 +903,7 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
 
     func generateCommitMessage() {
         if messageContainer.generateButton.isGenerating {
-            // Cancel currently active AI generation
-            generateTask?.cancel()
-            generateTask = nil
-            messageContainer.generateButton.isGenerating = false
-            updatePlaceholderString()
-            updateCommitButtonState()
+            cancelCommitMessageGeneration(restoreDraft: true)
             focusMessageInput()
             return
         }
@@ -897,12 +924,15 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         guard let root = workspace?.root() else { return }
 
         // Show generating feedback
+        draftBeforeGeneration = messageContainer.text
         messageContainer.text = ""
-        messageContainer.placeholder = "Generating with AI…"
         messageContainer.generateButton.isGenerating = true
         messageContainer.generateButton.isEnabled = true
+        updatePlaceholderString()
 
         generateTask?.cancel()
+        generationID += 1
+        let id = generationID
         generateTask = Task { [weak self] in
             // Git runs off the main thread: a big diff must not freeze the UI.
             let diff = await Task.detached {
@@ -915,26 +945,40 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
             }.value
             let hasDiff = !diff.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             let generated = hasDiff ? await AICommitService.shared.generateCommitMessage(diff: diff) : nil
-            guard !Task.isCancelled, let self else { return }
+            guard !Task.isCancelled, let self, self.generationID == id else { return }
+            self.draftBeforeGeneration = nil
             self.messageContainer.generateButton.isGenerating = false
             self.generateTask = nil
-            self.updatePlaceholderString()
             if let generated, !generated.isEmpty {
                 self.messageContainer.text = generated
             } else {
                 // Graceful fallback to the heuristic message.
                 self.messageContainer.text = fallback
             }
+            self.updatePlaceholderString()
             self.updateCommitButtonState()
             self.focusMessageInput()
         }
     }
 
-    @objc func commit(_ sender: Any?) {
-        guard let workspace else { return }
+    private func cancelCommitMessageGeneration(restoreDraft: Bool) {
+        generationID += 1
         generateTask?.cancel()
         generateTask = nil
         messageContainer.generateButton.isGenerating = false
+        if restoreDraft, let draftBeforeGeneration {
+            messageContainer.text = draftBeforeGeneration
+        }
+        draftBeforeGeneration = nil
+        updatePlaceholderString()
+        updateCommitButtonState()
+    }
+
+    @objc func commit(_ sender: Any?) {
+        guard workspace != nil else { return }
+        if messageContainer.generateButton.isGenerating {
+            cancelCommitMessageGeneration(restoreDraft: true)
+        }
         var msg = messageContainer.text.trimmingCharacters(in: .whitespacesAndNewlines)
         if msg.isEmpty {
             // Auto-generate if message was left blank
@@ -945,17 +989,18 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
                 return
             }
         }
+        let message = msg
 
-        if stagedChanges.isEmpty && !unstagedChanges.isEmpty {
-            for change in unstagedChanges {
-                _ = try? workspace.gitStage(path: change.path)
+        let paths = stagedChanges.isEmpty ? unstagedChanges.map(\.path) : []
+        performGitOperation("Committing…", success: "Commit created", clearMessage: true) { workspace in
+            do {
+                for path in paths { try workspace.gitStage(path: path) }
+                try workspace.gitCommit(message: message)
+                return nil
+            } catch {
+                return Self.describe(error)
             }
         }
-
-        guard (try? workspace.gitCommit(message: msg)) != nil else { return }
-        messageContainer.text = ""
-        updateCommitButtonState()
-        onRefresh?()
     }
 
     func commitAmend() {
@@ -975,26 +1020,84 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
     }
 
     func commitAndPush() {
-        commit(nil)
-        _ = runGit(args: ["push"])
-        onRefresh?()
+        commitThenNetwork(sync: false)
     }
 
     func commitAndSync() {
-        commit(nil)
-        _ = runGit(args: ["pull", "--rebase"])
-        _ = runGit(args: ["push"])
-        onRefresh?()
+        commitThenNetwork(sync: true)
     }
 
     func pull() {
-        _ = runGit(args: ["pull"])
-        onRefresh?()
+        guard let root = workspace?.root() else { return }
+        performGitOperation("Pulling…", success: "Pull complete") { _ in
+            Self.gitFailure(Self.runGit(root: root, args: ["pull"]))
+        }
     }
 
     func push() {
-        _ = runGit(args: ["push"])
-        onRefresh?()
+        guard let root = workspace?.root() else { return }
+        performGitOperation("Pushing…", success: "Push complete") { _ in
+            Self.gitFailure(Self.runGit(root: root, args: ["push"]))
+        }
+    }
+
+    private func commitThenNetwork(sync: Bool) {
+        guard let root = workspace?.root() else { return }
+        let message = messageContainer.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !message.isEmpty else { generateCommitMessage(); return }
+        let paths = stagedChanges.isEmpty ? unstagedChanges.map(\.path) : []
+        performGitOperation(
+            sync ? "Committing & syncing…" : "Committing & pushing…",
+            success: sync ? "Commit and sync complete" : "Commit and push complete",
+            clearMessage: true
+        ) { workspace in
+            do {
+                for path in paths { try workspace.gitStage(path: path) }
+                try workspace.gitCommit(message: message)
+            } catch {
+                return Self.describe(error)
+            }
+            if sync,
+               let failure = Self.gitFailure(Self.runGit(root: root, args: ["pull", "--rebase"])) {
+                return failure
+            }
+            return Self.gitFailure(Self.runGit(root: root, args: ["push"]))
+        }
+    }
+
+    private func performGitOperation(
+        _ title: String,
+        success: String,
+        clearMessage: Bool = false,
+        _ operation: @escaping @Sendable (Workspace) -> String?
+    ) {
+        guard let workspace, !isPerformingGitOperation else { return }
+        isPerformingGitOperation = true
+        splitCommitButton.setLoading(true, title: title)
+        updateCommitButtonState()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let failure = operation(workspace)
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.isPerformingGitOperation = false
+                self.splitCommitButton.setLoading(false)
+                if failure == nil, clearMessage { self.messageContainer.text = "" }
+                self.onMessage?(failure.map { "Git: \($0)" } ?? success)
+                self.updateCommitButtonState()
+                self.onRefresh?()
+            }
+        }
+    }
+
+    private nonisolated static func gitFailure(_ result: (status: Int32, output: String)) -> String? {
+        guard result.status != 0 else { return nil }
+        let message = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        return message.isEmpty ? "Git command failed" : message
+    }
+
+    private nonisolated static func describe(_ error: Error) -> String {
+        if case CoreError.Io(let message) = error { return message }
+        return "\(error)"
     }
 
     func stash() {

@@ -203,6 +203,111 @@ final class SettingsTests: XCTestCase {
         XCTAssertGreaterThan(changes, 0, "open windows are told")
     }
 
+    func testSettingsWindowWritesTerminalFont() throws {
+        let defaults = UserDefaults.standard
+        let keys = [PreferencesWindowController.terminalFontNameKey, PreferencesWindowController.terminalFontSizeKey]
+        let saved = keys.map { defaults.object(forKey: $0) }
+        defer { for (key, value) in zip(keys, saved) { defaults.set(value, forKey: key) } }
+        keys.forEach { defaults.removeObject(forKey: $0) }
+
+        var changes = 0
+        let controller = PreferencesWindowController { changes += 1 }
+        func control<T>(_ name: String) throws -> T {
+            try XCTUnwrap(Mirror(reflecting: controller).children.first { $0.label == name }?.value as? T, name)
+        }
+        let font: NSPopUpButton = try control("terminalFont")
+        XCTAssertEqual(font.titleOfSelectedItem, PreferencesWindowController.terminalSameAsEditor)
+        let size: NSStepper = try control("terminalFontSize")
+        XCTAssertEqual(size.doubleValue, 12)
+
+        size.doubleValue = 15
+        _ = size.target?.perform(size.action, with: size)
+        XCTAssertEqual(defaults.double(forKey: PreferencesWindowController.terminalFontSizeKey), 15)
+
+        let family = try XCTUnwrap(font.itemTitles.dropFirst().first)
+        font.selectItem(withTitle: family)
+        _ = font.target?.perform(font.action, with: font)
+        XCTAssertEqual(defaults.string(forKey: PreferencesWindowController.terminalFontNameKey), family)
+
+        font.selectItem(withTitle: PreferencesWindowController.terminalSameAsEditor)
+        _ = font.target?.perform(font.action, with: font)
+        XCTAssertNil(defaults.string(forKey: PreferencesWindowController.terminalFontNameKey))
+        XCTAssertEqual(changes, 3, "open windows are told")
+    }
+
+    func testTerminalSettingsDefaultsAndClamping() throws {
+        let suite = "galaxy-terminal-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        let fallback = TerminalSettings.load(from: defaults)
+        XCTAssertEqual(fallback.lineHeight, 1.0)
+        XCTAssertEqual(fallback.cursorStyle, .block)
+        XCTAssertTrue(fallback.cursorBlink)
+        XCTAssertEqual(fallback.padding.left, 20, "the old hardcoded padding stays the default")
+        XCTAssertEqual(fallback.padding.right, 12)
+        XCTAssertEqual(fallback.padding.top, 4)
+        XCTAssertEqual(fallback.padding.bottom, 4)
+
+        defaults.set(3.0, forKey: TerminalSettings.lineHeightKey)
+        defaults.set("bar", forKey: TerminalSettings.cursorStyleKey)
+        defaults.set(false, forKey: TerminalSettings.cursorBlinkKey)
+        defaults.set(-5.0, forKey: TerminalSettings.paddingHorizontalKey)
+        defaults.set(100.0, forKey: TerminalSettings.paddingVerticalKey)
+        let custom = TerminalSettings.load(from: defaults)
+        XCTAssertEqual(custom.lineHeight, 1.5, "line height is clamped")
+        XCTAssertEqual(custom.cursorStyle, .bar)
+        XCTAssertFalse(custom.cursorBlink)
+        XCTAssertEqual(custom.padding.left, 0, "padding is clamped")
+        XCTAssertEqual(custom.padding.right, 0)
+        XCTAssertEqual(custom.padding.top, 40)
+
+        defaults.set("beam", forKey: TerminalSettings.cursorStyleKey)
+        XCTAssertEqual(TerminalSettings.load(from: defaults).cursorStyle, .block, "unknown style falls back")
+    }
+
+    func testSettingsWindowWritesTerminalLook() throws {
+        let defaults = UserDefaults.standard
+        let keys = [TerminalSettings.lineHeightKey, TerminalSettings.cursorStyleKey, TerminalSettings.cursorBlinkKey,
+                    TerminalSettings.paddingHorizontalKey, TerminalSettings.paddingVerticalKey]
+        let saved = keys.map { defaults.object(forKey: $0) }
+        defer { for (key, value) in zip(keys, saved) { defaults.set(value, forKey: key) } }
+        keys.forEach { defaults.removeObject(forKey: $0) }
+
+        var changes = 0
+        let controller = PreferencesWindowController { changes += 1 }
+        func control<T>(_ name: String) throws -> T {
+            try XCTUnwrap(Mirror(reflecting: controller).children.first { $0.label == name }?.value as? T, name)
+        }
+        let lineHeight: NSPopUpButton = try control("terminalLineHeight")
+        XCTAssertEqual(lineHeight.titleOfSelectedItem, "1.0×")
+        lineHeight.selectItem(withTitle: "1.3×")
+        _ = lineHeight.target?.perform(lineHeight.action, with: lineHeight)
+
+        let style: NSPopUpButton = try control("terminalCursorStyle")
+        style.selectItem(withTitle: "Underline")
+        _ = style.target?.perform(style.action, with: style)
+
+        let blink: NSButton = try control("terminalCursorBlink")
+        XCTAssertEqual(blink.state, .on)
+        blink.state = .off
+        _ = blink.target?.perform(blink.action, with: blink)
+
+        let paddingH: NSStepper = try control("terminalPaddingH")
+        XCTAssertEqual(paddingH.doubleValue, 20)
+        paddingH.doubleValue = 10
+        _ = paddingH.target?.perform(paddingH.action, with: paddingH)
+
+        let settings = TerminalSettings.current
+        XCTAssertEqual(settings.lineHeight, 1.3, accuracy: 0.001)
+        XCTAssertEqual(settings.cursorStyle, .underline)
+        XCTAssertFalse(settings.cursorBlink)
+        XCTAssertEqual(settings.padding.left, 10)
+        XCTAssertEqual(settings.padding.right, 2)
+        XCTAssertEqual(settings.padding.top, 4)
+        XCTAssertEqual(changes, 4, "open windows are told")
+    }
+
     func testSettingsWindowListsTheDefaultExcludesAndWritesToggles() throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-prefs-\(UUID().uuidString).json")
         defer { try? FileManager.default.removeItem(at: url) }

@@ -290,6 +290,9 @@ final class TerminalPanelView: NSView {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
+    /// Re-reads the terminal font settings in every pane, shown or not.
+    func reloadFonts() { views.forEach { $0.reloadFont() } }
+
     func owns(_ responder: NSResponder?) -> Bool {
         guard let responder else { return false }
         return views.contains { $0 === responder }

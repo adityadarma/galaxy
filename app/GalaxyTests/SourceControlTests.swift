@@ -261,6 +261,17 @@ final class SourceControlTests: XCTestCase {
         XCTAssertEqual(box.placeholder, "Message (⌘Enter to commit)")
     }
 
+    func testCommitButtonShowsAndClearsLoadingState() {
+        let button = CommitSplitButton()
+        button.setLoading(true, title: "Pushing…")
+        XCTAssertTrue(button.isLoading)
+        XCTAssertEqual(button.mainButton.accessibilityLabel(), "Pushing…")
+
+        button.setLoading(false)
+        XCTAssertFalse(button.isLoading)
+        XCTAssertEqual(button.mainButton.accessibilityLabel(), "Commit")
+    }
+
     func testCommandShiftFOpensSidebarSearchSeededWithSelection() {
         let controller = MainWindowController(bridge: CoreBridge())
         controller.showWindow(nil)

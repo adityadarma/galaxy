@@ -2,8 +2,8 @@ import AppKit
 
 @MainActor
 final class GitBranchPicker: NSView, NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate {
-    static let actionRowHeight: CGFloat = 34
-    static let branchRowHeight: CGFloat = 68
+    static let actionRowHeight: CGFloat = 32
+    static let branchRowHeight: CGFloat = 50
     static let maxVisibleBranches = 6
 
     private enum Item {
@@ -120,7 +120,8 @@ final class GitBranchPicker: NSView, NSTextFieldDelegate, NSTableViewDataSource,
         allBranches = branches
         commitsByBranch = [:]
         for commit in commits {
-            for ref in commit.refs where ref.kind == .branch || ref.kind == .remote {
+            // The checked-out branch is reported as a `.head` ref.
+            for ref in commit.refs where ref.kind != .tag && commitsByBranch[ref.name] == nil {
                 commitsByBranch[ref.name] = commit
             }
         }
@@ -193,17 +194,18 @@ final class GitBranchPicker: NSView, NSTextFieldDelegate, NSTableViewDataSource,
             ?? GitBranchPickerCell()
         switch items[row] {
         case .create:
-            cell.showAction(icon: "+", title: "Create new branch…")
+            cell.showAction(symbol: "plus", title: "Create new branch…")
         case .createFrom:
-            cell.showAction(icon: "+", title: "Create new branch from…")
+            cell.showAction(symbol: "plus.square.on.square", title: "Create new branch from…")
         case .checkoutDetached:
-            cell.showAction(icon: "⌘", title: "Checkout detached…")
+            cell.showAction(symbol: "scope", title: "Checkout detached…")
         case .branch(let branch, let commit):
             let age = commit.map { BlameFormat.relative($0.timestamp) } ?? ""
-            let headline = [branch.name, age].filter { !$0.isEmpty }.joined(separator: "  ")
-            let metadata = commit.map { "\($0.author)  •  \(String($0.hash.prefix(7)))  •  \($0.subject)" } ?? ""
-            cell.showBranch(title: headline, metadata: metadata,
-                            category: branch.remote ? "remotes" : "branches",
+            let metadata = commit.map { "\($0.author)  ·  \(String($0.hash.prefix(7)))  ·  \($0.subject)" } ?? ""
+            cell.showBranch(name: branch.name, age: age, metadata: metadata,
+                            category: branch.current ? "current" : (branch.remote ? "remote" : "branch"),
+                            symbol: branch.remote ? "cloud" : "arrow.triangle.branch",
+                            current: branch.current,
                             separated: row == 0 || !isBranch(items[row - 1]))
         }
         return cell
@@ -214,7 +216,8 @@ final class GitBranchPicker: NSView, NSTextFieldDelegate, NSTableViewDataSource,
     }
 
     private func height(for item: Item) -> CGFloat {
-        if case .branch = item { return Self.branchRowHeight }
+        // Branches without a known commit have no second line.
+        if case .branch(_, let commit) = item, commit != nil { return Self.branchRowHeight }
         return Self.actionRowHeight
     }
 
@@ -233,72 +236,120 @@ final class GitBranchPicker: NSView, NSTextFieldDelegate, NSTableViewDataSource,
 private final class GitBranchPickerCell: NSTableCellView {
     static let reuseID = NSUserInterfaceItemIdentifier("git-branch-picker-cell")
 
-    private let icon = NSTextField(labelWithString: "")
+    private let icon = NSImageView()
     private let title = NSTextField(labelWithString: "")
+    private let age = NSTextField(labelWithString: "")
     private let category = NSTextField(labelWithString: "")
     private let metadata = NSTextField(labelWithString: "")
     private let separator = NSBox()
+    private let titleRow: NSStackView
+    /// Centers single-line rows; two-line rows pin the title to the top.
+    private var titleCenterY: NSLayoutConstraint!
+    private var titleTop: NSLayoutConstraint!
 
     override init(frame frameRect: NSRect) {
+        titleRow = NSStackView(views: [title, age])
         super.init(frame: frameRect)
         identifier = Self.reuseID
-        icon.font = .systemFont(ofSize: 15)
-        icon.alignment = .center
-        icon.textColor = .secondaryLabelColor
+
+        icon.imageScaling = .scaleProportionallyDown
+        icon.contentTintColor = .secondaryLabelColor
+        icon.translatesAutoresizingMaskIntoConstraints = false
+
         title.font = .systemFont(ofSize: 13)
         title.lineBreakMode = .byTruncatingTail
         title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        category.font = .systemFont(ofSize: 11)
+        age.font = .systemFont(ofSize: 11)
+        age.textColor = .tertiaryLabelColor
+        age.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
+
+        category.font = .systemFont(ofSize: 10, weight: .medium)
         category.textColor = .secondaryLabelColor
+        category.alignment = .right
         category.setContentCompressionResistancePriority(.required, for: .horizontal)
-        metadata.font = .systemFont(ofSize: 12)
+        category.setContentHuggingPriority(.required, for: .horizontal)
+        category.translatesAutoresizingMaskIntoConstraints = false
+
+        metadata.font = .systemFont(ofSize: 11)
         metadata.textColor = .secondaryLabelColor
         metadata.lineBreakMode = .byTruncatingTail
-        let row = NSStackView(views: [icon, title, category])
-        row.spacing = 8
-        row.translatesAutoresizingMaskIntoConstraints = false
+        metadata.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         metadata.translatesAutoresizingMaskIntoConstraints = false
+
+        titleRow.orientation = .horizontal
+        titleRow.spacing = 8
+        titleRow.alignment = .firstBaseline
+        titleRow.translatesAutoresizingMaskIntoConstraints = false
+
         separator.boxType = .separator
         separator.translatesAutoresizingMaskIntoConstraints = false
-        addSubview(row)
-        addSubview(metadata)
-        addSubview(separator)
+
+        for view in [icon, titleRow, category, metadata, separator] { addSubview(view) }
+        titleCenterY = titleRow.centerYAnchor.constraint(equalTo: centerYAnchor)
+        titleTop = titleRow.topAnchor.constraint(equalTo: topAnchor, constant: 8)
         NSLayoutConstraint.activate([
-            icon.widthAnchor.constraint(equalToConstant: 18),
-            row.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 9),
-            row.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            row.topAnchor.constraint(equalTo: topAnchor, constant: 7),
-            metadata.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            metadata.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
-            metadata.topAnchor.constraint(equalTo: row.bottomAnchor, constant: 4),
+            icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+            icon.centerYAnchor.constraint(equalTo: titleRow.centerYAnchor),
+            icon.widthAnchor.constraint(equalToConstant: 16),
+            icon.heightAnchor.constraint(equalToConstant: 16),
+
+            titleRow.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 10),
+            titleRow.trailingAnchor.constraint(lessThanOrEqualTo: category.leadingAnchor, constant: -10),
+            titleCenterY,
+
+            category.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
+            category.firstBaselineAnchor.constraint(equalTo: title.firstBaselineAnchor),
+
+            metadata.leadingAnchor.constraint(equalTo: titleRow.leadingAnchor),
+            metadata.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -14),
+            metadata.topAnchor.constraint(equalTo: titleRow.bottomAnchor, constant: 3),
+
             separator.topAnchor.constraint(equalTo: topAnchor),
-            separator.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
-            separator.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            separator.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 10),
+            separator.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -10),
         ])
     }
 
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
-    func showAction(icon: String, title: String) {
-        self.icon.stringValue = icon
+    private func setSymbol(_ name: String, tint: NSColor) {
+        icon.image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 12, weight: .medium))
+        icon.contentTintColor = tint
+    }
+
+    private func setTwoLines(_ twoLines: Bool) {
+        titleCenterY.isActive = !twoLines
+        titleTop.isActive = twoLines
+        metadata.isHidden = !twoLines
+    }
+
+    func showAction(symbol: String, title: String) {
+        setSymbol(symbol, tint: .secondaryLabelColor)
         self.title.stringValue = title
-        category.stringValue = ""
+        self.title.font = .systemFont(ofSize: 13)
+        age.isHidden = true
         category.isHidden = true
         metadata.stringValue = ""
-        metadata.isHidden = true
+        setTwoLines(false)
         separator.isHidden = true
         setAccessibilityLabel(title)
     }
 
-    func showBranch(title: String, metadata: String, category: String, separated: Bool) {
-        icon.stringValue = "⎇"
-        self.title.stringValue = title
-        self.category.stringValue = category
+    func showBranch(name: String, age: String, metadata: String, category: String,
+                    symbol: String, current: Bool, separated: Bool) {
+        setSymbol(symbol, tint: current ? Theme.accent : .secondaryLabelColor)
+        title.stringValue = name
+        title.font = .systemFont(ofSize: 13, weight: current ? .semibold : .medium)
+        self.age.stringValue = age
+        self.age.isHidden = age.isEmpty
+        self.category.stringValue = category.uppercased()
+        self.category.textColor = current ? Theme.accent : .tertiaryLabelColor
         self.category.isHidden = false
         self.metadata.stringValue = metadata
-        self.metadata.isHidden = metadata.isEmpty
+        setTwoLines(!metadata.isEmpty)
         separator.isHidden = !separated
-        setAccessibilityLabel("\(title), \(metadata), \(category)")
+        setAccessibilityLabel([name, age, metadata, category].filter { !$0.isEmpty }.joined(separator: ", "))
     }
 }

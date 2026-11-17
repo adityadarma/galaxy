@@ -343,21 +343,21 @@ pub(super) fn check_type_node(
 }
 
 /// `if (x === null) return` leaves `x` without `null` for the statements
-/// after it in the same block. Only exits without an `else` are handled.
-/// Returns the name and its type before narrowing.
+/// after it in the same block. An `||` exit narrows every comparison because
+/// reaching the following statement means every operand was false.
 fn narrow_after_early_exit(
     text: &str,
     node: Node<'_>,
     state: &mut TypeState,
-) -> Option<(String, Type)> {
+) -> Vec<(String, Type)> {
     if node.kind() != "if_statement" || node.child_by_field_name("alternative").is_some() {
-        return None;
+        return Vec::new();
     }
     let (Some(condition), Some(consequence)) = (
         node.child_by_field_name("condition"),
         node.child_by_field_name("consequence"),
     ) else {
-        return None;
+        return Vec::new();
     };
     let exit = if consequence.kind() == "statement_block" {
         let count = consequence.named_child_count();
@@ -373,7 +373,7 @@ fn narrow_after_early_exit(
             "return_statement" | "throw_statement" | "continue_statement" | "break_statement"
         )
     }) {
-        return None;
+        return Vec::new();
     }
     let condition = node_text(text, condition)
         .unwrap_or("")
@@ -381,38 +381,44 @@ fn narrow_after_early_exit(
         .trim_start_matches('(')
         .trim_end_matches(')')
         .trim();
-    let (name, value, loose) = condition
-        .split_once("===")
-        .map(|(name, value)| (name, value, false))
-        .or_else(|| {
-            condition
-                .split_once("==")
-                .map(|(name, value)| (name, value, true))
-        })?;
-    let removed: &[Type] = match (value.trim(), loose) {
-        ("null", false) => &[Type::Null],
-        ("undefined", false) => &[Type::Undefined],
-        ("null" | "undefined", true) => &[Type::Null, Type::Undefined],
-        _ => return None,
-    };
-    let name = name.trim();
-    let Some(Type::Union(items)) = state.values.get(name) else {
-        return None;
-    };
-    let mut items: Vec<_> = items
-        .iter()
-        .filter(|item| !removed.contains(item))
-        .cloned()
-        .collect();
-    let narrowed = match items.len() {
-        0 => return None,
-        1 => items.remove(0),
-        _ => Type::Union(items),
-    };
-    state
-        .values
-        .insert(name.to_owned(), narrowed)
-        .map(|previous| (name.to_owned(), previous))
+    condition
+        .split("||")
+        .filter_map(|comparison| {
+            let comparison = comparison.trim().trim_matches(['(', ')']).trim();
+            let (name, value, loose) = comparison
+                .split_once("===")
+                .map(|(name, value)| (name, value, false))
+                .or_else(|| {
+                    comparison
+                        .split_once("==")
+                        .map(|(name, value)| (name, value, true))
+                })?;
+            let removed: &[Type] = match (value.trim(), loose) {
+                ("null", false) => &[Type::Null],
+                ("undefined", false) => &[Type::Undefined],
+                ("null" | "undefined", true) => &[Type::Null, Type::Undefined],
+                _ => return None,
+            };
+            let name = name.trim();
+            let Type::Union(items) = state.values.get(name)? else {
+                return None;
+            };
+            let mut items: Vec<_> = items
+                .iter()
+                .filter(|item| !removed.contains(item))
+                .cloned()
+                .collect();
+            let narrowed = match items.len() {
+                0 => return None,
+                1 => items.remove(0),
+                _ => Type::Union(items),
+            };
+            state
+                .values
+                .insert(name.to_owned(), narrowed)
+                .map(|previous| (name.to_owned(), previous))
+        })
+        .collect()
 }
 
 pub(super) fn infer_type(text: &str, node: Node<'_>, state: &mut TypeState) -> Type {

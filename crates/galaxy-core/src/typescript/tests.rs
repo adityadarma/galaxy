@@ -1246,6 +1246,29 @@ fn narrows_nullable_union_after_early_return() {
 }
 
 #[test]
+fn narrows_nullable_unions_after_or_condition_and_continue() {
+    let index = DocumentIndex::parse(
+        "cidr.ts",
+        "function ipToInt(ip: string): number | null { return null }\n\
+         function networkAddress(ipInt: number, prefix: number): number { return 0 }\n\
+         function parsePrefix(value: string): number | null { return null }\n\
+         function parseAll(values: string[]) {\n\
+           for (const value of values) {\n\
+             const addressInt: number | null = ipToInt(value)\n\
+             const prefix: number | null = parsePrefix(value)\n\
+             if (addressInt === null || prefix === null) continue\n\
+             values.map(() => networkAddress(addressInt, prefix))\n\
+           }\n\
+         }\n",
+    );
+    assert!(
+        index.type_diagnostics.is_empty(),
+        "{:?}",
+        index.type_diagnostics
+    );
+}
+
+#[test]
 fn early_return_narrowing_ends_with_its_block() {
     let index = DocumentIndex::parse(
         "scope.ts",

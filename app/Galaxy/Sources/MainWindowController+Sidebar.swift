@@ -48,6 +48,9 @@ extension MainWindowController {
     func applyPreferences() {
         editorView.setFont(Theme.editorFont)
         for group in groups { group.pane?.editorView.setFont(Theme.editorFont) }
+        // Terminals fall back to the editor font, so reload them for both tabs.
+        terminalPanel.reloadFonts()
+        editorTerminalView.reloadFont()
         applyViewToggles()
         reloadSettings(force: true)
     }

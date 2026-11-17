@@ -10,6 +10,25 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
     private let lineSpacing = NSStepper(frame: .zero)
     private let lineSpacingLabel = NSTextField(labelWithString: "")
 
+    // Terminal tab: UserDefaults keys read by `TerminalView`.
+    static let terminalFontNameKey = "TerminalFontName"
+    static let terminalFontSizeKey = "TerminalFontSize"
+    static let terminalSameAsEditor = "Same as Editor"
+    private let terminalFont = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let terminalFontSize = NSStepper(frame: .zero)
+    private let terminalFontSizeLabel = NSTextField(labelWithString: "")
+    private let terminalLineHeight = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let terminalCursorStyle = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let terminalCursorBlink = NSButton(checkboxWithTitle: "Blink cursor", target: nil, action: nil)
+    private let terminalPaddingH = NSStepper(frame: .zero)
+    private let terminalPaddingHLabel = NSTextField(labelWithString: "")
+    private let terminalPaddingV = NSStepper(frame: .zero)
+    private let terminalPaddingVLabel = NSTextField(labelWithString: "")
+    private static let terminalLineHeights: [Double] = [1.0, 1.1, 1.2, 1.3, 1.4, 1.5]
+    private static let terminalCursorStyles: [(title: String, value: TerminalSettings.CursorStyle)] = [
+        ("Block", .block), ("Bar", .bar), ("Underline", .underline),
+    ]
+
     // AI Commit settings (OpenAI-compatible API)
     private let baseURLField = NSTextField()
     private let modelPopup = NSPopUpButton(frame: .zero, pullsDown: false)
@@ -83,6 +102,7 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
         tabs.addTabViewItem(tab("Editor", symbol: "text.cursor", pane: buildEditorPane()))
         tabs.addTabViewItem(tab("Explorer", symbol: "folder", pane: buildExplorerPane()))
         tabs.addTabViewItem(tab("View", symbol: "rectangle.split.3x1", pane: buildViewPane()))
+        tabs.addTabViewItem(tab("Terminal", symbol: "terminal", pane: buildTerminalPane()))
         tabs.addTabViewItem(tab("AI", symbol: "sparkles", pane: buildAIPane()))
         window?.contentViewController = tabs
         tabs.fitWindow(to: tabs.tabViewItems.first)
@@ -174,6 +194,124 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
         hint.textColor = .secondaryLabelColor
         stack.addArrangedSubview(hint)
         return pane(stack)
+    }
+
+    private func buildTerminalPane() -> NSView {
+        let stack = NSStackView()
+        stack.addArrangedSubview(section("Font"))
+        let installedFonts = Self.installedFontFamilies()
+        terminalFont.addItems(withTitles: [Self.terminalSameAsEditor] + installedFonts)
+        let saved = UserDefaults.standard.string(forKey: Self.terminalFontNameKey) ?? Self.terminalSameAsEditor
+        terminalFont.selectItem(withTitle: installedFonts.contains(saved) ? saved : Self.terminalSameAsEditor)
+        terminalFont.setAccessibilityLabel("Terminal font")
+        terminalFont.target = self; terminalFont.action = #selector(saveTerminalFont(_:))
+        stack.addArrangedSubview(row("Font family", terminalFont))
+
+        let size = UserDefaults.standard.object(forKey: Self.terminalFontSizeKey) as? Double ?? 12
+        terminalFontSize.minValue = 10; terminalFontSize.maxValue = 24; terminalFontSize.increment = 1
+        terminalFontSize.doubleValue = min(max(size, 10), 24)
+        terminalFontSize.setAccessibilityLabel("Terminal font size")
+        terminalFontSize.target = self; terminalFontSize.action = #selector(saveTerminalFontSize(_:))
+        updateTerminalFontSizeLabel()
+        let sizeControls = NSStackView(views: [terminalFontSize, terminalFontSizeLabel])
+        sizeControls.spacing = 8
+        stack.addArrangedSubview(row("Font size", sizeControls))
+
+        let current = TerminalSettings.current
+        terminalLineHeight.addItems(withTitles: Self.terminalLineHeights.map { String(format: "%.1f×", $0) })
+        let heightIndex = Self.terminalLineHeights.enumerated()
+            .min { abs($0.element - Double(current.lineHeight)) < abs($1.element - Double(current.lineHeight)) }?.offset ?? 0
+        terminalLineHeight.selectItem(at: heightIndex)
+        terminalLineHeight.setAccessibilityLabel("Terminal line height")
+        terminalLineHeight.target = self; terminalLineHeight.action = #selector(saveTerminalLineHeight(_:))
+        stack.addArrangedSubview(row("Line height", terminalLineHeight))
+
+        stack.addArrangedSubview(section("Cursor"))
+        terminalCursorStyle.addItems(withTitles: Self.terminalCursorStyles.map(\.title))
+        terminalCursorStyle.selectItem(at: Self.terminalCursorStyles.firstIndex { $0.value == current.cursorStyle } ?? 0)
+        terminalCursorStyle.setAccessibilityLabel("Terminal cursor style")
+        terminalCursorStyle.target = self; terminalCursorStyle.action = #selector(saveTerminalCursorStyle(_:))
+        stack.addArrangedSubview(row("Style", terminalCursorStyle))
+        terminalCursorBlink.state = current.cursorBlink ? .on : .off
+        terminalCursorBlink.target = self; terminalCursorBlink.action = #selector(saveTerminalCursorBlink(_:))
+        stack.addArrangedSubview(row("", terminalCursorBlink))
+
+        stack.addArrangedSubview(section("Padding"))
+        for (stepper, value, label) in [
+            (terminalPaddingH, current.paddingHorizontal, "Horizontal terminal padding"),
+            (terminalPaddingV, current.paddingVertical, "Vertical terminal padding"),
+        ] {
+            stepper.minValue = TerminalSettings.paddingRange.lowerBound
+            stepper.maxValue = TerminalSettings.paddingRange.upperBound
+            stepper.increment = 2
+            stepper.doubleValue = Double(value)
+            stepper.setAccessibilityLabel(label)
+            stepper.target = self; stepper.action = #selector(saveTerminalPadding(_:))
+        }
+        updateTerminalPaddingLabels()
+        let hControls = NSStackView(views: [terminalPaddingH, terminalPaddingHLabel])
+        hControls.spacing = 8
+        stack.addArrangedSubview(row("Horizontal", hControls))
+        let vControls = NSStackView(views: [terminalPaddingV, terminalPaddingVLabel])
+        vControls.spacing = 8
+        stack.addArrangedSubview(row("Vertical", vControls))
+
+        let hint = NSTextField(wrappingLabelWithString: "Applies to open terminals right away. \"Same as Editor\" follows the editor font family.")
+        hint.font = .systemFont(ofSize: 11)
+        hint.textColor = .secondaryLabelColor
+        hint.preferredMaxLayoutWidth = 370
+        hint.widthAnchor.constraint(equalToConstant: 370).isActive = true
+        stack.addArrangedSubview(hint)
+        return pane(stack)
+    }
+
+    @objc private func saveTerminalFont(_ sender: Any?) {
+        let title = terminalFont.titleOfSelectedItem ?? Self.terminalSameAsEditor
+        if title == Self.terminalSameAsEditor {
+            UserDefaults.standard.removeObject(forKey: Self.terminalFontNameKey)
+        } else {
+            UserDefaults.standard.set(title, forKey: Self.terminalFontNameKey)
+        }
+        onChange()
+    }
+
+    @objc private func saveTerminalFontSize(_ sender: Any?) {
+        UserDefaults.standard.set(terminalFontSize.doubleValue, forKey: Self.terminalFontSizeKey)
+        updateTerminalFontSizeLabel()
+        onChange()
+    }
+
+    @objc private func saveTerminalLineHeight(_ sender: Any?) {
+        let index = max(terminalLineHeight.indexOfSelectedItem, 0)
+        UserDefaults.standard.set(Self.terminalLineHeights[index], forKey: TerminalSettings.lineHeightKey)
+        onChange()
+    }
+
+    @objc private func saveTerminalCursorStyle(_ sender: Any?) {
+        let style = Self.terminalCursorStyles[max(terminalCursorStyle.indexOfSelectedItem, 0)].value
+        UserDefaults.standard.set(style.rawValue, forKey: TerminalSettings.cursorStyleKey)
+        onChange()
+    }
+
+    @objc private func saveTerminalCursorBlink(_ sender: Any?) {
+        UserDefaults.standard.set(terminalCursorBlink.state == .on, forKey: TerminalSettings.cursorBlinkKey)
+        onChange()
+    }
+
+    @objc private func saveTerminalPadding(_ sender: Any?) {
+        UserDefaults.standard.set(terminalPaddingH.doubleValue, forKey: TerminalSettings.paddingHorizontalKey)
+        UserDefaults.standard.set(terminalPaddingV.doubleValue, forKey: TerminalSettings.paddingVerticalKey)
+        updateTerminalPaddingLabels()
+        onChange()
+    }
+
+    private func updateTerminalPaddingLabels() {
+        terminalPaddingHLabel.stringValue = "\(Int(terminalPaddingH.doubleValue)) pt"
+        terminalPaddingVLabel.stringValue = "\(Int(terminalPaddingV.doubleValue)) pt"
+    }
+
+    private func updateTerminalFontSizeLabel() {
+        terminalFontSizeLabel.stringValue = "\(Int(terminalFontSize.doubleValue)) pt"
     }
 
     private func section(_ title: String) -> NSTextField {

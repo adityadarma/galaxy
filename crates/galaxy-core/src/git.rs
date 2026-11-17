@@ -34,6 +34,13 @@ pub struct GitBranch {
     pub remote: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionSuggestion {
+    pub version: String,
+    pub previous_tag: Option<String>,
+    pub commit_count: u32,
+}
+
 pub fn branches(root: &Path) -> io::Result<Vec<GitBranch>> {
     let output = Command::new("git")
         .args([
@@ -528,6 +535,127 @@ pub fn push_tag(root: &Path, name: &str) -> io::Result<()> {
     )
 }
 
+/// Suggests the next SemVer tag for `rev` from Conventional Commits since
+/// the nearest reachable SemVer tag. Unknown commit formats bump patch.
+pub fn suggest_version(root: &Path, rev: &str) -> io::Result<VersionSuggestion> {
+    if !valid_commit_id(rev) {
+        return Err(io::Error::other("invalid commit id"));
+    }
+    let tags = git_output(root, &["tag", "--merged", rev, "--list"], LOCAL_TIMEOUT)?;
+    if !tags.status.success() {
+        return Err(io::Error::other(
+            String::from_utf8_lossy(&tags.stderr).trim().to_owned(),
+        ));
+    }
+    type SemverCandidate = (u64, (u64, u64, u64), bool, String);
+    let mut nearest: Option<SemverCandidate> = None;
+    for name in String::from_utf8_lossy(&tags.stdout).lines() {
+        let Some((version, prefixed)) = parse_semver_tag(name) else {
+            continue;
+        };
+        let range = format!("{name}..{rev}");
+        let count = git_output(root, &["rev-list", "--count", &range], LOCAL_TIMEOUT)?;
+        if !count.status.success() {
+            continue;
+        }
+        let Ok(distance) = String::from_utf8_lossy(&count.stdout).trim().parse::<u64>() else {
+            continue;
+        };
+        let candidate = (distance, version, prefixed, name.to_owned());
+        if nearest.as_ref().is_none_or(|current| {
+            distance < current.0 || (distance == current.0 && version > current.1)
+        }) {
+            nearest = Some(candidate);
+        }
+    }
+
+    let (base, prefixed, previous_tag, range) = match nearest {
+        Some((_, version, prefixed, name)) => {
+            let range = format!("{name}..{rev}");
+            (version, prefixed, Some(name), range)
+        }
+        None => ((0, 0, 0), true, None, rev.to_owned()),
+    };
+    let log = git_output(
+        root,
+        &["log", "--format=%s%x1f%b%x1e", &range, "--"],
+        LOCAL_TIMEOUT,
+    )?;
+    if !log.status.success() {
+        return Err(io::Error::other(
+            String::from_utf8_lossy(&log.stderr).trim().to_owned(),
+        ));
+    }
+    let messages = String::from_utf8_lossy(&log.stdout);
+    let commits: Vec<_> = messages
+        .split('\x1e')
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .collect();
+    let bump = commits
+        .iter()
+        .map(|message| conventional_bump(message))
+        .max()
+        .unwrap_or(0);
+    let next = match bump {
+        2 => (base.0.checked_add(1), Some(0), Some(0)),
+        1 => (Some(base.0), base.1.checked_add(1), Some(0)),
+        _ => (Some(base.0), Some(base.1), base.2.checked_add(1)),
+    };
+    let (Some(major), Some(minor), Some(patch)) = next else {
+        return Err(io::Error::other("version number is too large"));
+    };
+    Ok(VersionSuggestion {
+        version: format!("{}{major}.{minor}.{patch}", if prefixed { "v" } else { "" }),
+        previous_tag,
+        commit_count: commits.len().try_into().unwrap_or(u32::MAX),
+    })
+}
+
+fn parse_semver_tag(tag: &str) -> Option<((u64, u64, u64), bool)> {
+    let (version, prefixed) = match tag.strip_prefix('v') {
+        Some(version) => (version, true),
+        None => (tag, false),
+    };
+    let mut parts = version.split('.');
+    let parsed = (
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    );
+    (parts.next().is_none() && !version.contains(['-', '+'])).then_some((parsed, prefixed))
+}
+
+/// patch = 0, minor = 1, major = 2.
+fn conventional_bump(message: &str) -> u8 {
+    let (subject, body) = message.split_once('\x1f').unwrap_or((message, ""));
+    if body.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with("BREAKING CHANGE:") || line.starts_with("BREAKING-CHANGE:")
+    }) {
+        return 2;
+    }
+    let Some((header, _)) = subject.split_once(':') else {
+        return 0;
+    };
+    let breaking = header.strip_suffix('!');
+    let header = breaking.unwrap_or(header);
+    let conventional = header.bytes().all(|byte| byte.is_ascii_lowercase())
+        || header
+            .split_once('(')
+            .is_some_and(|(kind, scope)| !kind.is_empty() && scope.ends_with(')'));
+    if !conventional {
+        return 0;
+    }
+    if breaking.is_some() {
+        2
+    } else if header == "feat" || header.starts_with("feat(") {
+        1
+    } else {
+        0
+    }
+}
+
 /// An unfinished cherry-pick, revert, merge or rebase: its name and the
 /// arguments that abort it.
 fn in_progress(root: &Path) -> Option<(&'static str, &'static [&'static str])> {
@@ -873,6 +1001,22 @@ pub fn create_tag(root: &Path, name: &str, rev: &str) -> io::Result<()> {
         return Err(io::Error::other("invalid commit id"));
     }
     run_git(root, &["tag", name, rev], "creating tag", LOCAL_TIMEOUT)
+}
+
+/// Creates an annotated tag `name` at commit `rev`.
+pub fn create_annotated_tag(root: &Path, name: &str, rev: &str, message: &str) -> io::Result<()> {
+    if !valid_ref_name(name) {
+        return Err(io::Error::other("invalid tag name"));
+    }
+    if !valid_commit_id(rev) {
+        return Err(io::Error::other("invalid commit id"));
+    }
+    run_git(
+        root,
+        &["tag", "-a", name, rev, "-m", message],
+        "creating annotated tag",
+        LOCAL_TIMEOUT,
+    )
 }
 
 /// Checks out a commit, leaving HEAD detached.
@@ -2238,6 +2382,63 @@ mod tests {
             create_tag(dir.path(), "x", "main").is_err(),
             "only commit ids"
         );
+    }
+
+    #[test]
+    fn suggests_semver_from_conventional_commits_with_patch_fallback() {
+        let dir = identified_repo();
+        let first = commit_file(dir.path(), "a.txt", "a", "initial release");
+        create_tag(dir.path(), "v1.2.3", &first).unwrap();
+
+        let fix = commit_file(dir.path(), "a.txt", "b", "fix: repair parsing");
+        assert_eq!(
+            suggest_version(dir.path(), &fix).unwrap(),
+            VersionSuggestion {
+                version: "v1.2.4".into(),
+                previous_tag: Some("v1.2.3".into()),
+                commit_count: 1,
+            }
+        );
+        let feature = commit_file(dir.path(), "a.txt", "c", "feat(parser): add ranges");
+        assert_eq!(
+            suggest_version(dir.path(), &feature).unwrap().version,
+            "v1.3.0"
+        );
+        let breaking = commit_file(dir.path(), "a.txt", "d", "refactor!: replace API");
+        assert_eq!(
+            suggest_version(dir.path(), &breaking).unwrap().version,
+            "v2.0.0"
+        );
+
+        create_tag(dir.path(), "v2.0.0", &breaking).unwrap();
+        let unknown = commit_file(dir.path(), "a.txt", "e", "Update documentation");
+        assert_eq!(
+            suggest_version(dir.path(), &unknown).unwrap().version,
+            "v2.0.1"
+        );
+    }
+
+    #[test]
+    fn creates_annotated_tag_and_uses_unprefixed_semver_style() {
+        let dir = identified_repo();
+        let first = commit_file(dir.path(), "a.txt", "a", "base");
+        create_annotated_tag(dir.path(), "1.0.0", &first, "First release").unwrap();
+        let object_type = Command::new("git")
+            .args([
+                "-C",
+                dir.path().to_str().unwrap(),
+                "cat-file",
+                "-t",
+                "1.0.0",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&object_type.stdout).trim(), "tag");
+
+        let next = commit_file(dir.path(), "a.txt", "b", "feat: add export");
+        let suggestion = suggest_version(dir.path(), &next).unwrap();
+        assert_eq!(suggestion.version, "1.1.0");
+        assert_eq!(suggestion.previous_tag.as_deref(), Some("1.0.0"));
     }
 
     #[test]

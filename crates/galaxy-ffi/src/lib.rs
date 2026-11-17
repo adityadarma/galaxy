@@ -5488,6 +5488,13 @@ pub struct GitBranchInfo {
     pub remote: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct GitVersionSuggestionInfo {
+    pub version: String,
+    pub previous_tag: Option<String>,
+    pub commit_count: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum GitRefKindInfo {
     Head,
@@ -6204,6 +6211,15 @@ impl Workspace {
         Ok(())
     }
 
+    pub fn git_suggest_version(&self, hash: String) -> Result<GitVersionSuggestionInfo, CoreError> {
+        let suggestion = galaxy_core::git::suggest_version(self.inner.root(), &hash)?;
+        Ok(GitVersionSuggestionInfo {
+            version: suggestion.version,
+            previous_tag: suggestion.previous_tag,
+            commit_count: suggestion.commit_count,
+        })
+    }
+
     pub fn git_cherry_pick(&self, hash: String) -> Result<(), CoreError> {
         galaxy_core::git::cherry_pick(self.inner.root(), &hash)?;
         Ok(())
@@ -6306,6 +6322,16 @@ impl Workspace {
 
     pub fn git_create_tag(&self, name: String, hash: String) -> Result<(), CoreError> {
         galaxy_core::git::create_tag(self.inner.root(), &name, &hash)?;
+        Ok(())
+    }
+
+    pub fn git_create_annotated_tag(
+        &self,
+        name: String,
+        hash: String,
+        message: String,
+    ) -> Result<(), CoreError> {
+        galaxy_core::git::create_annotated_tag(self.inner.root(), &name, &hash, &message)?;
         Ok(())
     }
 
