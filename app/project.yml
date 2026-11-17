@@ -54,7 +54,10 @@ targets:
     sources:
       - path: Galaxy/Sources
       - path: Galaxy/Resources
-      - path: Galaxy/Generated
+      # Name the file, not the folder: on a fresh checkout (CI) the folder
+      # does not exist until the Build Rust Core phase runs, and XcodeGen
+      # skips a missing optional folder but keeps a missing optional file.
+      - path: Galaxy/Generated/galaxy_ffi.swift
         optional: true
     settings:
       base:
