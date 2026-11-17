@@ -329,19 +329,26 @@ mod tests {
             let _ = tx.send(b);
         })
         .unwrap();
-        // Let FSEvents start the stream before the test touches files.
-        thread::sleep(Duration::from_millis(200));
+        // Let FSEvents start the stream before the test touches files. CI
+        // VMs start it slowly, so wait longer than a local run needs, then
+        // drop late events from the test's own setup.
+        thread::sleep(STARTUP);
+        while rx.try_recv().is_ok() {}
         (w, rx)
     }
 
-    /// Collects batches until `done` holds or 5 s pass.
+    /// How long FSEvents gets to start, and to deliver a test's events.
+    const STARTUP: Duration = Duration::from_secs(1);
+    const DELIVERY: Duration = Duration::from_secs(15);
+
+    /// Collects batches until `done` holds or `DELIVERY` passes.
     fn collect(
         rx: &Receiver<ChangeBatch>,
         done: impl Fn(&BTreeSet<String>) -> bool,
     ) -> (BTreeSet<String>, usize) {
         let mut seen = BTreeSet::new();
         let mut batches = 0;
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + DELIVERY;
         while !done(&seen) {
             let left = deadline.saturating_duration_since(Instant::now());
             match rx.recv_timeout(left) {
@@ -377,7 +384,7 @@ mod tests {
         let (_w, rx) = start(dir.path());
 
         fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
-        let batch = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let batch = rx.recv_timeout(DELIVERY).unwrap();
         assert!(batch.git_changed);
         assert!(batch.paths.is_empty());
         assert!(!batch.rescan);
