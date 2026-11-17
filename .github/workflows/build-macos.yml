@@ -1,9 +1,9 @@
 name: Build macOS
 
+# Pushes to master are covered by ci.yml, so this runs only for pull
+# requests and manual runs to avoid duplicate Release builds.
 on:
   pull_request:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:

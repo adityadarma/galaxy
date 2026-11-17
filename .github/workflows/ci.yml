@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
 
 concurrency:
@@ -64,26 +64,26 @@ jobs:
           python3 scripts/bench-compare.py collect \
             --criterion target/criterion --app target/app-metrics.json \
             --out target/bench/current.json
-      # Baseline is the latest result from main. Caches written on main are
+      # Baseline is the latest result from master. Caches written on master are
       # readable from PR branches; the key prefix match picks the newest.
       - name: Restore baseline
-        if: github.ref != 'refs/heads/main'
+        if: github.ref != 'refs/heads/master'
         uses: actions/cache/restore@v4
         with:
           path: target/bench-baseline
           key: bench-baseline-${{ github.sha }}
           restore-keys: bench-baseline-
       - name: Compare against baseline (fail on > 10% regression)
-        if: github.ref != 'refs/heads/main'
+        if: github.ref != 'refs/heads/master'
         run: |
           python3 scripts/bench-compare.py compare \
             target/bench-baseline/current.json target/bench/current.json \
             --threshold 0.10
       - name: Store baseline
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/master'
         run: mkdir -p target/bench-baseline && cp target/bench/current.json target/bench-baseline/
       - name: Save baseline
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/master'
         uses: actions/cache/save@v4
         with:
           path: target/bench-baseline
