@@ -451,6 +451,14 @@ extension MainWindowController {
         typealias Row = EditorView.InlineGitHunk.Row
         let hunk = hunks[index]
         let base = (try? workspace.gitBaseDocument(relPath: path)) ?? nil
+        // The HEAD document is new, and its parser runs in the background.
+        // Reading styles at once gives removed rows none on a slow machine
+        // (seen on CI), so wait briefly for the first tree. This runs off
+        // the main thread.
+        if let base, base.syntaxActive() {
+            let deadline = Date().addingTimeInterval(1)
+            while !base.pollSyntax(), Date() < deadline { usleep(5_000) }
+        }
         let oldAll = gitLines(base?.text() ?? "")
         let newAll = gitLines(text)
         let oldStart = Int(hunk.oldStart), oldLen = Int(hunk.oldLen)

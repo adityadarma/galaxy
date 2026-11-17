@@ -239,8 +239,11 @@ final class DiffTabTests: XCTestCase {
             XCTAssertEqual(c.secondaryEditorView.gutterShift, x, accuracy: 0.5)
             XCTAssertEqual(c.editorView.gutterShift, x, accuracy: 0.5)
             XCTAssertEqual(l, r, "scrolled \(x): left \(l) vs right \(r)")
-            // Scrolled past the numbers the line is gone with the text.
-            XCTAssertEqual(l.filter { $0 != l[0] }.count, x == 0 ? 1 : 0, "scrolled \(x): \(l)")
+            // Scrolled past the numbers the line is gone with the text. Only
+            // samples up to the edge count: right of it, scrolled text can
+            // put a glyph under the sample, depending on the font metrics.
+            let gutterSide = l.prefix(7)
+            XCTAssertEqual(gutterSide.filter { $0 != l[0] }.count, x == 0 ? 1 : 0, "scrolled \(x): \(l)")
         }
     }
 
