@@ -14,7 +14,29 @@ permissions:
   contents: write
 
 jobs:
+  # Tests run in CI on master. A release only builds, and only for a commit
+  # whose master CI run already passed.
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Require a green master CI run for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PASSED="$(gh run list -R "$GITHUB_REPOSITORY" --workflow ci.yml \
+            --branch master --event push --commit "$GITHUB_SHA" \
+            --status success --json databaseId --jq 'length')"
+          if [[ "$PASSED" -lt 1 ]]; then
+            echo "No successful CI run on master for $GITHUB_SHA." >&2
+            echo "Release a commit on master after its CI run has passed." >&2
+            exit 1
+          fi
+
   build:
+    needs: verify
     strategy:
       fail-fast: false
       matrix:
@@ -49,9 +71,6 @@ jobs:
           shared-key: release-${{ matrix.arch }}
       - name: Install XcodeGen
         run: brew install xcodegen
-      - name: Test Rust core
-        run: cargo test --workspace --locked
-
       - name: Import signing certificate
         timeout-minutes: 5
         env:
@@ -76,7 +95,7 @@ jobs:
           security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
           IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" | awk -F'"' '/Galaxy Self-Signed/ { print $1 }' | awk '{ print $2 }')"
           [[ -n "$IDENTITY" ]] || { echo "Galaxy signing identity was not imported." >&2; exit 1; }
-          echo "identity=$IDENTITY" >> "$GITHUB_ENV"
+          echo "IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
           rm -f "$RUNNER_TEMP/galaxy-signing.p12"
 
       - name: Build signed app
