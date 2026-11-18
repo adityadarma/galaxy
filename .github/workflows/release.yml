@@ -172,7 +172,9 @@ jobs:
           RAW="${INPUT_VERSION:-$GITHUB_REF_NAME}"
           VERSION="${RAW#v}"
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Invalid version: $RAW" >&2; exit 1; }
+          # This job has no checkout, so gh cannot infer the repository.
           gh release create "v$VERSION" release/* \
+            --repo "$GITHUB_REPOSITORY" \
             --title "Galaxy $VERSION" \
             --generate-notes \
             --target "$GITHUB_SHA"
