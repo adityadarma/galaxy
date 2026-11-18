@@ -51,6 +51,9 @@ jobs:
           # grep without matches from failing it.
           set -o pipefail
           mkdir -p target
+          # xcodebuild refuses an existing -resultBundlePath, and rust-cache
+          # can restore one inside target/ from an earlier run.
+          rm -rf target/GalaxyTests.xcresult target/xcodebuild.log
           xcodebuild -project app/Galaxy.xcodeproj -scheme Galaxy \
             -configuration Debug -derivedDataPath app/build-test \
             -resultBundlePath target/GalaxyTests.xcresult test 2>&1 \
