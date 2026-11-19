@@ -114,6 +114,9 @@ jobs:
             CODE_SIGN_IDENTITY="$IDENTITY" CODE_SIGN_STYLE=Manual \
             -derivedDataPath "app/build-release-${{ matrix.arch }}" build -quiet
           APP="app/build-release-${{ matrix.arch }}/Build/Products/Release/Galaxy.app"
+          PLIST="$APP/Contents/Info.plist"
+          [[ "$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$PLIST")" == "$VERSION" ]] || { echo "App version does not match release tag: $VERSION" >&2; exit 1; }
+          [[ "$(/usr/libexec/PlistBuddy -c 'Print CFBundleVersion' "$PLIST")" == "$BUILD" ]] || { echo "App build number does not match GitHub run: $BUILD" >&2; exit 1; }
           # Self-signed certificates do not use a provisioning profile. Sign
           # the completed bundle explicitly, including its embedded framework.
           codesign --deep --force --sign "$IDENTITY" "$APP"
