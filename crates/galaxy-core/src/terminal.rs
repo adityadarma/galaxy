@@ -16,7 +16,7 @@ use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
-use alacritty_terminal::term::{Config, Term, TermMode};
+use alacritty_terminal::term::{Config, Osc52, Term, TermMode};
 use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, StdSyncHandler};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
@@ -27,6 +27,8 @@ const MAX_OUTPUT_BYTES: usize = 256 * 1024;
 pub const SCROLLBACK_LINES: usize = 5_000;
 
 type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
+/// Text a program stored with OSC 52, until the UI takes it.
+type SharedClipboard = Arc<Mutex<Option<String>>>;
 
 pub struct TerminalSession {
     master: Mutex<Box<dyn MasterPty + Send>>,
@@ -34,6 +36,7 @@ pub struct TerminalSession {
     child: Mutex<Box<dyn Child + Send + Sync>>,
     output: Arc<Mutex<Vec<u8>>>,
     grid: Arc<Mutex<Term<PtyListener>>>,
+    clipboard: SharedClipboard,
     version: Arc<AtomicU64>,
     exited: Arc<AtomicBool>,
     shell_name: String,
@@ -41,19 +44,29 @@ pub struct TerminalSession {
 
 /// Sends the terminal's replies (cursor position reports, device
 /// attributes) back to the shell. Prompts such as powerlevel10k wait for
-/// them, so dropping them leaves the prompt half drawn.
+/// them, so dropping them leaves the prompt half drawn. Also keeps the
+/// text of OSC 52 copy requests (opencode, tmux, vim) for the UI.
 #[derive(Clone)]
 struct PtyListener {
     writer: SharedWriter,
+    clipboard: SharedClipboard,
 }
 
 impl EventListener for PtyListener {
     fn send_event(&self, event: Event) {
-        if let Event::PtyWrite(text) = event
-            && let Ok(mut writer) = self.writer.lock()
-        {
-            let _ = writer.write_all(text.as_bytes());
-            let _ = writer.flush();
+        match event {
+            Event::PtyWrite(text) => {
+                if let Ok(mut writer) = self.writer.lock() {
+                    let _ = writer.write_all(text.as_bytes());
+                    let _ = writer.flush();
+                }
+            }
+            Event::ClipboardStore(_, text) => {
+                if let Ok(mut clipboard) = self.clipboard.lock() {
+                    *clipboard = Some(text);
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -315,9 +328,11 @@ impl TerminalSession {
             pair.master.take_writer().map_err(io::Error::other)?,
         ));
         let output = Arc::new(Mutex::new(Vec::new()));
+        let clipboard: SharedClipboard = Arc::new(Mutex::new(None));
         let grid = Arc::new(Mutex::new(Term::new(
             Config {
                 scrolling_history: SCROLLBACK_LINES,
+                osc52: Osc52::OnlyCopy,
                 ..Config::default()
             },
             &TerminalSize {
@@ -326,6 +341,7 @@ impl TerminalSession {
             },
             PtyListener {
                 writer: Arc::clone(&writer),
+                clipboard: Arc::clone(&clipboard),
             },
         )));
         let version = Arc::new(AtomicU64::new(1));
@@ -366,6 +382,7 @@ impl TerminalSession {
             child: Mutex::new(child),
             output,
             grid,
+            clipboard,
             version,
             exited,
             shell_name,
@@ -376,6 +393,11 @@ impl TerminalSession {
     pub fn take_output(&self) -> String {
         let mut output = self.output.lock().unwrap();
         String::from_utf8_lossy(&std::mem::take(&mut *output)).into_owned()
+    }
+
+    /// Text the program copied with OSC 52 since the last call.
+    pub fn take_clipboard(&self) -> Option<String> {
+        self.clipboard.lock().unwrap().take()
     }
 
     /// Typing jumps back to the live output, like other terminals.
@@ -610,6 +632,25 @@ mod tests {
             .unwrap();
         let off = wait_for(&session, |s| !s.mouse_drag);
         assert!(!off.mouse_drag && !off.sgr_mouse && !off.alt_screen);
+    }
+
+    #[test]
+    fn osc52_copy_is_captured() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = TerminalSession::spawn(dir.path(), 80, 24).unwrap();
+        assert_eq!(session.take_clipboard(), None);
+        // "galaxy copy" in base64.
+        session
+            .write(b"printf '\\033]52;c;Z2FsYXh5IGNvcHk=\\007'\n")
+            .unwrap();
+        let deadline = Instant::now() + SHELL_DEADLINE;
+        let mut copied = None;
+        while copied.is_none() && Instant::now() < deadline {
+            copied = session.take_clipboard();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(copied.as_deref(), Some("galaxy copy"));
+        assert_eq!(session.take_clipboard(), None, "taken once");
     }
 
     #[test]

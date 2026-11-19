@@ -37,6 +37,18 @@ final class TerminalView: NSView {
     private var heldMouseButton: Int?
     private var lastMouseCell: (column: Int, row: Int)?
 
+    /// A grid position on the visible screen, 0-based.
+    struct GridPoint: Equatable {
+        var row: Int
+        var column: Int
+    }
+    /// Text selected by dragging (programs without mouse tracking, or with
+    /// Shift held). Cleared on typing, scrolling and a new click.
+    private var selection: (anchor: GridPoint, head: GridPoint)? {
+        didSet { needsDisplay = true }
+    }
+    private var isSelecting = false
+
     private var settings = TerminalSettings.current
     private var padding: NSEdgeInsets { settings.padding }
 
@@ -94,6 +106,7 @@ final class TerminalView: NSView {
         handle = nil
         screen = nil
         lastSize = (0, 0)
+        selection = nil
         needsDisplay = true
     }
 
@@ -125,8 +138,14 @@ final class TerminalView: NSView {
     private func poll() {
         guard let handle else { return }
         _ = handle.pollOutput()
+        // OSC 52: programs such as opencode, tmux and vim copy this way.
+        if let copied = handle.takeClipboard(), !copied.isEmpty {
+            pasteboard.clearContents()
+            pasteboard.setString(copied, forType: .string)
+        }
         if screen?.version != handle.version() {
             let next = handle.screen()
+            if next.displayOffset != screen?.displayOffset { selection = nil }
             if next != screen {
                 screen = next
                 cursorVisible = true
@@ -284,19 +303,54 @@ final class TerminalView: NSView {
     }
 
     override func mouseDown(with event: NSEvent) {
-        if reportPress(event) { return }
+        if reportPress(event) {
+            // Track the same drag for Command-C without taking mouse input away
+            // from full-screen programs such as opencode.
+            let cell = selectionPoint(for: event)
+            selection = (cell, cell)
+            return
+        }
+        guard let screen else { return }
         let point = convert(event.locationInWindow, from: nil)
         let wantsLink = event.clickCount == 2 || event.modifierFlags.contains(.command)
-        guard wantsLink, let screen else { return }
         let row = Int((point.y - padding.top) / lineHeight)
-        guard screen.lines.indices.contains(row) else { return }
-        if let link = Self.fileLink(in: screen.lines[row].text) {
+        if wantsLink, screen.lines.indices.contains(row),
+           let link = Self.fileLink(in: screen.lines[row].text) {
             onOpenLink?(link.path, link.line, link.column)
+            return
+        }
+        let cell = selectionPoint(for: event)
+        selection = (cell, cell)
+        isSelecting = true
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        _ = reportRelease(event)
+        isSelecting = false
+        guard let selection else { return }
+        if selection.anchor == selection.head {
+            self.selection = nil
+        } else {
+            copy(nil)
+            self.selection = nil
         }
     }
 
-    override func mouseUp(with event: NSEvent) { _ = reportRelease(event) }
-    override func mouseDragged(with event: NSEvent) { reportDrag(event) }
+    override func mouseDragged(with event: NSEvent) {
+        if isSelecting, let anchor = selection?.anchor {
+            selection = (anchor, selectionPoint(for: event))
+            return
+        }
+        if heldMouseButton != nil, forwardsMouse(event), let anchor = selection?.anchor {
+            selection = (anchor, selectionPoint(for: event))
+        }
+        reportDrag(event)
+    }
+
+    private func selectionPoint(for event: NSEvent) -> GridPoint {
+        let cell = gridCell(for: event)
+        return GridPoint(row: cell.row - 1, column: cell.column - 1)
+    }
 
     override func otherMouseDown(with event: NSEvent) {
         if !reportPress(event) { super.otherMouseDown(with: event) }
@@ -362,12 +416,54 @@ final class TerminalView: NSView {
 
     // MARK: Edit menu
 
+    /// Copies the dragged selection, including drags forwarded to full-screen
+    /// programs, or the visible output if nothing was selected.
     @objc func copy(_ sender: Any?) {
         guard let screen else { return }
-        var lines = screen.lines.map(\.text)
-        while lines.last?.isEmpty == true { lines.removeLast() }
+        let text = Self.textToCopy(in: screen.lines, selection: selection)
+        guard !text.isEmpty else { return }
         pasteboard.clearContents()
-        pasteboard.setString(lines.joined(separator: "\n"), forType: .string)
+        pasteboard.setString(text, forType: .string)
+    }
+
+    static func textToCopy(in lines: [TerminalLineInfo], selection: (anchor: GridPoint, head: GridPoint)?) -> String {
+        if let selection {
+            return selectedText(in: lines, from: selection.anchor, to: selection.head)
+        }
+        var visible = lines.map(\.text)
+        while visible.last?.isEmpty == true { visible.removeLast() }
+        return visible.joined(separator: "\n")
+    }
+
+    /// Text between two grid points (either order), cell by cell, so wide
+    /// characters and gaps between runs keep their columns. Trailing blanks
+    /// on each line are dropped.
+    static func selectedText(in lines: [TerminalLineInfo], from a: GridPoint, to b: GridPoint) -> String {
+        let (start, end) = (a.row, a.column) <= (b.row, b.column) ? (a, b) : (b, a)
+        var rows: [String] = []
+        for row in max(0, start.row)...max(0, min(end.row, lines.count - 1)) where lines.indices.contains(row) {
+            let low = row == start.row ? start.column : 0
+            let high = row == end.row ? end.column : Int.max
+            var text = ""
+            var column = 0
+            func pad(to target: Int) {
+                while column < target {
+                    if column >= low && column <= high { text.append(" ") }
+                    column += 1
+                }
+            }
+            for run in lines[row].runs {
+                pad(to: Int(run.column))
+                for character in run.text {
+                    if column >= low && column <= high { text.append(character) }
+                    column += character.unicodeScalars.first.map(cellCount) ?? 1
+                }
+            }
+            while text.last == " " { text.removeLast() }
+            rows.append(text)
+        }
+        while rows.last?.isEmpty == true { rows.removeLast() }
+        return rows.joined(separator: "\n")
     }
 
     @objc func paste(_ sender: Any?) {
@@ -377,7 +473,11 @@ final class TerminalView: NSView {
         try? handle.write(input: text)
     }
 
-    @objc override func selectAll(_ sender: Any?) { copy(sender) }
+    @objc override func selectAll(_ sender: Any?) {
+        guard let screen, !screen.lines.isEmpty else { return }
+        selection = (GridPoint(row: 0, column: 0),
+                     GridPoint(row: screen.lines.count - 1, column: Int(screen.columns) - 1))
+    }
 
     /// Clears the screen and scrollback (⌘K in Terminal.app and VS Code).
     @objc func clearTerminal(_ sender: Any?) {
@@ -407,6 +507,7 @@ final class TerminalView: NSView {
         guard !bytes.isEmpty else { return }
         cursorVisible = true
         blinkTick = 0
+        selection = nil
         try? handle.write(input: bytes)
         poll()
     }
@@ -506,8 +607,23 @@ final class TerminalView: NSView {
                 drawRun(run, in: rect, color: colors.foreground, context: context)
             }
         }
+        drawSelection(screen)
         drawCursor(screen, palette)
         drawScrollIndicator(screen, palette)
+    }
+
+    private func drawSelection(_ screen: TerminalScreenInfo) {
+        guard let selection else { return }
+        let (start, end) = (selection.anchor.row, selection.anchor.column) <= (selection.head.row, selection.head.column)
+            ? (selection.anchor, selection.head) : (selection.head, selection.anchor)
+        NSColor.selectedTextBackgroundColor.withAlphaComponent(0.45).setFill()
+        let last = Int(screen.columns) - 1
+        for row in max(0, start.row)...min(end.row, screen.lines.count - 1) {
+            let low = row == start.row ? start.column : 0
+            let high = row == end.row ? end.column : last
+            guard high >= low else { continue }
+            cellRect(row: row, column: low, width: high - low + 1).fill()
+        }
     }
 
     private func drawRun(_ run: TerminalRunInfo, in rect: NSRect, color: NSColor, context: CGContext) {

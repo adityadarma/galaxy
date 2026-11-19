@@ -5955,6 +5955,11 @@ impl TerminalHandle {
         }
     }
 
+    /// Text the program copied with OSC 52 since the last call.
+    pub fn take_clipboard(&self) -> Option<String> {
+        self.session.take_clipboard()
+    }
+
     pub fn write(&self, input: String) -> Result<(), CoreError> {
         self.session
             .write(input.as_bytes())

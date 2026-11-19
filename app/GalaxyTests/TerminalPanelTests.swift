@@ -54,6 +54,26 @@ final class TerminalPanelTests: XCTestCase {
         XCTAssertEqual(TerminalView.cellCount("😀"), 2)
     }
 
+    func testSelectedTextCopiesOnlyTheSelection() {
+        func line(_ runs: [(UInt16, String)]) -> TerminalLineInfo {
+            TerminalLineInfo(text: runs.map(\.1).joined(), runs: runs.map {
+                TerminalRunInfo(column: $0.0, text: $0.1, foreground: .default, background: .default,
+                                bold: false, italic: false, dim: false, underline: false,
+                                strikeout: false, inverse: false)
+            })
+        }
+        let lines = [line([(0, "hello world")]), line([(0, "ab"), (4, "cd")]), line([])]
+        typealias P = TerminalView.GridPoint
+        XCTAssertEqual(TerminalView.selectedText(in: lines, from: P(row: 0, column: 6), to: P(row: 0, column: 10)), "world")
+        XCTAssertEqual(TerminalView.selectedText(in: lines, from: P(row: 0, column: 6), to: P(row: 1, column: 5)), "world\nab  cd")
+        XCTAssertEqual(TerminalView.selectedText(in: lines, from: P(row: 1, column: 5), to: P(row: 0, column: 6)), "world\nab  cd",
+                       "drag direction does not matter")
+        XCTAssertEqual(TerminalView.selectedText(in: lines, from: P(row: 2, column: 0), to: P(row: 2, column: 5)), "")
+        XCTAssertEqual(TerminalView.textToCopy(in: lines, selection: (P(row: 0, column: 6), P(row: 0, column: 10))), "world")
+        XCTAssertEqual(TerminalView.textToCopy(in: lines, selection: nil), "hello world\nabcd",
+                       "Command-C without a native selection still copies visible terminal output")
+    }
+
     func testPaletteFollowsAnsiAndInverse() {
         let palette = TerminalPalette(appearance: NSAppearance(named: .darkAqua)!)
         let run = TerminalRunInfo(column: 0, text: "x", foreground: .indexed(index: 1), background: .default,
