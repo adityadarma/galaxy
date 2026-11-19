@@ -46,6 +46,8 @@ targets:
     info:
       path: Galaxy/Resources/Info.plist
       properties:
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         SUFeedURL: $(SPARKLE_FEED_URL)
         SUEnableAutomaticChecks: true
         SURequireSignedFeed: true
