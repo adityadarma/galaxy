@@ -48,24 +48,41 @@ pub fn complete(language: Language, text: &str, line: u32, column: u32) -> Vec<C
 
     let mut items = Vec::new();
     let mut seen = HashSet::new();
-    collect(
-        root, root, byte, prefix, language, text, &mut seen, &mut items,
-    );
+    let context = CollectContext {
+        root,
+        byte,
+        prefix,
+        language,
+        text,
+    };
+    collect(root, &context, &mut seen, &mut items);
     items.sort_by(|a, b| a.sort.cmp(&b.sort));
     items.truncate(200);
     items
 }
 
+#[derive(Clone, Copy)]
+struct CollectContext<'tree, 'text> {
+    root: Node<'tree>,
+    byte: usize,
+    prefix: &'text str,
+    language: Language,
+    text: &'text str,
+}
+
 fn collect(
     node: Node<'_>,
-    root: Node<'_>,
-    byte: usize,
-    prefix: &str,
-    language: Language,
-    text: &str,
+    context: &CollectContext<'_, '_>,
     seen: &mut HashSet<String>,
     items: &mut Vec<Completion>,
 ) {
+    let CollectContext {
+        root,
+        byte,
+        prefix,
+        language,
+        text,
+    } = *context;
     if node.start_byte() > byte {
         return;
     }
@@ -157,10 +174,10 @@ fn collect(
             }
         }
         (Language::Swift, "function_declaration") => {
-            if let Some(name) = node.child_by_field_name("name") {
-                if name.kind() == "simple_identifier" {
-                    add(name, ItemKind::Function);
-                }
+            if let Some(name) = node.child_by_field_name("name")
+                && name.kind() == "simple_identifier"
+            {
+                add(name, ItemKind::Function);
             }
         }
         (Language::Swift, "property_declaration") => {
@@ -172,10 +189,10 @@ fn collect(
                 for child in pattern.named_children(&mut cursor) {
                     if child.kind() == "simple_identifier" {
                         add(child, ItemKind::Variable);
-                    } else if child.kind() == "pattern" {
-                        if let Some(name) = child.child_by_field_name("bound_identifier") {
-                            add(name, ItemKind::Variable);
-                        }
+                    } else if child.kind() == "pattern"
+                        && let Some(name) = child.child_by_field_name("bound_identifier")
+                    {
+                        add(name, ItemKind::Variable);
                     }
                 }
             }
@@ -196,7 +213,7 @@ fn collect(
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect(child, root, byte, prefix, language, text, seen, items);
+        collect(child, context, seen, items);
     }
 }
 
