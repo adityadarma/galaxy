@@ -113,23 +113,27 @@ fn pointer_receiver_methods_are_not_hidden() {
 }
 
 #[test]
-fn member_prefix_is_case_insensitive() {
-    let (_, found) = run(&[], &user("\tu := User{}\n\tu.na|"));
+fn member_prefix_is_case_sensitive() {
+    let (_, found) = run(&[], &user("\tu := User{}\n\tu.Na|"));
     assert_eq!(labels(&found).first(), Some(&"Name"));
     assert!(!has(&found, "Greet"));
+    let (_, found) = run(&[], &user("\tu := User{}\n\tu.na|"));
+    assert!(!has(&found, "Name"));
 }
 
 #[test]
-fn member_fuzzy_after_prefix() {
+fn member_matches_only_prefix() {
     let decls = "type T struct {\n\tWidth int\n\tId    int\n\tTitle string\n\tZed   int\n}\n";
     let (_, found) = run(&[], &body("", decls, "\tt := T{}\n\tt.i|"));
-    assert_eq!(labels(&found), ["Id", "Title", "Width"]);
+    assert!(!has(&found, "Id"));
+    assert!(!has(&found, "Title"));
+    assert!(!has(&found, "Width"));
 }
 
 #[test]
-fn fuzzy_subsequence_matches() {
+fn subsequence_does_not_match() {
     let (_, found) = run(&[], &user("\tu := User{}\n\tu.gt|"));
-    assert_eq!(labels(&found), ["Greet"]);
+    assert!(!has(&found, "Greet"));
 }
 
 #[test]
@@ -380,10 +384,11 @@ fn tiers_order_locals_package_imports_universe_keywords() {
 }
 
 #[test]
-fn exact_prefix_before_fuzzy_across_tiers() {
+fn non_prefix_is_excluded_across_tiers() {
     let decls = "var xnet = 1\nvar network = 2\n";
     let (_, found) = run(&[], &body("", decls, "\tnet|"));
-    assert!(pos(&found, "network") < pos(&found, "xnet"));
+    assert!(has(&found, "network"));
+    assert!(!has(&found, "xnet"));
 }
 
 #[test]

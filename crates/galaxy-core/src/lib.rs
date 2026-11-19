@@ -8,6 +8,7 @@ pub mod analysis;
 pub mod change;
 pub mod clipboard;
 pub mod commands;
+pub mod completion;
 pub mod composition;
 pub mod dap;
 pub mod dart;

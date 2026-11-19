@@ -120,81 +120,20 @@ final class CompletionPopup: NSView, NSTableViewDataSource, NSTableViewDelegate 
 
     // MARK: Ranking
 
-    /// Items that fit `query`, best first. The first typed letter has to
-    /// start a word of the label (`isset`, `getUser`, `app.name`, `$order`),
-    /// or the query has to appear as one run inside it. Later letters may
-    /// then be spread out, but score lower the further apart they are. A
-    /// label whose words never start with the first letter and does not
-    /// contain the query is dropped. Equal scores keep the order they came in.
+    /// All languages match a case-sensitive prefix; keep the engine's order.
+    /// Variables also match after `$` when the editor query omits it.
     static func rank(_ items: [CompletionInfo], query: String) -> [(item: CompletionInfo, matched: [Int])] {
-        let q = Array(query.lowercased())
-        guard !q.isEmpty else {
-            return items.prefix(maxResults).map { ($0, []) }
-        }
-        var scored: [(index: Int, score: Int, matched: [Int])] = []
-        for (index, item) in items.enumerated() {
-            if let hit = match(label: item.label, query: q) {
-                scored.append((index, hit.score, hit.matched))
+        items.lazy.compactMap { item -> (item: CompletionInfo, matched: [Int])? in
+            let offset: Int
+            if item.label.hasPrefix(query) {
+                offset = 0
+            } else if item.label.hasPrefix("$"), item.label.dropFirst().hasPrefix(query) {
+                offset = 1
+            } else {
+                return nil
             }
-        }
-        scored.sort { $0.score != $1.score ? $0.score > $1.score : $0.index < $1.index }
-        return scored.prefix(maxResults).map { (items[$0.index], $0.matched) }
-    }
-
-    static func match(label: String, query q: [Character]) -> (score: Int, matched: [Int])? {
-        let chars = Array(label)
-        let lower = Array(label.lowercased())
-        // Lowercasing can change the length (`İ`); skip such labels' highlights.
-        guard lower.count == chars.count, !q.isEmpty, q.count <= chars.count else { return nil }
-        let boundary = chars.indices.map { i -> Bool in
-            if i == 0 { return true }
-            let previous = chars[i - 1], current = chars[i]
-            if !previous.isLetter && !previous.isNumber { return true }
-            if current.isUppercase && previous.isLowercase { return true }
-            return current.isNumber && !previous.isNumber
-        }
-        var best: (score: Int, matched: [Int])?
-        var tried = 0
-        for start in chars.indices where boundary[start] && lower[start] == q[0] {
-            tried += 1
-            if tried > 8 { break }
-            var matched = [start]
-            var score = 0
-            var position = start
-            var failed = false
-            for character in q.dropFirst() {
-                var next: Int?
-                if position + 1 < chars.count, lower[position + 1] == character {
-                    next = position + 1
-                } else {
-                    next = ((position + 1)..<chars.count).first { boundary[$0] && lower[$0] == character }
-                        ?? ((position + 1)..<chars.count).first { lower[$0] == character }
-                }
-                guard let found = next else { failed = true; break }
-                score -= found - position - 1
-                matched.append(found)
-                position = found
-            }
-            if failed { continue }
-            for (offset, index) in matched.enumerated() {
-                score += 10
-                if boundary[index] { score += 12 }
-                if offset > 0, matched[offset - 1] + 1 == index { score += 15 }
-            }
-            // A match at the very start (past a `$`) beats one further in.
-            let lead = chars.first == "$" ? 1 : 0
-            if start == 0 || start == lead { score += 60 }
-            if chars.count == q.count { score += 120 }
-            score -= (chars.count - q.count) / 3
-            if best == nil || score > best!.score { best = (score, matched) }
-        }
-        if best != nil { return best }
-        // The query as one run inside the label.
-        if let range = lower.firstRange(of: q) {
-            let matched = Array(range)
-            return (4 * q.count - range.lowerBound - (chars.count - q.count) / 3, matched)
-        }
-        return nil
+            return (item, Array(offset..<(offset + query.count)))
+        }.prefix(maxResults).map { $0 }
     }
 
     // MARK: Selection and keys

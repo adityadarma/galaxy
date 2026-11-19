@@ -11,27 +11,27 @@ final class CompletionPopupTests: XCTestCase {
         CompletionPopup.rank(items, query: query).map(\.item.label)
     }
 
-    func testExactAndPrefixMatchesComeBeforeScatteredLetters() {
+    func testOnlyCaseSensitivePrefixesMatchInEveryLanguage() {
         let items = [
             item("AccessPermissionSetting", detail: "Google\\Service"),
             item("CommissionChargeTo", detail: "App\\Enums"),
             item("isset"),
             item("issetValue"),
+            item("ISSET"),
         ]
-        let ranked = labels(items, "isset")
-        XCTAssertEqual(ranked.first, "isset")
-        XCTAssertEqual(ranked, ["isset", "issetValue"])
+        XCTAssertEqual(labels(items, "isset"), ["isset", "issetValue"])
+        XCTAssertEqual(labels(items, "ISSET"), ["ISSET"])
     }
 
-    func testCamelCaseInitialsMatch() {
+    func testCamelCaseInitialsDoNotMatch() {
         let items = [item("getUserName"), item("gutter"), item("unrelated")]
-        XCTAssertEqual(labels(items, "gun"), ["getUserName"])
+        XCTAssertTrue(labels(items, "gun").isEmpty)
     }
 
     func testVariablesMatchPastTheDollar() {
         let items = [item("$order"), item("$other"), item("border")]
         let ranked = labels(items, "or")
-        XCTAssertEqual(ranked.first, "$order")
+        XCTAssertEqual(ranked, ["$order"])
     }
 
     func testDottedKeysMatchAtWordStarts() {
@@ -44,9 +44,12 @@ final class CompletionPopupTests: XCTestCase {
         XCTAssertEqual(labels(items, ""), ["b", "a", "c"])
     }
 
-    func testMatchedIndexesPointAtTheTypedLetters() throws {
-        let hit = try XCTUnwrap(CompletionPopup.match(label: "getUserName", query: Array("gun")))
-        XCTAssertEqual(hit.matched, [0, 3, 7])
+    func testSuggestionsRequireCaseSensitivePrefix() {
+        let items = [item("log"), item("Log"), item("logger"), item("AuditLog"), item("LogicalAnd"), item("$LogEntry")]
+        let ranked = CompletionPopup.rank(items, query: "Log")
+        XCTAssertEqual(ranked.map(\.item.label), ["Log", "$LogEntry"])
+        XCTAssertEqual(ranked.map(\.matched), [[0, 1, 2], [1, 2, 3]])
+        XCTAssertEqual(labels(items, "log"), ["log", "logger"])
     }
 
     func testHeightFollowsTheNumberOfRows() {

@@ -110,7 +110,7 @@ extension EditorView {
     }
 
     nonisolated override func mouseDown(with event: NSEvent) {
-        onAppKitMainThread { handleMouseDown(with: event) }
+        onAppKitMainThread(with: event) { handleMouseDown(with: $0) }
     }
 
     private func handleMouseDown(with event: NSEvent) {

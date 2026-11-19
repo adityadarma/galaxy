@@ -123,6 +123,36 @@ fn filters_by_typed_prefix() {
 }
 
 #[test]
+fn completion_uses_case_sensitive_prefix_not_subsequence() {
+    let project = Project::new();
+    let source = format!("{HEAD}        $user->na|\n    }}\n}}\n");
+    assert_eq!(labels(&project.complete(&source)), ["name"]);
+    assert!(
+        project
+            .complete(&format!("{HEAD}        $user->Na|\n    }}\n}}\n"))
+            .is_empty()
+    );
+    assert!(
+        project
+            .complete(&format!("{HEAD}        $user->ame|\n    }}\n}}\n"))
+            .is_empty()
+    );
+
+    let classes = project.complete(&format!("{HEAD}        new User|\n    }}\n}}\n"));
+    assert!(labels(&classes).contains(&"User"));
+    assert!(
+        !labels(&project.complete(&format!("{HEAD}        new user|\n    }}\n}}\n")))
+            .contains(&"User")
+    );
+
+    let functions = project.complete(&format!("{HEAD}        log|\n    }}\n}}\n"));
+    assert!(labels(&functions).contains(&"log"));
+    assert!(
+        !labels(&project.complete(&format!("{HEAD}        Log|\n    }}\n}}\n"))).contains(&"log")
+    );
+}
+
+#[test]
 fn definition_of_trait_method_call_points_to_trait() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("app/Traits")).unwrap();

@@ -1007,7 +1007,6 @@ enum FileGlyph {
         case "pdf": (nil, "doc.richtext", .systemRed)
         case "zip", "tar", "gz", "tgz", "bz2", "xz", "rar", "7z", "jar", "war": (nil, "doc.zipper", .secondaryLabelColor)
         case "ttf", "otf", "woff", "woff2": (nil, "textformat", .secondaryLabelColor)
-        case "dockerfile": ("docker", "shippingbox", .labelColor)
         case "go": ("go", "doc", .labelColor)
         case "vue": ("vue", "v.square.fill", .labelColor)
         case "svelte": ("svelte", "s.square.fill", .labelColor)

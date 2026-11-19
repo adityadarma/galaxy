@@ -37,16 +37,14 @@ guard let app = appURL() else {
     exit(1)
 }
 
-let done = DispatchSemaphore(value: 0)
-var failure: Error?
 let configuration = NSWorkspace.OpenConfiguration()
 configuration.activates = true
 NSWorkspace.shared.open([url], withApplicationAt: app, configuration: configuration) { _, error in
-    failure = error
-    done.signal()
+    if let error {
+        FileHandle.standardError.write(Data("galaxy: could not open \(url.path): \(error.localizedDescription)\n".utf8))
+        exit(1)
+    }
+    exit(0)
 }
-done.wait()
-if let failure {
-    FileHandle.standardError.write(Data("galaxy: could not open \(url.path): \(failure.localizedDescription)\n".utf8))
-    exit(1)
-}
+// Keep the main queue available until NSWorkspace finishes opening the URL.
+dispatchMain()

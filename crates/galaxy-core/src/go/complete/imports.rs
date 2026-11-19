@@ -47,7 +47,7 @@ pub(super) fn items(cx: &mut Cx<'_>, from: usize) -> Vec<Item> {
             if imported.contains(p) || p.split('/').any(|s| s == "internal" || s == "vendor") {
                 continue;
             }
-            if let Some(rank) = match_rank(p, &typed, false) {
+            if let Some(rank) = match_rank(p, &typed) {
                 found.push((rank, p.len(), p.clone()));
             }
         }

@@ -21,6 +21,7 @@ use galaxy_core::analysis::{
 use galaxy_core::change::{Change, ChangeSet};
 use galaxy_core::clipboard;
 use galaxy_core::commands::{self, CommandRegistry};
+use galaxy_core::completion::{self, Language as SimpleCompletionLanguage};
 use galaxy_core::dart::{self, DartEngine};
 use galaxy_core::disk::{DiskCheck, DiskStamp};
 use galaxy_core::document::{Document, Encoding, LineEnding};
@@ -1341,6 +1342,30 @@ impl Core {
                 .into_iter()
                 .map(php_completion_item)
                 .collect();
+            let answered = !items.is_empty();
+            if document.revision() == revision {
+                self.analysis
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .set_completion(&uri, items);
+            }
+            return answered;
+        }
+        if matches!(
+            Path::new(&path).extension().and_then(|ext| ext.to_str()),
+            Some("py" | "swift")
+        ) {
+            let language = if path.ends_with(".py") {
+                SimpleCompletionLanguage::Python
+            } else {
+                SimpleCompletionLanguage::Swift
+            };
+            let text = document.lock().editor.doc.text();
+            let items: Vec<LspCompletionItem> =
+                completion::complete(language, &text, line as u32, character as u32)
+                    .into_iter()
+                    .map(php_completion_item)
+                    .collect();
             let answered = !items.is_empty();
             if document.revision() == revision {
                 self.analysis

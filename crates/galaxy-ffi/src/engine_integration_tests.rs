@@ -2,6 +2,31 @@
 
 use super::*;
 
+#[test]
+fn swift_and_python_completion_reach_the_editor() {
+    let dir = tempfile::tempdir().unwrap();
+    for (name, source, expected) in [
+        ("main.py", "def log_info():\n    pass\nlo", "log_info"),
+        ("main.swift", "func logInfo() {}\nlo", "logInfo"),
+    ] {
+        let path = dir.path().join(name);
+        std::fs::write(&path, source).unwrap();
+        let core = Core::new();
+        let document = core
+            .open_document(path.to_string_lossy().into_owned())
+            .unwrap();
+        let line = if name.ends_with(".py") { 2 } else { 1 };
+        assert!(core.request_completion(document.clone(), line, 2));
+        assert!(
+            core.completions(document.clone())
+                .iter()
+                .any(|item| item.label == expected)
+        );
+        assert!(!core.request_completion(document.clone(), line, 0));
+        assert!(core.completions(document).is_empty());
+    }
+}
+
 const GO_MAIN: &str = "package main\n\ntype User struct {\n\tName string\n}\n\nfunc (u *User) Greet(greeting string) string {\n\treturn greeting + u.Name\n}\n\nfunc main() {\n\tu := &User{Name: \"a\"}\n\tu.Greet(\"hi\")\n}\n";
 
 fn go_project() -> (tempfile::TempDir, String) {

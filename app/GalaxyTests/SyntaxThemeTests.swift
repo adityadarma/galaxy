@@ -32,11 +32,12 @@ final class SyntaxThemeTests: XCTestCase {
         let comment = try XCTUnwrap(snapshot.styles.first { $0.scope == "comment" })
         let line = try XCTUnwrap(snapshot.lines.first { $0.line == comment.line })
         let attributed = NSMutableAttributedString(string: line.text, attributes: [.font: EditorView.defaultFont, .foregroundColor: NSColor.textColor])
+        let appearance = try XCTUnwrap(NSAppearance(named: .darkAqua))
         attributed.addAttribute(.foregroundColor,
-                                value: Theme.syntax(comment.scope, appearance: NSAppearance.current),
+                                value: Theme.syntax(comment.scope, appearance: appearance),
                                 range: NSRange(location: Int(comment.start), length: Int(comment.end - comment.start)))
         let color = attributed.attribute(.foregroundColor, at: Int(comment.start), effectiveRange: nil) as? NSColor
-        XCTAssertEqual(color, Theme.syntax("comment", appearance: NSAppearance.current))
+        XCTAssertEqual(color, Theme.syntax("comment", appearance: appearance))
     }
 
     /// Regression: the editor's syntax layout used

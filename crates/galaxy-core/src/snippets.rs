@@ -443,10 +443,9 @@ pub fn matching(path: &str, query: &str) -> Vec<Snippet> {
     if query.is_empty() {
         return Vec::new();
     }
-    let query = query.to_ascii_lowercase();
     snippets_for_path(path)
         .into_iter()
-        .filter(|s| s.prefix.to_ascii_lowercase().starts_with(&query))
+        .filter(|s| s.prefix.starts_with(query))
         .collect()
 }
 

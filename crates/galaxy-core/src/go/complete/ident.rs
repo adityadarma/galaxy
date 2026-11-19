@@ -178,7 +178,6 @@ fn auto_imports(
                 Item::new(&name, ItemKind::Class, 5).detail(format!("import \"{path}\""));
             item.key = format!("{name}\0{index:03}{path}");
             item.extra = extra?;
-            item.strict = true;
             Some(item)
         })
         .collect()

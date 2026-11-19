@@ -135,7 +135,7 @@ final class MarkdownPreviewView: NSView, WKNavigationDelegate {
 
     /// Links open in the default browser; the pane itself never navigates.
     func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction,
-                 decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+                 decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void) {
         guard action.navigationType == .linkActivated else {
             decisionHandler(.allow)
             return

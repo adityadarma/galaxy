@@ -147,24 +147,15 @@ pub(super) fn keyword_items(prefix: &str) -> Vec<Completion> {
         .collect()
 }
 
-/// `0` exact prefix, `1` other match, behind the caller's group digit.
+/// Keep the caller's group order for case-sensitive prefix matches.
 pub(in crate::php) fn rank(prefix: &str, name: &str, group: char) -> String {
-    let lower = name.to_lowercase();
-    let near = if lower.starts_with(&prefix.to_lowercase()) {
-        '0'
-    } else {
-        '1'
-    };
-    format!("{near}{group}{lower}")
+    let near = if name.starts_with(prefix) { '0' } else { '1' };
+    format!("{near}{group}{name}")
 }
 
-/// Letters of `needle` appear in `haystack` in order, ignoring case.
+/// PHP suggestions match the typed text at the start, preserving case.
 pub(in crate::php) fn fuzzy(needle: &str, haystack: &str) -> bool {
-    let mut hay = haystack.chars().flat_map(char::to_lowercase);
-    needle
-        .chars()
-        .flat_map(char::to_lowercase)
-        .all(|n| hay.any(|h| h == n))
+    haystack.starts_with(needle)
 }
 
 /// `use` statement that makes `fqn` usable by its short name, or `None`

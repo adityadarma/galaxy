@@ -38,8 +38,6 @@ struct Item {
     /// 0 members and locals, 1 package level, 2 imports, 3 universe,
     /// 4 keywords, 5 auto-imports.
     pub tier: u8,
-    /// Only a prefix of the typed text matches, never a subsequence.
-    pub strict: bool,
     /// Deduplication key; the label unless several items share it.
     pub key: String,
     pub extra: Vec<Insertion>,
@@ -55,7 +53,6 @@ impl Item {
             snippet: false,
             kind,
             tier,
-            strict: false,
             key: label.to_owned(),
             extra: Vec::new(),
             replace_from: None,
@@ -129,21 +126,9 @@ pub(super) fn column_of(src: &str, byte: usize) -> u32 {
     src[line_start..byte].encode_utf16().count() as u32
 }
 
-/// `Some(0)` for a case-insensitive prefix, `Some(1)` for a subsequence.
-fn match_rank(text: &str, typed: &str, strict: bool) -> Option<u8> {
-    if typed.is_empty() {
-        return Some(0);
-    }
-    let text = text.to_lowercase();
-    let typed = typed.to_lowercase();
-    if text.starts_with(&typed) {
-        return Some(0);
-    }
-    if strict {
-        return None;
-    }
-    let mut chars = text.chars();
-    typed.chars().all(|t| chars.any(|c| c == t)).then_some(1)
+/// Matches the typed text at the start, preserving case.
+fn match_rank(text: &str, typed: &str) -> Option<u8> {
+    text.starts_with(typed).then_some(0)
 }
 
 /// Filters `items` by `typed`, ranks, deduplicates and caps them.
@@ -151,18 +136,13 @@ fn finish(items: Vec<Item>, typed: &str) -> Vec<Completion> {
     let mut seen = HashSet::new();
     let mut out: Vec<Completion> = Vec::new();
     for item in items {
-        let Some(rank) = match_rank(&item.label, typed, item.strict) else {
+        let Some(rank) = match_rank(&item.label, typed) else {
             continue;
         };
         if !seen.insert(item.key.clone()) {
             continue;
         }
-        let sort = format!(
-            "{rank}{}{}{}",
-            item.tier,
-            item.label.to_lowercase(),
-            item.key
-        );
+        let sort = format!("{rank}{}{}{}", item.tier, item.label, item.key);
         out.push(Completion {
             label: item.label,
             detail: item.detail,

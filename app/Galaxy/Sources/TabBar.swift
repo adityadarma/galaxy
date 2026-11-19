@@ -9,6 +9,17 @@ nonisolated func onAppKitMainThread<Result>(_ body: @MainActor () -> Result) -> 
     }
 }
 
+/// Pass the event synchronously on AppKit's main thread instead of capturing a
+/// non-Sendable NSEvent in a closure that crosses actor isolation.
+nonisolated func onAppKitMainThread<Result>(
+    with event: NSEvent, _ body: @MainActor (NSEvent) -> Result
+) -> Result {
+    precondition(Thread.isMainThread)
+    return withoutActuallyEscaping(body) { body in
+        unsafeBitCast(body, to: ((NSEvent) -> Result).self)(event)
+    }
+}
+
 /// One open document (M2-06).
 @MainActor
 final class EditorTab {
@@ -96,7 +107,7 @@ final class EditorTab {
 @MainActor
 final class TabScrollView: NSScrollView {
     nonisolated override func scrollWheel(with event: NSEvent) {
-        onAppKitMainThread { scrollWheelOnMainActor(with: event) }
+        onAppKitMainThread(with: event) { scrollWheelOnMainActor(with: $0) }
     }
 
     private func scrollWheelOnMainActor(with event: NSEvent) {
@@ -218,7 +229,6 @@ final class TabBar: NSView {
         scrollView.verticalScrollElasticity = .none
         scrollView.drawsBackground = false
         scrollView.borderType = .noBorder
-        scrollView.contentView.copiesOnScroll = false
         addSubview(scrollView)
 
         previewButton.setButtonType(.momentaryChange)
@@ -334,7 +344,7 @@ final class TabBar: NSView {
     weak var titleBar: TitleBar?
 
     nonisolated override func mouseDown(with event: NSEvent) {
-        onAppKitMainThread { mouseDownOnMainActor(with: event) }
+        onAppKitMainThread(with: event) { mouseDownOnMainActor(with: $0) }
     }
 
     private func mouseDownOnMainActor(with event: NSEvent) {
@@ -342,7 +352,7 @@ final class TabBar: NSView {
     }
 
     nonisolated override func mouseUp(with event: NSEvent) {
-        onAppKitMainThread { mouseUpOnMainActor(with: event) }
+        onAppKitMainThread(with: event) { mouseUpOnMainActor(with: $0) }
     }
 
     private func mouseUpOnMainActor(with event: NSEvent) {
@@ -661,15 +671,15 @@ final class TabItemView: NSView {
     }
 
     nonisolated override func mouseDown(with event: NSEvent) {
-        onAppKitMainThread { bar?.track(tab: index, from: event) }
+        onAppKitMainThread(with: event) { bar?.track(tab: index, from: $0) }
     }
 
     nonisolated override func menu(for event: NSEvent) -> NSMenu? {
-        onAppKitMainThread { bar?.menuForTab?(index) ?? super.menu(for: event) }
+        onAppKitMainThread(with: event) { bar?.menuForTab?(index) ?? super.menu(for: $0) }
     }
 
     nonisolated override func otherMouseUp(with event: NSEvent) {
-        onAppKitMainThread {
+        onAppKitMainThread(with: event) { event in
             if event.buttonNumber == 2 { bar?.onClose?(index) }
         }
     }

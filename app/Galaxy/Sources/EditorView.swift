@@ -589,7 +589,6 @@ final class EditorView: NSView {
         // conversions below can never overflow and trap.
         let visible = rect.intersection(bounds)
         guard !visible.isNull, !visible.isEmpty, lineCount > 0 else { return 0..<0 }
-        let height = metrics.lineHeight
         let first = min(lineCount, Int(line(atY: visible.minY).line))
         let last = min(lineCount, Int(line(atY: max(visible.minY, visible.maxY - 1)).line) + 1)
         return first..<max(first, last)

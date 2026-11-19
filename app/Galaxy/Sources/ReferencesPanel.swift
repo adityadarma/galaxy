@@ -73,7 +73,6 @@ final class ReferencesPanel: CardView, NSTableViewDataSource, NSTableViewDelegat
 
         preview.frame = NSRect(x: 0, y: 0, width: 640, height: 280)
         previewScroll.documentView = preview
-        previewScroll.contentView.copiesOnScroll = false
         previewScroll.drawsBackground = false
         previewScroll.hasVerticalScroller = true
         previewScroll.hasHorizontalScroller = true
@@ -303,7 +302,6 @@ final class ReferencesPanel: CardView, NSTableViewDataSource, NSTableViewDelegat
 
     private func attributedPreview(text: String, styles: [StyleRun]) -> (NSMutableAttributedString, [NSRange]) {
         let source = text as NSString
-        let lineCount = max(1, text.reduce(1) { $1 == "\n" ? $0 + 1 : $0 })
         let result = NSMutableAttributedString()
         var ranges: [NSRange] = []
         var sourceStart = 0

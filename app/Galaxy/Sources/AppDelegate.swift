@@ -322,20 +322,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             return
         }
         let finish = FullScreenExit(completion: completion)
-        var enterToken: NSObjectProtocol?
-        enterToken = NotificationCenter.default.addObserver(
-            forName: NSWindow.didEnterFullScreenNotification, object: window, queue: .main
-        ) { _ in
-            if let enterToken { NotificationCenter.default.removeObserver(enterToken) }
-            var exitToken: NSObjectProtocol?
-            exitToken = NotificationCenter.default.addObserver(
-                forName: NSWindow.didExitFullScreenNotification, object: window, queue: .main
-            ) { _ in
-                if let exitToken { NotificationCenter.default.removeObserver(exitToken) }
-                onAppKitMainThread { finish.run() }
-            }
-            onAppKitMainThread { window.toggleFullScreen(nil) }
-        }
+        finish.observe(window)
         // If a transition never reports, do not stall the windows behind it.
         DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
             onAppKitMainThread { finish.run() }
@@ -404,10 +391,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
 @MainActor
 private final class FullScreenExit {
     private var completion: (() -> Void)?
+    private var enterToken: NSObjectProtocol?
+    private var exitToken: NSObjectProtocol?
 
     init(completion: (() -> Void)?) { self.completion = completion }
 
+    func observe(_ window: NSWindow) {
+        enterToken = NotificationCenter.default.addObserver(
+            forName: NSWindow.didEnterFullScreenNotification, object: window, queue: .main
+        ) { [weak self] _ in
+            onAppKitMainThread {
+                guard let self else { return }
+                if let enterToken = self.enterToken {
+                    NotificationCenter.default.removeObserver(enterToken)
+                    self.enterToken = nil
+                }
+                self.exitToken = NotificationCenter.default.addObserver(
+                    forName: NSWindow.didExitFullScreenNotification, object: window, queue: .main
+                ) { [weak self] _ in
+                    onAppKitMainThread { self?.run() }
+                }
+                window.toggleFullScreen(nil)
+            }
+        }
+    }
+
     func run() {
+        if let enterToken { NotificationCenter.default.removeObserver(enterToken) }
+        if let exitToken { NotificationCenter.default.removeObserver(exitToken) }
+        enterToken = nil
+        exitToken = nil
         let handler = completion
         completion = nil
         handler?()

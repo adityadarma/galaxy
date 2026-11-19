@@ -63,7 +63,7 @@ final class DiskChangeTests: XCTestCase {
         XCTAssertFalse(c.tabs.contains { $0.isEdited })
         XCTAssertTrue(c.statusLabel.stringValue.contains("reloaded from disk"))
 
-        c.editorView.document?.undo()
+        _ = c.editorView.document?.undo()
         XCTAssertEqual(text(c.editorView.document), "b.txt line 1\nline 2\n")
     }
 
@@ -102,7 +102,7 @@ final class DiskChangeTests: XCTestCase {
         c.checkOpenFiles()
         XCTAssertEqual(text(c.editorView.document), "theirs\n")
         XCTAssertFalse(c.tabs[0].isEdited)
-        c.editorView.document?.undo()
+        _ = c.editorView.document?.undo()
         XCTAssertTrue(text(c.editorView.document).hasPrefix("mine "), "undo brings the edits back")
     }
 
