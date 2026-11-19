@@ -874,9 +874,8 @@ impl RustEngine {
                         module.as_deref(),
                     )
                 });
-                let file_uses = graph_uses.unwrap_or_else(|| {
-                    cached_uses.unwrap_or_else(|| parse_use_bindings(&text))
-                });
+                let file_uses = graph_uses
+                    .unwrap_or_else(|| cached_uses.unwrap_or_else(|| parse_use_bindings(&text)));
                 Some((
                     path,
                     parsed_declarations,
@@ -3379,12 +3378,14 @@ fn discover_static_module(
                 bindings,
             } => {
                 let binding_module = [module.as_slice(), &suffix].concat();
-                graph.uses.entry(path.clone()).or_default().extend(
-                    bindings.into_iter().map(|mut binding| {
+                graph
+                    .uses
+                    .entry(path.clone())
+                    .or_default()
+                    .extend(bindings.into_iter().map(|mut binding| {
                         binding.module = binding_module.clone();
                         binding
-                    }),
-                );
+                    }));
             }
             StaticItem::Module {
                 module: suffix,

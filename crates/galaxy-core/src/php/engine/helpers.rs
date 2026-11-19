@@ -172,7 +172,11 @@ pub(super) fn import_edit(file: &FileSymbols, fqn: &str) -> Option<Insertion> {
         return None;
     }
     let key = fqn.trim_start_matches('\\').to_lowercase();
-    if let Some(entry) = file.class_imports.iter().find(|entry| entry.name.to_lowercase() > key) {
+    if let Some(entry) = file
+        .class_imports
+        .iter()
+        .find(|entry| entry.name.to_lowercase() > key)
+    {
         return Some(Insertion {
             line: entry.start_line,
             column: 0,

@@ -69,6 +69,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: release-${{ matrix.arch }}
+      - name: Match Rust workspace version to release tag
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: python3 scripts/set-rust-release-version.py "$VERSION"
       - name: Install XcodeGen
         run: brew install xcodegen
       - name: Import signing certificate

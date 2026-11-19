@@ -628,11 +628,18 @@ impl<'a> Reader<'a> {
         self.uses.insert(alias.to_lowercase(), full.clone());
         let mut statement = clause;
         while statement.kind() != "namespace_use_declaration" {
-            let Some(parent) = statement.parent() else { return };
+            let Some(parent) = statement.parent() else {
+                return;
+            };
             statement = parent;
         }
         let line = statement.start_position().row as u32;
-        if self.out.class_imports.last().is_some_and(|entry| entry.end_line >= line) {
+        if self
+            .out
+            .class_imports
+            .last()
+            .is_some_and(|entry| entry.end_line >= line)
+        {
             return;
         }
         let line_start = statement.start_byte() - statement.start_position().column;
@@ -648,7 +655,10 @@ impl<'a> Reader<'a> {
                 break;
             }
             let start = comment.start_byte() - comment.start_position().column;
-            if !self.src[start..comment.start_byte()].chars().all(char::is_whitespace) {
+            if !self.src[start..comment.start_byte()]
+                .chars()
+                .all(char::is_whitespace)
+            {
                 break;
             }
             start_line = comment.start_position().row as u32;

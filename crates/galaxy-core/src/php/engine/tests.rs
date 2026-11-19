@@ -442,7 +442,10 @@ fn auto_import_orders_by_full_name_and_preserves_attached_comments() {
     let middle = import_edit(&file, "azure\\Middle").unwrap();
     assert_eq!(middle.line, 3);
     let last = import_edit(&file, "Zulu\\End").unwrap();
-    assert_eq!(last.line, 5, "class import stays before function and const imports");
+    assert_eq!(
+        last.line, 5,
+        "class import stays before function and const imports"
+    );
 }
 
 #[test]
