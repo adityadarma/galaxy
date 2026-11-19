@@ -529,6 +529,15 @@ final class CommitSplitButton: NSView {
 
 @MainActor
 final class SourceControlController: NSObject, NSTableViewDataSource, NSTableViewDelegate {
+    private struct GitOperationResult: Sendable {
+        var failure: String?
+        var didCommit = false
+    }
+
+    static func shouldClearCommitMessage(current: String, submitted: String?, didCommit: Bool) -> Bool {
+        didCommit && submitted != nil && current == submitted
+    }
+
     private enum SectionType {
         case staged
         case unstaged
@@ -756,9 +765,9 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
             let remotes = Self.runGit(root: root, args: ["remote"]).output
                 .split(whereSeparator: \.isNewline).map(String.init)
             guard let remote = remotes.contains("origin") ? "origin" : remotes.first else {
-                return "No Git remote is configured"
+                return GitOperationResult(failure: "No Git remote is configured")
             }
-            return Self.gitFailure(Self.runGit(root: root, args: ["push", "-u", remote, branch]))
+            return GitOperationResult(failure: Self.gitFailure(Self.runGit(root: root, args: ["push", "-u", remote, branch])))
         }
     }
 
@@ -1025,13 +1034,13 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         let message = msg
 
         let paths = stagedChanges.isEmpty ? unstagedChanges.map(\.path) : []
-        performGitOperation("Committing…", success: "Commit created", clearMessage: true) { workspace in
+        performGitOperation("Committing…", success: "Commit created", submittedMessage: messageContainer.text) { workspace in
             do {
                 for path in paths { try workspace.gitStage(path: path) }
                 try workspace.gitCommit(message: message)
-                return nil
+                return GitOperationResult(didCommit: true)
             } catch {
-                return Self.describe(error)
+                return GitOperationResult(failure: Self.describe(error))
             }
         }
     }
@@ -1063,14 +1072,14 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
     func pull() {
         guard let root = workspace?.root() else { return }
         performGitOperation("Pulling…", success: "Pull complete") { _ in
-            Self.gitFailure(Self.runGit(root: root, args: ["pull"]))
+            GitOperationResult(failure: Self.gitFailure(Self.runGit(root: root, args: ["pull"])))
         }
     }
 
     func push() {
         guard let root = workspace?.root() else { return }
         performGitOperation("Pushing…", success: "Push complete") { _ in
-            Self.gitFailure(Self.runGit(root: root, args: ["push"]))
+            GitOperationResult(failure: Self.gitFailure(Self.runGit(root: root, args: ["push"])))
         }
     }
 
@@ -1082,40 +1091,43 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         performGitOperation(
             sync ? "Committing & syncing…" : "Committing & pushing…",
             success: sync ? "Commit and sync complete" : "Commit and push complete",
-            clearMessage: true
+            submittedMessage: messageContainer.text
         ) { workspace in
             do {
                 for path in paths { try workspace.gitStage(path: path) }
                 try workspace.gitCommit(message: message)
             } catch {
-                return Self.describe(error)
+                return GitOperationResult(failure: Self.describe(error))
             }
             if sync,
                let failure = Self.gitFailure(Self.runGit(root: root, args: ["pull", "--rebase"])) {
-                return failure
+                return GitOperationResult(failure: failure, didCommit: true)
             }
-            return Self.gitFailure(Self.runGit(root: root, args: ["push"]))
+            return GitOperationResult(failure: Self.gitFailure(Self.runGit(root: root, args: ["push"])), didCommit: true)
         }
     }
 
     private func performGitOperation(
         _ title: String,
         success: String,
-        clearMessage: Bool = false,
-        _ operation: @escaping @Sendable (Workspace) -> String?
+        submittedMessage: String? = nil,
+        _ operation: @escaping @Sendable (Workspace) -> GitOperationResult
     ) {
         guard let workspace, !isPerformingGitOperation else { return }
         isPerformingGitOperation = true
         splitCommitButton.setLoading(true, title: title)
         updateCommitButtonState()
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let failure = operation(workspace)
+            let result = operation(workspace)
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.isPerformingGitOperation = false
                 self.splitCommitButton.setLoading(false)
-                if failure == nil, clearMessage { self.messageContainer.text = "" }
-                self.onMessage?(failure.map { "Git: \($0)" } ?? success)
+                if Self.shouldClearCommitMessage(current: self.messageContainer.text,
+                                                 submitted: submittedMessage, didCommit: result.didCommit) {
+                    self.messageContainer.text = ""
+                }
+                self.onMessage?(result.failure.map { "Git: \($0)" } ?? success)
                 self.updateCommitButtonState()
                 self.onRefresh?()
             }

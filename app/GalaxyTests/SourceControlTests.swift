@@ -3,6 +3,17 @@ import XCTest
 
 @MainActor
 final class SourceControlTests: XCTestCase {
+    func testCommitMessageClearsAfterCommitEvenWhenPushFails() {
+        XCTAssertTrue(SourceControlController.shouldClearCommitMessage(
+            current: "Fix bug", submitted: "Fix bug", didCommit: true))
+        XCTAssertFalse(SourceControlController.shouldClearCommitMessage(
+            current: "Fix bug", submitted: "Fix bug", didCommit: false), "failed commits keep the draft")
+        XCTAssertFalse(SourceControlController.shouldClearCommitMessage(
+            current: "Next change", submitted: "Fix bug", didCommit: true), "new draft must not be erased")
+        XCTAssertFalse(SourceControlController.shouldClearCommitMessage(
+            current: "Fix bug", submitted: nil, didCommit: true), "non-commit operations leave the draft alone")
+    }
+
     func testSourceControlInitialState() {
         let sc = SourceControlController()
         sc.refresh(status: nil)
