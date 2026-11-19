@@ -14,6 +14,8 @@ final class CoreBridge {
     private let completionQueue = DispatchQueue(label: "dev.adityadarma.galaxy.completion")
     private let referencesQueue = DispatchQueue(label: "dev.adityadarma.galaxy.references")
     private let rustRefreshQueue = DispatchQueue(label: "dev.adityadarma.galaxy.rust-refresh")
+    private let analysisQueue = DispatchQueue(label: "dev.adityadarma.galaxy.analysis")
+    private var analysisPollPending = false
     private var pendingCompletionRequest: DispatchWorkItem?
     private var pendingReferencesRequest: DispatchWorkItem?
     private(set) var lastEvent: CoreEvent?
@@ -67,7 +69,15 @@ final class CoreBridge {
 
     /// Drains finished analysis results; drives diagnostics updates.
     func pollAnalysis() {
-        _ = core.pollAnalysis()
+        guard !analysisPollPending else { return }
+        analysisPollPending = true
+        let core = core
+        analysisQueue.async { [weak self] in
+            _ = core.pollAnalysis()
+            Task { @MainActor [weak self] in
+                self?.analysisPollPending = false
+            }
+        }
     }
 
     func refreshWorkspaceIndexes(root: String) {

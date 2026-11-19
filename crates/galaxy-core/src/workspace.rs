@@ -25,7 +25,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use ignore::{DirEntry as WalkEntry, WalkBuilder};
-use regex::RegexBuilder;
+use regex::{Regex, RegexBuilder};
 
 /// Directories hidden regardless of ignore files (PRD 7.1).
 pub const DEFAULT_EXCLUDES: &[&str] = &[".git", "node_modules", "target", "dist", "build"];
@@ -179,12 +179,18 @@ pub struct IndexDelta {
 pub struct Workspace {
     root: PathBuf,
     /// `files.exclude` globs, relative to the root. Shared between clones.
-    explorer_excludes: Arc<RwLock<Vec<String>>>,
+    explorer_excludes: Arc<RwLock<ExplorerExcludes>>,
     indexed_paths: Arc<RwLock<Vec<String>>>,
     /// The volume ignores letter case in names (the macOS default), so git
     /// matches `AGENTS.MD` in a `.gitignore` against `AGENTS.md`. Ignore
     /// rules are then matched the same way.
     case_insensitive: bool,
+}
+
+#[derive(Debug, Default)]
+struct ExplorerExcludes {
+    globs: Vec<String>,
+    patterns: Vec<Regex>,
 }
 
 /// Whether the volume holding `root` treats `Name` and `name` as one file.
@@ -260,7 +266,7 @@ fn split_globs(value: &str) -> Vec<String> {
         .collect()
 }
 
-fn glob_matches(glob: &str, path: &str) -> bool {
+fn glob_regex(glob: &str) -> Result<Regex, regex::Error> {
     let mut pattern = String::from("^");
     let mut chars = glob.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -280,9 +286,11 @@ fn glob_matches(glob: &str, path: &str) -> bool {
         }
     }
     pattern.push('$');
-    RegexBuilder::new(&pattern)
-        .build()
-        .is_ok_and(|regex| regex.is_match(path))
+    RegexBuilder::new(&pattern).build()
+}
+
+fn glob_matches(glob: &str, path: &str) -> bool {
+    glob_regex(glob).is_ok_and(|regex| regex.is_match(path))
 }
 
 impl Workspace {
@@ -313,10 +321,14 @@ impl Workspace {
             .explorer_excludes
             .write()
             .unwrap_or_else(|e| e.into_inner());
-        if *current == globs {
+        if current.globs == globs {
             return false;
         }
-        *current = globs;
+        current.patterns = globs
+            .iter()
+            .filter_map(|glob| glob_regex(glob).ok())
+            .collect();
+        current.globs = globs;
         true
     }
 
@@ -467,6 +479,7 @@ impl Workspace {
             .explorer_excludes
             .read()
             .unwrap_or_else(|e| e.into_inner())
+            .patterns
             .clone();
 
         let unignored = self.unignored_names(&dir);
@@ -476,7 +489,7 @@ impl Workspace {
             .filter_map(|e| {
                 let path = e.path();
                 let rel_path = self.rel_string(&path)?;
-                if excludes.iter().any(|glob| glob_matches(glob, &rel_path)) {
+                if excludes.iter().any(|regex| regex.is_match(&rel_path)) {
                     return None;
                 }
                 let name = e.file_name().to_string_lossy().into_owned();
@@ -989,6 +1002,21 @@ mod tests {
         assert!(!names(&ws.list_dir("src").unwrap()).contains(&"deep"));
         ws.set_explorer_excludes(Vec::new());
         assert!(names(&ws.list_dir("").unwrap()).contains(&".git"));
+    }
+
+    #[test]
+    fn explorer_excludes_are_shared_and_refreshed_across_clones() {
+        let (_dir, ws) = tree();
+        let clone = ws.clone();
+        assert!(ws.set_explorer_excludes(vec!["**/deep".into()]));
+        assert!(!names(&clone.list_dir("src").unwrap()).contains(&"deep"));
+
+        assert!(clone.set_explorer_excludes(vec!["**/.git".into()]));
+        assert!(names(&ws.list_dir("src").unwrap()).contains(&"deep"));
+        assert!(!names(&ws.list_dir("").unwrap()).contains(&".git"));
+
+        assert!(ws.set_explorer_excludes(Vec::new()));
+        assert!(names(&clone.list_dir("").unwrap()).contains(&".git"));
     }
 
     #[test]

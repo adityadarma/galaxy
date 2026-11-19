@@ -9,7 +9,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, mpsc};
 use std::time::{Duration, Instant};
 
 use ignore::WalkBuilder;
@@ -42,7 +42,7 @@ const STD_TYPES: &[&str] = &[
     "String", "Vec", "Option", "Result", "Box", "Rc", "Arc", "HashMap", "HashSet",
 ];
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct Declaration {
     name: String,
     crate_name: String,
@@ -56,7 +56,7 @@ struct Declaration {
     signature: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum Visibility {
     Private,
     Public,
@@ -96,7 +96,7 @@ struct CfgContext {
     features: HashSet<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct UseBinding {
     local: String,
     target: Vec<String>,
@@ -127,6 +127,12 @@ pub struct RustEngine {
     packages: Vec<CargoPackage>,
     open: HashMap<PathBuf, (Vec<Declaration>, Vec<UseBinding>, String)>,
     ready: bool,
+    /// `canonicalize` results. Name resolution asks for the crate and module
+    /// of every indexed file per identifier; a `realpath` syscall each time
+    /// made workspace diagnostics take minutes.
+    canonical_paths: RwLock<HashMap<PathBuf, PathBuf>>,
+    /// `crate_for` results, for the same reason: it scans every Cargo target.
+    crate_names: RwLock<HashMap<PathBuf, String>>,
 }
 
 /// Result of a Cargo refresh requested manually or after saving Rust source.
@@ -733,23 +739,47 @@ impl RustEngine {
             packages: Vec::new(),
             open: HashMap::new(),
             ready: false,
+            canonical_paths: RwLock::new(HashMap::new()),
+            crate_names: RwLock::new(HashMap::new()),
         }
     }
 
     pub fn build(root: &Path) -> Built {
-        Self::build_with_scheduler(root, crate::index_scheduler::shared_index_scheduler())
+        Self::build_with_cache(root, &mut RustIndexCache::default())
+    }
+
+    /// Builds the index, reparsing only files whose size or modification time
+    /// differ from `cache`. `cache` is replaced with entries for this build.
+    pub fn build_with_cache(root: &Path, cache: &mut RustIndexCache) -> Built {
+        Self::build_with_scheduler_and_cache(
+            root,
+            crate::index_scheduler::shared_index_scheduler(),
+            cache,
+        )
     }
 
     pub fn build_with_scheduler(
         root: &Path,
         scheduler: &crate::index_scheduler::IndexScheduler,
     ) -> Built {
+        Self::build_with_scheduler_and_cache(root, scheduler, &mut RustIndexCache::default())
+    }
+
+    fn build_with_scheduler_and_cache(
+        root: &Path,
+        scheduler: &crate::index_scheduler::IndexScheduler,
+        cache: &mut RustIndexCache,
+    ) -> Built {
         let mut declarations = Vec::new();
         let mut files = Vec::new();
         let mut uses = HashMap::new();
+        let mut file_cache = FileCache {
+            previous: std::mem::take(&mut cache.files),
+            next: HashMap::new(),
+        };
         let packages = cargo_packages(root);
         let roots = cargo_source_roots(root);
-        let module_graph = static_module_graph(&packages);
+        let module_graph = static_module_graph(&packages, &mut file_cache);
         let mut candidates = Vec::new();
         for package in &packages {
             if !package.indexed {
@@ -808,12 +838,33 @@ impl RustEngine {
         candidates.sort_by(|left, right| left.0.cmp(&right.0));
         candidates.dedup_by(|left, right| left.0 == right.0);
         candidates.truncate(MAX_FILES);
+        let reusable = &file_cache;
         let indexed = scheduler.map_ordered(
             candidates,
-            |(path, source_root, crate_name, cfg, module, uses)| {
-                let text = std::fs::read_to_string(&path).ok()?;
-                Some((
-                    path.clone(),
+            |(path, source_root, crate_name, cfg, module, graph_uses)| {
+                let stamp = std::fs::metadata(&path)
+                    .ok()
+                    .and_then(|metadata| FileStamp::of(&metadata));
+                let context = DeclarationContext {
+                    source_root: source_root.clone(),
+                    crate_name: crate_name.clone(),
+                    features: sorted_features(&cfg),
+                    module: module.clone(),
+                };
+                let cached = stamp.and_then(|stamp| reusable.fresh(&path, stamp));
+                let cached_declarations = cached
+                    .and_then(|file| file.declarations.as_ref())
+                    .filter(|cached| cached.context == context)
+                    .map(|cached| cached.items.clone());
+                let parse_uses = graph_uses.is_none();
+                let cached_uses = cached.and_then(|file| file.uses.clone());
+                let text = if cached_declarations.is_none() || (parse_uses && cached_uses.is_none())
+                {
+                    std::fs::read_to_string(&path).ok()?
+                } else {
+                    String::new()
+                };
+                let parsed_declarations = cached_declarations.unwrap_or_else(|| {
                     parse_declarations(
                         &path,
                         &text,
@@ -821,16 +872,35 @@ impl RustEngine {
                         &crate_name,
                         &cfg,
                         module.as_deref(),
-                    ),
-                    uses.unwrap_or_else(|| parse_use_bindings(&text)),
+                    )
+                });
+                let file_uses = graph_uses.unwrap_or_else(|| {
+                    cached_uses.unwrap_or_else(|| parse_use_bindings(&text))
+                });
+                Some((
+                    path,
+                    parsed_declarations,
+                    file_uses,
+                    stamp.map(|stamp| (stamp, context, parse_uses)),
                 ))
             },
         );
-        for (path, parsed_declarations, parsed_uses) in indexed.into_iter().flatten() {
+        for (path, parsed_declarations, parsed_uses, record) in indexed.into_iter().flatten() {
+            if let Some((stamp, context, parse_uses)) = record {
+                let file = file_cache.entry(&path, stamp);
+                file.declarations = Some(CachedDeclarations {
+                    context,
+                    items: parsed_declarations.clone(),
+                });
+                if parse_uses {
+                    file.uses = Some(parsed_uses.clone());
+                }
+            }
             files.push(path.clone());
             declarations.extend(parsed_declarations);
             uses.insert(path, parsed_uses);
         }
+        cache.files = file_cache.next;
         declarations.sort_by(|left, right| {
             (&left.name, &left.path, left.line).cmp(&(&right.name, &right.path, right.line))
         });
@@ -852,6 +922,7 @@ impl RustEngine {
         self.source_roots = built.source_roots;
         self.packages = built.packages;
         self.ready = true;
+        self.clear_canonical_paths();
     }
 
     pub fn from_built(built: Built) -> Self {
@@ -871,6 +942,80 @@ impl RustEngine {
         }
     }
 
+    /// Hash of everything besides a file's own text that decides its
+    /// diagnostics: declarations (without positions), imports, module layout
+    /// and Cargo metadata. Callers reuse cached diagnostics of unchanged files
+    /// while this stays the same.
+    pub fn diagnostics_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let state = &mut hasher;
+        self.declarations.len().hash(state);
+        for item in &self.declarations {
+            item.name.hash(state);
+            item.crate_name.hash(state);
+            item.module.hash(state);
+            match &item.visibility {
+                Visibility::Private => 0_u8.hash(state),
+                Visibility::Public => 1_u8.hash(state),
+                Visibility::Restricted(module) => {
+                    2_u8.hash(state);
+                    module.hash(state);
+                }
+            }
+            (item.kind as u8).hash(state);
+            item.path.hash(state);
+            item.scope_depth.hash(state);
+        }
+        self.files.hash(state);
+        let mut uses = self.uses.iter().collect::<Vec<_>>();
+        uses.sort_by(|left, right| left.0.cmp(right.0));
+        for (path, bindings) in uses {
+            path.hash(state);
+            bindings.len().hash(state);
+            for binding in bindings {
+                binding.local.hash(state);
+                binding.target.hash(state);
+                binding.glob.hash(state);
+                binding.public.hash(state);
+                binding.module.hash(state);
+            }
+        }
+        let mut identities = self.module_identities.iter().collect::<Vec<_>>();
+        identities.sort();
+        identities.hash(state);
+        self.source_roots.hash(state);
+        fn sorted(set: &HashSet<String>) -> Vec<&String> {
+            let mut values = set.iter().collect::<Vec<_>>();
+            values.sort();
+            values
+        }
+        self.packages.len().hash(state);
+        for package in &self.packages {
+            package.name.hash(state);
+            package.root.hash(state);
+            package.indexed.hash(state);
+            sorted(&package.selected_features).hash(state);
+            package.targets.len().hash(state);
+            for target in &package.targets {
+                target.name.hash(state);
+                target.source_root.hash(state);
+                target.root.hash(state);
+            }
+            package.dependencies.len().hash(state);
+            for dependency in &package.dependencies {
+                dependency.name.hash(state);
+                dependency.package.hash(state);
+                dependency.path.hash(state);
+                dependency.git.hash(state);
+                dependency.optional.hash(state);
+                dependency.default_features.hash(state);
+                sorted(&dependency.features).hash(state);
+            }
+        }
+        hasher.finish()
+    }
+
     pub fn is_ready(&self) -> bool {
         self.ready
     }
@@ -888,6 +1033,7 @@ impl RustEngine {
         {
             return false;
         }
+        self.clear_canonical_paths();
         for path in paths {
             if path.extension().and_then(|extension| extension.to_str()) != Some("rs") {
                 continue;
@@ -2053,8 +2199,36 @@ impl RustEngine {
             .unwrap_or_default()
     }
 
-    fn module_for(&self, path: &Path) -> Vec<String> {
+    fn canonical(&self, path: &Path) -> PathBuf {
+        if let Some(canonical) = self
+            .canonical_paths
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(path)
+        {
+            return canonical.clone();
+        }
         let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        self.canonical_paths
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(path.to_path_buf(), canonical.clone());
+        canonical
+    }
+
+    fn clear_canonical_paths(&self) {
+        self.canonical_paths
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.crate_names
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    fn module_for(&self, path: &Path) -> Vec<String> {
+        let canonical = self.canonical(path);
         self.module_identities
             .get(&canonical)
             .or_else(|| self.module_identities.get(path))
@@ -2063,7 +2237,24 @@ impl RustEngine {
     }
 
     fn crate_for(&self, path: &Path) -> String {
-        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if let Some(name) = self
+            .crate_names
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(path)
+        {
+            return name.clone();
+        }
+        let name = self.crate_for_uncached(path);
+        self.crate_names
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(path.to_path_buf(), name.clone());
+        name
+    }
+
+    fn crate_for_uncached(&self, path: &Path) -> String {
+        let path = self.canonical(path);
         self.packages
             .iter()
             .flat_map(|package| package.targets.iter())
@@ -2079,7 +2270,7 @@ impl RustEngine {
     }
 
     fn dependency_for(&self, path: &Path, name: &str) -> Option<CargoDependency> {
-        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let path = self.canonical(path);
         let package = self
             .packages
             .iter()
@@ -2124,7 +2315,7 @@ impl RustEngine {
     }
 
     fn cfg_for(&self, path: &Path) -> CfgContext {
-        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let path = self.canonical(path);
         self.packages
             .iter()
             .find(|package| path.starts_with(&package.root))
@@ -2919,9 +3110,190 @@ struct StaticModuleGraph {
     uses: HashMap<PathBuf, Vec<UseBinding>>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+enum StaticItem {
+    Use {
+        module: Vec<String>,
+        bindings: Vec<UseBinding>,
+    },
+    Module {
+        module: Vec<String>,
+        path_override: Option<String>,
+    },
+    Include {
+        module: Vec<String>,
+        source: String,
+    },
+}
+
+/// Parse results of Rust files from a previous build, reused while a file's
+/// size and modification time stay the same.
+#[derive(Debug, Default)]
+pub struct RustIndexCache {
+    files: HashMap<PathBuf, CachedRustFile>,
+}
+
+const RUST_INDEX_CACHE_SCHEMA: u32 = 1;
+
+#[derive(serde::Serialize)]
+struct StoredRustIndexRef<'a> {
+    schema: u32,
+    engine: u128,
+    root: &'a Path,
+    files: &'a HashMap<PathBuf, CachedRustFile>,
+}
+
+#[derive(serde::Deserialize)]
+struct StoredRustIndex {
+    schema: u32,
+    engine: u128,
+    root: PathBuf,
+    files: HashMap<PathBuf, CachedRustFile>,
+}
+
+impl RustIndexCache {
+    /// Loads the cache saved for `root`. An unreadable file, another schema,
+    /// another root or a rebuilt executable gives an empty cache.
+    pub fn load(path: &Path, root: &Path) -> Self {
+        let files = std::fs::read(path)
+            .ok()
+            .and_then(|bytes| bincode::deserialize::<StoredRustIndex>(&bytes).ok())
+            .filter(|stored| {
+                stored.schema == RUST_INDEX_CACHE_SCHEMA
+                    && stored.engine == engine_stamp()
+                    && stored.root == root
+            })
+            .map(|stored| stored.files)
+            .unwrap_or_default();
+        Self { files }
+    }
+
+    pub fn save(&self, path: &Path, root: &Path) -> io::Result<()> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::other("cache path has no parent"))?;
+        std::fs::create_dir_all(parent)?;
+        let bytes = bincode::serialize(&StoredRustIndexRef {
+            schema: RUST_INDEX_CACHE_SCHEMA,
+            engine: engine_stamp(),
+            root,
+            files: &self.files,
+        })
+        .map_err(io::Error::other)?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+        io::Write::write_all(&mut temporary, &bytes)?;
+        temporary.persist(path).map_err(|error| error.error)?;
+        Ok(())
+    }
+}
+
+/// Modification time of the running executable. Parse results are only valid
+/// for the parser code that produced them, so a rebuilt app drops the cache.
+fn engine_stamp() -> u128 {
+    std::env::current_exe()
+        .and_then(std::fs::metadata)
+        .ok()
+        .and_then(|metadata| FileStamp::of(&metadata))
+        .map_or(0, |stamp| stamp.modified_nanos)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct FileStamp {
+    size: u64,
+    modified_nanos: u128,
+}
+
+impl FileStamp {
+    fn of(metadata: &std::fs::Metadata) -> Option<Self> {
+        let modified = metadata
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        Some(Self {
+            size: metadata.len(),
+            modified_nanos: modified.as_nanos(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CachedRustFile {
+    stamp: FileStamp,
+    scan: Option<CachedScan>,
+    declarations: Option<CachedDeclarations>,
+    uses: Option<Vec<UseBinding>>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CachedScan {
+    features: Vec<String>,
+    items: Vec<StaticItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct DeclarationContext {
+    source_root: PathBuf,
+    crate_name: String,
+    features: Vec<String>,
+    module: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CachedDeclarations {
+    context: DeclarationContext,
+    items: Vec<Declaration>,
+}
+
+/// Entries of the previous build and the entries confirmed by this one.
+struct FileCache {
+    previous: HashMap<PathBuf, CachedRustFile>,
+    next: HashMap<PathBuf, CachedRustFile>,
+}
+
+impl FileCache {
+    fn fresh(&self, path: &Path, stamp: FileStamp) -> Option<&CachedRustFile> {
+        self.next
+            .get(path)
+            .or_else(|| self.previous.get(path))
+            .filter(|file| file.stamp == stamp)
+    }
+
+    fn entry(&mut self, path: &Path, stamp: FileStamp) -> &mut CachedRustFile {
+        let previous = &mut self.previous;
+        let file = self.next.entry(path.to_path_buf()).or_insert_with(|| {
+            previous
+                .remove(path)
+                .filter(|file| file.stamp == stamp)
+                .unwrap_or_else(|| CachedRustFile::new(stamp))
+        });
+        if file.stamp != stamp {
+            *file = CachedRustFile::new(stamp);
+        }
+        file
+    }
+}
+
+impl CachedRustFile {
+    fn new(stamp: FileStamp) -> Self {
+        Self {
+            stamp,
+            scan: None,
+            declarations: None,
+            uses: None,
+        }
+    }
+}
+
+fn sorted_features(cfg: &CfgContext) -> Vec<String> {
+    let mut features = cfg.features.iter().cloned().collect::<Vec<_>>();
+    features.sort();
+    features
+}
+
 /// Discover the subset of Rust's module graph that can be followed without
 /// macro expansion. Files not reached here retain their filesystem identity.
-fn static_module_graph(packages: &[CargoPackage]) -> StaticModuleGraph {
+fn static_module_graph(packages: &[CargoPackage], cache: &mut FileCache) -> StaticModuleGraph {
     let mut graph = StaticModuleGraph::default();
     let mut visited = HashSet::new();
     for package in packages.iter().filter(|package| package.indexed) {
@@ -2936,6 +3308,7 @@ fn static_module_graph(packages: &[CargoPackage]) -> StaticModuleGraph {
                     },
                     &mut graph,
                     &mut visited,
+                    cache,
                 );
             }
         }
@@ -2957,45 +3330,115 @@ fn discover_static_module(
     cfg: &CfgContext,
     graph: &mut StaticModuleGraph,
     visited: &mut HashSet<PathBuf>,
+    cache: &mut FileCache,
 ) {
     if graph.identities.len() >= MAX_FILES {
         return;
     }
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    if !visited.insert(path.clone())
-        || std::fs::metadata(&path).map_or(true, |metadata| metadata.len() > MAX_FILE_BYTES)
-    {
+    if !visited.insert(path.clone()) {
         return;
     }
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    let Ok(metadata) = std::fs::metadata(&path) else {
         return;
     };
+    if metadata.len() > MAX_FILE_BYTES {
+        return;
+    }
+    let stamp = FileStamp::of(&metadata);
+    let features = sorted_features(cfg);
+    let cached = stamp
+        .and_then(|stamp| cache.fresh(&path, stamp))
+        .and_then(|file| file.scan.as_ref())
+        .filter(|scan| scan.features == features)
+        .map(|scan| scan.items.clone());
+    let items = match cached {
+        Some(items) => items,
+        None => {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                return;
+            };
+            let mut items = Vec::new();
+            if let Some(tree) = parse_tree(&text) {
+                scan_static_items(&text, tree.root_node(), &[], cfg, &mut items);
+            }
+            items
+        }
+    };
+    if let Some(stamp) = stamp {
+        cache.entry(&path, stamp).scan = Some(CachedScan {
+            features,
+            items: items.clone(),
+        });
+    }
     graph.identities.insert(path.clone(), module.clone());
-    let Some(tree) = parse_tree(&text) else {
-        return;
-    };
-    discover_static_items(
-        &path,
-        &text,
-        tree.root_node(),
-        &module,
-        manifest_dir,
-        cfg,
-        graph,
-        visited,
-    );
+    for item in items {
+        match item {
+            StaticItem::Use {
+                module: suffix,
+                bindings,
+            } => {
+                let binding_module = [module.as_slice(), &suffix].concat();
+                graph.uses.entry(path.clone()).or_default().extend(
+                    bindings.into_iter().map(|mut binding| {
+                        binding.module = binding_module.clone();
+                        binding
+                    }),
+                );
+            }
+            StaticItem::Module {
+                module: suffix,
+                path_override,
+            } => {
+                let Some(name) = suffix.last() else {
+                    continue;
+                };
+                if let Some(child_path) = static_module_file(&path, path_override.as_deref(), name)
+                {
+                    discover_static_module(
+                        &child_path,
+                        [module.as_slice(), &suffix].concat(),
+                        manifest_dir,
+                        cfg,
+                        graph,
+                        visited,
+                        cache,
+                    );
+                }
+            }
+            StaticItem::Include {
+                module: suffix,
+                source,
+            } => {
+                let Some(include) = static_include_file(&source, &path, manifest_dir) else {
+                    continue;
+                };
+                discover_static_module(
+                    &include,
+                    [module.as_slice(), &suffix].concat(),
+                    manifest_dir,
+                    cfg,
+                    graph,
+                    visited,
+                    cache,
+                );
+                let include = include.canonicalize().unwrap_or(include);
+                if let Some(bindings) = graph.uses.get(&include).cloned() {
+                    graph.uses.entry(path.clone()).or_default().extend(bindings);
+                }
+            }
+        }
+    }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn discover_static_items(
-    path: &Path,
+/// Module-graph facts of one file that do not depend on where the file sits
+/// in the graph. `module` is relative to the file's own module.
+fn scan_static_items(
     text: &str,
     node: Node<'_>,
     module: &[String],
-    manifest_dir: &Path,
     cfg: &CfgContext,
-    graph: &mut StaticModuleGraph,
-    visited: &mut HashSet<PathBuf>,
+    out: &mut Vec<StaticItem>,
 ) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -3003,14 +3446,10 @@ fn discover_static_items(
             continue;
         }
         if child.kind() == "use_declaration" {
-            graph.uses.entry(path.to_path_buf()).or_default().extend(
-                use_bindings(child.utf8_text(text.as_bytes()).unwrap_or(""))
-                    .into_iter()
-                    .map(|mut binding| {
-                        binding.module = module.to_vec();
-                        binding
-                    }),
-            );
+            out.push(StaticItem::Use {
+                module: module.to_vec(),
+                bindings: use_bindings(child.utf8_text(text.as_bytes()).unwrap_or("")),
+            });
         }
         if child.kind() == "mod_item" {
             let Some(name) = child
@@ -3025,48 +3464,31 @@ fn discover_static_items(
                 .utf8_text(text.as_bytes())
                 .is_ok_and(|source| source.trim_end().ends_with('}'))
             {
-                discover_static_items(
-                    path,
-                    text,
-                    child,
-                    &child_module,
-                    manifest_dir,
-                    cfg,
-                    graph,
-                    visited,
-                );
-            } else if let Some(child_path) = static_module_file(path, text, child, name) {
-                discover_static_module(
-                    &child_path,
-                    child_module,
-                    manifest_dir,
-                    cfg,
-                    graph,
-                    visited,
-                );
+                scan_static_items(text, child, &child_module, cfg, out);
+            } else {
+                out.push(StaticItem::Module {
+                    module: child_module,
+                    path_override: module_path_override(child, text).map(str::to_owned),
+                });
             }
             continue;
         }
         if child.kind() == "macro_invocation"
-            && let Some(include) = static_include_file(child, text, path, manifest_dir)
+            && let Ok(source) = child.utf8_text(text.as_bytes())
+            && source.trim().starts_with("include!")
         {
-            discover_static_module(&include, module.to_vec(), manifest_dir, cfg, graph, visited);
-            let include = include.canonicalize().unwrap_or(include);
-            if let Some(bindings) = graph.uses.get(&include).cloned() {
-                graph
-                    .uses
-                    .entry(path.to_path_buf())
-                    .or_default()
-                    .extend(bindings);
-            }
+            out.push(StaticItem::Include {
+                module: module.to_vec(),
+                source: source.trim().to_owned(),
+            });
             continue;
         }
-        discover_static_items(path, text, child, module, manifest_dir, cfg, graph, visited);
+        scan_static_items(text, child, module, cfg, out);
     }
 }
 
-fn static_module_file(path: &Path, text: &str, node: Node<'_>, name: &str) -> Option<PathBuf> {
-    if let Some(override_path) = module_path_override(node, text) {
+fn static_module_file(path: &Path, path_override: Option<&str>, name: &str) -> Option<PathBuf> {
+    if let Some(override_path) = path_override {
         let path = module_directory(path).join(override_path);
         return path.is_file().then_some(path);
     }
@@ -3080,14 +3502,9 @@ fn static_module_file(path: &Path, text: &str, node: Node<'_>, name: &str) -> Op
     found.next().is_none().then_some(path)
 }
 
-fn static_include_file(
-    node: Node<'_>,
-    text: &str,
-    path: &Path,
-    manifest_dir: &Path,
-) -> Option<PathBuf> {
-    let source = node.utf8_text(text.as_bytes()).ok()?.trim();
+fn static_include_file(source: &str, path: &Path, manifest_dir: &Path) -> Option<PathBuf> {
     let argument = source
+        .trim()
         .strip_prefix("include!")?
         .trim()
         .strip_prefix('(')?
@@ -5988,6 +6405,100 @@ mod tests {
                 root.path().join("tools/codegen/src"),
             ]
         );
+    }
+
+    #[test]
+    fn index_cache_reuses_unchanged_files_and_reparses_changed_ones() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"app\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.path().join("src/net")).unwrap();
+        std::fs::write(
+            root.path().join("src/lib.rs"),
+            "pub mod net;\nmod inline { pub mod deep; }\npub use net::Client;\n",
+        )
+        .unwrap();
+        std::fs::write(root.path().join("src/net/mod.rs"), "pub struct Client;\n").unwrap();
+        std::fs::create_dir_all(root.path().join("src/inline")).unwrap();
+        std::fs::write(root.path().join("src/inline/deep.rs"), "pub fn deep() {}\n").unwrap();
+        let names = |built: &Built| {
+            let mut names = built
+                .declarations
+                .iter()
+                .map(|item| (item.name.clone(), item.module.clone(), item.line))
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+
+        let cold = RustEngine::build(root.path());
+        let mut cache = RustIndexCache::default();
+        let first = RustEngine::build_with_cache(root.path(), &mut cache);
+        let file = root.path().join("cache.bin");
+        cache.save(&file, root.path()).unwrap();
+        let mut cache = RustIndexCache::load(&file, root.path());
+        assert_eq!(cache.files.len(), first.files.len());
+        let warm = RustEngine::build_with_cache(root.path(), &mut cache);
+        assert_eq!(names(&warm), names(&cold));
+        assert_eq!(warm.module_identities, cold.module_identities);
+        assert_eq!(warm.uses.len(), cold.uses.len());
+
+        std::fs::write(
+            root.path().join("src/net/mod.rs"),
+            "pub struct Client;\npub struct Server;\n",
+        )
+        .unwrap();
+        let changed = RustEngine::build_with_cache(root.path(), &mut cache);
+        assert!(
+            changed
+                .declarations
+                .iter()
+                .any(|item| item.name == "Server" && item.module == ["net"])
+        );
+        assert_eq!(names(&changed), names(&RustEngine::build(root.path())));
+    }
+
+    #[test]
+    fn index_cache_ignores_cache_of_another_root() {
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"app\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/lib.rs"), "pub fn run() {}\n").unwrap();
+        let mut cache = RustIndexCache::default();
+        RustEngine::build_with_cache(root.path(), &mut cache);
+        let file = root.path().join("cache.bin");
+        cache.save(&file, root.path()).unwrap();
+        assert!(RustIndexCache::load(&file, other.path()).files.is_empty());
+    }
+
+    #[test]
+    fn diagnostics_fingerprint_ignores_bodies_but_tracks_declarations() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"app\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        let lib = root.path().join("src/lib.rs");
+        let fingerprint =
+            || RustEngine::from_built(RustEngine::build(root.path())).diagnostics_fingerprint();
+
+        std::fs::write(&lib, "pub fn run() {}\n").unwrap();
+        let original = fingerprint();
+        std::fs::write(&lib, "\n\npub fn run() {\n    let x = 1;\n}\n").unwrap();
+        assert_eq!(fingerprint(), original);
+
+        std::fs::write(&lib, "pub fn run() {}\npub fn stop() {}\n").unwrap();
+        assert_ne!(fingerprint(), original);
     }
 
     #[test]

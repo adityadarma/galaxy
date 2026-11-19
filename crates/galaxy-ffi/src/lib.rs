@@ -54,6 +54,7 @@ use galaxy_core::workspace::{
     SearchMatch as CoreSearchMatch, SearchOptions as CoreSearchOptions, Workspace as CoreWorkspace,
 };
 
+mod rust_diagnostics_cache;
 mod typescript_editor;
 mod typescript_globals;
 mod typescript_navigation;
@@ -873,7 +874,7 @@ impl Core {
                     .or_insert_with(|| Arc::new(Mutex::new(RustEngine::pending(&root))))
                     .clone()
             };
-            let built = RustEngine::build(&root);
+            let built = build_rust_index(&root);
             engine
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -4961,8 +4962,10 @@ fn publish_workspace_rust_diagnostics(
                 .or_insert_with(|| Arc::new(Mutex::new(RustEngine::pending(&project_root))))
                 .clone()
         };
-        let built = RustEngine::build(&project_root);
+        let built = build_rust_index(&project_root);
         let snapshot = RustEngine::from_built(built);
+        let fingerprint = snapshot.diagnostics_fingerprint();
+        let cached = Mutex::new(rust_diagnostics_cache::load(&project_root, fingerprint));
         let diagnostic_total = files.len() as u64;
         send_workspace_index_phase(
             listener,
@@ -4977,11 +4980,27 @@ fn publish_workspace_rust_diagnostics(
             .map_ordered_with_progress(
                 files,
                 |path| {
-                    let text = std::fs::read_to_string(&path).ok()?;
+                    let (size, modified_nanos) = file_size_and_mtime(&path)?;
+                    let reused = cached
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&path)
+                        .filter(|file| file.size == size && file.modified_nanos == modified_nanos);
+                    let problems = match reused {
+                        Some(file) => file.problems,
+                        None => {
+                            let text = std::fs::read_to_string(&path).ok()?;
+                            snapshot
+                                .diagnostics_indexed(&path, &text)
+                                .into_iter()
+                                .map(rust_diagnostics_cache::CachedProblem::from)
+                                .collect()
+                        }
+                    };
                     let uri = file_uri(&path);
-                    let diagnostics = snapshot
-                        .diagnostics_indexed(&path, &text)
-                        .into_iter()
+                    let diagnostics = problems
+                        .iter()
+                        .cloned()
                         .map(|problem| LspDiagnostic {
                             uri: uri.clone(),
                             range: LspRange {
@@ -4997,7 +5016,12 @@ fn publish_workspace_rust_diagnostics(
                             unnecessary: false,
                         })
                         .collect();
-                    Some((uri, diagnostics))
+                    let entry = rust_diagnostics_cache::CachedFile {
+                        size,
+                        modified_nanos,
+                        problems,
+                    };
+                    Some((path, uri, diagnostics, entry))
                 },
                 |completed, total| {
                     send_workspace_index_phase(
@@ -5013,9 +5037,16 @@ fn publish_workspace_rust_diagnostics(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .install(snapshot.into_built());
-        let mut analysis = analysis.lock().unwrap_or_else(|e| e.into_inner());
-        for (uri, diagnostics) in results.into_iter().flatten() {
-            analysis.set_diagnostics(&uri, diagnostics);
+        let mut entries = BTreeMap::new();
+        {
+            let mut analysis = analysis.lock().unwrap_or_else(|e| e.into_inner());
+            for (path, uri, diagnostics, entry) in results.into_iter().flatten() {
+                analysis.set_diagnostics(&uri, diagnostics);
+                entries.insert(path, entry);
+            }
+        }
+        if let Err(error) = rust_diagnostics_cache::save(&project_root, fingerprint, entries) {
+            tracing::warn!(root = %project_root.display(), %error, "failed to save Rust diagnostics cache");
         }
         tracing::debug!(
             root = %project_root.display(),
@@ -5105,6 +5136,41 @@ fn refresh_workspace_index(workspace: &CoreWorkspace, paths: &[String]) -> (u64,
         .count() as u64;
     save_workspace_manifest(root, &current);
     (total, changed)
+}
+
+fn file_size_and_mtime(path: &Path) -> Option<(u64, u128)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    let modified = metadata
+        .modified()
+        .ok()?
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()?;
+    Some((metadata.len(), modified.as_nanos()))
+}
+
+/// Builds the Rust index of `root`, reparsing only files whose size or
+/// modification time changed since the cached build.
+fn build_rust_index(root: &Path) -> rust::Built {
+    let Some(path) = rust_index_cache_path(root) else {
+        return RustEngine::build(root);
+    };
+    let mut cache = rust::RustIndexCache::load(&path, root);
+    let built = RustEngine::build_with_cache(root, &mut cache);
+    if let Err(error) = cache.save(&path, root) {
+        tracing::warn!(root = %root.display(), %error, "failed to save Rust index cache");
+    }
+    built
+}
+
+fn rust_index_cache_path(root: &Path) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    root.hash(&mut hasher);
+    Some(
+        PathBuf::from(home)
+            .join("Library/Caches/Galaxy/workspace-index")
+            .join(format!("{:016x}.rust-index-v1", hasher.finish())),
+    )
 }
 
 fn workspace_file_freshness(path: &Path) -> Option<String> {
@@ -5298,7 +5364,7 @@ fn spawn_rust_index(
         .name("rust-index".into())
         .spawn(move || {
             let started = Instant::now();
-            let built = RustEngine::build(&root);
+            let built = build_rust_index(&root);
             let stats = {
                 let mut engine = engine.lock().unwrap_or_else(|e| e.into_inner());
                 engine.install(built);
