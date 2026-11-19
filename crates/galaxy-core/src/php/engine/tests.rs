@@ -404,7 +404,7 @@ fn suggests_classes_with_import() {
     assert_eq!(
         profile.extra,
         [Insertion {
-            line: 4,
+            line: 3,
             column: 0,
             text: "use App\\Models\\Profile;\n".into()
         }]
@@ -417,6 +417,45 @@ fn suggests_classes_with_import() {
     let items = project.complete(&format!("{HEAD}        $x = new Us|\n    }}\n}}\n"));
     let user = items.iter().find(|c| c.label == "User").expect("User");
     assert!(user.extra.is_empty(), "already imported");
+}
+
+#[test]
+fn auto_import_inserts_between_alphabetical_names() {
+    let source = "<?php\nnamespace App\\Http;\n\nuse Closure;\nuse Illuminate\\Http\\Request;\nuse Symfony\\Component\\HttpFoundation\\Response;\n\nclass Page {}\n";
+    let file = parse_file(Path::new("Page.php"), source);
+    let edit = import_edit(&file, "Illuminate\\Support\\Facades\\Log").unwrap();
+    assert_eq!(edit.line, 5);
+    let at = byte_offset(source, edit.line, edit.column).unwrap();
+    let mut result = source.to_owned();
+    result.insert_str(at, &edit.text);
+    assert!(result.contains("use Illuminate\\Http\\Request;\nuse Illuminate\\Support\\Facades\\Log;\nuse Symfony\\Component\\HttpFoundation\\Response;"));
+    let updated = parse_file(Path::new("Page.php"), &result);
+    assert!(import_edit(&updated, "Illuminate\\Support\\Facades\\Log").is_none());
+}
+
+#[test]
+fn auto_import_orders_by_full_name_and_preserves_attached_comments() {
+    let source = "<?php\nnamespace App;\nuse Alpha\\Thing as Zed;\n// Keep this comment with Bravo.\nuse Bravo\\Thing as First;\nuse function strlen;\nuse const PHP_VERSION;\n";
+    let file = parse_file(Path::new("Page.php"), source);
+    let first = import_edit(&file, "Aardvark\\Start").unwrap();
+    assert_eq!(first.line, 2);
+    let middle = import_edit(&file, "azure\\Middle").unwrap();
+    assert_eq!(middle.line, 3);
+    let last = import_edit(&file, "Zulu\\End").unwrap();
+    assert_eq!(last.line, 5, "class import stays before function and const imports");
+}
+
+#[test]
+fn auto_import_preserves_indentation_and_grouped_imports() {
+    let source = "<?php\nnamespace App {\n    use Alpha\\{\n        One,\n        Two,\n    };\n    use Zulu\\Last;\n}\n";
+    let file = parse_file(Path::new("Page.php"), source);
+    let edit = import_edit(&file, "Beta\\Middle").unwrap();
+    assert_eq!(edit.line, 6);
+    assert_eq!(edit.text, "    use Beta\\Middle;\n");
+    let first = import_edit(&file, "Aardvark\\First").unwrap();
+    assert_eq!(first.line, 2);
+    let last = import_edit(&file, "Zzz\\End").unwrap();
+    assert_eq!(last.line, 7);
 }
 
 #[test]

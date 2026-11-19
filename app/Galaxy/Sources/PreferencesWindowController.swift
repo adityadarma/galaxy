@@ -24,7 +24,7 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
     private let terminalPaddingHLabel = NSTextField(labelWithString: "")
     private let terminalPaddingV = NSStepper(frame: .zero)
     private let terminalPaddingVLabel = NSTextField(labelWithString: "")
-    private static let terminalLineHeights: [Double] = [1.0, 1.1, 1.2, 1.3, 1.4, 1.5]
+    private static let terminalLineHeights: [Double] = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5]
     private static let terminalCursorStyles: [(title: String, value: TerminalSettings.CursorStyle)] = [
         ("Block", .block), ("Bar", .bar), ("Underline", .underline),
     ]

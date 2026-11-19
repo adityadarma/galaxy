@@ -171,6 +171,21 @@ pub(super) fn import_edit(file: &FileSymbols, fqn: &str) -> Option<Insertion> {
     if file.uses.contains_key(&short.to_lowercase()) {
         return None;
     }
+    let key = fqn.trim_start_matches('\\').to_lowercase();
+    if let Some(entry) = file.class_imports.iter().find(|entry| entry.name.to_lowercase() > key) {
+        return Some(Insertion {
+            line: entry.start_line,
+            column: 0,
+            text: format!("{}use {fqn};\n", entry.indent),
+        });
+    }
+    if let Some(entry) = file.class_imports.last() {
+        return Some(Insertion {
+            line: entry.end_line + 1,
+            column: 0,
+            text: format!("{}use {fqn};\n", entry.indent),
+        });
+    }
     let statement = format!("use {fqn};\n");
     let edit = if let Some(line) = file.last_use_line {
         Insertion {

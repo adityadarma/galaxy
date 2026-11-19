@@ -120,12 +120,22 @@ pub struct FunctionInfo {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClassImport {
+    pub name: String,
+    pub start_line: u32,
+    pub end_line: u32,
+    pub indent: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FileSymbols {
     pub classes: Vec<Arc<ClassInfo>>,
     pub functions: Vec<Arc<FunctionInfo>>,
     pub namespace: String,
     /// Lowercase alias to fully qualified name.
     pub uses: HashMap<String, String>,
+    /// Class imports in source order, with whole-statement insertion boundaries.
+    pub class_imports: Vec<ClassImport>,
     pub last_use_line: Option<u32>,
     pub namespace_line: Option<u32>,
     pub open_tag_line: Option<u32>,
@@ -615,7 +625,41 @@ impl<'a> Reader<'a> {
             .child_by_field_name("alias")
             .map(|n| self.text(n).to_owned())
             .unwrap_or_else(|| full.rsplit('\\').next().unwrap_or(&full).to_owned());
-        self.uses.insert(alias.to_lowercase(), full);
+        self.uses.insert(alias.to_lowercase(), full.clone());
+        let mut statement = clause;
+        while statement.kind() != "namespace_use_declaration" {
+            let Some(parent) = statement.parent() else { return };
+            statement = parent;
+        }
+        let line = statement.start_position().row as u32;
+        if self.out.class_imports.last().is_some_and(|entry| entry.end_line >= line) {
+            return;
+        }
+        let line_start = statement.start_byte() - statement.start_position().column;
+        let indent = &self.src[line_start..statement.start_byte()];
+        // A line insertion must not split inline code or a namespace header.
+        if !indent.chars().all(|ch| ch == ' ' || ch == '\t') {
+            return;
+        }
+        let mut start_line = line;
+        let mut previous = statement.prev_named_sibling();
+        while let Some(comment) = previous {
+            if comment.kind() != "comment" || comment.end_position().row as u32 + 1 != start_line {
+                break;
+            }
+            let start = comment.start_byte() - comment.start_position().column;
+            if !self.src[start..comment.start_byte()].chars().all(char::is_whitespace) {
+                break;
+            }
+            start_line = comment.start_position().row as u32;
+            previous = comment.prev_named_sibling();
+        }
+        self.out.class_imports.push(ClassImport {
+            name: full,
+            start_line,
+            end_line: statement.end_position().row as u32,
+            indent: indent.to_owned(),
+        });
     }
 
     fn names_in(&self, node: Node<'_>) -> Vec<String> {

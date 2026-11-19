@@ -543,7 +543,7 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         case unstaged
     }
 
-    private enum Row {
+    private enum Row: Equatable {
         case header(type: SectionType, title: String, count: Int, isCollapsed: Bool)
         case change(GitChangeInfo, isStaged: Bool)
         case empty(String)
@@ -699,23 +699,26 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
     }
 
     private func rebuildRows() {
-        rows = []
+        var next: [Row] = []
         if !stagedChanges.isEmpty {
-            rows.append(.header(type: .staged, title: "Staged Changes", count: stagedChanges.count, isCollapsed: isStagedCollapsed))
+            next.append(.header(type: .staged, title: "Staged Changes", count: stagedChanges.count, isCollapsed: isStagedCollapsed))
             if !isStagedCollapsed {
-                rows += stagedChanges.map { Row.change($0, isStaged: true) }
+                next += stagedChanges.map { Row.change($0, isStaged: true) }
             }
         }
         if !unstagedChanges.isEmpty || stagedChanges.isEmpty {
-            rows.append(.header(type: .unstaged, title: "Changes", count: unstagedChanges.count, isCollapsed: isChangesCollapsed))
+            next.append(.header(type: .unstaged, title: "Changes", count: unstagedChanges.count, isCollapsed: isChangesCollapsed))
             if !isChangesCollapsed {
                 if unstagedChanges.isEmpty && stagedChanges.isEmpty {
-                    rows.append(.empty("No changes"))
+                    next.append(.empty("No changes"))
                 } else {
-                    rows += unstagedChanges.map { Row.change($0, isStaged: false) }
+                    next += unstagedChanges.map { Row.change($0, isStaged: false) }
                 }
             }
         }
+        // Status refreshes often; reloading unchanged rows makes the list flicker.
+        guard next != rows else { return }
+        rows = next
         table.reloadData()
     }
 
@@ -840,7 +843,7 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
 
     @objc private func tableClicked(_ sender: Any?) {
         let row = table.clickedRow
-        guard row >= 0, row < rows.count else { return }
+        guard row >= 0, row < rows.count, !clickLandedOnButton() else { return }
         switch rows[row] {
         case .header(let type, _, _, _):
             toggleSection(type)
@@ -849,6 +852,19 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         case .empty:
             break
         }
+    }
+
+    /// The table also sends its action for clicks on a row's own buttons,
+    /// which already handled them.
+    private func clickLandedOnButton() -> Bool {
+        guard let event = NSApp.currentEvent, event.window === table.window,
+              let point = table.superview?.convert(event.locationInWindow, from: nil) else { return false }
+        var view = table.hitTest(point)
+        while let current = view, current !== table {
+            if current is NSButton { return true }
+            view = current.superview
+        }
+        return false
     }
 
     /// Changes with a committed version open as a diff; new, untracked and
@@ -870,19 +886,17 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         onRefresh?()
     }
 
+    /// One `git add -A` rather than a file at a time, so a stale row list or a
+    /// single failing path cannot leave changes behind.
     @objc func stageAll() {
         guard let workspace else { return }
-        for change in unstagedChanges {
-            _ = try? workspace.gitStage(path: change.path)
-        }
+        _ = try? workspace.gitStageAll()
         onRefresh?()
     }
 
     @objc func unstageAll() {
         guard let workspace else { return }
-        for change in stagedChanges {
-            _ = try? workspace.gitUnstage(path: change.path)
-        }
+        _ = try? workspace.gitUnstageAll()
         onRefresh?()
     }
 
@@ -1033,10 +1047,10 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         }
         let message = msg
 
-        let paths = stagedChanges.isEmpty ? unstagedChanges.map(\.path) : []
+        let stageEverything = stagedChanges.isEmpty
         performGitOperation("Committing…", success: "Commit created", submittedMessage: messageContainer.text) { workspace in
             do {
-                for path in paths { try workspace.gitStage(path: path) }
+                if stageEverything { try workspace.gitStageAll() }
                 try workspace.gitCommit(message: message)
                 return GitOperationResult(didCommit: true)
             } catch {
@@ -1087,14 +1101,14 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         guard let root = workspace?.root() else { return }
         let message = messageContainer.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !message.isEmpty else { generateCommitMessage(); return }
-        let paths = stagedChanges.isEmpty ? unstagedChanges.map(\.path) : []
+        let stageEverything = stagedChanges.isEmpty
         performGitOperation(
             sync ? "Committing & syncing…" : "Committing & pushing…",
             success: sync ? "Commit and sync complete" : "Commit and push complete",
             submittedMessage: messageContainer.text
         ) { workspace in
             do {
-                for path in paths { try workspace.gitStage(path: path) }
+                if stageEverything { try workspace.gitStageAll() }
                 try workspace.gitCommit(message: message)
             } catch {
                 return GitOperationResult(failure: Self.describe(error))
@@ -1447,6 +1461,10 @@ final class SourceControlHeaderCellView: NSTableCellView {
         trackingAreas.forEach(removeTrackingArea)
         addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
                                        owner: self, userInfo: nil))
+        // A cell made by a reload under the pointer gets no mouseEntered.
+        if let window {
+            setActionsVisible(bounds.contains(convert(window.mouseLocationOutsideOfEventStream, from: nil)))
+        }
     }
 
     override func mouseEntered(with event: NSEvent) { setActionsVisible(true) }
@@ -1666,6 +1684,11 @@ final class SourceControlItemCellView: NSTableCellView {
         trackingAreas.forEach(removeTrackingArea)
         addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
                                        owner: self, userInfo: nil))
+        // A cell made by a reload under the pointer gets no mouseEntered.
+        if let window {
+            isHovered = bounds.contains(convert(window.mouseLocationOutsideOfEventStream, from: nil))
+            updateButtonVisibility()
+        }
     }
 
     override func mouseEntered(with event: NSEvent) {

@@ -453,6 +453,38 @@ final class TerminalPanelTests: XCTestCase {
         XCTAssertFalse(c.validateMenuItem(kill))
     }
 
+    func testPasteTypesFilePathsTextOrASavedScreenshot() throws {
+        let pasteboard = NSPasteboard(name: NSPasteboard.Name("galaxy-test-\(UUID().uuidString)"))
+        defer { pasteboard.releaseGlobally() }
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-paste-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        pasteboard.clearContents()
+        pasteboard.setString("echo hi", forType: .string)
+        XCTAssertEqual(TerminalView.pasteText(from: pasteboard, imageDirectory: directory), "echo hi")
+
+        pasteboard.clearContents()
+        pasteboard.writeObjects([URL(fileURLWithPath: "/tmp/My Shot (1).png") as NSURL])
+        XCTAssertEqual(TerminalView.pasteText(from: pasteboard, imageDirectory: directory),
+                       "/tmp/My\\ Shot\\ \\(1\\).png", "copied files paste as escaped paths")
+
+        let image = NSImage(size: NSSize(width: 4, height: 4))
+        image.lockFocus()
+        NSColor.red.setFill()
+        NSRect(x: 0, y: 0, width: 4, height: 4).fill()
+        image.unlockFocus()
+        pasteboard.clearContents()
+        pasteboard.setData(try XCTUnwrap(image.tiffRepresentation), forType: .tiff)
+        let path = try XCTUnwrap(TerminalView.pasteText(from: pasteboard, imageDirectory: directory))
+        XCTAssertTrue(path.hasPrefix(directory.path), path)
+        XCTAssertTrue(path.hasSuffix(".png"), path)
+        let saved = try Data(contentsOf: URL(fileURLWithPath: path))
+        XCTAssertEqual(Array(saved.prefix(4)), [0x89, 0x50, 0x4E, 0x47], "the screenshot is saved as PNG")
+
+        pasteboard.clearContents()
+        XCTAssertNil(TerminalView.pasteText(from: pasteboard, imageDirectory: directory))
+    }
+
     /// ⌘V goes through the window's key monitor and menu, not `keyDown`, so
     /// the terminal has to answer the paste command itself.
     func testCommandVPastesIntoTheFocusedTerminal() throws {

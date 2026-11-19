@@ -467,10 +467,54 @@ final class TerminalView: NSView {
     }
 
     @objc func paste(_ sender: Any?) {
-        guard let handle, var text = pasteboard.string(forType: .string) else { return }
+        guard let handle, var text = Self.pasteText(from: pasteboard) else { return }
         text = text.replacingOccurrences(of: "\r\n", with: "\r").replacingOccurrences(of: "\n", with: "\r")
         if screen?.bracketedPaste == true { text = "\u{1b}[200~\(text)\u{1b}[201~" }
         try? handle.write(input: text)
+    }
+
+    /// Where pasted pictures are saved; the system clears its temporary folder.
+    static let pastedImageDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("GalaxyPastedImages", isDirectory: true)
+
+    /// What a paste types: the paths of files copied in Finder, else the
+    /// text, else a copied picture (a screenshot) saved as a PNG file, by
+    /// path. Shell programs, AI command lines among them, take a file path
+    /// where a terminal cannot send the picture itself.
+    static func pasteText(from pasteboard: NSPasteboard, imageDirectory: URL = pastedImageDirectory) -> String? {
+        if let urls = pasteboard.readObjects(forClasses: [NSURL.self],
+                                             options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty {
+            return urls.map { shellEscaped($0.path) }.joined(separator: " ")
+        }
+        if let text = pasteboard.string(forType: .string) { return text }
+        let png: Data
+        if let data = pasteboard.data(forType: .png) {
+            png = data
+        } else if let tiff = pasteboard.data(forType: .tiff), let rep = NSBitmapImageRep(data: tiff),
+                  let data = rep.representation(using: .png, properties: [:]) {
+            png = data
+        } else {
+            return nil
+        }
+        do {
+            try FileManager.default.createDirectory(at: imageDirectory, withIntermediateDirectories: true)
+            let url = imageDirectory.appendingPathComponent("pasted-\(Int(Date().timeIntervalSince1970 * 1000)).png")
+            try png.write(to: url, options: .atomic)
+            return shellEscaped(url.path)
+        } catch {
+            return nil
+        }
+    }
+
+    /// Backslash-escapes a path the way Terminal.app pastes and drops files.
+    static func shellEscaped(_ path: String) -> String {
+        let plain = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "/._-+,:@%"))
+        var out = ""
+        for scalar in path.unicodeScalars {
+            if !plain.contains(scalar) { out.append("\\") }
+            out.unicodeScalars.append(scalar)
+        }
+        return out
     }
 
     @objc override func selectAll(_ sender: Any?) {
@@ -869,7 +913,7 @@ struct TerminalSettings: Equatable {
     static let paddingHorizontalKey = "TerminalPaddingHorizontal"
     static let paddingVerticalKey = "TerminalPaddingVertical"
 
-    static let lineHeightRange: ClosedRange<Double> = 1.0...1.5
+    static let lineHeightRange: ClosedRange<Double> = 0.5...1.5
     static let paddingRange: ClosedRange<Double> = 0...40
     static let defaultPaddingHorizontal: Double = 20
     static let defaultPaddingVertical: Double = 4
