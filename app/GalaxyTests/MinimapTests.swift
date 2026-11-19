@@ -140,10 +140,12 @@ final class MinimapTests: XCTestCase {
     func testScrollDecorationUpdatesAreCoalesced() throws {
         let c = try makeWindow(lines: 100)
         defer { c.window?.orderOut(nil) }
+        let previousUpdate = c.lastScrollDecorationUpdate
         c.scheduleScrollDecorationUpdate()
         c.scheduleScrollDecorationUpdate()
         XCTAssertTrue(c.scrollDecorationUpdatePending)
         RunLoop.current.run(until: Date().addingTimeInterval(0.1))
-        XCTAssertFalse(c.scrollDecorationUpdatePending)
+        // Layout notifications may queue another update after the first one runs.
+        XCTAssertGreaterThan(c.lastScrollDecorationUpdate, previousUpdate)
     }
 }

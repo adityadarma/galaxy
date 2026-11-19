@@ -47,8 +47,8 @@ final class CompletionPopupTests: XCTestCase {
     func testSuggestionsRequireCaseSensitivePrefix() {
         let items = [item("log"), item("Log"), item("logger"), item("AuditLog"), item("LogicalAnd"), item("$LogEntry")]
         let ranked = CompletionPopup.rank(items, query: "Log")
-        XCTAssertEqual(ranked.map(\.item.label), ["Log", "$LogEntry"])
-        XCTAssertEqual(ranked.map(\.matched), [[0, 1, 2], [1, 2, 3]])
+        XCTAssertEqual(ranked.map(\.item.label), ["Log", "LogicalAnd", "$LogEntry"])
+        XCTAssertEqual(ranked.map(\.matched), [[0, 1, 2], [0, 1, 2], [1, 2, 3]])
         XCTAssertEqual(labels(items, "log"), ["log", "logger"])
     }
 
