@@ -19,11 +19,10 @@ final class CountPillView: NSView {
         wantsLayer = true
         layer?.cornerRadius = 9
         layer?.masksToBounds = true
-        // VS Code-style badge: muted blue chip with light blue digits.
-        layer?.backgroundColor = NSColor(srgbRed: 0.30, green: 0.45, blue: 0.62, alpha: 0.45).cgColor
 
-        label.font = .monospacedDigitSystemFont(ofSize: 11, weight: .medium)
-        label.textColor = NSColor(srgbRed: 0.62, green: 0.80, blue: 1.0, alpha: 1.0)
+        label.font = .monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
+        // Solid accent chip with white digits: readable on light and dark.
+        label.textColor = .white
         label.alignment = .center
         label.translatesAutoresizingMaskIntoConstraints = false
         addSubview(label)
@@ -38,6 +37,21 @@ final class CountPillView: NSView {
     }
 
     required init?(coder: NSCoder) { fatalError() }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        refreshFill()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        refreshFill()
+    }
+
+    /// Layer colours do not follow appearance changes by themselves.
+    private func refreshFill() {
+        layer?.backgroundColor = Theme.accent.resolved(for: effectiveAppearance).cgColor
+    }
 
     func setCount(_ count: Int) {
         label.stringValue = CountFormat.compact(count)
@@ -680,6 +694,10 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         rebuildRows()
         updateCommitButtonState()
     }
+
+    /// Rows across Staged Changes and Changes. A file with both staged and
+    /// unstaged edits counts in each group, as in VS Code's badge.
+    var changeCount: Int { stagedChanges.count + unstagedChanges.count }
 
     private func isStagedChange(_ change: GitChangeInfo) -> Bool {
         if change.code.count >= 1 {
@@ -1702,9 +1720,9 @@ final class SourceControlItemCellView: NSTableCellView {
     }
 
     private func statusBadgeInfo(for change: GitChangeInfo, isStaged: Bool) -> (letter: String, color: NSColor) {
-        let orangeColor = NSColor(srgbRed: 226/255.0, green: 192/255.0, blue: 141/255.0, alpha: 1.0) // VS Code Modified amber #e2c08d
-        let greenColor = NSColor(srgbRed: 115/255.0, green: 201/255.0, blue: 145/255.0, alpha: 1.0) // VS Code Green #73c991
-        let redColor = NSColor(srgbRed: 199/255.0, green: 78/255.0, blue: 57/255.0, alpha: 1.0)     // VS Code Red #c74e39
+        let orangeColor = GitFileStatus.modified.color ?? .labelColor
+        let greenColor = GitFileStatus.added.color ?? .labelColor
+        let redColor = GitFileStatus.deleted.color ?? .labelColor
 
         let code = change.code
         if isStaged {

@@ -58,9 +58,35 @@ final class DiffTabTests: XCTestCase {
         XCTAssertFalse(c.diffHunkActions.isHidden)
         XCTAssertEqual(c.diffHunkActions.hunkButtons.count, 4)
 
-        try XCTUnwrap(c.diffHunkActions.hunkButtons.first {
-            $0.tag == 0 && $0.toolTip?.contains("Stage") == true
-        }).performClick(nil)
+        let revert = try XCTUnwrap(c.diffHunkActions.hunkButtons.first { $0.tag == 0 && $0.toolTip == "Revert Block" })
+        let stage = try XCTUnwrap(c.diffHunkActions.hunkButtons.first { $0.tag == 0 && $0.toolTip == "Stage Block" })
+        XCTAssertEqual(revert.frame.minX, stage.frame.minX)
+        XCTAssertLessThan(revert.frame.minY, stage.frame.minY, "stage sits below revert")
+        XCTAssertGreaterThanOrEqual(revert.frame.minX, c.secondaryScrollView.frame.maxX, "clear of the left scrollbar")
+        XCTAssertLessThanOrEqual(revert.frame.maxX, c.scrollView.frame.minX, "clear of the right pane")
+
+        let split = c.editorSplitView
+        let gutter = try XCTUnwrap(split.diffGutterRect)
+        let regions = split.diffGutterCursorRegions()
+        XCTAssertFalse(regions.drag.isEmpty)
+        for drag in regions.drag {
+            XCTAssertEqual(drag.width, EditorSplitView.diffHandleWidth, "only the line resizes")
+            XCTAssertEqual(drag.maxX, gutter.maxX, accuracy: 0.5, "the line runs down the gutter's right edge")
+            for button in [revert, stage] {
+                let frame = c.diffHunkActions.convert(button.frame, to: split)
+                XCTAssertFalse(drag.intersects(frame), "buttons never show the resize cursor")
+            }
+        }
+        XCTAssertTrue(regions.arrow.contains { $0.minX == gutter.minX }, "rest of the gutter uses the arrow")
+        XCTAssertFalse(revert.frame.intersects(stage.frame), "stacked buttons do not overlap")
+        XCTAssertFalse(revert.isBordered, "a bezel would paint past the frame")
+        let handleX = gutter.maxX - EditorSplitView.diffHandleWidth
+        for button in [revert, stage] {
+            XCTAssertLessThanOrEqual(c.diffHunkActions.convert(button.frame, to: split).maxX, handleX,
+                                     "buttons sit left of the line")
+        }
+
+        stage.performClick(nil)
         let deadline = Date().addingTimeInterval(5)
         while c.statusLabel.stringValue != "Staged change.", Date() < deadline {
             RunLoop.current.run(until: Date().addingTimeInterval(0.02))
@@ -69,7 +95,7 @@ final class DiffTabTests: XCTestCase {
         XCTAssertEqual(c.activeTab?.doc.text(), "one\nTWO\nthree\nfour\nfive\n")
 
         try XCTUnwrap(c.diffHunkActions.hunkButtons.first {
-            $0.tag == 1 && $0.toolTip?.contains("Restore") == true
+            $0.tag == 1 && $0.toolTip == "Revert Block"
         }).performClick(nil)
         XCTAssertEqual(c.activeTab?.doc.text(), "one\nTWO\nthree\nfour\n")
         XCTAssertTrue(c.activeTab?.doc.isModified() ?? false)
@@ -107,6 +133,17 @@ final class DiffTabTests: XCTestCase {
         c.layoutDiffHunkActions()
         let after = try XCTUnwrap(c.diffHunkActions.hunkButtons.first?.frame.minY)
         if c.scrollView.contentView.bounds.minY > 0 { XCTAssertLessThan(after, before) }
+
+        // A button scrolled partly above the editor is cut off at its top
+        // edge and cannot be clicked through the tab bar.
+        let actions = c.diffHunkActions
+        XCTAssertTrue(actions.clipsToBounds)
+        let button = try XCTUnwrap(actions.hunkButtons.first)
+        button.frame.origin.y = -button.frame.height / 2
+        let above = actions.convert(NSPoint(x: button.frame.midX, y: -2), to: actions.superview)
+        XCTAssertNil(actions.hitTest(above))
+        let inside = actions.convert(NSPoint(x: button.frame.midX, y: 2), to: actions.superview)
+        XCTAssertTrue(actions.hitTest(inside) === button)
 
         c.openWorkspaceFile(ws, FileEntry(name: "other.txt", relPath: "other.txt", isDir: false), preview: false)
         XCTAssertTrue(c.diffHunkActions.isHidden)
@@ -240,10 +277,23 @@ final class DiffTabTests: XCTestCase {
         let scroller = try XCTUnwrap(c.scrollView.verticalScroller)
         XCTAssertFalse(scroller.isHidden)
         XCTAssertEqual(c.scrollView.ruler.frame.maxX, scroller.frame.minX, accuracy: 1)
+        for scroll in [c.secondaryScrollView, c.scrollView] {
+            let vertical = try XCTUnwrap(scroll.verticalScroller)
+            let backdrop = scroll.verticalScrollerBackdrop
+            XCTAssertFalse(backdrop.isHidden, "text must not show through the scroller track")
+            XCTAssertEqual(backdrop.frame, vertical.frame)
+            let subviews = scroll.subviews
+            XCTAssertLessThan(try XCTUnwrap(subviews.firstIndex(of: backdrop)),
+                              try XCTUnwrap(subviews.firstIndex(of: vertical)))
+            XCTAssertGreaterThan(try XCTUnwrap(subviews.firstIndex(of: backdrop)),
+                                 try XCTUnwrap(subviews.firstIndex(of: scroll.contentView)))
+        }
 
         c.openWorkspaceFile(ws, FileEntry(name: "other.txt", relPath: "other.txt", isDir: false), preview: false)
         XCTAssertEqual(c.scrollView.scrollerStyle, .overlay)
         XCTAssertTrue(c.scrollView.autohidesScrollers)
+        c.window?.contentView?.layoutSubtreeIfNeeded()
+        XCTAssertTrue(c.scrollView.verticalScrollerBackdrop.isHidden, "overlay scrollers keep floating over text")
     }
 
     func testAnAlreadyOpenFileKeepsItsTabWhenOpeningTheDiff() throws {

@@ -82,13 +82,31 @@ final class TerminalView: NSView {
     override var isFlipped: Bool { true }
     override var isOpaque: Bool { true }
 
+    /// Last palette given to the core, so a redraw only sends a changed one.
+    private var sentPalette: (ansi: [UInt32], foreground: UInt32, background: UInt32, cursor: UInt32)?
+
+    /// Programs such as opencode ask the terminal for its colors (OSC 10/11)
+    /// to choose a light or dark look. The core answers with these.
+    private func sendPalette(_ palette: TerminalPalette) {
+        guard let handle else { return }
+        let values = palette.hexValues
+        if let sent = sentPalette, sent.ansi == values.ansi, sent.foreground == values.foreground,
+           sent.background == values.background, sent.cursor == values.cursor { return }
+        handle.setColors(ansi: values.ansi, foreground: values.foreground,
+                         background: values.background, cursor: values.cursor)
+        sentPalette = values
+    }
+
     func start(handle: TerminalHandle) {
         let changed = self.handle !== handle
         self.handle = handle
         if changed {
             screen = nil
             lastSize = (0, 0)
+            sentPalette = nil
         }
+        // Before the shell's first prompt, so its first color query is right.
+        sendPalette(TerminalPalette(appearance: effectiveAppearance))
         timer?.invalidate()
         let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
             onAppKitMainThread { self?.tick() }
@@ -624,6 +642,7 @@ final class TerminalView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         let palette = TerminalPalette(appearance: effectiveAppearance)
+        sendPalette(palette)
         palette.background.setFill()
         dirtyRect.intersection(bounds).fill()
         if showsLeadingDivider {
@@ -998,22 +1017,71 @@ struct TerminalPalette {
     let cursor: NSColor
     let ansi: [NSColor]
 
+    /// Background and default text follow the editor theme, so the terminal
+    /// and the editor read as one surface.
     init(appearance: NSAppearance) {
-        let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let dark = Theme.definition(for: appearance).isDark
         background = Theme.editorBackground.resolved(for: appearance)
+        foreground = Theme.editorForeground.resolved(for: appearance)
+        cursor = Theme.accent.resolved(for: appearance)
         if dark {
-            foreground = NSColor(hex: "#CCCCCC") ?? .textColor
-            cursor = NSColor(hex: "#AEAFAD") ?? .textColor
             ansi = ["#000000", "#CD3131", "#0DBC79", "#E5E510", "#2472C8", "#BC3FBC", "#11A8CD", "#E5E5E5",
                     "#666666", "#F14C4C", "#23D18B", "#F5F543", "#3B8EEA", "#D670D6", "#29B8DB", "#E5E5E5"]
                 .map { NSColor(hex: $0) ?? .textColor }
         } else {
-            foreground = NSColor(hex: "#3B3B3B") ?? .textColor
-            cursor = NSColor(hex: "#005FB8") ?? .textColor
-            ansi = ["#000000", "#CD3131", "#107C10", "#949800", "#0451A5", "#BC05BC", "#0598BC", "#555555",
-                    "#666666", "#CD3131", "#14CE14", "#B5BA00", "#0451A5", "#BC05BC", "#0598BC", "#A5A5A5"]
+            // Tuned for the warm off-white editor. Prompts such as
+            // powerlevel10k fill segments with these under black or white
+            // text, so yellow and blue are segment colors first; as text,
+            // `minimumContrast` darkens them. White (7) stays light for the
+            // clock segment.
+            ansi = ["#000000", "#B42318", "#3D9C41", "#DBB90F", "#2E6A9F", "#8E3FA8", "#0E7C86", "#D3D0CB",
+                    "#6E6A64", "#C9252D", "#2E8B3A", "#B07800", "#3B74D1", "#9C4BBB", "#13848F", "#EAE8E4"]
                 .map { NSColor(hex: $0) ?? .textColor }
         }
+        minimumContrast = dark ? nil : 4.5
+    }
+
+    /// Text below this contrast with its cell is darkened or lightened until
+    /// it reaches it, like VS Code's `terminal.integrated.minimumContrastRatio`.
+    /// Prompts use bright 256-color greens meant for dark terminals.
+    let minimumContrast: CGFloat?
+
+    static func luminance(_ color: NSColor) -> CGFloat {
+        let c = color.usingColorSpace(.sRGB) ?? color
+        func linear(_ v: CGFloat) -> CGFloat { v <= 0.03928 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4) }
+        return 0.2126 * linear(c.redComponent) + 0.7152 * linear(c.greenComponent) + 0.0722 * linear(c.blueComponent)
+    }
+
+    static func contrast(_ a: NSColor, _ b: NSColor) -> CGFloat {
+        let (x, y) = (luminance(a), luminance(b))
+        return (max(x, y) + 0.05) / (min(x, y) + 0.05)
+    }
+
+    /// `color`, moved toward black on a light cell or white on a dark one in
+    /// 10% steps until it has `ratio` contrast with `background`.
+    static func readable(_ color: NSColor, on background: NSColor, ratio: CGFloat) -> NSColor {
+        guard contrast(color, background) < ratio else { return color }
+        let fg = color.usingColorSpace(.sRGB) ?? color
+        let target: CGFloat = luminance(background) > 0.5 ? 0 : 1
+        var adjusted = fg
+        for step in 1...10 {
+            let t = CGFloat(step) / 10
+            func mix(_ v: CGFloat) -> CGFloat { v + (target - v) * t }
+            adjusted = NSColor(srgbRed: mix(fg.redComponent), green: mix(fg.greenComponent),
+                               blue: mix(fg.blueComponent), alpha: fg.alphaComponent)
+            if contrast(adjusted, background) >= ratio { break }
+        }
+        return adjusted
+    }
+
+    /// `0xRRGGBB` of each color, the form the core answers color queries with.
+    var hexValues: (ansi: [UInt32], foreground: UInt32, background: UInt32, cursor: UInt32) {
+        func hex(_ color: NSColor) -> UInt32 {
+            let c = color.usingColorSpace(.sRGB) ?? color
+            func byte(_ v: CGFloat) -> UInt32 { UInt32((max(0, min(1, v)) * 255).rounded()) }
+            return byte(c.redComponent) << 16 | byte(c.greenComponent) << 8 | byte(c.blueComponent)
+        }
+        return (ansi.map(hex), hex(foreground), hex(background), hex(cursor))
     }
 
     func color(_ color: TerminalColorInfo, isForeground: Bool) -> NSColor? {
@@ -1035,6 +1103,7 @@ struct TerminalPalette {
             bg = fg
             fg = swapped
         }
+        if let minimumContrast { fg = Self.readable(fg, on: bg ?? background, ratio: minimumContrast) }
         if run.dim { fg = fg.withAlphaComponent(0.6) }
         return (fg, bg)
     }

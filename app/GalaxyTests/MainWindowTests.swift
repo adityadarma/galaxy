@@ -7,6 +7,22 @@ import XCTest
 final class MainWindowTests: XCTestCase {
     private func settle() { RunLoop.current.run(until: Date().addingTimeInterval(0.4)) }
 
+    /// The window edges and the strip above the status bar show the content
+    /// view, which must be the chrome colour, not the window's white.
+    func testWindowBackgroundIsTheThemeChrome() throws {
+        for name in [NSAppearance.Name.aqua, .darkAqua] {
+            let view = FileDropView(frame: NSRect(x: 0, y: 0, width: 20, height: 20))
+            view.appearance = NSAppearance(named: name)
+            let rep = try XCTUnwrap(view.bitmapImageRepForCachingDisplay(in: view.bounds))
+            view.cacheDisplay(in: view.bounds, to: rep)
+            let drawn = try XCTUnwrap(rep.colorAt(x: 2, y: 2)?.usingColorSpace(.sRGB))
+            let chrome = Theme.chrome.resolved(for: NSAppearance(named: name)!)
+            XCTAssertEqual(drawn.redComponent, chrome.redComponent, accuracy: 0.01, "\(name.rawValue)")
+            XCTAssertEqual(drawn.greenComponent, chrome.greenComponent, accuracy: 0.01, "\(name.rawValue)")
+            XCTAssertEqual(drawn.blueComponent, chrome.blueComponent, accuracy: 0.01, "\(name.rawValue)")
+        }
+    }
+
     func testReferencesPeekIsLazyAtStartup() {
         let controller = MainWindowController(bridge: CoreBridge())
         defer { controller.window?.orderOut(nil) }

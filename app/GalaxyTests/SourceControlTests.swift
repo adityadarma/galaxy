@@ -43,6 +43,19 @@ final class SourceControlTests: XCTestCase {
         XCTAssertEqual(sc.numberOfRows(in: dummyTable), 4)
     }
 
+    func testChangeCountMatchesBothSections() {
+        let sc = SourceControlController()
+        sc.refresh(status: GitStatusInfo(
+            branch: "main",
+            changedPaths: ["a.swift", "b.swift", "c.swift"],
+            changes: [GitChangeInfo(path: "a.swift", staged: true, code: "M "),
+                      GitChangeInfo(path: "b.swift", staged: true, code: "MM"),
+                      GitChangeInfo(path: "c.swift", staged: false, code: "??")]))
+        XCTAssertEqual(sc.changeCount, 4, "a file with staged and unstaged edits counts in each section")
+        sc.refresh(status: nil)
+        XCTAssertEqual(sc.changeCount, 0)
+    }
+
     func testChangeRowHasAnOpenFileButtonThatOpensTheFileNotTheDiff() throws {
         let sc = SourceControlController()
         var opened: [String] = []

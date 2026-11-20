@@ -25,7 +25,8 @@ final class ThemeTests: XCTestCase {
         Theme.select(Theme.systemName, persist: false)
         XCTAssertEqual(Theme.definition(for: light).name, "Galaxy Light")
         XCTAssertEqual(Theme.definition(for: dark).name, "Galaxy Dark")
-        XCTAssertEqual(hex(Theme.editorBackground, light), "#FFFFFF")
+        XCTAssertEqual(hex(Theme.editorBackground, light), "#F7F6F4")
+        XCTAssertEqual(hex(Theme.sidebar, light), "#F7F6F4", "the sidebar and editor share one surface")
         XCTAssertEqual(hex(Theme.editorBackground, dark), "#15171D")
     }
 

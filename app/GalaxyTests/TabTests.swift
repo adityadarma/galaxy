@@ -181,6 +181,15 @@ final class TabTests: XCTestCase {
         XCTAssertEqual(c.pathBar.label.accessibilityLabel(), c.pathBar.components.joined(separator: " / "))
     }
 
+    /// A light theme on a dark Mac drew the folders white: the dimmed label
+    /// color was fixed to the appearance it was first read under.
+    func testPathColorsFollowTheAppearance() {
+        for color in [PathBar.folderColor, PathBar.separatorColor] {
+            XCTAssertLessThan(color.resolved(for: NSAppearance(named: .aqua)!).redComponent, 0.5)
+            XCTAssertGreaterThan(color.resolved(for: NSAppearance(named: .darkAqua)!).redComponent, 0.5)
+        }
+    }
+
     func testRefreshingSymbolBreadcrumbsDoesNotAccumulateSeparators() {
         let bar = PathBar(frame: NSRect(x: 0, y: 0, width: 600, height: PathBar.height))
         bar.show(["src", "network.ts"])

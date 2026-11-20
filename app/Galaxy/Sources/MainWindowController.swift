@@ -81,7 +81,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     func removeMarkdownPreviewIfLoaded() {
         loadedMarkdownPreview?.removeFromSuperview()
     }
-    let editorSplitView = NSSplitView()
+    let editorSplitView = EditorSplitView()
     let diffHunkActions = DiffHunkActionsView()
     let problemsPanel = ProblemsPanel()
     var loadedReferencesPanel: ReferencesPanel?
@@ -741,11 +741,15 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         groupChrome.addSubview(findBarSlot)
         groupChrome.addSubview(editorSplitView)
         diffHunkActions.isHidden = true
+        // A hunk scrolled partly above the editor must not draw its buttons
+        // over the tab bar.
+        diffHunkActions.clipsToBounds = true
         diffHunkActions.translatesAutoresizingMaskIntoConstraints = false
         groupChrome.addSubview(diffHunkActions)
         diffHunkActions.onRevert = { [weak self] index in self?.revertDiffHunk(at: index) }
         diffHunkActions.onStage = { [weak self] index in self?.stageDiffHunk(at: index) }
         diffHunkActions.configure(scrollView: scrollView, leftPane: secondaryScrollView)
+        diffHunkActions.gutter = editorSplitView
         groupChrome.addSubview(stickyScopeView)
         editorTerminalView.translatesAutoresizingMaskIntoConstraints = false
         editorTerminalView.isHidden = true

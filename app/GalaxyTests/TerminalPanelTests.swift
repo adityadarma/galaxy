@@ -89,6 +89,40 @@ final class TerminalPanelTests: XCTestCase {
         XCTAssertEqual(palette.colors(for: bold).foreground, palette.ansi[9], "bold uses the bright color")
     }
 
+    func testPaletteMatchesTheEditorTheme() {
+        for name in [NSAppearance.Name.aqua, .darkAqua] {
+            let appearance = NSAppearance(named: name)!
+            let palette = TerminalPalette(appearance: appearance)
+            XCTAssertEqual(palette.background, Theme.editorBackground.resolved(for: appearance))
+            XCTAssertEqual(palette.foreground, Theme.editorForeground.resolved(for: appearance))
+            let hex = palette.hexValues
+            XCTAssertEqual(hex.ansi.count, 16)
+            XCTAssertEqual(hex.background, name == .aqua ? 0xF7F6F4 : 0x15171D, "Galaxy Light and Dark backgrounds")
+        }
+    }
+
+    func testLightPaletteStaysReadableOnTheEditorBackground() {
+        let contrast = TerminalPalette.contrast
+        let palette = TerminalPalette(appearance: NSAppearance(named: .aqua)!)
+        func run(_ fg: UInt8, on bg: TerminalColorInfo = .default) -> TerminalRunInfo {
+            TerminalRunInfo(column: 0, text: "x", foreground: .indexed(index: fg), background: bg, bold: false,
+                            italic: false, dim: false, underline: false, strikeout: false, inverse: false)
+        }
+        // Every ANSI color and powerlevel10k's prompt green (76) read as text.
+        for index: UInt8 in Array(1...6) + [76] {
+            let drawn = palette.colors(for: run(index))
+            XCTAssertGreaterThanOrEqual(contrast(drawn.foreground, palette.background), 4.5, "color \(index) as text")
+        }
+        XCTAssertEqual(palette.colors(for: run(1)).foreground, palette.ansi[1], "readable colors are left alone")
+        // Segments: black on yellow and white, light gray on blue.
+        for index in [3, 7] {
+            XCTAssertGreaterThanOrEqual(contrast(palette.ansi[0], palette.ansi[index]), 7, "black on ANSI \(index)")
+        }
+        let folder = palette.colors(for: run(254, on: .indexed(index: 4)))
+        XCTAssertGreaterThanOrEqual(contrast(folder.foreground, palette.ansi[4]), 4.5, "folder text on blue")
+        XCTAssertGreaterThan(TerminalPalette.luminance(palette.ansi[7]), 0.5, "white stays light")
+    }
+
     func testHeaderShowsTheChipForOneTerminalOnly() {
         let header = BottomPanelHeader(frame: NSRect(x: 0, y: 0, width: 900, height: BottomPanelHeader.height))
         let zsh = TerminalSummary(name: "zsh", icon: PanelTerminal.defaultIcon, tint: nil, group: 0)

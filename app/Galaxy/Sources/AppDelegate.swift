@@ -141,6 +141,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
         updater.checkForUpdates()
     }
 
+    @objc func installCommandLineTool(_ sender: Any?) {
+        let alert = NSAlert()
+        let link = CommandLineTool.defaultLinkURL
+        do {
+            try CommandLineTool.install(link: link)
+            let directory = link.deletingLastPathComponent()
+            let shown = (directory.path as NSString).abbreviatingWithTildeInPath
+            alert.messageText = "The 'galaxy' command is installed"
+            var text = "Run `galaxy` to open Galaxy, or `galaxy .` to open the current folder."
+            if !CommandLineTool.shellPathContains(directory) {
+                text += "\n\n\(shown) is not on your PATH. Add this line to ~/.zshrc:\nexport PATH=\"\(shown):$PATH\""
+            }
+            alert.informativeText = text
+        } catch {
+            alert.alertStyle = .warning
+            alert.messageText = "Could not install the 'galaxy' command"
+            alert.informativeText = error.localizedDescription
+        }
+        alert.runModal()
+    }
+
     func canCheckForUpdates() -> Bool {
         updater.isAvailable
     }

@@ -9,8 +9,11 @@ final class PathBar: NSView {
     static let inset: CGFloat = 16
     /// Folders and chevrons stay readable on the editor surface in both
     /// appearances; the file name is the brightest.
-    static let folderColor = NSColor.labelColor.withAlphaComponent(0.72)
-    static let separatorColor = NSColor.labelColor.withAlphaComponent(0.55)
+    /// Resolved per appearance: `labelColor.withAlphaComponent` kept the
+    /// appearance it was first read under, so a light theme on a dark Mac
+    /// drew white folders.
+    static let folderColor = NSColor(name: nil) { NSColor.labelColor.resolved(for: $0).withAlphaComponent(0.72) }
+    static let separatorColor = NSColor(name: nil) { NSColor.labelColor.resolved(for: $0).withAlphaComponent(0.55) }
 
     let label = NSTextField(labelWithString: "")
     /// Copper dot after the file name while there are unsaved changes.

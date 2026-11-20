@@ -24,6 +24,32 @@ final class DiagnosticScrollView: NSScrollView {
     override func tile() {
         super.tile()
         updateScrollerInset()
+        updateScrollerBackdrops()
+    }
+
+    /// Legacy scrollers (the diff pane) sit over a clip that still spans the
+    /// whole view, and their track is translucent, so text showed through.
+    /// An opaque strip under each visible scroller hides it.
+    let verticalScrollerBackdrop = EditorBackgroundStrip()
+    let horizontalScrollerBackdrop = EditorBackgroundStrip()
+
+    private func updateScrollerBackdrops() {
+        let pairs: [(EditorBackgroundStrip, NSScroller?)] = [
+            (verticalScrollerBackdrop, verticalScroller),
+            (horizontalScrollerBackdrop, horizontalScroller),
+        ]
+        for (backdrop, scroller) in pairs {
+            guard scrollerStyle == .legacy, let scroller, !scroller.isHidden else {
+                backdrop.isHidden = true
+                continue
+            }
+            let index = subviews.firstIndex(of: scroller) ?? 0
+            if backdrop.superview !== self || (subviews.firstIndex(of: backdrop) ?? Int.max) > index {
+                addSubview(backdrop, positioned: .below, relativeTo: scroller)
+            }
+            backdrop.frame = scroller.frame
+            backdrop.isHidden = false
+        }
     }
 
     func updateScrollerInset() {
@@ -33,6 +59,24 @@ final class DiagnosticScrollView: NSScrollView {
         let left = min(max(editor.gutterWidth, 0), max(frame.width - 1, 0))
         guard left > 0, abs(frame.minX - left) > 0.01 else { return }
         scroller.frame = NSRect(x: frame.minX + left, y: frame.minY, width: frame.width - left, height: frame.height)
+    }
+}
+
+/// Opaque editor-background fill that never takes mouse events.
+@MainActor
+final class EditorBackgroundStrip: NSView {
+    nonisolated override var isOpaque: Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        Theme.editorBackground.resolved(for: effectiveAppearance).setFill()
+        dirtyRect.intersection(bounds).fill()
     }
 }
 

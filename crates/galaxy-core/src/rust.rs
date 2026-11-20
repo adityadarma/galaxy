@@ -2430,12 +2430,41 @@ fn structural_braces(line: &str) -> (usize, usize) {
 /// The nearest Cargo workspace root, then `.git`, then the file directory.
 pub fn project_root(file: &Path) -> PathBuf {
     let start = file.parent().unwrap_or(file);
-    start
+    let Some(package) = start
         .ancestors()
         .find(|dir| dir.join("Cargo.toml").is_file())
-        .or_else(|| start.ancestors().find(|dir| dir.join(".git").exists()))
-        .unwrap_or(start)
+    else {
+        return start
+            .ancestors()
+            .find(|dir| dir.join(".git").exists())
+            .unwrap_or(start)
+            .to_path_buf();
+    };
+    package
+        .ancestors()
+        .skip(1)
+        .find(|dir| workspace_covers(dir, package))
+        .unwrap_or(package)
         .to_path_buf()
+}
+
+/// Whether `dir` holds a Cargo workspace listing `package` in `members` or
+/// `exclude`. Excluded packages count so they share the workspace engine and
+/// its references, matching how `cargo_packages` indexes them.
+fn workspace_covers(dir: &Path, package: &Path) -> bool {
+    let Ok(contents) = std::fs::read_to_string(dir.join("Cargo.toml")) else {
+        return false;
+    };
+    if !contents.lines().any(|line| line.trim() == "[workspace]") {
+        return false;
+    }
+    toml_array_values(&contents, "members")
+        .into_iter()
+        .chain(toml_array_values(&contents, "exclude"))
+        .any(|member| match member.strip_suffix("/*") {
+            Some(parent) => package.parent() == Some(dir.join(parent).as_path()),
+            None => package == dir.join(member),
+        })
 }
 
 /// Source directories in the local Cargo package or workspace. A normal
@@ -2450,7 +2479,10 @@ fn cargo_source_roots(root: &Path) -> Vec<PathBuf> {
     let Ok(contents) = std::fs::read_to_string(&manifest) else {
         return vec![root.join("src")];
     };
-    for member in toml_array_values(&contents, "members") {
+    for member in toml_array_values(&contents, "members")
+        .into_iter()
+        .chain(toml_array_values(&contents, "exclude"))
+    {
         let pattern = root.join(member);
         if member.ends_with("/*") {
             let Some(parent) = pattern.parent() else {
@@ -2498,7 +2530,10 @@ fn cargo_packages(root: &Path) -> Vec<CargoPackage> {
         })];
     };
     let mut roots = vec![root.to_path_buf()];
-    for member in toml_array_values(&contents, "members") {
+    for member in toml_array_values(&contents, "members")
+        .into_iter()
+        .chain(toml_array_values(&contents, "exclude"))
+    {
         let pattern = root.join(member);
         if member.ends_with("/*") {
             if let Some(parent) = pattern.parent()
@@ -6405,6 +6440,106 @@ mod tests {
                 root.path().join("tools/cli/src"),
                 root.path().join("tools/codegen/src"),
             ]
+        );
+    }
+
+    #[test]
+    fn cargo_workspace_source_roots_include_excluded_packages() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/core\"]\nexclude = [\"fuzz\"]\n",
+        )
+        .unwrap();
+        for package in ["crates/core", "fuzz"] {
+            let package = root.path().join(package);
+            std::fs::create_dir_all(package.join("src")).unwrap();
+            std::fs::write(package.join("Cargo.toml"), "[package]\nname = \"test\"\n").unwrap();
+        }
+
+        assert_eq!(
+            cargo_source_roots(root.path()),
+            vec![
+                root.path().join("crates/core/src"),
+                root.path().join("fuzz/src"),
+            ]
+        );
+    }
+
+    #[test]
+    fn project_root_is_the_workspace_that_lists_the_package() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/*\"]\nexclude = [\"fuzz\"]\n",
+        )
+        .unwrap();
+        for package in ["crates/core", "fuzz", "vendor/other"] {
+            let package = root.path().join(package);
+            std::fs::create_dir_all(package.join("src")).unwrap();
+            std::fs::write(package.join("Cargo.toml"), "[package]\nname = \"test\"\n").unwrap();
+        }
+
+        assert_eq!(
+            project_root(&root.path().join("crates/core/src/lib.rs")),
+            root.path()
+        );
+        assert_eq!(
+            project_root(&root.path().join("fuzz/src/main.rs")),
+            root.path()
+        );
+        assert_eq!(
+            project_root(&root.path().join("vendor/other/src/lib.rs")),
+            root.path().join("vendor/other")
+        );
+    }
+
+    #[test]
+    fn references_include_uses_from_excluded_workspace_packages() {
+        let root = tempfile::tempdir().unwrap();
+        let base = root.path().canonicalize().unwrap();
+        std::fs::write(
+            base.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"crates/core\"]\nexclude = [\"fuzz\"]\n",
+        )
+        .unwrap();
+        let core = base.join("crates/core");
+        std::fs::create_dir_all(core.join("src")).unwrap();
+        std::fs::write(core.join("Cargo.toml"), "[package]\nname = \"rpccore\"\n").unwrap();
+        let lib = core.join("src/lib.rs");
+        let rpc = core.join("src/rpc.rs");
+        std::fs::write(&lib, "pub mod rpc;\n").unwrap();
+        let declaration = "pub fn parse_payload(bytes: &[u8]) -> bool { bytes.is_empty() }\n";
+        std::fs::write(&rpc, declaration).unwrap();
+        let fuzz = base.join("fuzz");
+        std::fs::create_dir_all(fuzz.join("fuzz_targets")).unwrap();
+        std::fs::write(
+            fuzz.join("Cargo.toml"),
+            "[package]\nname = \"fuzz\"\n\n[dependencies]\nrpccore = { path = \"../crates/core\" }\n\n\
+             [[bin]]\nname = \"payload\"\npath = \"fuzz_targets/payload.rs\"\n",
+        )
+        .unwrap();
+        let target = fuzz.join("fuzz_targets/payload.rs");
+        std::fs::write(
+            &target,
+            "use rpccore::rpc::parse_payload;\nfn main() { let _ = parse_payload(b\"\"); }\n",
+        )
+        .unwrap();
+
+        let project = project_root(&rpc);
+        assert_eq!(project, base);
+        let mut engine = RustEngine::pending(&project);
+        engine.install(RustEngine::build(&project));
+        let found = engine.references(&rpc, declaration, 0, 8);
+        let mut lines: Vec<_> = found
+            .iter()
+            .map(|usage| (usage.path.clone(), usage.line))
+            .collect();
+        lines.sort();
+        assert_eq!(
+            lines,
+            vec![(rpc.clone(), 0), (target.clone(), 0), (target, 1)],
+            "{found:?}"
         );
     }
 

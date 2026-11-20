@@ -6051,6 +6051,23 @@ impl TerminalHandle {
         self.session.take_clipboard()
     }
 
+    /// The palette the app draws with, as `0xRRGGBB`, so programs that ask
+    /// for the terminal's colors (opencode, vim) match the theme. `ansi`
+    /// holds the 16 ANSI colors; a different length is ignored.
+    pub fn set_colors(&self, ansi: Vec<u32>, foreground: u32, background: u32, cursor: u32) {
+        let rgb = |hex: u32| ((hex >> 16) as u8, (hex >> 8) as u8, hex as u8);
+        let Ok(ansi) = <[u32; 16]>::try_from(ansi) else {
+            return;
+        };
+        self.session
+            .set_colors(galaxy_core::terminal::TerminalPaletteColors {
+                ansi: ansi.map(rgb),
+                foreground: rgb(foreground),
+                background: rgb(background),
+                cursor: rgb(cursor),
+            });
+    }
+
     pub fn write(&self, input: String) -> Result<(), CoreError> {
         self.session
             .write(input.as_bytes())

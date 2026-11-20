@@ -17,7 +17,7 @@ use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::{Config, Osc52, Term, TermMode};
-use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, StdSyncHandler};
+use alacritty_terminal::vte::ansi::{Color, NamedColor, Processor, Rgb, StdSyncHandler};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 
 const MAX_OUTPUT_BYTES: usize = 256 * 1024;
@@ -29,6 +29,73 @@ pub const SCROLLBACK_LINES: usize = 5_000;
 type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 /// Text a program stored with OSC 52, until the UI takes it.
 type SharedClipboard = Arc<Mutex<Option<String>>>;
+type SharedColors = Arc<Mutex<TerminalPaletteColors>>;
+
+/// The colors the UI draws with. Programs such as opencode and vim ask for
+/// them (OSC 4, 10, 11, 12) to pick a light or dark look, so the answers
+/// must follow the app's theme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalPaletteColors {
+    pub ansi: [(u8, u8, u8); 16],
+    pub foreground: (u8, u8, u8),
+    pub background: (u8, u8, u8),
+    pub cursor: (u8, u8, u8),
+}
+
+impl Default for TerminalPaletteColors {
+    /// The dark palette, until the UI sends the real one.
+    fn default() -> Self {
+        Self {
+            ansi: [
+                (0x00, 0x00, 0x00),
+                (0xCD, 0x31, 0x31),
+                (0x0D, 0xBC, 0x79),
+                (0xE5, 0xE5, 0x10),
+                (0x24, 0x72, 0xC8),
+                (0xBC, 0x3F, 0xBC),
+                (0x11, 0xA8, 0xCD),
+                (0xE5, 0xE5, 0xE5),
+                (0x66, 0x66, 0x66),
+                (0xF1, 0x4C, 0x4C),
+                (0x23, 0xD1, 0x8B),
+                (0xF5, 0xF5, 0x43),
+                (0x3B, 0x8E, 0xEA),
+                (0xD6, 0x70, 0xD6),
+                (0x29, 0xB8, 0xDB),
+                (0xE5, 0xE5, 0xE5),
+            ],
+            foreground: (0xB9, 0xBD, 0xC7),
+            background: (0x15, 0x17, 0x1D),
+            cursor: (0x2E, 0x8C, 0xF2),
+        }
+    }
+}
+
+impl TerminalPaletteColors {
+    /// The color at an `alacritty_terminal` color index: 0–255 are the
+    /// xterm colors, then foreground, background and cursor.
+    fn lookup(&self, index: usize) -> Option<(u8, u8, u8)> {
+        const FOREGROUND: usize = NamedColor::Foreground as usize;
+        const BACKGROUND: usize = NamedColor::Background as usize;
+        const CURSOR: usize = NamedColor::Cursor as usize;
+        match index {
+            0..=15 => Some(self.ansi[index]),
+            16..=231 => {
+                let n = index - 16;
+                let level = |v: usize| if v == 0 { 0 } else { (55 + v * 40) as u8 };
+                Some((level(n / 36), level((n / 6) % 6), level(n % 6)))
+            }
+            232..=255 => {
+                let gray = (8 + (index - 232) * 10) as u8;
+                Some((gray, gray, gray))
+            }
+            FOREGROUND => Some(self.foreground),
+            BACKGROUND => Some(self.background),
+            CURSOR => Some(self.cursor),
+            _ => None,
+        }
+    }
+}
 
 pub struct TerminalSession {
     master: Mutex<Box<dyn MasterPty + Send>>,
@@ -37,6 +104,7 @@ pub struct TerminalSession {
     output: Arc<Mutex<Vec<u8>>>,
     grid: Arc<Mutex<Term<PtyListener>>>,
     clipboard: SharedClipboard,
+    colors: SharedColors,
     version: Arc<AtomicU64>,
     exited: Arc<AtomicBool>,
     shell_name: String,
@@ -45,25 +113,41 @@ pub struct TerminalSession {
 /// Sends the terminal's replies (cursor position reports, device
 /// attributes) back to the shell. Prompts such as powerlevel10k wait for
 /// them, so dropping them leaves the prompt half drawn. Also keeps the
-/// text of OSC 52 copy requests (opencode, tmux, vim) for the UI.
+/// text of OSC 52 copy requests (opencode, tmux, vim) for the UI, and
+/// answers color queries with the theme's palette.
 #[derive(Clone)]
 struct PtyListener {
     writer: SharedWriter,
     clipboard: SharedClipboard,
+    colors: SharedColors,
+}
+
+impl PtyListener {
+    fn reply(&self, text: &str) {
+        if let Ok(mut writer) = self.writer.lock() {
+            let _ = writer.write_all(text.as_bytes());
+            let _ = writer.flush();
+        }
+    }
 }
 
 impl EventListener for PtyListener {
     fn send_event(&self, event: Event) {
         match event {
-            Event::PtyWrite(text) => {
-                if let Ok(mut writer) = self.writer.lock() {
-                    let _ = writer.write_all(text.as_bytes());
-                    let _ = writer.flush();
-                }
-            }
+            Event::PtyWrite(text) => self.reply(&text),
             Event::ClipboardStore(_, text) => {
                 if let Ok(mut clipboard) = self.clipboard.lock() {
                     *clipboard = Some(text);
+                }
+            }
+            Event::ColorRequest(index, format) => {
+                let color = self
+                    .colors
+                    .lock()
+                    .ok()
+                    .and_then(|colors| colors.lookup(index));
+                if let Some((r, g, b)) = color {
+                    self.reply(&format(Rgb { r, g, b }));
                 }
             }
             _ => {}
@@ -329,6 +413,7 @@ impl TerminalSession {
         ));
         let output = Arc::new(Mutex::new(Vec::new()));
         let clipboard: SharedClipboard = Arc::new(Mutex::new(None));
+        let colors: SharedColors = Arc::new(Mutex::new(TerminalPaletteColors::default()));
         let grid = Arc::new(Mutex::new(Term::new(
             Config {
                 scrolling_history: SCROLLBACK_LINES,
@@ -342,6 +427,7 @@ impl TerminalSession {
             PtyListener {
                 writer: Arc::clone(&writer),
                 clipboard: Arc::clone(&clipboard),
+                colors: Arc::clone(&colors),
             },
         )));
         let version = Arc::new(AtomicU64::new(1));
@@ -383,10 +469,18 @@ impl TerminalSession {
             output,
             grid,
             clipboard,
+            colors,
             version,
             exited,
             shell_name,
         })
+    }
+
+    /// The palette the UI draws with, for answering color queries.
+    pub fn set_colors(&self, colors: TerminalPaletteColors) {
+        if let Ok(mut current) = self.colors.lock() {
+            *current = colors;
+        }
     }
 
     /// Raw output since the last call (capped), for tests and logging.
@@ -632,6 +726,62 @@ mod tests {
             .unwrap();
         let off = wait_for(&session, |s| !s.mouse_drag);
         assert!(!off.mouse_drag && !off.sgr_mouse && !off.alt_screen);
+    }
+
+    #[test]
+    fn color_queries_are_answered_with_the_ui_palette() {
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl Write for Sink {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let colors: SharedColors = Arc::new(Mutex::new(TerminalPaletteColors::default()));
+        let listener = PtyListener {
+            writer: Arc::new(Mutex::new(Box::new(Sink(Arc::clone(&written))))),
+            clipboard: Arc::new(Mutex::new(None)),
+            colors: Arc::clone(&colors),
+        };
+        let mut term = Term::new(
+            Config::default(),
+            &TerminalSize { cols: 80, rows: 24 },
+            listener,
+        );
+        let mut parser = Processor::<StdSyncHandler>::new();
+        let mut light = TerminalPaletteColors {
+            background: (0xFF, 0xFF, 0xFF),
+            foreground: (0x01, 0x02, 0x03),
+            ..TerminalPaletteColors::default()
+        };
+        light.ansi[1] = (0xAB, 0xCD, 0xEF);
+        *colors.lock().unwrap() = light;
+
+        parser.advance(&mut term, b"\x1b]11;?\x07\x1b]10;?\x1b\\\x1b]4;1;?\x07");
+        let reply = String::from_utf8(written.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            reply,
+            "\x1b]11;rgb:ffff/ffff/ffff\x07\x1b]10;rgb:0101/0202/0303\x1b\\\x1b]4;1;rgb:abab/cdcd/efef\x07"
+        );
+    }
+
+    #[test]
+    fn xterm_cube_and_grays_match_the_ui() {
+        let colors = TerminalPaletteColors::default();
+        assert_eq!(colors.lookup(16), Some((0, 0, 0)));
+        assert_eq!(colors.lookup(17), Some((0, 0, 95)));
+        assert_eq!(colors.lookup(231), Some((255, 255, 255)));
+        assert_eq!(colors.lookup(232), Some((8, 8, 8)));
+        assert_eq!(colors.lookup(255), Some((238, 238, 238)));
+        assert_eq!(
+            colors.lookup(NamedColor::Background as usize),
+            Some(colors.background)
+        );
+        assert_eq!(colors.lookup(NamedColor::DimBlack as usize), None);
     }
 
     #[test]

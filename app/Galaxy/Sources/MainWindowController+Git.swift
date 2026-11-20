@@ -183,7 +183,6 @@ extension MainWindowController {
             return
         }
         statusBar.showGit(branch: status.branch, changedCount: status.changedPaths.count)
-        activityBar.setBadge(status.changedPaths.count, for: .sourceControl)
 
         var map: [String: GitFileStatus] = [:]
         for change in status.changes {
@@ -192,6 +191,7 @@ extension MainWindowController {
         explorer.gitStatusMap = map
         explorer.gitChangedPaths = Set(status.changedPaths)
         sourceControl.refresh(status: status)
+        activityBar.setBadge(sourceControl.changeCount, for: .sourceControl)
         refreshTabBar()
         refreshGitDiff()
         refreshBlame()
@@ -608,6 +608,7 @@ extension MainWindowController {
             secondaryScrollView.removeFromSuperview()
             editorSplitView.isVertical = true
             editorSplitView.addSubview(secondaryScrollView, positioned: .below, relativeTo: scrollView)
+            editorSplitView.showsDiffGutter = true
         }
         secondaryEditorView.isReadOnly = true
         secondaryEditorView.diffSide = .removed
@@ -647,6 +648,7 @@ extension MainWindowController {
         secondaryEditorView.lineTints = [:]
         editorView.lineTints = [:]
         secondaryScrollView.removeFromSuperview()
+        editorSplitView.showsDiffGutter = false
         editorSplitView.isVertical = true
         editorSplitView.adjustSubviews()
     }

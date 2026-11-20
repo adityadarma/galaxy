@@ -3,7 +3,7 @@ import AppKit
 private let bundleID = "dev.adityadarma.galaxy"
 
 private func usage() -> Never {
-    FileHandle.standardError.write(Data("usage: galaxy <file-or-folder>\n".utf8))
+    FileHandle.standardError.write(Data("usage: galaxy [file-or-folder]\n".utf8))
     exit(2)
 }
 
@@ -22,6 +22,23 @@ private func appURL() -> URL? {
     return NSWorkspace.shared.urlForApplication(withBundleIdentifier: bundleID)
 }
 
+// `galaxy` alone opens (or brings forward) the app without a path.
+if CommandLine.arguments.count == 1 {
+    guard let app = appURL() else {
+        FileHandle.standardError.write(Data("galaxy: Galaxy.app was not found\n".utf8))
+        exit(1)
+    }
+    let configuration = NSWorkspace.OpenConfiguration()
+    configuration.activates = true
+    NSWorkspace.shared.openApplication(at: app, configuration: configuration) { _, error in
+        if let error {
+            FileHandle.standardError.write(Data("galaxy: could not open Galaxy: \(error.localizedDescription)\n".utf8))
+            exit(1)
+        }
+        exit(0)
+    }
+    dispatchMain()
+}
 guard CommandLine.arguments.count == 2 else { usage() }
 if ["-h", "--help"].contains(CommandLine.arguments[1]) { usage() }
 

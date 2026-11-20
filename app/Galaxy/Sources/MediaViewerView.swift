@@ -205,6 +205,13 @@ final class FileDropView: NSView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
+    /// The gaps around the cards (window edges, above the status bar) show
+    /// this view, so it paints the theme's chrome, not the window background.
+    override func draw(_ dirtyRect: NSRect) {
+        Theme.chrome.setFill()
+        dirtyRect.intersection(bounds).fill()
+    }
+
     private func fileURLs(in sender: NSDraggingInfo) -> [URL] {
         let options: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
         return (sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: options) as? [URL]) ?? []

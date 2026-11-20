@@ -282,19 +282,20 @@ enum GitFileStatus: Equatable {
         return .none
     }
 
+    /// VS Code's `gitDecoration.*` colors. The dark values are too pale on a
+    /// light background, so light themes use VS Code's light values.
     var color: NSColor? {
         switch self {
-        case .modified:
-            // VS Code modified amber/yellow #e2c08d
-            return NSColor(srgbRed: 226/255.0, green: 192/255.0, blue: 141/255.0, alpha: 1.0)
-        case .added, .untracked, .renamed:
-            // VS Code added/new green #73c991
-            return NSColor(srgbRed: 115/255.0, green: 201/255.0, blue: 145/255.0, alpha: 1.0)
-        case .deleted:
-            // VS Code deleted red #c74e39
-            return NSColor(srgbRed: 199/255.0, green: 78/255.0, blue: 57/255.0, alpha: 1.0)
-        case .none:
-            return nil
+        case .modified: Self.themed(dark: "#E2C08D", light: "#895503")
+        case .added, .untracked, .renamed: Self.themed(dark: "#73C991", light: "#587C0C")
+        case .deleted: Self.themed(dark: "#E06C5A", light: "#AD0707")
+        case .none: nil
+        }
+    }
+
+    private static func themed(dark: String, light: String) -> NSColor {
+        NSColor(name: nil) { appearance in
+            NSColor(hex: Theme.definition(for: appearance).isDark ? dark : light) ?? .labelColor
         }
     }
 }
