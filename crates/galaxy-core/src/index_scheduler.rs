@@ -171,7 +171,11 @@ impl Drop for Permits<'_> {
 pub fn shared_index_scheduler() -> &'static IndexScheduler {
     static SCHEDULER: OnceLock<IndexScheduler> = OnceLock::new();
     SCHEDULER.get_or_init(|| {
-        IndexScheduler::new(std::thread::available_parallelism().map_or(1, |count| count.get()).min(2))
+        IndexScheduler::new(
+            std::thread::available_parallelism()
+                .map_or(1, |count| count.get())
+                .min(2),
+        )
     })
 }
 
