@@ -594,6 +594,14 @@ extension MainWindowController {
         }
         if !isDiffPaneShown {
             isDiffPaneShown = true
+            diffHunkActions.isHidden = false
+            // The overview ruler occupies the right edge. Give the diff a
+            // persistent, reserved scrollbar beside it rather than an
+            // auto-hiding overlay that is obscured by the ruler.
+            scrollView.scrollerStyle = .legacy
+            scrollView.autohidesScrollers = false
+            secondaryScrollView.scrollerStyle = .legacy
+            secondaryScrollView.autohidesScrollers = false
             updateWrapState()
             updateMinimap()
             removeMarkdownPreviewIfLoaded()
@@ -614,10 +622,17 @@ extension MainWindowController {
         }
         editorSplitView.adjustSubviews()
         secondaryEditorView.requestDocumentRefresh(scrollCaret: false)
+        layoutDiffHunkActions()
     }
 
     func leaveDiffPane() {
         isDiffPaneShown = false
+        diffHunkActions.isHidden = true
+        diffHunkActions.subviews.forEach { $0.removeFromSuperview() }
+        scrollView.scrollerStyle = .overlay
+        scrollView.autohidesScrollers = true
+        secondaryScrollView.scrollerStyle = .overlay
+        secondaryScrollView.autohidesScrollers = true
         updateWrapState()
         updateMinimap()
         diffMap = DiffLineMap()
@@ -644,6 +659,8 @@ extension MainWindowController {
         editorView.diffSpacers = map.newSpacers
         editorView.lineTints = Dictionary(map.newChangedLines.map { ($0, Theme.diffAdded) }, uniquingKeysWith: { a, _ in a })
         secondaryEditorView.lineTints = Dictionary(map.oldChangedLines.map { ($0, Theme.diffRemoved) }, uniquingKeysWith: { a, _ in a })
+        diffHunkActions.show(map: map, lineHeight: editorView.metrics.lineHeight)
+        layoutDiffHunkActions()
         guard diffRevealPending else { return }
         diffRevealPending = false
         let lineHeight = editorView.metrics.lineHeight
@@ -682,6 +699,95 @@ extension MainWindowController {
         defer { isSyncingDiffScroll = false }
         target.contentView.scroll(to: NSPoint(x: x, y: y - inset))
         target.reflectScrolledClipView(target.contentView)
+        layoutDiffHunkActions()
+    }
+
+    func layoutDiffHunkActions() {
+        guard isDiffPaneShown else { return }
+        diffHunkActions.layoutSubtreeIfNeeded()
+        diffHunkActions.updatePositions()
+    }
+
+    func revertDiffHunk(at index: Int) {
+        guard diffMap.hunks.indices.contains(index), let workspace, let tab = activeTab,
+              let path = tab.relPath, let base = tab.diffBase else { return }
+        let oldText = base.text()
+        let text = tab.doc.text()
+        // Diff calculation is asynchronous; never apply stale offsets to a newer edit.
+        guard let current = try? workspace.gitDiffHunks(relPath: path, text: text),
+              DiffLineMap(current).hunks == diffMap.hunks,
+              let edit = Self.revertedDiffHunk(diffMap.hunks[index], base: oldText, working: text) else {
+            refreshGitDiff()
+            return
+        }
+        tab.doc.commitText(text: edit.text, replacement: edit.range)
+        editorView.didChangeDocument()
+        refreshGitDiff()
+    }
+
+    /// Replace exactly the changed lines, preserving the surrounding newline
+    /// (including when either side has no final newline).
+    nonisolated static func revertedDiffHunk(_ hunk: DiffLineMap.Hunk, base: String, working: String)
+        -> (range: Utf16Range, text: String)? {
+        func offsets(_ text: String) -> [Int] {
+            var result = [0]
+            for (offset, unit) in text.utf16.enumerated() where unit == 10 { result.append(offset + 1) }
+            if !text.hasSuffix("\n"), !text.isEmpty { result.append(text.utf16.count) }
+            return result
+        }
+        let old = offsets(base)
+        let new = offsets(working)
+        guard hunk.oldStart >= 0, hunk.oldLen >= 0, hunk.newStart >= 0, hunk.newLen >= 0,
+              hunk.oldStart + hunk.oldLen < old.count,
+              hunk.newStart + hunk.newLen < new.count else { return nil }
+        // `.lines()` in the Git diff excludes the trailing empty element;
+        // `offsets` includes it when the text ends in a newline.
+        let oldCount = old.count - 1
+        let newCount = new.count - 1
+        guard hunk.oldStart + hunk.oldLen <= oldCount,
+              hunk.newStart + hunk.newLen <= newCount else { return nil }
+        let oldStart = old[hunk.oldStart]
+        let oldEnd = hunk.oldStart + hunk.oldLen < oldCount
+            ? old[hunk.oldStart + hunk.oldLen] : base.utf16.count
+        var newStart = new[hunk.newStart]
+        let newEnd = hunk.newStart + hunk.newLen < newCount
+            ? new[hunk.newStart + hunk.newLen] : working.utf16.count
+        // When lines were appended to a file without a trailing newline, the
+        // inserted separator belongs to the insertion too.
+        if hunk.oldLen == 0, hunk.oldStart == oldCount, !base.isEmpty,
+           !base.hasSuffix("\n"), newStart > 0 {
+            newStart -= 1
+        }
+        guard oldStart <= oldEnd, newStart <= newEnd else { return nil }
+        let units = Array(base.utf16)
+        var body = String(decoding: units[oldStart..<oldEnd], as: UTF16.self)
+        if newEnd < working.utf16.count, !body.isEmpty, !body.hasSuffix("\n") { body += "\n" }
+        if hunk.newLen == 0, newStart == working.utf16.count, !working.isEmpty,
+           !working.hasSuffix("\n"), !body.isEmpty { body = "\n" + body }
+        return (Utf16Range(location: UInt64(newStart), length: UInt64(newEnd - newStart)), body)
+    }
+
+    func stageDiffHunk(at index: Int) {
+        guard diffMap.hunks.indices.contains(index), let workspace, let tab = activeTab,
+              let path = tab.relPath else { return }
+        let text = tab.doc.text()
+        guard let current = try? workspace.gitDiffHunks(relPath: path, text: text),
+              DiffLineMap(current).hunks == diffMap.hunks else {
+            refreshGitDiff()
+            return
+        }
+        let oldStart = UInt64(diffMap.hunks[index].oldStart)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let failure: String? = {
+                do { try workspace.gitStageHunk(relPath: path, text: text, oldStart: oldStart); return nil }
+                catch { return "Could not stage change." }
+            }()
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.statusLabel.stringValue = failure ?? "Staged change."
+                if failure == nil { self.refreshGitStatus() }
+            }
+        }
     }
 
     /// Pure helper called from the utility queue in `refreshGitDiff()`, so it

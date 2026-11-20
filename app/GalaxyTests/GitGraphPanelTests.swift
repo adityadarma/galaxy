@@ -279,7 +279,7 @@ final class GitGraphPanelTests: XCTestCase {
     }
 
     private func run(_ panel: GitGraphPanel, row: Int, _ title: String,
-                     file: StaticString = #filePath, line: UInt = #line) throws -> String {
+                      file: StaticString = #filePath, line: UInt = #line) throws -> String {
         let item = try XCTUnwrap(panel.contextItems(forRow: row).first { $0.title == title },
                                  "missing \(title)", file: file, line: line)
         var message: String?
@@ -287,6 +287,49 @@ final class GitGraphPanelTests: XCTestCase {
         _ = item.target?.perform(item.action, with: item)
         XCTAssertTrue(waitUntil { message != nil }, file: file, line: line)
         return message ?? ""
+    }
+
+    func testTagMenuTracksPushDeleteAndLocalDeletion() throws {
+        let dir = try makeRepo()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let remote = FileManager.default.temporaryDirectory.appendingPathComponent("git-graph-origin-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: remote) }
+        try git(dir, "init", "--bare", remote.path)
+        try git(dir, "remote", "add", "origin", remote.path)
+        try commitFile(dir, "a.txt", "a\n", "base")
+        try git(dir, "tag", "v1")
+
+        let panel = try panel(for: dir)
+        panel.confirm = { _, _, _ in true }
+        panel.refresh(includeOrigin: true)
+        XCTAssertTrue(waitUntil { panel.originTags == [] })
+        XCTAssertTrue(titles(panel, row: 0).contains("Push Tag \"v1\" to origin"))
+        XCTAssertFalse(titles(panel, row: 0).contains("Delete Tag \"v1\" on origin"))
+
+        XCTAssertEqual(try run(panel, row: 0, "Push Tag \"v1\" to origin"), "Pushed tag v1 to origin")
+        XCTAssertTrue(waitUntil { panel.originTags == ["v1"] })
+        XCTAssertTrue(titles(panel, row: 0).contains("Delete Tag \"v1\" on origin"))
+        XCTAssertFalse(titles(panel, row: 0).contains("Push Tag \"v1\" to origin"))
+
+        XCTAssertEqual(try run(panel, row: 0, "Delete Tag \"v1\" on origin"), "Deleted tag v1 on origin")
+        XCTAssertTrue(waitUntil { panel.originTags == [] })
+        XCTAssertFalse(titles(panel, row: 0).contains("Delete Tag \"v1\" on origin"))
+        XCTAssertTrue(titles(panel, row: 0).contains("Push Tag \"v1\" to origin"))
+
+        XCTAssertEqual(try run(panel, row: 0, "Delete Tag \"v1\" (Local)"), "Deleted local tag v1")
+        XCTAssertTrue(waitUntil { panel.rows.first?.commit?.refs.contains { $0.kind == .tag } == false })
+        XCTAssertFalse(titles(panel, row: 0).contains { $0.contains("Tag \"v1\"") })
+    }
+
+    func testContextMenuDisablesActionsThatDoNotApplyToHead() throws {
+        let dir = try makeRepo()
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try commitFile(dir, "a.txt", "one\n", "base")
+        let panel = try panel(for: dir)
+        let menu = panel.contextItems(forRow: 0)
+        XCTAssertFalse(menu.contains { $0.title == "Checkout Branch \"main\"" }, "HEAD is not a separate local branch ref")
+        XCTAssertEqual(menu.first { $0.title == "Cherry Pick…" }?.isEnabled, false)
+        XCTAssertEqual(menu.first { $0.title == "Checkout Commit (Detached)" }?.isEnabled, true)
     }
 
     func testHistoryBeyondOnePageIsLoadedWhenScrolledToTheEnd() throws {

@@ -23,7 +23,7 @@ use crate::workspace::{IndexDelta, WorkspaceIndex};
 /// Below this many candidates one thread is faster than spawning several.
 const PARALLEL_THRESHOLD: usize = 8_192;
 /// Most threads used per search.
-const MAX_THREADS: usize = 8;
+const MAX_THREADS: usize = 2;
 /// Recent files remembered for ranking.
 pub const MAX_RECENT: usize = 50;
 

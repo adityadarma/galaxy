@@ -82,6 +82,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         loadedMarkdownPreview?.removeFromSuperview()
     }
     let editorSplitView = NSSplitView()
+    let diffHunkActions = DiffHunkActionsView()
     let problemsPanel = ProblemsPanel()
     var loadedReferencesPanel: ReferencesPanel?
     var referencesPanel: ReferencesPanel {
@@ -739,6 +740,12 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         groupChrome.addSubview(breadcrumbBar)
         groupChrome.addSubview(findBarSlot)
         groupChrome.addSubview(editorSplitView)
+        diffHunkActions.isHidden = true
+        diffHunkActions.translatesAutoresizingMaskIntoConstraints = false
+        groupChrome.addSubview(diffHunkActions)
+        diffHunkActions.onRevert = { [weak self] index in self?.revertDiffHunk(at: index) }
+        diffHunkActions.onStage = { [weak self] index in self?.stageDiffHunk(at: index) }
+        diffHunkActions.configure(scrollView: scrollView, leftPane: secondaryScrollView)
         groupChrome.addSubview(stickyScopeView)
         editorTerminalView.translatesAutoresizingMaskIntoConstraints = false
         editorTerminalView.isHidden = true
@@ -801,6 +808,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             editorSplitView.leadingAnchor.constraint(equalTo: groupChrome.leadingAnchor),
             editorSplitView.trailingAnchor.constraint(equalTo: groupChrome.trailingAnchor),
             editorSplitView.bottomAnchor.constraint(equalTo: groupChrome.bottomAnchor),
+            diffHunkActions.topAnchor.constraint(equalTo: editorSplitView.topAnchor),
+            diffHunkActions.leadingAnchor.constraint(equalTo: editorSplitView.leadingAnchor),
+            diffHunkActions.trailingAnchor.constraint(equalTo: editorSplitView.trailingAnchor),
+            diffHunkActions.bottomAnchor.constraint(equalTo: editorSplitView.bottomAnchor),
             stickyScopeView.topAnchor.constraint(equalTo: editorSplitView.topAnchor),
             stickyScopeView.leadingAnchor.constraint(equalTo: editorSplitView.leadingAnchor),
             stickyTrailing,

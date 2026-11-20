@@ -62,8 +62,10 @@ extension MainWindowController {
         let rulerWidth = OverviewRulerView.width
         let width = MinimapView.width
         let height = scrollView.bounds.height
-        scrollView.ruler.frame = NSRect(x: scrollView.bounds.width - rulerWidth, y: 0, width: rulerWidth, height: height)
-        minimap.frame = NSRect(x: scrollView.bounds.width - rulerWidth - width, y: 0, width: width, height: height)
+        let rightEdge = isDiffPaneShown ? scrollView.verticalScroller?.frame.minX ?? scrollView.bounds.width
+                                        : scrollView.bounds.width
+        scrollView.ruler.frame = NSRect(x: rightEdge - rulerWidth, y: 0, width: rulerWidth, height: height)
+        minimap.frame = NSRect(x: rightEdge - rulerWidth - width, y: 0, width: width, height: height)
         scrollView.ruler.needsDisplay = true
         minimap.needsDisplay = true
     }

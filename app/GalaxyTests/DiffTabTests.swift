@@ -49,6 +49,70 @@ final class DiffTabTests: XCTestCase {
         }
     }
 
+    func testDiffHunkButtonsRevertOneChangeAndStageAnother() throws {
+        let c = try makeController()
+        defer { c.window?.orderOut(nil) }
+        c.openWorkspaceDiff(try XCTUnwrap(c.workspace), relPath: "tracked.txt")
+        waitForDiff(c)
+        XCTAssertEqual(c.diffMap.hunks.count, 2)
+        XCTAssertFalse(c.diffHunkActions.isHidden)
+        XCTAssertEqual(c.diffHunkActions.hunkButtons.count, 4)
+
+        try XCTUnwrap(c.diffHunkActions.hunkButtons.first {
+            $0.tag == 0 && $0.toolTip?.contains("Stage") == true
+        }).performClick(nil)
+        let deadline = Date().addingTimeInterval(5)
+        while c.statusLabel.stringValue != "Staged change.", Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+        }
+        XCTAssertEqual(c.statusLabel.stringValue, "Staged change.")
+        XCTAssertEqual(c.activeTab?.doc.text(), "one\nTWO\nthree\nfour\nfive\n")
+
+        try XCTUnwrap(c.diffHunkActions.hunkButtons.first {
+            $0.tag == 1 && $0.toolTip?.contains("Restore") == true
+        }).performClick(nil)
+        XCTAssertEqual(c.activeTab?.doc.text(), "one\nTWO\nthree\nfour\n")
+        XCTAssertTrue(c.activeTab?.doc.isModified() ?? false)
+    }
+
+    func testRevertHunkPreservesNewlinesAtFileEdges() throws {
+        func revert(_ old: String, _ new: String, _ hunk: DiffLineMap.Hunk,
+                    file: StaticString = #filePath, line: UInt = #line) throws -> String {
+            let edit = try XCTUnwrap(MainWindowController.revertedDiffHunk(hunk, base: old, working: new),
+                                     file: file, line: line)
+            let result = (new as NSString).replacingCharacters(
+                in: NSRange(location: Int(edit.range.location), length: Int(edit.range.length)), with: edit.text)
+            return result
+        }
+        XCTAssertEqual(try revert("a\nb\nc\n", "a\nB\nc\n", .init(oldStart: 1, oldLen: 1, newStart: 1, newLen: 1)), "a\nb\nc\n")
+        XCTAssertEqual(try revert("a\nc\n", "a\nb\nc\n", .init(oldStart: 1, oldLen: 0, newStart: 1, newLen: 1)), "a\nc\n")
+        XCTAssertEqual(try revert("a\nb\nc\n", "a\nc\n", .init(oldStart: 1, oldLen: 1, newStart: 1, newLen: 0)), "a\nb\nc\n")
+        XCTAssertEqual(try revert("a\nb\n", "a\n", .init(oldStart: 1, oldLen: 1, newStart: 1, newLen: 0)), "a\nb\n")
+        XCTAssertEqual(try revert("a\nb", "a", .init(oldStart: 1, oldLen: 1, newStart: 1, newLen: 0)), "a\nb")
+        XCTAssertEqual(try revert("a", "a\nb", .init(oldStart: 1, oldLen: 0, newStart: 1, newLen: 1)), "a")
+        XCTAssertEqual(try revert("", "a\n", .init(oldStart: 0, oldLen: 0, newStart: 0, newLen: 1)), "")
+    }
+
+    func testDiffHunkButtonsFollowScrollAndDisappearOutsideDiff() throws {
+        let c = try makeController()
+        defer { c.window?.orderOut(nil) }
+        let ws = try XCTUnwrap(c.workspace)
+        c.openWorkspaceDiff(ws, relPath: "tracked.txt")
+        waitForDiff(c)
+        c.window?.contentView?.layoutSubtreeIfNeeded()
+        c.layoutDiffHunkActions()
+        let before = try XCTUnwrap(c.diffHunkActions.hunkButtons.first?.frame.minY)
+        c.scrollView.contentView.scroll(to: NSPoint(x: 0, y: 20))
+        c.scrollView.reflectScrolledClipView(c.scrollView.contentView)
+        c.layoutDiffHunkActions()
+        let after = try XCTUnwrap(c.diffHunkActions.hunkButtons.first?.frame.minY)
+        if c.scrollView.contentView.bounds.minY > 0 { XCTAssertLessThan(after, before) }
+
+        c.openWorkspaceFile(ws, FileEntry(name: "other.txt", relPath: "other.txt", isDir: false), preview: false)
+        XCTAssertTrue(c.diffHunkActions.isHidden)
+        XCTAssertTrue(c.diffHunkActions.hunkButtons.isEmpty)
+    }
+
     // MARK: Line mapping
 
     func testLineMapFollowsInsertionsAndDeletionsBothWays() {
@@ -160,6 +224,28 @@ final class DiffTabTests: XCTestCase {
         XCTAssertEqual(c.secondaryEditorView.document?.text(), "one\ntwo\nthree\nfour\n")
     }
 
+    func testDiffScrollbarsRemainVisibleAndDoNotCoverTheOverviewRuler() throws {
+        let c = try makeController()
+        defer { c.window?.orderOut(nil) }
+        let ws = try XCTUnwrap(c.workspace)
+        c.openWorkspaceDiff(ws, relPath: "tracked.txt")
+        waitForDiff(c)
+        c.window?.contentView?.layoutSubtreeIfNeeded()
+
+        for scroll in [c.secondaryScrollView, c.scrollView] {
+            XCTAssertTrue(scroll.hasVerticalScroller)
+            XCTAssertEqual(scroll.scrollerStyle, .legacy)
+            XCTAssertFalse(scroll.autohidesScrollers)
+        }
+        let scroller = try XCTUnwrap(c.scrollView.verticalScroller)
+        XCTAssertFalse(scroller.isHidden)
+        XCTAssertEqual(c.scrollView.ruler.frame.maxX, scroller.frame.minX, accuracy: 1)
+
+        c.openWorkspaceFile(ws, FileEntry(name: "other.txt", relPath: "other.txt", isDir: false), preview: false)
+        XCTAssertEqual(c.scrollView.scrollerStyle, .overlay)
+        XCTAssertTrue(c.scrollView.autohidesScrollers)
+    }
+
     func testAnAlreadyOpenFileKeepsItsTabWhenOpeningTheDiff() throws {
         let c = try makeController()
         defer { c.window?.orderOut(nil) }
@@ -258,7 +344,9 @@ final class DiffTabTests: XCTestCase {
         let right = c.scrollView
         XCTAssertTrue(right.ruler.superview === right)
         XCTAssertFalse(right.ruler.isHidden, "the working side keeps its ruler")
-        XCTAssertEqual(right.ruler.frame.maxX, right.bounds.width, accuracy: 0.5)
+        let scroller = try XCTUnwrap(right.verticalScroller)
+        XCTAssertEqual(right.ruler.frame.maxX, scroller.frame.minX, accuracy: 0.5)
+        XCTAssertEqual(scroller.frame.maxX, right.bounds.width, accuracy: 0.5)
         XCTAssertNil(c.secondaryScrollView.ruler.superview, "the committed side has none")
         XCTAssertEqual(c.secondaryEditorView.rightInset, 0)
         XCTAssertTrue(c.minimap.isHidden, "no minimap in a diff")

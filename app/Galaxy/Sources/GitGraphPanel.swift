@@ -127,6 +127,11 @@ final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, N
 
     var workspace: Workspace? {
         didSet {
+            originTags = nil
+            // Keep in-flight reads marked busy until they return; they belong
+            // to the old workspace and must not overwrite the new one's state.
+            if loadingOrigin { originRefreshPending = true }
+            if loading { reloadPending = true }
             loadPinned()
             limit = pageSize
             hasMore = false
@@ -177,7 +182,10 @@ final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, N
     private(set) var rows: [GitGraphRow] = []
     private var timer: Timer?
     private var loading = false
+    private var reloadPending = false
     private var loadingOrigin = false
+    /// A tag operation can finish while an earlier remote read is in flight.
+    private var originRefreshPending = false
     private(set) var isPerformingOperation = false
     private var commits: [GitCommitInfo] = []
     private var uncommitted = 0
@@ -585,7 +593,10 @@ final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, N
             refreshOriginTags(workspace)
             refreshChoices(authors: true)
         }
-        guard !loading else { return }
+        if loading {
+            reloadPending = true
+            return
+        }
         loading = true
         let limit = self.limit
         let generation = self.generation
@@ -599,6 +610,16 @@ final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, N
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.loading = false
+                guard self.workspace === workspace else {
+                    self.reloadPending = false
+                    self.refresh()
+                    return
+                }
+                if self.reloadPending {
+                    self.reloadPending = false
+                    self.refresh()
+                    return
+                }
                 // A filter changed during the read; this result is for the old one.
                 if generation != self.generation { self.refresh(); return }
                 self.commits = commits
@@ -628,18 +649,33 @@ final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, N
     }
 
     private func refreshOriginTags(_ workspace: Workspace) {
-        guard !loadingOrigin else { return }
+        if loadingOrigin {
+            originRefreshPending = true
+            return
+        }
         loadingOrigin = true
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let result: Result<Set<String>?, Error> = Result { try workspace.gitRemoteTags().map(Set.init) }
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.loadingOrigin = false
+                guard self.workspace === workspace else {
+                    self.originRefreshPending = false
+                    if let currentWorkspace = self.workspace { self.refreshOriginTags(currentWorkspace) }
+                    return
+                }
+                if self.originRefreshPending {
+                    // This read may predate a push/delete. Ignore it and use a fresh one.
+                    self.originRefreshPending = false
+                    self.refreshOriginTags(workspace)
+                    return
+                }
                 switch result {
                 case .success(let tags):
                     self.originTags = tags
                 case .failure(let error):
-                    // Keep the last known set rather than guess.
+                    // The remote is unknown; stale entries must not offer destructive actions.
+                    self.originTags = nil
                     self.onMessage?("Git: could not read tags from origin: \(Self.describe(error))")
                 }
                 self.rebuild()
@@ -736,10 +772,10 @@ final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, N
                 self?.perform("Checked out \(ref.name)") { try $0.gitCheckout(name: ref.name) }
             })
         }
-        items.append(item("Checkout Commit (Detached)") { [weak self] in
+        items.append(item("Checkout Commit (Detached)", enabled: !(isHead && isDetached)) { [weak self] in
             self?.perform("Checked out \(short)") { try $0.gitCheckoutCommit(hash: commit.hash) }
         })
-        items.append(item("Cherry Pick…") { [weak self] in
+        items.append(item("Cherry Pick…", enabled: !isHead) { [weak self] in
             guard let self, self.confirm("Cherry pick \(short)?",
                                          "Applies this commit's changes as a new commit on \(branch). If it conflicts, it is aborted and nothing changes.",
                                          "Cherry Pick") else { return }
@@ -757,7 +793,7 @@ final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, N
                                          "Revert") else { return }
             self.perform("Reverted \(short)") { try $0.gitRevert(hash: commit.hash) }
         })
-        if isHead {
+        if isHead && !isDetached {
             items.append(item("Reset Last Commit (Soft)…") { [weak self] in
                 guard let self, self.confirm("Reset last commit?",
                                              "Removes this commit from \(branch) and keeps its changes staged." + self.remoteNote(),
@@ -787,7 +823,7 @@ final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, N
                 self.perform("Rebased \(branch) on \(short)") { try $0.gitRebaseOnto(hash: commit.hash) }
             })
         }
-        items.append(item("Reset current branch to this Commit…") { [weak self] in
+        items.append(item("Reset current branch to this Commit…", enabled: !isDetached) { [weak self] in
             guard let self else { return }
             let detail = "Moves \(branch) to \(short)." + self.remoteNote()
             guard let mode = self.chooseResetMode(detail) else { return }
@@ -843,7 +879,7 @@ final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, N
             guard let self, self.confirm("Delete tag \"\(tag)\"?",
                                          "The tag is removed from this repository only. Origin is not changed.",
                                          "Delete") else { return }
-            self.perform("Deleted local tag \(tag)", refreshOrigin: true) { try $0.gitDeleteTag(name: tag) }
+            self.perform("Deleted local tag \(tag)", removedLocalTag: tag) { try $0.gitDeleteTag(name: tag) }
         }]
         guard let originTags else { return items }
         if originTags.contains(tag) {
@@ -851,11 +887,15 @@ final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, N
                 guard let self, self.confirm("Delete tag \"\(tag)\" on origin?",
                                              "This removes the tag from the shared remote, so it disappears for everyone. The local tag is kept.",
                                              "Delete on origin") else { return }
-                self.perform("Deleted tag \(tag) on origin", refreshOrigin: true) { try $0.gitDeleteRemoteTag(name: tag) }
+                self.perform("Deleted tag \(tag) on origin", refreshOrigin: true, updatedOriginTag: (tag, false)) {
+                    try $0.gitDeleteRemoteTag(name: tag)
+                }
             })
         } else {
             items.append(item("Push Tag \"\(tag)\" to origin", true) { [weak self] in
-                self?.perform("Pushed tag \(tag) to origin", refreshOrigin: true) { try $0.gitPushTag(name: tag) }
+                self?.perform("Pushed tag \(tag) to origin", refreshOrigin: true, updatedOriginTag: (tag, true)) {
+                    try $0.gitPushTag(name: tag)
+                }
             })
         }
         return items
@@ -947,7 +987,9 @@ final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, N
 
     /// Runs a git operation off the main thread, then reports and reloads.
     /// `success` is the status-line text when it works.
-    private func perform(_ success: String, refreshOrigin: Bool = false, _ operation: @escaping @Sendable (Workspace) throws -> Void) {
+    private func perform(_ success: String, refreshOrigin: Bool = false, updatedOriginTag: (String, Bool)? = nil,
+                         removedLocalTag: String? = nil,
+                         _ operation: @escaping @Sendable (Workspace) throws -> Void) {
         guard let workspace, !isPerformingOperation else { return }
         isPerformingOperation = true
         operationProgress.isHidden = false
@@ -963,6 +1005,18 @@ final class GitGraphPanel: NSView, NSTableViewDataSource, NSTableViewDelegate, N
                 self.operationProgress.stopAnimation(nil)
                 self.operationProgress.isHidden = true
                 self.refreshButton.isEnabled = true
+                guard self.workspace === workspace else { return }
+                if failure == nil, let removedLocalTag {
+                    for index in self.commits.indices {
+                        self.commits[index].refs.removeAll { $0.kind == .tag && $0.name == removedLocalTag }
+                    }
+                    self.rebuild()
+                }
+                if failure == nil, let (tag, exists) = updatedOriginTag, var tags = self.originTags {
+                    if exists { tags.insert(tag) } else { tags.remove(tag) }
+                    self.originTags = tags
+                    self.rebuild()
+                }
                 self.onMessage?(failure.map { "Git: \($0)" } ?? success)
                 self.onRepositoryChanged?()
                 self.refreshChoices(authors: false)

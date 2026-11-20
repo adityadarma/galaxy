@@ -1116,7 +1116,8 @@ final class EditorView: NSView {
             }
             if let tint = lineTints[line.line] {
                 context.setFillColor(tint.cgColor)
-                context.fill(CGRect(x: 0, y: top, width: bounds.width, height: block))
+                let startX = diffSide == nil ? 0 : gutterShift + gutterWidth
+                context.fill(CGRect(x: startX, y: top, width: max(0, bounds.width - startX), height: block))
             }
 
             // Current line: lines with a caret and no selection on them.
