@@ -673,6 +673,11 @@ extension MainWindowController {
 
     /// Keeps both panes on the same lines while either one scrolls.
     func installDiffScrollSync() {
+        NotificationCenter.default.addObserver(
+            forName: NSSplitView.didResizeSubviewsNotification, object: editorSplitView, queue: .main
+        ) { [weak self] _ in
+            onAppKitMainThread { self?.diffHunkActions.updatePositions() }
+        }
         for (view, isPrimary) in [(scrollView, true), (secondaryScrollView, false)] {
             view.contentView.postsBoundsChangedNotifications = true
             NotificationCenter.default.addObserver(
