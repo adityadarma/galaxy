@@ -34,8 +34,8 @@ enum MainMenu {
         fileMenu.addItem(withTitle: "Open File or Folder…", action: #selector(MainWindowController.openDocument(_:)), keyEquivalent: "o")
         let openFolder = fileMenu.addItem(withTitle: "Open Folder…", action: #selector(MainWindowController.openFolder(_:)), keyEquivalent: "o")
         openFolder.keyEquivalentModifierMask = [.command, .shift]
-        let recent = NSMenuItem(title: "Recent Projects", action: nil, keyEquivalent: "")
-        let recentMenu = NSMenu(title: "Recent Projects")
+        let recent = NSMenuItem(title: "Open Recent", action: nil, keyEquivalent: "")
+        let recentMenu = NSMenu(title: "Open Recent")
         recentMenu.identifier = NSUserInterfaceItemIdentifier("recent-projects")
         populateRecentProjects(recentMenu)
         recent.submenu = recentMenu
@@ -247,19 +247,36 @@ enum MainMenu {
 
     private static func populateRecentProjects(_ menu: NSMenu) {
         menu.removeAllItems()
-        for path in MainWindowController.recentProjectPaths() {
-            let item = NSMenuItem(title: URL(fileURLWithPath: path).lastPathComponent,
+        for path in MainWindowController.recentProjectPaths().prefix(10) {
+            let item = NSMenuItem(title: (path as NSString).abbreviatingWithTildeInPath,
                                   action: #selector(MainWindowController.openRecentProject(_:)),
                                   keyEquivalent: "")
             item.representedObject = path
             item.toolTip = path
             menu.addItem(item)
         }
+        let files = MainWindowController.recentFilePaths()
+        if !files.isEmpty {
+            if !menu.items.isEmpty { menu.addItem(.separator()) }
+            for path in files.prefix(10) {
+                let item = NSMenuItem(title: (path as NSString).abbreviatingWithTildeInPath,
+                                      action: #selector(MainWindowController.openRecentFile(_:)),
+                                      keyEquivalent: "")
+                item.representedObject = path
+                item.toolTip = path
+                menu.addItem(item)
+            }
+        }
         if menu.items.isEmpty {
-            let empty = NSMenuItem(title: "No Recent Projects", action: nil, keyEquivalent: "")
+            let empty = NSMenuItem(title: "No Recently Opened Items", action: nil, keyEquivalent: "")
             empty.isEnabled = false
             menu.addItem(empty)
         }
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "More…", action: #selector(MainWindowController.showRecentItems(_:)), keyEquivalent: "")
+        let clear = menu.addItem(withTitle: "Clear Recently Opened…",
+                                 action: #selector(MainWindowController.clearRecentlyOpened(_:)), keyEquivalent: "")
+        clear.isEnabled = !MainWindowController.recentProjectPaths().isEmpty || !files.isEmpty
     }
 
     private static func findRecentProjectsMenu(in menu: NSMenu?) -> NSMenu? {

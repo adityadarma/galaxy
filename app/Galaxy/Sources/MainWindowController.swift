@@ -235,6 +235,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// Files opened in this workspace, most recent first, relative paths.
     var recentFiles: [String] = []
     var loadedQuickOpen: QuickOpen?
+    var loadedRecentItemsPicker: RecentItemsPicker?
     var loadedWorkspaceSearch: WorkspaceSearch?
     var searchGeneration = 0
     var loadedGoToLine: GoToLine?

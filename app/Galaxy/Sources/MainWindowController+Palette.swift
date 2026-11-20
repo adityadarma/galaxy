@@ -99,6 +99,7 @@ extension MainWindowController {
 
     /// Closes transient navigation overlays, whichever is open.
     func closeOverlays() {
+        if isRecentItemsVisible { closeRecentItems() }
         closeReferencesPeek()
         if isWorkspaceSearchVisible { closeWorkspaceSearch() }
         if isQuickOpenVisible { closeGoToFile() }
@@ -127,6 +128,7 @@ extension MainWindowController {
                     self.loadedPHPVersionPicker,
                     self.loadedIndentationPicker,
                     self.loadedGitPicker,
+                    self.loadedRecentItemsPicker,
                 ].compactMap { $0 }.filter { !$0.isHidden }
                 guard !overlays.isEmpty else { return }
 

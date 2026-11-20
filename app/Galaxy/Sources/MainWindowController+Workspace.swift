@@ -39,7 +39,8 @@ extension MainWindowController {
         }
     }
 
-    func openWorkspace(at url: URL, restoresTabsIncrementally: Bool = false) throws {
+    func openWorkspace(at url: URL, restoresTabsIncrementally: Bool = false,
+                       rememberRecent: Bool = true) throws {
         if openExistingWorkspace?(url) == true { return }
         // A new folder is a new project session. Do not carry files from the
         // previous workspace into the new tab bar.
@@ -63,7 +64,7 @@ extension MainWindowController {
         }
         workspace = ws
         titleBar.setProjectTitle(ws.name())
-        Self.rememberProject(url.path)
+        if rememberRecent { Self.rememberProject(url.path) }
         workspaceSettingsModified = nil
         fileFinder = nil
         recentFiles = []
@@ -122,24 +123,71 @@ extension MainWindowController {
         open(url: URL(fileURLWithPath: path))
     }
 
+    @objc func openRecentFile(_ sender: Any?) {
+        guard let path = (sender as? NSMenuItem)?.representedObject as? String else { return }
+        openRecentPath(path)
+    }
+
+    func openRecentPath(_ path: String) {
+        guard FileManager.default.fileExists(atPath: path) else {
+            statusLabel.stringValue = "Recently opened item no longer exists: \(path)"
+            return
+        }
+        open(url: URL(fileURLWithPath: path))
+    }
+
     static func recentProjectPaths() -> [String] {
         UserDefaults.standard.stringArray(forKey: "RecentProjectPaths") ?? []
     }
+
+    static func recentFilePaths() -> [String] {
+        UserDefaults.standard.stringArray(forKey: "RecentFilePaths") ?? []
+    }
+
+    static func forgetRecentPath(_ path: String, isFolder: Bool) {
+        let key = isFolder ? "RecentProjectPaths" : "RecentFilePaths"
+        let identity = fileKey(path) ?? path
+        UserDefaults.standard.set((UserDefaults.standard.stringArray(forKey: key) ?? [])
+            .filter { fileKey($0) != identity }, forKey: key)
+        MainMenu.refreshRecentProjects()
+    }
+
+    static func clearRecentlyOpened() {
+        UserDefaults.standard.removeObject(forKey: "RecentProjectPaths")
+        UserDefaults.standard.removeObject(forKey: "RecentFilePaths")
+        MainMenu.refreshRecentProjects()
+    }
+
+    @objc func clearRecentlyOpened(_ sender: Any?) { Self.clearRecentlyOpened() }
 
     private static func rememberProject(_ path: String) {
         let key = fileKey(path) ?? path
         var paths = recentProjectPaths().filter { fileKey($0) != key }
         paths.insert(path, at: 0)
-        UserDefaults.standard.set(Array(paths.prefix(10)), forKey: "RecentProjectPaths")
+        UserDefaults.standard.set(Array(paths.prefix(100)), forKey: "RecentProjectPaths")
+        MainMenu.refreshRecentProjects()
+    }
+
+    static func rememberFile(_ path: String) {
+        let key = fileKey(path) ?? path
+        var paths = recentFilePaths().filter { fileKey($0) != key }
+        paths.insert(path, at: 0)
+        UserDefaults.standard.set(Array(paths.prefix(100)), forKey: "RecentFilePaths")
         MainMenu.refreshRecentProjects()
     }
 
     /// Opens a file in its own tab (or shows its tab if already open).
-    func openFile(at url: URL) throws {
-        if MediaKind.kind(for: url) != nil { return openMediaFile(at: url) }
+    func openFile(at url: URL, rememberRecent: Bool = true) throws {
+        if MediaKind.kind(for: url) != nil {
+            openMediaFile(at: url)
+            if rememberRecent { Self.rememberFile(url.path) }
+            return
+        }
         if let i = tabIndex(forPath: url.path) {
             tabs[i].isPreview = false
-            return selectTab(i)
+            selectTab(i)
+            if rememberRecent { Self.rememberFile(url.path) }
+            return
         }
         let doc = try sharedDocument(forFileKey: Self.fileKey(url.path) ?? "") ?? bridge.openDocument(path: url.path)
         let name = url.lastPathComponent
@@ -149,17 +197,24 @@ extension MainWindowController {
         tab.fileKey = Self.fileKey(doc.path())
         tab.relPath = relativePath(doc.path())
         add(tab, replacing: slotForOpening(preview: false))
+        if rememberRecent { Self.rememberFile(url.path) }
     }
 
     /// Single click in the explorer opens a preview tab, which the next
     /// single click replaces; a double click or an edit keeps it.
-    func openWorkspaceFile(_ workspace: Workspace, _ entry: FileEntry, preview: Bool) {
+    func openWorkspaceFile(_ workspace: Workspace, _ entry: FileEntry, preview: Bool,
+                           rememberRecent: Bool = true) {
         let path = URL(fileURLWithPath: workspace.root()).appendingPathComponent(entry.relPath).path
         let fileURL = URL(fileURLWithPath: path)
-        if MediaKind.kind(for: fileURL) != nil { return openMediaFile(at: fileURL, preview: preview) }
+        if MediaKind.kind(for: fileURL) != nil {
+            openMediaFile(at: fileURL, preview: preview)
+            if !preview && rememberRecent { Self.rememberFile(path) }
+            return
+        }
         if let i = tabIndex(forPath: path) {
             if !preview { tabs[i].isPreview = false }
             selectTab(i)
+            if !preview && rememberRecent { Self.rememberFile(path) }
             window?.makeFirstResponder(editorView)
             return
         }
@@ -174,6 +229,7 @@ extension MainWindowController {
             tab.fileKey = Self.fileKey(doc.path())
             tab.relPath = entry.relPath
             add(tab, replacing: slotForOpening(preview: preview))
+            if !preview && rememberRecent { Self.rememberFile(path) }
             window?.makeFirstResponder(editorView)
         } catch {
             report(error, while: "open \(entry.relPath)")

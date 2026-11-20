@@ -123,6 +123,23 @@ final class TerminalPanelTests: XCTestCase {
         XCTAssertGreaterThan(TerminalPalette.luminance(palette.ansi[7]), 0.5, "white stays light")
     }
 
+    func testDecorativeBlockKeepsItsOriginalColorOnLightBackground() {
+        let palette = TerminalPalette(appearance: NSAppearance(named: .aqua)!)
+        let muted = TerminalColorInfo.rgb(r: 204, g: 204, b: 204)
+        let run = TerminalRunInfo(column: 0, text: "\u{2584}", foreground: muted, background: .default,
+                                  bold: false, italic: false, dim: false, underline: false, strikeout: false,
+                                  inverse: false)
+        let raw = palette.colors(for: run, adjustContrast: false)
+        XCTAssertEqual(raw.foreground, NSColor(srgbRed: 204 / 255, green: 204 / 255, blue: 204 / 255, alpha: 1))
+        XCTAssertLessThan(TerminalPalette.contrast(raw.foreground, palette.background), 4.5,
+                          "opencode's faint separator stays faint")
+        XCTAssertGreaterThanOrEqual(TerminalPalette.contrast(palette.colors(for: run).foreground, palette.background), 4.5,
+                                    "ordinary text still receives minimum contrast")
+        let cell = NSRect(x: 0, y: 0, width: 8, height: 16)
+        XCTAssertEqual(TerminalView.customGlyph("\u{2584}", cell: cell)?.first?.rect,
+                       NSRect(x: 0, y: 8, width: 8, height: 8))
+    }
+
     func testHeaderShowsTheChipForOneTerminalOnly() {
         let header = BottomPanelHeader(frame: NSRect(x: 0, y: 0, width: 900, height: BottomPanelHeader.height))
         let zsh = TerminalSummary(name: "zsh", icon: PanelTerminal.defaultIcon, tint: nil, group: 0)

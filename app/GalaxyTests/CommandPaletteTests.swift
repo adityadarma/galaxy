@@ -71,7 +71,11 @@ final class CommandPaletteTests: XCTestCase {
                    action != #selector(NSApplication.arrangeInFront(_:)),
                    action != #selector(NSWindow.makeKeyAndOrderFront(_:)),  // AppKit's open-window list
                    action != #selector(MainWindowController.showCommandPalette(_:)),
-                   action != #selector(MainWindowController.openRecentProject(_:)) {  // a list, not one command
+                   action != #selector(MainWindowController.openRecentProject(_:)),
+                   action != #selector(MainWindowController.openRecentFile(_:)),
+                   action != #selector(MainWindowController.showRecentItems(_:)),
+                   action != #selector(MainWindowController.clearRecentlyOpened(_:)),
+                   action != #selector(AppDelegate.installCommandLineTool(_:)) {  // menu-only actions
                     missing.append(NSStringFromSelector(action))
                 }
             }

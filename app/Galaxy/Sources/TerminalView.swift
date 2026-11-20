@@ -660,6 +660,10 @@ final class TerminalView: NSView {
             let y = padding.top + CGFloat(row) * lineHeight
             for run in line.runs {
                 let colors = palette.colors(for: run)
+                // Block and box characters are UI artwork, not text. Keep
+                // their requested color instead of boosting faint dividers
+                // (such as opencode's lower-half-block separator) to 4.5:1.
+                let glyphColor = palette.colors(for: run, adjustContrast: false).foreground
                 let width = CGFloat(run.text.unicodeScalars.reduce(0) { $0 + Self.cellCount($1) })
                 let rect = NSRect(x: padding.left + CGFloat(run.column) * cellWidth, y: y,
                                   width: width * cellWidth, height: lineHeight)
@@ -667,7 +671,7 @@ final class TerminalView: NSView {
                     background.setFill()
                     rect.fill()
                 }
-                drawRun(run, in: rect, color: colors.foreground, context: context)
+                drawRun(run, in: rect, color: colors.foreground, glyphColor: glyphColor, context: context)
             }
         }
         drawSelection(screen)
@@ -689,7 +693,8 @@ final class TerminalView: NSView {
         }
     }
 
-    private func drawRun(_ run: TerminalRunInfo, in rect: NSRect, color: NSColor, context: CGContext) {
+    private func drawRun(_ run: TerminalRunInfo, in rect: NSRect, color: NSColor,
+                         glyphColor: NSColor, context: CGContext) {
         guard !run.text.allSatisfy({ $0 == " " }) || run.underline || run.strikeout else { return }
         var attributes: [NSAttributedString.Key: Any] = [
             .font: fonts.font(bold: run.bold, italic: run.italic),
@@ -714,7 +719,7 @@ final class TerminalView: NSView {
                     // Block and line characters fill the whole cell, so
                     // TUIs (opencode, htop) draw seamless bars and boxes.
                     for part in parts {
-                        color.withAlphaComponent(color.alphaComponent * part.alpha).setFill()
+                        glyphColor.withAlphaComponent(glyphColor.alphaComponent * part.alpha).setFill()
                         part.rect.fill()
                     }
                 } else if character != " " {
@@ -1093,7 +1098,7 @@ struct TerminalPalette {
         }
     }
 
-    func colors(for run: TerminalRunInfo) -> (foreground: NSColor, background: NSColor?) {
+    func colors(for run: TerminalRunInfo, adjustContrast: Bool = true) -> (foreground: NSColor, background: NSColor?) {
         var fg = color(run.foreground, isForeground: true) ?? foreground
         var bg = color(run.background, isForeground: false)
         // Bold ANSI 0–7 use the bright variant, as xterm does.
@@ -1103,7 +1108,7 @@ struct TerminalPalette {
             bg = fg
             fg = swapped
         }
-        if let minimumContrast { fg = Self.readable(fg, on: bg ?? background, ratio: minimumContrast) }
+        if adjustContrast, let minimumContrast { fg = Self.readable(fg, on: bg ?? background, ratio: minimumContrast) }
         if run.dim { fg = fg.withAlphaComponent(0.6) }
         return (fg, bg)
     }

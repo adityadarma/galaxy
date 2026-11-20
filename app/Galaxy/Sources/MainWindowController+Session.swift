@@ -190,10 +190,10 @@ extension MainWindowController {
                     openWorkspaceDiff(workspace, relPath: rel)
                 } else {
                     let entry = FileEntry(name: (rel as NSString).lastPathComponent, relPath: rel, isDir: false)
-                    openWorkspaceFile(workspace, entry, preview: saved.isPreview)
+                    openWorkspaceFile(workspace, entry, preview: saved.isPreview, rememberRecent: false)
                 }
             } else {
-                try? openFile(at: URL(fileURLWithPath: saved.path))
+                try? openFile(at: URL(fileURLWithPath: saved.path), rememberRecent: false)
             }
             // A diff with no committed version opens as a plain tab.
             guard let index = tabIndex(forPath: saved.path, diff: saved.isDiff == true)
@@ -296,7 +296,9 @@ extension MainWindowController {
                         restoresWorkspaceTabs = !workspaceSession.tabs.isEmpty
                             || !(workspaceSession.extraGroups?.isEmpty ?? true)
                     }
-                    try openWorkspace(at: URL(fileURLWithPath: root), restoresTabsIncrementally: incrementally && restoresWorkspaceTabs)
+                    try openWorkspace(at: URL(fileURLWithPath: root),
+                                      restoresTabsIncrementally: incrementally && restoresWorkspaceTabs,
+                                      rememberRecent: false)
                     restoredWorkspace = true
                 } catch {
                     Log.app.error("restoring workspace failed: \(String(describing: error), privacy: .public)")
