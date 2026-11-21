@@ -54,6 +54,18 @@ final class TerminalPanelTests: XCTestCase {
         XCTAssertEqual(TerminalView.cellCount("😀"), 2)
     }
 
+    func testBoldTextUsesSyntheticWeightOnlyWhenFontLacksBoldFace() throws {
+        let monaco = FontSet(try XCTUnwrap(NSFont(name: "Monaco", size: 12)))
+        XCTAssertEqual(monaco.font(bold: true, italic: false).fontName, monaco.regular.fontName)
+        XCTAssertEqual(monaco.syntheticBoldStrokeWidth(bold: true, italic: false), -3)
+        XCTAssertNil(monaco.syntheticBoldStrokeWidth(bold: false, italic: false))
+
+        let menlo = FontSet(try XCTUnwrap(NSFont(name: "Menlo-Regular", size: 12)))
+        XCTAssertTrue(menlo.font(bold: true, italic: false).fontDescriptor.symbolicTraits.contains(.bold))
+        XCTAssertNil(menlo.syntheticBoldStrokeWidth(bold: true, italic: false), "native bold needs no extra stroke")
+        XCTAssertEqual(monaco.cellWidth, FontSet(monaco.regular).cellWidth, "synthetic weight leaves grid metrics intact")
+    }
+
     func testSelectedTextCopiesOnlyTheSelection() {
         func line(_ runs: [(UInt16, String)]) -> TerminalLineInfo {
             TerminalLineInfo(text: runs.map(\.1).joined(), runs: runs.map {
@@ -248,18 +260,20 @@ final class TerminalPanelTests: XCTestCase {
         c.toggleTerminal(nil)
         c.window?.layoutIfNeeded()
         let header = c.bottomPanelHeaderForTesting
+        let handle = c.bottomPanelResizeHandle
         let before = c.bottomPanelContentHeight
-        // The top strip of the header is the drag handle.
-        let sash = header.superview!.convert(NSPoint(x: header.bounds.midX, y: 2), from: header)
-        XCTAssertTrue(header.hitTest(sash) === header)
-        header.onResize?(true, 0)
-        header.onResize?(false, 100)
+        XCTAssertFalse(handle.isHidden)
+        XCTAssertEqual(handle.frame.height, Theme.cardGap, accuracy: 0.5)
+        let center = handle.convert(NSPoint(x: handle.bounds.midX, y: handle.bounds.midY), to: c.detailView.superview)
+        XCTAssertTrue(c.detailView.hitTest(center) === handle, "the gap, not the panel tabs, owns the resize cursor")
+        handle.onResize?(true, 0)
+        handle.onResize?(false, 100)
         XCTAssertEqual(c.bottomPanelContentHeight, before + 100, accuracy: 0.5)
-        header.onResize?(true, 0)
-        header.onResize?(false, -10_000)
+        handle.onResize?(true, 0)
+        handle.onResize?(false, -10_000)
         XCTAssertEqual(c.bottomPanelContentHeight, MainWindowController.minBottomPanelHeight, "never below the minimum")
-        header.onResize?(true, 0)
-        header.onResize?(false, 10_000)
+        handle.onResize?(true, 0)
+        handle.onResize?(false, 10_000)
         c.window?.layoutIfNeeded()
         let editorTop = c.tabBar.convert(c.tabBar.bounds, to: nil).minY
         let headerTop = header.convert(header.bounds, to: nil).maxY
@@ -277,10 +291,12 @@ final class TerminalPanelTests: XCTestCase {
         c.window?.layoutIfNeeded()
         XCTAssertTrue(c.bottomPanelCard.isHidden)
         XCTAssertEqual(c.editorCard.frame.height, c.detailView.bounds.height, accuracy: 0.5)
+        XCTAssertTrue(c.bottomPanelResizeHandle.isHidden)
 
         c.toggleTerminal(nil)
         c.window?.layoutIfNeeded()
         XCTAssertFalse(c.bottomPanelCard.isHidden)
+        XCTAssertFalse(c.bottomPanelResizeHandle.isHidden)
         let gap = c.editorCard.frame.minY - c.bottomPanelCard.frame.maxY
         let flipped = c.detailView.isFlipped
         let between = flipped ? c.bottomPanelCard.frame.minY - c.editorCard.frame.maxY : gap
@@ -290,6 +306,7 @@ final class TerminalPanelTests: XCTestCase {
         c.toggleTerminal(nil)
         c.window?.layoutIfNeeded()
         XCTAssertTrue(c.bottomPanelCard.isHidden)
+        XCTAssertTrue(c.bottomPanelResizeHandle.isHidden)
         XCTAssertEqual(c.editorCard.frame.height, c.detailView.bounds.height, accuracy: 0.5)
     }
 

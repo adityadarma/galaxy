@@ -24,6 +24,17 @@ enum CommandLineTool {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/galaxy")
     }
 
+    /// A link to this app's helper, not merely a command with the same name
+    /// elsewhere on PATH. A stale link to another Galaxy build can be updated.
+    static func isInstalled(helper: URL = helperURL, link: URL = defaultLinkURL) -> Bool {
+        let files = FileManager.default
+        guard files.isExecutableFile(atPath: helper.path),
+              let destination = try? files.destinationOfSymbolicLink(atPath: link.path) else { return false }
+        let resolved = URL(fileURLWithPath: destination, relativeTo: link.deletingLastPathComponent())
+            .standardizedFileURL.resolvingSymlinksInPath()
+        return resolved == helper.standardizedFileURL.resolvingSymlinksInPath()
+    }
+
     /// Creates or replaces the symlink. A regular file at `link` is left alone.
     static func install(helper: URL = helperURL, link: URL = defaultLinkURL) throws {
         let files = FileManager.default

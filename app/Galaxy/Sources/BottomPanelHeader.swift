@@ -38,38 +38,6 @@ final class BottomPanelHeader: NSView {
     }
     var onToggleMaximize: (() -> Void)?
     var onClose: (() -> Void)?
-    /// Dragging the top edge (VS Code's sash): called with the drag start
-    /// (`true`) and then the vertical distance moved, up positive.
-    var onResize: ((_ began: Bool, _ deltaY: CGFloat) -> Void)?
-
-    /// Height of the grab strip along the top edge.
-    static let sashHeight: CGFloat = 5
-
-    private func inSash(_ point: NSPoint) -> Bool { point.y < Self.sashHeight }
-
-    override func hitTest(_ point: NSPoint) -> NSView? {
-        guard !isHidden, let local = superview.map({ convert(point, from: $0) }),
-              bounds.contains(local), inSash(local) else { return super.hitTest(point) }
-        return self
-    }
-
-    override func resetCursorRects() {
-        super.resetCursorRects()
-        addCursorRect(NSRect(x: 0, y: 0, width: bounds.width, height: Self.sashHeight), cursor: .resizeUpDown)
-    }
-
-    override func mouseDown(with event: NSEvent) {
-        guard inSash(convert(event.locationInWindow, from: nil)), let window else {
-            return super.mouseDown(with: event)
-        }
-        let startY = event.locationInWindow.y
-        onResize?(true, 0)
-        while let next = window.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
-            onResize?(false, next.locationInWindow.y - startY)
-            if next.type == .leftMouseUp { break }
-        }
-    }
-
     private(set) var selectedTab: Tab = .terminal
     private var tabViews: [Tab: PanelTabView] = [:]
     private let tabStack = NSStackView()
@@ -212,6 +180,28 @@ final class BottomPanelHeader: NSView {
         b.widthAnchor.constraint(equalToConstant: 22).isActive = true
         b.heightAnchor.constraint(equalToConstant: 22).isActive = true
         return b
+    }
+}
+
+/// Transparent resize target centered in the gap between the editor and
+/// bottom-panel cards, rather than inside the panel's tab header.
+@MainActor
+final class BottomPanelResizeHandle: NSView {
+    var onResize: ((_ began: Bool, _ deltaY: CGFloat) -> Void)?
+
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        addCursorRect(bounds, cursor: .resizeUpDown)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard let window else { return }
+        let startY = event.locationInWindow.y
+        onResize?(true, 0)
+        while let next = window.nextEvent(matching: [.leftMouseDragged, .leftMouseUp]) {
+            onResize?(false, next.locationInWindow.y - startY)
+            if next.type == .leftMouseUp { break }
+        }
     }
 }
 

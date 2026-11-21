@@ -25,6 +25,7 @@ extension MainWindowController {
         bottomPanelContent.isHidden = !open
         // A card of its own, apart from the editor card by the card gap.
         bottomPanelCard.isHidden = !open
+        bottomPanelResizeHandle.isHidden = !open
         bottomPanelGap.constant = open ? -Theme.cardGap : 0
         titleBar.setPanelVisible(open)
         detailView.needsLayout = true

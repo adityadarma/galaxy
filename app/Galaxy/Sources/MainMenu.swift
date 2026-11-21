@@ -7,6 +7,7 @@ enum MainMenu {
 
         let appItem = NSMenuItem()
         let appMenu = NSMenu()
+        appMenu.delegate = NSApp.delegate as? NSMenuDelegate
         appMenu.addItem(withTitle: "About Galaxy",
                         action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)),
                         keyEquivalent: "")

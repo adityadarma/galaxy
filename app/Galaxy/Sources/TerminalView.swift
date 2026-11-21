@@ -701,6 +701,10 @@ final class TerminalView: NSView {
             .foregroundColor: color,
             .ligature: 0,
         ]
+        if let stroke = fonts.syntheticBoldStrokeWidth(bold: run.bold, italic: run.italic) {
+            attributes[.strokeWidth] = stroke
+            attributes[.strokeColor] = color
+        }
         // Place each cell at its grid column, so the shell's layout holds
         // even where the font's glyphs are not exactly one cell wide.
         let baseline = rect.minY + fonts.baselineOffset
@@ -972,7 +976,7 @@ struct TerminalSettings: Equatable {
 }
 
 /// The terminal font in its four styles, with the grid metrics.
-private struct FontSet {
+struct FontSet {
     let regular: NSFont
     let bold: NSFont
     let italic: NSFont
@@ -1011,6 +1015,17 @@ private struct FontSet {
         case (false, true): italic
         case (false, false): regular
         }
+    }
+
+    /// Core Text does not synthesize a bold face for fonts such as Monaco:
+    /// AppKit returns the regular face for `convert(toHaveTrait:)`. A small
+    /// negative stroke width fills and outlines bold cells without changing
+    /// their point size, cell width, or baseline.
+    func syntheticBoldStrokeWidth(bold isBold: Bool, italic isItalic: Bool) -> CGFloat? {
+        guard isBold, !font(bold: isBold, italic: isItalic).fontDescriptor.symbolicTraits.contains(.bold) else {
+            return nil
+        }
+        return -3
     }
 }
 

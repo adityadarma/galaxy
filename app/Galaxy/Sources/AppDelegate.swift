@@ -2,7 +2,7 @@ import AppKit
 import os
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, NSMenuDelegate {
     private let bridge = CoreBridge()
     private let updater = AppUpdater()
     private var windowControllers: [MainWindowController] = []
@@ -160,6 +160,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation {
             alert.informativeText = error.localizedDescription
         }
         alert.runModal()
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        guard let item = menu.items.first(where: { $0.action == #selector(installCommandLineTool(_:)) }) else { return }
+        item.isHidden = CommandLineTool.isInstalled()
     }
 
     func canCheckForUpdates() -> Bool {

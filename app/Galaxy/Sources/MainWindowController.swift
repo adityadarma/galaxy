@@ -107,6 +107,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// Covers the editor while no tab is open.
     let emptyEditor = EmptyEditorView()
     let bottomPanelHeader = BottomPanelHeader()
+    let bottomPanelResizeHandle = BottomPanelResizeHandle()
     let bottomPanelContent = BottomPanelContentView()
     var bottomPanelHeight: NSLayoutConstraint!
     var bottomPanelHeaderHeight: NSLayoutConstraint!
@@ -714,6 +715,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
         bottomPanelHeader.translatesAutoresizingMaskIntoConstraints = false
         bottomPanelHeader.clipsToBounds = true
+        bottomPanelResizeHandle.translatesAutoresizingMaskIntoConstraints = false
+        bottomPanelResizeHandle.isHidden = true
         bottomPanelContent.translatesAutoresizingMaskIntoConstraints = false
         bottomPanelHeight = bottomPanelContent.heightAnchor.constraint(equalToConstant: 0)
         bottomPanelHeaderHeight = bottomPanelHeader.heightAnchor.constraint(equalToConstant: 0)
@@ -730,6 +733,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         bottomPanelCard.isHidden = true
         detailView.addSubview(editorCard)
         detailView.addSubview(bottomPanelCard)
+        detailView.addSubview(bottomPanelResizeHandle)
         groupsSplitView.translatesAutoresizingMaskIntoConstraints = false
         groupsSplitView.addSubview(activeGroup.slot)
         editorCard.addSubview(groupsSplitView)
@@ -788,6 +792,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             editorCard.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
             editorCard.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
             bottomPanelGap,
+            bottomPanelResizeHandle.topAnchor.constraint(equalTo: editorCard.bottomAnchor),
+            bottomPanelResizeHandle.bottomAnchor.constraint(equalTo: bottomPanelCard.topAnchor),
+            bottomPanelResizeHandle.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
+            bottomPanelResizeHandle.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
             bottomPanelCard.leadingAnchor.constraint(equalTo: detailView.leadingAnchor),
             bottomPanelCard.trailingAnchor.constraint(equalTo: detailView.trailingAnchor),
             bottomPanelCard.bottomAnchor.constraint(equalTo: detailView.bottomAnchor),
@@ -880,7 +888,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             self?.activeTerminal.flatMap { self?.terminalMenu(for: $0) }
         }
         bottomPanelHeader.onToggleMaximize = { [weak self] in self?.toggleBottomPanelMaximized() }
-        bottomPanelHeader.onResize = { [weak self] began, delta in self?.resizeBottomPanel(began: began, deltaY: delta) }
+        bottomPanelResizeHandle.onResize = { [weak self] began, delta in self?.resizeBottomPanel(began: began, deltaY: delta) }
         if let saved = UserDefaults.standard.object(forKey: "BottomPanelHeight") as? Double, saved >= Double(Self.minBottomPanelHeight) {
             bottomPanelOpenHeight = CGFloat(saved)
         }
