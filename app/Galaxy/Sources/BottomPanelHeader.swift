@@ -11,7 +11,6 @@ final class BottomPanelHeader: NSView {
         case debugConsole
         case testResults
         case terminal
-        case ports
 
         var title: String {
             switch self {
@@ -20,7 +19,6 @@ final class BottomPanelHeader: NSView {
             case .debugConsole: "DEBUG CONSOLE"
             case .testResults: "TEST RESULTS"
             case .terminal: "TERMINAL"
-            case .ports: "PORTS"
             }
         }
     }

@@ -173,7 +173,41 @@ extension MainWindowController {
     }
 
     func refreshGitStatus() {
-        guard let workspace, let status = bridge.gitStatus(workspace: workspace) else {
+        guard let workspace else {
+            gitStatusNeedsRefresh = false
+            applyGitStatus(nil)
+            return
+        }
+        if gitStatusInFlight {
+            gitStatusNeedsRefresh = true
+            return
+        }
+        gitStatusInFlight = true
+        DispatchQueue.global(qos: .utility).async { [weak self, workspace] in
+            let status = try? workspace.gitStatus()
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.gitStatusInFlight = false
+                guard self.workspace === workspace else {
+                    let needsRefresh = self.gitStatusNeedsRefresh
+                    self.gitStatusNeedsRefresh = false
+                    if needsRefresh {
+                        self.refreshGitStatus()
+                    }
+                    return
+                }
+                self.applyGitStatus(status)
+                if self.gitStatusNeedsRefresh {
+                    self.gitStatusNeedsRefresh = false
+                    self.refreshGitStatus()
+                }
+            }
+        }
+    }
+
+    private func applyGitStatus(_ status: GitStatusInfo?) {
+        gitStatusSnapshot = status
+        guard let status else {
             statusBar.showGit(branch: nil, changedCount: 0)
             activityBar.setBadge(0, for: .sourceControl)
             explorer.gitStatusMap = [:]
@@ -314,22 +348,37 @@ extension MainWindowController {
         }
         let text = tab.doc.text()
         let document = tab.doc
+        let revision = document.revision()
         let wantsHunks = tab.diffBase != nil
+        let diffBaseText = tab.diffBase?.text()
+        let stagedDiff = tab.isStagedDiff
         let open = editorView.inlineGitHunk
-        DispatchQueue.global(qos: .utility).async { [weak self, workspace, path, text, open, document] in
-            let changes = (try? workspace.gitDiffLines(relPath: path, text: text)) ?? []
-            let mapped = Self.gitLineMarkers(changes)
-            let hunks = (open != nil || wantsHunks) ? ((try? workspace.gitDiffHunks(relPath: path, text: text)) ?? []) : []
+        DispatchQueue.global(qos: .utility).async { [weak self, workspace, path, text, open, document, revision, diffBaseText, stagedDiff] in
+            let changes = stagedDiff ? [] : ((try? workspace.gitDiffLines(relPath: path, text: text)) ?? [])
+            let mapped = stagedDiff ? [:] : Self.gitLineMarkers(changes)
+            let hunks: [GitDiffHunkInfo]
+            if let diffBaseText {
+                hunks = workspace.gitDiffHunksBetween(oldText: diffBaseText, newText: text)
+            } else {
+                hunks = open != nil ? ((try? workspace.gitDiffHunks(relPath: path, text: text)) ?? []) : []
+            }
             let map = wantsHunks ? DiffLineMap(hunks) : nil
+            let inlineChanges = map.flatMap { map in
+                diffBaseText.map { map.inlineChanges(oldText: $0, newText: text) }
+            }
             // An open inline hunk follows the edit: same HEAD hunk, new text.
             // It closes once the change is gone, e.g. after an undo.
-            let refreshed = open.map { Self.refreshedInlineHunk($0, hunks: hunks, workspace: workspace, document: document, path: path, text: text) }
+            let refreshed = open.map { Self.refreshedInlineHunk($0, hunks: diffBaseText == nil ? hunks : [], workspace: workspace, document: document, path: path, text: text) }
             Task { @MainActor [weak self] in
-                guard let self, self.activeTab?.relPath == path else { return }
+                guard let self, self.activeTab?.relPath == path,
+                      self.activeTab?.isStagedDiff == stagedDiff,
+                      self.activeTab?.doc === document,
+                      document.revision() == revision,
+                      self.activeTab?.diffBase?.text() == diffBaseText else { return }
                 self.editorView.gitLineChanges = mapped
                 self.scrollView.ruler.updateGit(changes: mapped, lineCount: document.lineCount())
                 if let refreshed, self.editorView.inlineGitHunk == open { self.editorView.inlineGitHunk = refreshed }
-                if let map, self.isDiffPaneShown { self.applyDiff(map) }
+                if let map, self.isDiffPaneShown { self.applyDiff(map, inlineChanges: inlineChanges ?? .init()) }
             }
         }
     }
@@ -538,32 +587,54 @@ extension MainWindowController {
 
     // MARK: Diff tab
 
-    /// Opens `relPath` beside its committed version (left, read-only) and the
-    /// working copy (right, editable). A file with no committed version opens
-    /// as a normal tab. The diff gets its own tab, shared document with the
-    /// file's plain tab, which stays as it is.
-    func openWorkspaceDiff(_ workspace: Workspace, relPath: String) {
+    /// Staged rows compare HEAD with the index; Changes compare the index
+    /// with disk. Direct calls retain the committed-versus-working view.
+    func openWorkspaceDiff(_ workspace: Workspace, relPath: String, staged: Bool? = nil) {
         let name = (relPath as NSString).lastPathComponent
-        guard let base = (try? workspace.gitBaseDocument(relPath: relPath)) ?? nil else {
+        let head = (try? workspace.gitBaseDocument(relPath: relPath)) ?? nil
+        let index = staged == nil ? nil : (try? workspace.gitIndexDocument(relPath: relPath)) ?? nil
+        let path = URL(fileURLWithPath: workspace.root()).appendingPathComponent(relPath).path
+        let base: DocumentHandle?
+        if staged == false {
+            base = index ?? bridge.newDocument()
+        } else if staged == true {
+            base = head ?? bridge.newDocument()
+        } else {
+            base = head
+        }
+        guard let base else {
             return openWorkspaceFile(workspace, FileEntry(name: name, relPath: relPath, isDir: false), preview: false)
         }
         diffRevealPending = true
-        let path = URL(fileURLWithPath: workspace.root()).appendingPathComponent(relPath).path
-        if let i = tabIndex(forPath: path, diff: true) {
+        let deleted = !FileManager.default.fileExists(atPath: path)
+        let existing = tabs.firstIndex { $0.fileKey == Self.fileKey(path)
+            && $0.diffBase != nil && $0.isStagedDiff == (staged == true) }
+        if let i = existing, staged != true {
             tabs[i].isPreview = false
             tabs[i].diffBase = base
+            tabs[i].isDeletedOnDisk = staged != true && deleted
             if activeIndex == i {
                 applyDiffPane(for: tabs[i])
                 refreshGitDiff()
                 refreshTabBar()
             } else {
                 selectTab(i)
+                refreshGitDiff()
             }
             window?.makeFirstResponder(editorView)
             return
         }
         do {
-            let doc = try sharedDocument(forFileKey: Self.fileKey(path) ?? "") ?? workspace.openFile(relPath: relPath)
+            let doc: DocumentHandle
+            if staged == true {
+                doc = index ?? bridge.newDocument()
+                if index == nil { doc.setPath(path: path) }
+            } else if deleted {
+                doc = bridge.newDocument()
+                doc.setPath(path: path)
+            } else {
+                doc = try sharedDocument(forFileKey: Self.fileKey(path) ?? "") ?? workspace.openFile(relPath: relPath)
+            }
             let tab = EditorTab(
                 doc: doc, title: name,
                 pathComponents: relPath.split(separator: "/").map(String.init),
@@ -571,7 +642,9 @@ extension MainWindowController {
             tab.fileKey = Self.fileKey(doc.path())
             tab.relPath = relPath
             tab.diffBase = base
-            add(tab, replacing: slotForOpening(preview: false))
+            tab.isStagedDiff = staged == true
+            tab.isDeletedOnDisk = staged != true && deleted
+            add(tab, replacing: existing ?? slotForOpening(preview: false))
             window?.makeFirstResponder(editorView)
         } catch {
             report(error, while: "open \(relPath)")
@@ -583,6 +656,8 @@ extension MainWindowController {
     func applyDiffPane(for tab: EditorTab) {
         editorView.lineTints = [:]
         secondaryEditorView.lineTints = [:]
+        editorView.inlineDiffRanges = [:]
+        secondaryEditorView.inlineDiffRanges = [:]
         editorView.diffSpacers = []
         secondaryEditorView.diffSpacers = []
         editorView.diffSide = nil
@@ -611,6 +686,7 @@ extension MainWindowController {
             editorSplitView.showsDiffGutter = true
         }
         secondaryEditorView.isReadOnly = true
+        editorView.isReadOnly = tab.isStagedDiff || tab.isDeletedOnDisk
         secondaryEditorView.diffSide = .removed
         editorView.diffSide = .added
         secondaryEditorView.diffPartner = editorView
@@ -638,6 +714,7 @@ extension MainWindowController {
         updateMinimap()
         diffMap = DiffLineMap()
         secondaryEditorView.isReadOnly = false
+        editorView.isReadOnly = false
         secondaryEditorView.diffSide = nil
         editorView.diffSide = nil
         secondaryEditorView.diffPartner = nil
@@ -647,6 +724,8 @@ extension MainWindowController {
         editorView.diffSpacers = []
         secondaryEditorView.lineTints = [:]
         editorView.lineTints = [:]
+        secondaryEditorView.inlineDiffRanges = [:]
+        editorView.inlineDiffRanges = [:]
         secondaryScrollView.removeFromSuperview()
         editorSplitView.showsDiffGutter = false
         editorSplitView.isVertical = true
@@ -655,13 +734,16 @@ extension MainWindowController {
 
     /// Tints the changed lines of both panes and, the first time, scrolls to
     /// the first change.
-    private func applyDiff(_ map: DiffLineMap) {
+    private func applyDiff(_ map: DiffLineMap, inlineChanges: DiffLineMap.InlineChanges) {
         diffMap = map
         secondaryEditorView.diffSpacers = map.oldSpacers
         editorView.diffSpacers = map.newSpacers
         editorView.lineTints = Dictionary(map.newChangedLines.map { ($0, Theme.diffAdded) }, uniquingKeysWith: { a, _ in a })
         secondaryEditorView.lineTints = Dictionary(map.oldChangedLines.map { ($0, Theme.diffRemoved) }, uniquingKeysWith: { a, _ in a })
-        diffHunkActions.show(map: map, lineHeight: editorView.metrics.lineHeight)
+        editorView.inlineDiffRanges = inlineChanges.new
+        secondaryEditorView.inlineDiffRanges = inlineChanges.old
+        diffHunkActions.show(map: map, lineHeight: editorView.metrics.lineHeight,
+                             actionsEnabled: activeTab?.isStagedDiff != true && activeTab?.isDeletedOnDisk != true)
         layoutDiffHunkActions()
         guard diffRevealPending else { return }
         diffRevealPending = false
@@ -716,13 +798,14 @@ extension MainWindowController {
     }
 
     func revertDiffHunk(at index: Int) {
-        guard diffMap.hunks.indices.contains(index), let workspace, let tab = activeTab,
-              let path = tab.relPath, let base = tab.diffBase else { return }
+        guard diffMap.hunks.indices.contains(index), let tab = activeTab,
+              !tab.isStagedDiff, !tab.isDeletedOnDisk,
+              let workspace, tab.relPath != nil, let base = tab.diffBase else { return }
         let oldText = base.text()
         let text = tab.doc.text()
         // Diff calculation is asynchronous; never apply stale offsets to a newer edit.
-        guard let current = try? workspace.gitDiffHunks(relPath: path, text: text),
-              DiffLineMap(current).hunks == diffMap.hunks,
+        let current = workspace.gitDiffHunksBetween(oldText: oldText, newText: text)
+        guard DiffLineMap(current).hunks == diffMap.hunks,
               let edit = Self.revertedDiffHunk(diffMap.hunks[index], base: oldText, working: text) else {
             refreshGitDiff()
             return
@@ -776,23 +859,32 @@ extension MainWindowController {
 
     func stageDiffHunk(at index: Int) {
         guard diffMap.hunks.indices.contains(index), let workspace, let tab = activeTab,
-              let path = tab.relPath else { return }
+              !tab.isStagedDiff, !tab.isDeletedOnDisk,
+              let path = tab.relPath, let base = tab.diffBase else { return }
         let text = tab.doc.text()
-        guard let current = try? workspace.gitDiffHunks(relPath: path, text: text),
-              DiffLineMap(current).hunks == diffMap.hunks else {
+        let current = workspace.gitDiffHunksBetween(oldText: base.text(), newText: text)
+        guard DiffLineMap(current).hunks == diffMap.hunks else {
             refreshGitDiff()
             return
         }
         let oldStart = UInt64(diffMap.hunks[index].oldStart)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let failure: String? = {
-                do { try workspace.gitStageHunk(relPath: path, text: text, oldStart: oldStart); return nil }
+                do { try workspace.gitStageIndexHunk(relPath: path, text: text, oldStart: oldStart); return nil }
                 catch { return "Could not stage change." }
             }()
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                if failure == nil {
+                    // The right document still contains the working copy, but
+                    // the left snapshot must follow the newly staged index.
+                    tab.diffBase = ((try? workspace.gitIndexDocument(relPath: path)) ?? nil) ?? self.bridge.newDocument()
+                    if self.activeTab === tab {
+                        self.applyDiffPane(for: tab)
+                    }
+                    self.refreshGitStatus()
+                }
                 self.statusLabel.stringValue = failure ?? "Staged change."
-                if failure == nil { self.refreshGitStatus() }
             }
         }
     }

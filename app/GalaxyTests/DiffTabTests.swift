@@ -49,10 +49,43 @@ final class DiffTabTests: XCTestCase {
         }
     }
 
+    func testStagedAndUnstagedDiffsShowSeparateChangesForSameFile() throws {
+        let file = root.appendingPathComponent("tracked.txt")
+        try "one\nTWO\nthree\nfour\n".write(to: file, atomically: true, encoding: .utf8)
+        try git("add", "tracked.txt")
+        try "one\nTWO\nthree\nFOUR\n".write(to: file, atomically: true, encoding: .utf8)
+
+        let c = try makeController()
+        defer { c.window?.orderOut(nil) }
+        let workspace = try XCTUnwrap(c.workspace)
+        c.openWorkspaceDiff(workspace, relPath: "tracked.txt", staged: true)
+        waitForDiff(c)
+        XCTAssertEqual(c.activeTab?.diffBase?.text(), "one\ntwo\nthree\nfour\n")
+        XCTAssertEqual(c.activeTab?.doc.text(), "one\nTWO\nthree\nfour\n")
+        XCTAssertEqual(c.diffMap.hunks.count, 1)
+        XCTAssertEqual(c.diffMap.hunks.first?.oldStart, 1)
+        XCTAssertTrue(c.activeTab?.isStagedDiff == true)
+        XCTAssertTrue(c.editorView.isReadOnly)
+
+        c.openWorkspaceDiff(workspace, relPath: "tracked.txt", staged: false)
+        let deadline = Date().addingTimeInterval(5)
+        while (c.activeTab?.diffBase?.text() != "one\nTWO\nthree\nfour\n"
+               || c.diffMap.hunks.first?.oldStart != 3), Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+        }
+        XCTAssertEqual(c.activeTab?.diffBase?.text(), "one\nTWO\nthree\nfour\n")
+        XCTAssertEqual(c.activeTab?.doc.text(), "one\nTWO\nthree\nFOUR\n")
+        XCTAssertEqual(c.diffMap.hunks.count, 1)
+        XCTAssertEqual(c.diffMap.hunks.first?.oldStart, 3)
+        XCTAssertFalse(c.activeTab?.isStagedDiff ?? true)
+        XCTAssertFalse(c.editorView.isReadOnly)
+        XCTAssertEqual(c.tabs.filter { $0.relPath == "tracked.txt" && $0.diffBase != nil }.count, 2)
+    }
+
     func testDiffHunkButtonsRevertOneChangeAndStageAnother() throws {
         let c = try makeController()
         defer { c.window?.orderOut(nil) }
-        c.openWorkspaceDiff(try XCTUnwrap(c.workspace), relPath: "tracked.txt")
+        c.openWorkspaceDiff(try XCTUnwrap(c.workspace), relPath: "tracked.txt", staged: false)
         waitForDiff(c)
         XCTAssertEqual(c.diffMap.hunks.count, 2)
         XCTAssertFalse(c.diffHunkActions.isHidden)
@@ -94,8 +127,17 @@ final class DiffTabTests: XCTestCase {
         XCTAssertEqual(c.statusLabel.stringValue, "Staged change.")
         XCTAssertEqual(c.activeTab?.doc.text(), "one\nTWO\nthree\nfour\nfive\n")
 
+        let refreshed = Date().addingTimeInterval(5)
+        while (c.activeTab?.diffBase?.text() != "one\nTWO\nthree\nfour\n"
+               || c.diffMap.hunks.count != 1), Date() < refreshed {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+        }
+        XCTAssertEqual(c.activeTab?.diffBase?.text(), "one\nTWO\nthree\nfour\n", "the left pane reloads the staged index")
+        XCTAssertEqual(c.diffMap.hunks.count, 1, "the staged hunk disappears from Changes")
+        XCTAssertEqual(c.diffMap.hunks.first?.oldStart, 4)
+
         try XCTUnwrap(c.diffHunkActions.hunkButtons.first {
-            $0.tag == 1 && $0.toolTip == "Revert Block"
+            $0.tag == 0 && $0.toolTip == "Revert Block"
         }).performClick(nil)
         XCTAssertEqual(c.activeTab?.doc.text(), "one\nTWO\nthree\nfour\n")
         XCTAssertTrue(c.activeTab?.doc.isModified() ?? false)
@@ -192,6 +234,40 @@ final class DiffTabTests: XCTestCase {
 
     // MARK: Opening
 
+    func testInlineDiffHighlightsChangedColumnsAndWholeInsertedLines() {
+        let map = DiffLineMap(hunks: [
+            .init(oldStart: 0, oldLen: 1, newStart: 0, newLen: 2),
+        ])
+        let changes = map.inlineChanges(oldText: "let value = oldName\n", newText: "let value = newName\nadded\n")
+        XCTAssertEqual(changes.old[0], .init(start: 12, end: 15))
+        XCTAssertEqual(changes.new[0], .init(start: 12, end: 15))
+        XCTAssertEqual(changes.new[1], .init(start: 0, end: 5))
+    }
+
+    func testInlineDiffUsesUTF16ColumnsAndLeavesUnchangedLinesUntinted() {
+        let map = DiffLineMap(hunks: [.init(oldStart: 0, oldLen: 1, newStart: 0, newLen: 1)])
+        let changes = map.inlineChanges(oldText: "🦊 cat end\n", newText: "🦊 dog end\n")
+        XCTAssertEqual(changes.old[0], .init(start: 3, end: 6))
+        XCTAssertEqual(changes.new[0], .init(start: 3, end: 6))
+        XCTAssertNil(changes.old[1])
+    }
+
+    func testDeletedFileOpensCommittedTextBesideEmptyWorkingCopy() throws {
+        let c = try makeController()
+        defer { c.window?.orderOut(nil) }
+        let ws = try XCTUnwrap(c.workspace)
+        try FileManager.default.removeItem(at: root.appendingPathComponent("tracked.txt"))
+
+        c.openWorkspaceDiff(ws, relPath: "tracked.txt")
+        waitForDiff(c)
+
+        XCTAssertTrue(c.isDiffPaneShown)
+        XCTAssertTrue(try XCTUnwrap(c.activeTab).isDeletedOnDisk)
+        XCTAssertEqual(c.secondaryEditorView.document?.text(), "one\ntwo\nthree\nfour\n")
+        XCTAssertEqual(c.editorView.document?.text(), "")
+        XCTAssertEqual(c.diffMap.oldChangedLines, [0, 1, 2, 3])
+    }
+
     func testChangedFileOpensCommittedTextBesideTheWorkingCopy() throws {
         let c = try makeController()
         defer { c.window?.orderOut(nil) }
@@ -209,6 +285,9 @@ final class DiffTabTests: XCTestCase {
         XCTAssertEqual(c.diffMap.newChangedLines, [1, 4])
         XCTAssertEqual(c.secondaryEditorView.lineTints.keys.sorted(), [1])
         XCTAssertEqual(c.editorView.lineTints.keys.sorted(), [1, 4])
+        XCTAssertEqual(c.secondaryEditorView.inlineDiffRanges[1], .init(start: 0, end: 3))
+        XCTAssertEqual(c.editorView.inlineDiffRanges[1], .init(start: 0, end: 3))
+        XCTAssertEqual(c.editorView.inlineDiffRanges[4], .init(start: 0, end: 4))
         XCTAssertEqual(c.secondaryEditorView.diffSpacers, [.init(beforeLine: 4, rows: 1)])
         XCTAssertTrue(c.editorView.diffSpacers.isEmpty)
         XCTAssertEqual(c.secondaryEditorView.diffSide, .removed)
@@ -252,6 +331,8 @@ final class DiffTabTests: XCTestCase {
         c.openWorkspaceFile(ws, FileEntry(name: "other.txt", relPath: "other.txt", isDir: false), preview: false)
         XCTAssertFalse(c.isDiffPaneShown, "a normal file shows a single pane")
         XCTAssertTrue(c.editorView.lineTints.isEmpty)
+        XCTAssertTrue(c.editorView.inlineDiffRanges.isEmpty)
+        XCTAssertTrue(c.secondaryEditorView.inlineDiffRanges.isEmpty)
         XCTAssertNil(c.editorView.diffSide)
         XCTAssertNil(c.secondaryEditorView.diffSide)
         XCTAssertNil(c.secondaryEditorView.document)

@@ -34,7 +34,7 @@ extension MainWindowController {
     /// its buffer instead of reading the file again (two buffers of one file
     /// would overwrite each other's edits).
     func sharedDocument(forFileKey key: String) -> DocumentHandle? {
-        allTabs.first { $0.isDocument && $0.fileKey == key }?.doc
+        allTabs.first { $0.isDocument && !$0.isStagedDiff && $0.fileKey == key }?.doc
     }
 
     /// Pins the live editor stack over `group`'s slot.

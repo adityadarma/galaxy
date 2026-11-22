@@ -219,6 +219,9 @@ final class EditorView: NSView {
     var lineTints: [UInt64: NSColor] = [:] {
         didSet { if lineTints != oldValue { needsDisplay = true } }
     }
+    var inlineDiffRanges: [UInt64: DiffLineMap.TextRange] = [:] {
+        didSet { if inlineDiffRanges != oldValue { needsDisplay = true } }
+    }
     /// Empty visual rows used only by side-by-side diffs to align hunks.
     var diffSpacers: [DiffLineMap.Spacer] = [] {
         didSet {
@@ -1118,6 +1121,11 @@ final class EditorView: NSView {
                 context.setFillColor(tint.cgColor)
                 let startX = diffSide == nil ? 0 : gutterShift + gutterWidth
                 context.fill(CGRect(x: startX, y: top, width: max(0, bounds.width - startX), height: block))
+            }
+            if let changed = inlineDiffRanges[line.line] {
+                let color = diffSide == .removed ? Theme.diffRemovedStrong : Theme.diffAddedStrong
+                context.setFillColor(color.cgColor)
+                for rect in span(UInt64(changed.start), UInt64(changed.end), 0, 0) { context.fill(rect) }
             }
 
             // Current line: lines with a caret and no selection on them.

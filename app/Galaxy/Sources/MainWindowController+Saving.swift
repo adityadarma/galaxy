@@ -54,6 +54,7 @@ extension MainWindowController {
     /// was cancelled.
     @discardableResult
     func save() -> Bool {
+        guard activeTab?.isStagedDiff != true else { return false }
         guard activeTab?.isDocument != false, let doc = editorView.document else { return true }
         if doc.path().isEmpty { return saveAs() }
         if doc.checkDisk() == .changed, let tab = activeTab {
@@ -80,6 +81,7 @@ extension MainWindowController {
 
     @discardableResult
     func saveAs() -> Bool {
+        guard activeTab?.isStagedDiff != true else { return false }
         guard activeTab?.isDocument != false, let doc = editorView.document, let url = askSaveLocation(documentName) else { return false }
         do {
             try doc.saveAs(path: url.path)

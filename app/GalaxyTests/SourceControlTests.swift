@@ -56,12 +56,23 @@ final class SourceControlTests: XCTestCase {
         XCTAssertEqual(sc.changeCount, 0)
     }
 
+    func testOpenDiffPassesStagedSectionForMixedFile() {
+        let sc = SourceControlController()
+        var opened: [(String, Bool)] = []
+        sc.onOpenDiff = { opened.append(($0, $1)) }
+        let change = GitChangeInfo(path: "mixed.swift", staged: true, code: "MM")
+        sc.open(change, staged: true)
+        sc.open(change, staged: false)
+        XCTAssertEqual(opened.map(\.0), ["mixed.swift", "mixed.swift"])
+        XCTAssertEqual(opened.map(\.1), [true, false])
+    }
+
     func testChangeRowHasAnOpenFileButtonThatOpensTheFileNotTheDiff() throws {
         let sc = SourceControlController()
         var opened: [String] = []
         var diffs: [String] = []
         sc.onOpen = { opened.append($0) }
-        sc.onOpenDiff = { diffs.append($0) }
+        sc.onOpenDiff = { path, _ in diffs.append(path) }
         sc.refresh(status: GitStatusInfo(
             branch: "main", changedPaths: ["README.md", "gone.txt"],
             changes: [GitChangeInfo(path: "README.md", staged: false, code: " M"),
@@ -86,6 +97,21 @@ final class SourceControlTests: XCTestCase {
         XCTAssertFalse(deleted.discardButton.isHidden)
         modified.mouseExited(with: NSEvent())
         XCTAssertTrue(modified.openFileButton.isHidden)
+    }
+
+    func testDeletedChangeOpensCommittedDiffInsteadOfMissingFile() {
+        let sc = SourceControlController()
+        var opened: [String] = []
+        var diffs: [String] = []
+        sc.onOpen = { opened.append($0) }
+        sc.onOpenDiff = { path, _ in diffs.append(path) }
+
+        sc.open(GitChangeInfo(path: "deleted.txt", staged: false, code: " D"))
+        sc.open(GitChangeInfo(path: "staged-deletion.txt", staged: true, code: "D "))
+        sc.open(GitChangeInfo(path: "new.txt", staged: false, code: "??"))
+
+        XCTAssertEqual(diffs, ["deleted.txt", "staged-deletion.txt"])
+        XCTAssertEqual(opened, ["new.txt"])
     }
 
     func testDirectoryUsesTheFullRowUntilTheHoverButtonsAppear() throws {

@@ -17,7 +17,6 @@ extension MainWindowController {
             // Typing goes back to the editor, as in VS Code.
             if terminalPanel.owns(window?.firstResponder) { window?.makeFirstResponder(editorView) }
             outputPanel.stop()
-            portsPanel.stop()
         }
         bottomPanelHeight.constant = open ? currentBottomPanelHeight() : 0
         bottomPanelHeaderHeight.constant = open ? BottomPanelHeader.height : 0
@@ -77,7 +76,6 @@ extension MainWindowController {
         terminalPanel.isHidden = tab != .terminal
         problemsPanel.isHidden = tab != .problems
         outputPanel.isHidden = tab != .output
-        portsPanel.isHidden = tab != .ports
         testResultsPanel.isHidden = tab != .testResults
         debugConsole.isHidden = tab != .debugConsole
         if tab == .terminal {
@@ -85,6 +83,5 @@ extension MainWindowController {
             window?.makeFirstResponder(terminalPanel.activePane)
         }
         if tab == .output { outputPanel.start() } else { outputPanel.stop() }
-        if tab == .ports { portsPanel.start() } else { portsPanel.stop() }
     }
 }

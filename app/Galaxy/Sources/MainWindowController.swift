@@ -100,7 +100,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// "Move Terminal into Editor Area"). Covers the path bar and editor.
     let editorTerminalView = TerminalView()
     let outputPanel = OutputPanel()
-    let portsPanel = PortsPanel()
     let gitGraphPanel = GitGraphPanel()
     /// Shows the active tab when it is a picture or a PDF.
     let mediaViewer = MediaViewerView()
@@ -578,9 +577,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             guard let self, let workspace = self.workspace else { return }
             self.openWorkspaceFile(workspace, FileEntry(name: (relPath as NSString).lastPathComponent, relPath: relPath, isDir: false), preview: false)
         }
-        sourceControl.onOpenDiff = { [weak self] relPath in
+        sourceControl.onOpenDiff = { [weak self] relPath, staged in
             guard let self, let workspace = self.workspace else { return }
-            self.openWorkspaceDiff(workspace, relPath: relPath)
+            self.openWorkspaceDiff(workspace, relPath: relPath, staged: staged)
         }
         sourceControl.onRefresh = { [weak self] in self?.refreshGitStatus() }
         sourceControl.onMessage = { [weak self] message in self?.statusLabel.stringValue = message }
@@ -706,7 +705,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         // `BottomPanelContentView.layout()` sizes these (never below its
         // minimum). No autoresizing mask: one tied to the collapsed,
         // zero-height container conflicts with the panels' own constraints.
-        for panel in [terminalPanel, outputPanel, portsPanel, problemsPanel, debugConsole, testResultsPanel] as [NSView] {
+        for panel in [terminalPanel, outputPanel, problemsPanel, debugConsole, testResultsPanel] as [NSView] {
             panel.translatesAutoresizingMaskIntoConstraints = true
             panel.autoresizingMask = []
             // A zero frame would become a `height == 0` constraint before
@@ -775,7 +774,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         // Every panel is added once and switched with `isHidden`; see
         // `setBottomPanelOpen`.
         debugConsole.isHidden = true
-        for panel in [terminalPanel, problemsPanel, outputPanel, portsPanel, debugConsole, testResultsPanel] as [NSView] {
+        for panel in [terminalPanel, problemsPanel, outputPanel, debugConsole, testResultsPanel] as [NSView] {
             bottomPanelContent.addSubview(panel)
         }
         bottomPanelContent.isHidden = true
@@ -872,7 +871,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         testResultsPanel.isHidden = true
         problemsPanel.isHidden = true
         outputPanel.isHidden = true
-        portsPanel.isHidden = true
         gitGraphPanel.isHidden = true
         terminalPanel.isHidden = true
         problemsPanel.isHidden = true
@@ -1153,6 +1151,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
 
     /// Where the session is saved. Tests point it elsewhere.
     var sessionURL = Session.defaultURL
+    /// Git reads happen off the main actor; repeated watcher events share one
+    /// in-flight read and request at most one follow-up for its latest state.
+    var gitStatusInFlight = false
+    var gitStatusNeedsRefresh = false
+    var gitStatusSnapshot: GitStatusInfo?
     var didCloseWindow = false
     var isTerminatingApplication = false
 }

@@ -30,11 +30,11 @@ final class DiffHunkActionsView: NSView {
 
     var hunkButtons: [NSButton] { subviews.compactMap { $0 as? NSButton } }
 
-    func show(map: DiffLineMap, lineHeight: CGFloat) {
+    func show(map: DiffLineMap, lineHeight: CGFloat, actionsEnabled: Bool = true) {
         self.map = map
         self.lineHeight = lineHeight
         subviews.forEach { $0.removeFromSuperview() }
-        guard !isHidden, lineHeight > 0 else { return updateGutterExclusions() }
+        guard !isHidden, actionsEnabled, lineHeight > 0 else { return updateGutterExclusions() }
         for index in map.hunks.indices {
             addSubview(button("arrow.right", tooltip: "Revert Block", index: index,
                               action: #selector(revertHunk(_:))))

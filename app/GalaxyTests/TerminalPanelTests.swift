@@ -4,6 +4,21 @@ import XCTest
 
 @MainActor
 final class TerminalPanelTests: XCTestCase {
+    func testRepeatedTerminalGlyphsReuseBoundedShapingCache() {
+        let view = TerminalView(frame: NSRect(x: 0, y: 0, width: 400, height: 200))
+        let font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        let attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: NSColor.white]
+        let first = view.glyphLine(for: "é", attributes: attributes, font: font, color: .white, strokeWidth: nil)
+        let second = view.glyphLine(for: "é", attributes: attributes, font: font, color: .white, strokeWidth: nil)
+        XCTAssertTrue(first === second)
+        for index in 0..<2100 {
+            _ = view.glyphLine(for: "\(index)é", attributes: attributes, font: font, color: .white, strokeWidth: nil)
+        }
+        XCTAssertLessThanOrEqual(view.cachedGlyphCount, 2048)
+        view.reloadFont()
+        XCTAssertEqual(view.cachedGlyphCount, 0)
+    }
+
     private func key(_ keyCode: UInt16, _ characters: String, _ flags: NSEvent.ModifierFlags = []) -> NSEvent {
         NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: flags, timestamp: 0,
                          windowNumber: 0, context: nil, characters: characters,

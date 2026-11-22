@@ -1337,6 +1337,42 @@ pub fn head_blob(root: &Path, rel_path: &str) -> io::Result<Option<Vec<u8>>> {
         .map(|mut blob| blob.take_data()))
 }
 
+/// The file as staged in Git's index. A missing entry represents a staged
+/// deletion (or an untracked file), not an empty file.
+pub fn index_blob(root: &Path, rel_path: &str) -> io::Result<Option<Vec<u8>>> {
+    let output = git_output(
+        root,
+        &["ls-files", "--stage", "-z", "--", rel_path],
+        LOCAL_TIMEOUT,
+    )?;
+    if !output.status.success() {
+        return Err(io::Error::other(
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ));
+    }
+    let entry = output.stdout.split(|&b| b == 0).find(|line| {
+        line.iter()
+            .position(|&b| b == b'\t')
+            .is_some_and(|tab| &line[tab + 1..] == rel_path.as_bytes())
+    });
+    let Some(entry) = entry else { return Ok(None) };
+    let oid = entry
+        .split(|&b| b == b'\t')
+        .next()
+        .unwrap_or_default()
+        .split(|&b| b == b' ')
+        .nth(1)
+        .unwrap_or_default();
+    let oid = std::str::from_utf8(oid).map_err(io::Error::other)?;
+    let blob = git_output(root, &["cat-file", "blob", oid], LOCAL_TIMEOUT)?;
+    if !blob.status.success() {
+        return Err(io::Error::other(
+            String::from_utf8_lossy(&blob.stderr).into_owned(),
+        ));
+    }
+    Ok(Some(blob.stdout))
+}
+
 /// Whether Git's ignore rules cover `rel_path`. Ignored files are never part
 /// of a change, so the gutter must not mark them. Any failure (no `git`, not
 /// a repository, timeout) reads as "not ignored".
@@ -1592,6 +1628,39 @@ pub fn stage_hunk(root: &Path, rel_path: &str, new_text: &str, hunk: DiffHunk) -
     let patch = hunk_patch(rel_path, &base, new_text, hunk);
     let file = std::env::temp_dir().join(format!(
         "galaxy-hunk-{}-{}.patch",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    ));
+    std::fs::write(&file, patch)?;
+    let result = run_git(
+        root,
+        &[
+            "apply",
+            "--cached",
+            "--unidiff-zero",
+            "--whitespace=nowarn",
+            &file.to_string_lossy(),
+        ],
+        "stage change",
+        LOCAL_TIMEOUT,
+    );
+    let _ = std::fs::remove_file(&file);
+    result
+}
+
+/// Apply a working-tree hunk to the index when other hunks are already staged.
+pub fn stage_index_hunk(
+    root: &Path,
+    rel_path: &str,
+    index_text: &str,
+    working_text: &str,
+    hunk: DiffHunk,
+) -> io::Result<()> {
+    let patch = hunk_patch(rel_path, index_text, working_text, hunk);
+    let file = std::env::temp_dir().join(format!(
+        "galaxy-index-hunk-{}-{}.patch",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1921,6 +1990,54 @@ mod tests {
             Some(b"one\n".to_vec())
         );
         assert_eq!(head_blob(dir.path(), "new.txt").unwrap(), None, "untracked");
+    }
+
+    #[test]
+    fn index_blob_and_hunk_keep_staged_and_working_changes_separate() {
+        let dir = tempfile::tempdir().unwrap();
+        run(dir.path(), ["init", "-b", "main"]);
+        fs::write(dir.path().join("mixed.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+        run(dir.path(), ["add", "mixed.txt"]);
+        run(
+            dir.path(),
+            [
+                "-c",
+                "user.name=T",
+                "-c",
+                "user.email=t@example.com",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        );
+        fs::write(dir.path().join("mixed.txt"), "one\nTWO\nthree\nfour\n").unwrap();
+        run(dir.path(), ["add", "mixed.txt"]);
+        fs::write(dir.path().join("mixed.txt"), "one\nTWO\nthree\nFOUR\n").unwrap();
+        let index = index_blob(dir.path(), "mixed.txt").unwrap().unwrap();
+        assert_eq!(index, b"one\nTWO\nthree\nfour\n");
+        let index = String::from_utf8(index).unwrap();
+        let working = fs::read_to_string(dir.path().join("mixed.txt")).unwrap();
+        let hunks = diff_hunks(&index, &working);
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].old_start, 3);
+        stage_index_hunk(dir.path(), "mixed.txt", &index, &working, hunks[0]).unwrap();
+        assert_eq!(
+            index_blob(dir.path(), "mixed.txt").unwrap().unwrap(),
+            working.as_bytes()
+        );
+        assert_eq!(
+            head_blob(dir.path(), "mixed.txt").unwrap().unwrap(),
+            b"one\ntwo\nthree\nfour\n"
+        );
+        fs::write(dir.path().join("new file.txt"), "new\n").unwrap();
+        assert_eq!(index_blob(dir.path(), "new file.txt").unwrap(), None);
+        run(dir.path(), ["add", "new file.txt"]);
+        assert_eq!(
+            index_blob(dir.path(), "new file.txt").unwrap().unwrap(),
+            b"new\n"
+        );
+        run(dir.path(), ["rm", "--cached", "new file.txt"]);
+        assert_eq!(index_blob(dir.path(), "new file.txt").unwrap(), None);
     }
 
     #[test]

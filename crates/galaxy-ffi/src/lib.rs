@@ -6504,6 +6504,19 @@ impl Workspace {
         Ok(Some(Arc::new(DocumentHandle::new(doc, path))))
     }
 
+    /// The staged version of a file, or `None` when it is absent from the index.
+    pub fn git_index_document(
+        &self,
+        rel_path: String,
+    ) -> Result<Option<Arc<DocumentHandle>>, CoreError> {
+        let Some(bytes) = galaxy_core::git::index_blob(self.inner.root(), &rel_path)? else {
+            return Ok(None);
+        };
+        let doc = Document::from_bytes(&bytes)?;
+        let path = self.inner.root().join(&rel_path);
+        Ok(Some(Arc::new(DocumentHandle::new(doc, path))))
+    }
+
     /// Changed regions between `HEAD` and `text` for `rel_path`. A file that
     /// is not in HEAD is one inserted region.
     pub fn git_diff_hunks(
@@ -6524,6 +6537,23 @@ impl Workspace {
             .collect())
     }
 
+    /// Diff two snapshots supplied by the caller (HEAD/index/working tree).
+    pub fn git_diff_hunks_between(
+        &self,
+        old_text: String,
+        new_text: String,
+    ) -> Vec<GitDiffHunkInfo> {
+        galaxy_core::git::diff_hunks(&old_text, &new_text)
+            .into_iter()
+            .map(|h| GitDiffHunkInfo {
+                old_start: h.old_start as u64,
+                old_len: h.old_len as u64,
+                new_start: h.new_start as u64,
+                new_len: h.new_len as u64,
+            })
+            .collect()
+    }
+
     /// Stages the region of `rel_path` that starts at `old_start` in `HEAD`
     /// (see `git_diff_hunks`), with `text` as the working content. The other
     /// changes stay unstaged. Does nothing when that region is gone.
@@ -6542,6 +6572,25 @@ impl Workspace {
             return Ok(());
         };
         galaxy_core::git::stage_hunk(self.inner.root(), &rel_path, &text, hunk)?;
+        Ok(())
+    }
+
+    /// Stage a hunk relative to the current index, not HEAD.
+    pub fn git_stage_index_hunk(
+        &self,
+        rel_path: String,
+        text: String,
+        old_start: u64,
+    ) -> Result<(), CoreError> {
+        let base = galaxy_core::git::index_blob(self.inner.root(), &rel_path)?.unwrap_or_default();
+        let base = String::from_utf8_lossy(&base);
+        let Some(hunk) = galaxy_core::git::diff_hunks(&base, &text)
+            .into_iter()
+            .find(|h| h.old_start as u64 == old_start)
+        else {
+            return Ok(());
+        };
+        galaxy_core::git::stage_index_hunk(self.inner.root(), &rel_path, &base, &text, hunk)?;
         Ok(())
     }
 

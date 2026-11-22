@@ -60,6 +60,17 @@ final class TerminalView: NSView {
         return Theme.editorFont.withSize(size)
     }
     private lazy var fonts = FontSet(font, lineHeight: settings.lineHeight)
+    /// Core Text shaping is expensive for TUI screens with many repeated
+    /// non-ASCII cells. Reuse shaped glyphs across frames, with a hard cap.
+    private struct GlyphKey: Hashable {
+        var text: String
+        var font: NSFont
+        var color: NSColor
+        var strokeWidth: CGFloat?
+    }
+    private var glyphLines: [GlyphKey: CTLine] = [:]
+    var cachedGlyphCount: Int { glyphLines.count }
+    private static let glyphCacheLimit = 2048
     private var cellWidth: CGFloat { fonts.cellWidth }
     private var lineHeight: CGFloat { fonts.lineHeight }
 
@@ -134,6 +145,7 @@ final class TerminalView: NSView {
         cursorVisible = true
         blinkTick = 0
         fonts = FontSet(font, lineHeight: settings.lineHeight)
+        glyphLines.removeAll()
         lastSize = (0, 0)
         resizeTerminal()
         needsDisplay = true
@@ -212,6 +224,7 @@ final class TerminalView: NSView {
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
+        glyphLines.removeAll()
         needsDisplay = true
     }
 
@@ -713,6 +726,8 @@ final class TerminalView: NSView {
             if abs(kern) > 0.01 { attributes[.kern] = kern }
             Self.drawText(run.text, attributes: attributes, x: rect.minX, baseline: baseline, context: context)
         } else {
+            let runFont = fonts.font(bold: run.bold, italic: run.italic)
+            let strokeWidth = fonts.syntheticBoldStrokeWidth(bold: run.bold, italic: run.italic)
             var column = 0
             for character in run.text {
                 let cells = character.unicodeScalars.first.map(Self.cellCount) ?? 1
@@ -727,7 +742,9 @@ final class TerminalView: NSView {
                         part.rect.fill()
                     }
                 } else if character != " " {
-                    Self.drawText(String(character), attributes: attributes, x: x, baseline: baseline, context: context)
+                    let line = glyphLine(for: String(character), attributes: attributes,
+                                         font: runFont, color: color, strokeWidth: strokeWidth)
+                    Self.drawLine(line, x: x, baseline: baseline, context: context)
                 }
                 column += cells
             }
@@ -850,8 +867,22 @@ final class TerminalView: NSView {
     /// string drawing adds the font's own line spacing on top, which put
     /// the glyphs low in their cells, under the prompt's colored blocks.
     static func drawText(_ text: String, attributes: [NSAttributedString.Key: Any], x: CGFloat, baseline: CGFloat,
-                         context: CGContext) {
+                          context: CGContext) {
         let line = CTLineCreateWithAttributedString(NSAttributedString(string: text, attributes: attributes))
+        drawLine(line, x: x, baseline: baseline, context: context)
+    }
+
+    func glyphLine(for text: String, attributes: [NSAttributedString.Key: Any],
+                   font: NSFont, color: NSColor, strokeWidth: CGFloat?) -> CTLine {
+        let key = GlyphKey(text: text, font: font, color: color, strokeWidth: strokeWidth)
+        if let line = glyphLines[key] { return line }
+        let line = CTLineCreateWithAttributedString(NSAttributedString(string: text, attributes: attributes))
+        if glyphLines.count >= Self.glyphCacheLimit { glyphLines.removeAll(keepingCapacity: true) }
+        glyphLines[key] = line
+        return line
+    }
+
+    private static func drawLine(_ line: CTLine, x: CGFloat, baseline: CGFloat, context: CGContext) {
         context.saveGState()
         // The view is flipped; Core Text draws with y up.
         context.textMatrix = CGAffineTransform(scaleX: 1, y: -1)

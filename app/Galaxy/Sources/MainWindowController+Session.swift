@@ -31,7 +31,8 @@ extension MainWindowController {
                 if tab === group.activeTab { out.active = out.tabs.count }
                 out.tabs.append(Session.Tab(path: path, isPreview: tab.isPreview, line: loc.line, col: loc.col,
                                             scrollY: y.map(Double.init), isPinned: tab.isPinned ? true : nil,
-                                            isDiff: tab.diffBase != nil ? true : nil))
+                                            isDiff: tab.diffBase != nil ? true : nil,
+                                            isStagedDiff: tab.isStagedDiff ? true : nil))
             }
             saved.append(out)
         }
@@ -143,7 +144,10 @@ extension MainWindowController {
             let doc: DocumentHandle
             var components = [name]
             var relPath: String?
-            if let key, let existing = sharedDocument(forFileKey: key) {
+            if saved.isStagedDiff == true, let workspace, let rel = relativePath(saved.path) {
+                doc = ((try? workspace.gitIndexDocument(relPath: rel)) ?? nil) ?? bridge.newDocument()
+                if doc.path().isEmpty { doc.setPath(path: saved.path) }
+            } else if let key, let existing = sharedDocument(forFileKey: key) {
                 doc = existing
             } else if let workspace, let rel = relativePath(saved.path) {
                 doc = try workspace.openFile(relPath: rel)
@@ -159,9 +163,13 @@ extension MainWindowController {
             tab.fileKey = key
             tab.relPath = relPath
             tab.isPinned = saved.isPinned == true
-            if saved.isDiff == true, let workspace, let relPath,
-               let base = (try? workspace.gitBaseDocument(relPath: relPath)) ?? nil {
-                tab.diffBase = base
+            if saved.isDiff == true, let workspace, let relPath {
+                tab.isStagedDiff = saved.isStagedDiff == true
+                if tab.isStagedDiff {
+                    tab.diffBase = ((try? workspace.gitBaseDocument(relPath: relPath)) ?? nil) ?? bridge.newDocument()
+                } else {
+                    tab.diffBase = (try? workspace.gitBaseDocument(relPath: relPath)) ?? nil
+                }
             }
             tab.scrollY = saved.scrollY.map { CGFloat($0) }
             tab.isEdited = doc.isModified()
@@ -187,7 +195,7 @@ extension MainWindowController {
                 continue
             } else if let workspace, let rel = relativePath(saved.path) {
                 if saved.isDiff == true {
-                    openWorkspaceDiff(workspace, relPath: rel)
+                    openWorkspaceDiff(workspace, relPath: rel, staged: saved.isStagedDiff == true ? true : nil)
                 } else {
                     let entry = FileEntry(name: (rel as NSString).lastPathComponent, relPath: rel, isDir: false)
                     openWorkspaceFile(workspace, entry, preview: saved.isPreview, rememberRecent: false)
@@ -196,7 +204,9 @@ extension MainWindowController {
                 try? openFile(at: URL(fileURLWithPath: saved.path), rememberRecent: false)
             }
             // A diff with no committed version opens as a plain tab.
-            guard let index = tabIndex(forPath: saved.path, diff: saved.isDiff == true)
+            guard let index = tabs.firstIndex(where: { $0.fileKey == Self.fileKey(saved.path)
+                && ($0.diffBase != nil) == (saved.isDiff == true)
+                && (saved.isDiff != true || $0.isStagedDiff == (saved.isStagedDiff == true)) })
                 ?? tabIndex(forPath: saved.path) else { continue }
             let tab = tabs[index]
             tab.doc.goToLine(line: saved.line, col: saved.col)
@@ -246,7 +256,8 @@ extension MainWindowController {
                 // The user may have opened this file while the batches ran. A
                 // diff without a committed version came back as a plain tab.
                 if saved.isTerminal != true,
-                   self.tabIndex(forPath: saved.path, diff: tab.diffBase != nil) != nil { continue }
+                   self.tabs.contains(where: { $0.fileKey == tab.fileKey && ($0.diffBase != nil) == (tab.diffBase != nil)
+                       && $0.isStagedDiff == tab.isStagedDiff }) { continue }
                 let insertionIndex = min(savedIndex, self.tabs.count)
                 self.tabs.insert(tab, at: insertionIndex)
                 if let activeIndex = self.activeIndex, activeIndex >= insertionIndex {
@@ -256,11 +267,13 @@ extension MainWindowController {
             self.refreshTabBar()
             next = end
             if next < pending.count {
-                DispatchQueue.main.async(execute: restoreNextBatch)
+                // A chain of immediate main-queue blocks can finish before
+                // AppKit gets a display cycle, leaving the window blank.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.016, execute: restoreNextBatch)
             }
         }
 
-        DispatchQueue.main.async(execute: restoreNextBatch)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.016, execute: restoreNextBatch)
     }
 
     func saveSessionForQuit(otherWindows: [Session] = []) {

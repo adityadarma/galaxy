@@ -65,9 +65,11 @@ final class EditorTab {
     var hasDiskConflict = false
     /// Last time this tab was active, used to release background syntax state.
     var lastActiveAt = Date.now
-    /// The file as committed at HEAD, shown read-only beside the working copy
-    /// (opened from Source Control). `nil` is the plain single-pane view.
+    /// The left snapshot (HEAD or index), shown read-only beside the right
+    /// snapshot. `nil` is the plain single-pane view.
     var diffBase: DocumentHandle?
+    /// Staged diff compares HEAD to index; other diff tabs compare index to disk.
+    var isStagedDiff = false
     /// Who last changed each line, for the inline blame; refreshed after edits.
     var blame: BlameInfo?
     /// Document line count when `blame` was computed. Edits that add or remove
@@ -80,7 +82,7 @@ final class EditorTab {
     /// Title with the file's state on disk.
     var displayTitle: String {
         if isDeletedOnDisk { return "\(title) (deleted)" }
-        return diffBase == nil ? title : "\(title) (Working Tree)"
+        return diffBase == nil ? title : "\(title) (\(isStagedDiff ? "Staged Changes" : "Working Tree"))"
     }
     /// Identifies an Untitled buffer in the back/forward history.
     private let untitledKey = "untitled:" + UUID().uuidString

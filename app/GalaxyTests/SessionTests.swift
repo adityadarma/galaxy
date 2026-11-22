@@ -126,6 +126,32 @@ final class SessionTests: XCTestCase {
         }
     }
 
+    func testGitStatusRefreshDoesNotBlockRestoredWindow() throws {
+        let repo = try makeRepo()
+        let controller = makeController()
+        defer { controller.window?.orderOut(nil) }
+        try controller.openWorkspace(at: repo)
+        controller.refreshGitStatus()
+        let deadline = Date().addingTimeInterval(5)
+        while controller.gitStatusSnapshot == nil, Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+        }
+        XCTAssertEqual(controller.gitStatusSnapshot?.branch, "main")
+        XCTAssertTrue(controller.gitStatusSnapshot?.changedPaths.contains("src/main.rs") == true)
+
+        // Multiple watcher notifications must keep only one read in flight
+        // and eventually publish the newest status.
+        controller.refreshGitStatus()
+        controller.refreshGitStatus()
+        let updated = Date().addingTimeInterval(5)
+        while (controller.gitStatusInFlight || controller.gitStatusNeedsRefresh), Date() < updated {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+        }
+        XCTAssertFalse(controller.gitStatusInFlight)
+        XCTAssertFalse(controller.gitStatusNeedsRefresh)
+        XCTAssertEqual(controller.gitStatusSnapshot?.branch, "main")
+    }
+
     func testADiffTabComesBackAsADiffTab() throws {
         let repo = try makeRepo()
         let first = makeController()
@@ -145,6 +171,30 @@ final class SessionTests: XCTestCase {
         XCTAssertEqual(second.tabBar.items.map(\.title), ["main.rs (Working Tree)", "long.rs"])
         XCTAssertNotNil(second.tabs[0].diffBase)
         XCTAssertNil(second.tabs[1].diffBase)
+    }
+
+    func testStagedDiffRestoresIndexSnapshotWithoutUsingWorkingDocument() throws {
+        let repo = try makeRepo()
+        try git(repo, "add", "src/main.rs")
+        try "fn main() { working(); }\n".write(to: repo.appendingPathComponent("src/main.rs"), atomically: true, encoding: .utf8)
+        let first = makeController()
+        try first.openWorkspace(at: repo)
+        let workspace = try XCTUnwrap(first.workspace)
+        first.openWorkspaceDiff(workspace, relPath: "src/main.rs", staged: true)
+        waitForDiff(first)
+        XCTAssertTrue(first.activeTab?.isStagedDiff == true)
+        first.saveSession()
+        first.window?.close()
+
+        let saved = try XCTUnwrap(Session.load(from: sessionURL))
+        XCTAssertEqual(saved.tabs.first?.isStagedDiff, true)
+        let second = makeController()
+        defer { second.window?.orderOut(nil) }
+        XCTAssertTrue(second.restore(saved))
+        XCTAssertTrue(second.activeTab?.isStagedDiff == true)
+        XCTAssertEqual(second.activeTab?.diffBase?.text(), "fn main() {}\n")
+        XCTAssertEqual(second.activeTab?.doc.text(), "fn main() { changed(); }\n")
+        XCTAssertTrue(second.editorView.isReadOnly)
     }
 
     func testTheActiveDiffTabShowsTwoPanesAfterRestore() throws {
@@ -257,9 +307,12 @@ final class SessionTests: XCTestCase {
 
         let restored = expectation(description: "workspace tabs restored")
         DispatchQueue.main.async {
-            XCTAssertEqual(second.tabBar.items.map(\.title), ["long.rs", "main.rs"])
-            XCTAssertEqual(second.activeTab?.title, "main.rs", "deferred tabs do not steal focus")
-            restored.fulfill()
+            XCTAssertEqual(second.tabBar.items.map(\.title), ["main.rs"], "AppKit gets a turn before deferred tabs")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                XCTAssertEqual(second.tabBar.items.map(\.title), ["long.rs", "main.rs"])
+                XCTAssertEqual(second.activeTab?.title, "main.rs", "deferred tabs do not steal focus")
+                restored.fulfill()
+            }
         }
         wait(for: [restored], timeout: 1)
     }
@@ -284,8 +337,29 @@ final class SessionTests: XCTestCase {
         XCTAssertNotNil(second.activeTab?.diffBase, "the active tab is the diff")
 
         let restored = expectation(description: "workspace tabs restored")
-        DispatchQueue.main.async {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
             XCTAssertEqual(second.tabBar.items.map(\.title), ["long.rs", "main.rs (Working Tree)"])
+            restored.fulfill()
+        }
+        wait(for: [restored], timeout: 1)
+    }
+
+    func testExtraWindowRestoreDefersInactiveTabs() throws {
+        let first = makeController()
+        try first.openWorkspace(at: root.appendingPathComponent("ws"))
+        try first.openFile(at: root.appendingPathComponent("ws/src/long.rs"))
+        try first.openFile(at: root.appendingPathComponent("ws/src/main.rs"))
+        let saved = first.currentSession()
+        try saved.save(to: Session.workspaceURL(for: root.appendingPathComponent("ws").path))
+        first.window?.close()
+
+        let extraWindow = makeController()
+        defer { extraWindow.window?.orderOut(nil) }
+        XCTAssertTrue(extraWindow.restore(saved, incrementally: true))
+        XCTAssertEqual(extraWindow.tabs.count, 1, "the extra window can draw its active tab before loading the rest")
+        let restored = expectation(description: "extra window tabs restored")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            XCTAssertEqual(extraWindow.tabs.count, 2)
             restored.fulfill()
         }
         wait(for: [restored], timeout: 1)

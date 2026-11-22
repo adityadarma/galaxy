@@ -16,9 +16,11 @@ struct Session: Codable, Equatable {
         var scrollY: Double?
         /// Optional so sessions saved before pinning still decode.
         var isPinned: Bool? = nil
-        /// The tab was the file's working-tree diff, not its plain editor.
+        /// The tab was a diff, not its plain editor.
         /// Optional so older sessions still decode.
         var isDiff: Bool? = nil
+        /// Whether this diff displays the staged index snapshot.
+        var isStagedDiff: Bool? = nil
         /// An editor-area terminal. Its shell starts again when restoring; a
         /// terminated app cannot reconnect to the former child process.
         var isTerminal: Bool? = nil

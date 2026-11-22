@@ -63,6 +63,7 @@ extension MainWindowController {
             throw error
         }
         workspace = ws
+        gitStatusSnapshot = nil
         titleBar.setProjectTitle(ws.name())
         if rememberRecent { Self.rememberProject(url.path) }
         workspaceSettingsModified = nil
@@ -191,7 +192,7 @@ extension MainWindowController {
         }
         let doc = try sharedDocument(forFileKey: Self.fileKey(url.path) ?? "") ?? bridge.openDocument(path: url.path)
         let name = url.lastPathComponent
-        let branch = workspace.flatMap { bridge.gitStatus(workspace: $0)?.branch }
+        let branch = gitStatusSnapshot?.branch
         let tab = EditorTab(doc: doc, title: name, pathComponents: [name], windowTitle: name,
                             isPreview: false, status: describe(branch: branch))
         tab.fileKey = Self.fileKey(doc.path())
@@ -220,7 +221,7 @@ extension MainWindowController {
         }
         do {
             let doc = try sharedDocument(forFileKey: Self.fileKey(path) ?? "") ?? workspace.openFile(relPath: entry.relPath)
-            let branch = bridge.gitStatus(workspace: workspace)?.branch
+            let branch = gitStatusSnapshot?.branch
             let tab = EditorTab(
                 doc: doc, title: entry.name,
                 pathComponents: entry.relPath.split(separator: "/").map(String.init),

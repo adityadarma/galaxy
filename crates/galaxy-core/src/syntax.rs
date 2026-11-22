@@ -742,7 +742,7 @@ const JAVASCRIPT_HIGHLIGHTS: &str = r#"
 (call_expression function: (identifier) @function)
 (call_expression function: (identifier) @function.builtin (#eq? @function.builtin "require"))
 ((import_statement "from" @keyword))
-[("const") ("let") ("var") ("function") ("class") ("return") ("if") ("else") ("for") ("while") ("import") ("export") ("async") ("await") ("new")] @keyword
+[("const") ("let") ("var") ("function") ("class") ("return") ("if") ("else") ("for") ("while") ("import") ("export") ("default") ("async") ("await") ("new")] @keyword
 (meta_property ["meta" "target"] @keyword)
 [("=") ("+") ("-") ("*") ("/") ("%") ("**") ("==") ("===") ("!=") ("!==") (">") (">=") (">>") (">>=") (">>>") (">>>=") ("<") ("<=") ("<<") ("<<=") ("&&") ("||") ("??") ("!") ("&") ("|") ("^") ("~") ("+=") ("-=") ("*=") ("/=") ("%=") ("**=") ("&=") ("|=") ("^=") ("&&=") ("||=") ("??=")] @operator
 [("(") (")") ("[") ("]") ("{") ("}") (",") (";") (".") (":") ("?") ("=>") ("++") ("--")] @punctuation
@@ -3465,6 +3465,26 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(scope_at("?."), dot_scopes);
         assert!(scope_at("subscriptionPenaltySettings").contains(&HighlightScope::Property));
+    }
+
+    #[test]
+    fn javascript_export_default_is_keyword() {
+        let language = SyntaxLanguage::JavaScript;
+        let source = "export default config;\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let doc = Document::from_text(source);
+        let runs = style_runs_for_viewport(&doc, &tree, language, 0, 1);
+        let start = source.find("default").unwrap();
+        assert!(
+            runs.iter().any(|run| {
+                run.start == start
+                    && run.end == start + "default".len()
+                    && run.scope == HighlightScope::Keyword
+            }),
+            "default in export default must use the keyword color"
+        );
     }
 
     #[test]

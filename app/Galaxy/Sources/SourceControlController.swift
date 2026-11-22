@@ -585,9 +585,8 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
 
     var workspace: Workspace?
     var onOpen: ((String) -> Void)?
-    /// Opens the file beside its committed version. Only changes that have one
-    /// (not new or deleted files) use it; the rest go to `onOpen`.
-    var onOpenDiff: ((String) -> Void)?
+    /// Opens a diff for the selected section, preserving whether its row is staged.
+    var onOpenDiff: ((String, Bool) -> Void)?
     var onRefresh: (() -> Void)?
     var onMessage: ((String) -> Void)?
 
@@ -865,8 +864,8 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         switch rows[row] {
         case .header(let type, _, _, _):
             toggleSection(type)
-        case .change(let change, _):
-            open(change)
+        case .change(let change, let isStaged):
+            open(change, staged: isStaged)
         case .empty:
             break
         }
@@ -885,11 +884,11 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         return false
     }
 
-    /// Changes with a committed version open as a diff; new, untracked and
-    /// deleted files have nothing to compare against and open normally.
-    private func open(_ change: GitChangeInfo) {
-        let hasCommittedVersion = !change.code.contains("?") && !change.code.contains("A") && !change.code.contains("D")
-        if hasCommittedVersion, let onOpenDiff { onOpenDiff(change.path) } else { onOpen?(change.path) }
+    /// Staged rows compare with HEAD, including new files; unstaged rows
+    /// compare with the index, except untracked files which open normally.
+    func open(_ change: GitChangeInfo, staged: Bool = false) {
+        let isUntracked = !staged && change.code == "??"
+        if !isUntracked, let onOpenDiff { onOpenDiff(change.path, staged) } else { onOpen?(change.path) }
     }
 
     func stage(change: GitChangeInfo) {

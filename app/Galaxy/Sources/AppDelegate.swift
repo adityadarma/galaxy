@@ -240,7 +240,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         }
         let fromFullScreen = session.fullScreen != true && isAnyWindowFullScreen
         let controller = makeWindowController()
-        if !controller.restore(session) { controller.newDocument(nil) }
+        // Extra windows may have as many tabs as the primary window. Restore
+        // their active tab now, then fill the rest after AppKit can draw.
+        if !controller.restore(session, incrementally: true) { controller.newDocument(nil) }
         showMainWindow(controller, concealedForFullScreen: session.fullScreen == true)
         if session.fullScreen == true, let window = controller.window {
             fullScreenQueue.append(window)

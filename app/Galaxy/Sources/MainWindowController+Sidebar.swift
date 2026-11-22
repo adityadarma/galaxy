@@ -156,7 +156,8 @@ extension MainWindowController {
             searchSidebar.view.isHidden = true
             sourceControl.view.isHidden = false
             sourceControl.workspace = workspace
-            sourceControl.refresh(status: workspace.flatMap { bridge.gitStatus(workspace: $0) })
+            sourceControl.refresh(status: gitStatusSnapshot)
+            refreshGitStatus()
             sectionHeader.mode = .sourceControl
             sectionHeader.title = "SOURCE CONTROL"
             activityBar.setActive(isSidebarVisible ? .sourceControl : nil)

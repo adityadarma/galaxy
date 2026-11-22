@@ -174,6 +174,8 @@ enum Theme {
     /// Diff tab: lines added or changed (right), removed or replaced (left).
     static let diffAdded = NSColor.systemGreen.withAlphaComponent(0.16)
     static let diffRemoved = NSColor.systemRed.withAlphaComponent(0.16)
+    static let diffAddedStrong = NSColor.systemGreen.withAlphaComponent(0.12)
+    static let diffRemovedStrong = NSColor.systemRed.withAlphaComponent(0.30)
     /// Git gutter colors. Dark follows One Dark Pro's `editorGutter.*Background`
     /// (the palette of the Galaxy Dark theme); light keeps VS Code's defaults.
     static func gitChange(_ kind: GitLineChangeKind) -> NSColor {
