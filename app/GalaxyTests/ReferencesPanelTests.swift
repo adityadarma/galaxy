@@ -447,7 +447,9 @@ final class ReferencesPanelTests: XCTestCase {
         controller.findReferences(nil)
 
         XCTAssertNotNil(controller.referencesRequest)
-        waitUntil { controller.loadedReferencesPanel?.statusText == "(2)" }
+        // A cold TypeScript index on a shared CI runner can take longer than
+        // the default two-second UI wait. Keep checking the eventual result.
+        waitUntil(timeout: 10) { controller.loadedReferencesPanel?.statusText == "(2)" }
         XCTAssertEqual(controller.loadedReferencesPanel?.statusText, "(2)")
 
         controller.workspaceIndexState = nil
