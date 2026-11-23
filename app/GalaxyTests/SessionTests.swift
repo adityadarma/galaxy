@@ -18,6 +18,7 @@ final class SessionTests: XCTestCase {
     }
 
     override func tearDownWithError() throws {
+        Session.remove(at: Session.workspaceURL(for: root.appendingPathComponent("ws").path))
         try? FileManager.default.removeItem(at: root)
     }
 
@@ -33,6 +34,30 @@ final class SessionTests: XCTestCase {
     }
 
     private func path(_ rel: String) -> String { root.appendingPathComponent(rel).path }
+
+    func testOpenRecentInNewWindowRestoresWorkspaceAfterProjectWindowCloses() throws {
+        let project = root.appendingPathComponent("ws")
+        let first = makeController()
+        try first.openWorkspace(at: project)
+        try first.openFile(at: project.appendingPathComponent("src/long.rs"))
+        first.activeTab?.doc.goToLine(line: 300, col: 3)
+        try first.openFile(at: project.appendingPathComponent("src/main.rs"))
+        first.window?.close()
+
+        let saved = try XCTUnwrap(Session.load(from: Session.workspaceURL(for: project.path)))
+        XCTAssertEqual(saved.tabs.map(\.path), [path("ws/src/long.rs"), path("ws/src/main.rs")])
+
+        let second = makeController()
+        defer { second.window?.orderOut(nil) }
+        second.newDocument(nil) // A newly created window begins with Untitled.
+        second.openRecentPath(project.path)
+        XCTAssertEqual(second.workspace?.root(), project.path)
+        XCTAssertEqual(second.tabBar.items.map(\.title), ["long.rs", "main.rs"])
+        XCTAssertEqual(second.activeTab?.doc.path(), path("ws/src/main.rs"))
+        second.selectTab(0)
+        let caret = second.location(of: try XCTUnwrap(second.activeTab))
+        XCTAssertEqual([caret.line, caret.col], [300, 3])
+    }
 
     func testTabsCaretsAndScrollComeBack() throws {
         let first = makeController()

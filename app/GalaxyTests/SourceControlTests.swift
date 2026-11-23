@@ -349,4 +349,43 @@ final class SourceControlTests: XCTestCase {
         XCTAssertEqual(controller.searchSidebar.queryText, "needle", "seeded with the selection")
 
     }
+
+    func testSavingEditedFileRefreshesSidebarSearchAndKeepsOtherMatches() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("galaxy-search-save-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let package = folder.appendingPathComponent("package.json")
+        let nested = folder.appendingPathComponent("nested")
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        try "{\"version\":\"0.5.123\"}\n".write(to: package, atomically: true, encoding: .utf8)
+        try "{\"version\":\"0.5.123\"}\n".write(
+            to: nested.appendingPathComponent("package.json"), atomically: true, encoding: .utf8)
+
+        let controller = MainWindowController(bridge: CoreBridge())
+        controller.showWindow(nil)
+        defer { controller.window?.orderOut(nil) }
+        try controller.openWorkspace(at: folder)
+        try controller.openFile(at: package)
+        controller.showSearchTab()
+        controller.searchSidebar.present(seed: "0.5.123")
+        func waitFor(_ condition: () -> Bool) {
+            let deadline = Date().addingTimeInterval(10)
+            while !condition(), Date() < deadline {
+                RunLoop.current.run(until: Date().addingTimeInterval(0.02))
+            }
+        }
+        waitFor { controller.searchSidebar.results.count == 2 }
+        XCTAssertEqual(Set(controller.searchSidebar.results.map(\.relPath)),
+                       ["package.json", "nested/package.json"])
+
+        let doc = try XCTUnwrap(controller.activeTab?.doc)
+        _ = doc.setFind(pattern: "0.5.123", config: FindConfig(caseSensitive: true, wholeWord: false, regex: false))
+        XCTAssertEqual(doc.replaceAll(replacement: "0.5.124"), 1)
+        XCTAssertTrue(controller.save())
+        waitFor { controller.searchSidebar.results.count == 1 }
+        XCTAssertEqual(controller.searchSidebar.results.map(\.relPath), ["nested/package.json"])
+        XCTAssertEqual(controller.searchSidebar.results.first?.text, "{\"version\":\"0.5.123\"}")
+        XCTAssertTrue(try String(contentsOf: package, encoding: .utf8).contains("0.5.124"))
+    }
 }

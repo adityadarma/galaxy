@@ -105,6 +105,7 @@ extension MainWindowController {
     private func savedStatus(_ doc: DocumentHandle) {
         statusLabel.stringValue = "\(documentName): saved, \(doc.lineCount()) lines, \(doc.lenBytes()) bytes"
         updateEditedState()
+        refreshSearchAfterSaving(doc)
         // Saving keybindings.json applies it right away.
         if Self.fileKey(doc.path()) == Self.fileKey(keybindingsURL.path) {
             reloadKeybindings(force: true)
@@ -164,9 +165,16 @@ extension MainWindowController {
         do {
             try tab.doc.save()
             tab.isEdited = false
+            refreshSearchAfterSaving(tab.doc)
             scheduleRustCompilerRefresh(afterSaving: tab.doc)
         } catch {
             Log.ui.error("auto-save failed for \(tab.doc.path(), privacy: .public): \(String(describing: error), privacy: .public)")
         }
+    }
+
+    private func refreshSearchAfterSaving(_ doc: DocumentHandle) {
+        guard activeSidebarTab == .search, !searchSidebar.queryText.isEmpty,
+              relativePath(doc.path()) != nil else { return }
+        searchSidebar.refresh()
     }
 }

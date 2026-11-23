@@ -440,7 +440,7 @@ final class SearchSidebarController: NSObject, NSTextFieldDelegate, NSTableViewD
     // Results List
     private let table = NSTableView()
     private let scroll = NSScrollView()
-    private var results: [WorkspaceSearchMatch] = []
+    private(set) var results: [WorkspaceSearchMatch] = []
 
     // Dynamic Constraints
     private var toggleBottomToQuery: NSLayoutConstraint!
@@ -905,8 +905,7 @@ final class SearchResultTableCellView: NSTableCellView {
     }
 
     func configure(with match: WorkspaceSearchMatch) {
-        let fileName = (match.relPath as NSString).lastPathComponent
-        fileLabel.stringValue = fileName
+        fileLabel.stringValue = match.relPath
         matchLabel.stringValue = "\(match.line + 1):\(match.column + 1)  \(match.text.trimmingCharacters(in: .whitespacesAndNewlines))"
     }
 }

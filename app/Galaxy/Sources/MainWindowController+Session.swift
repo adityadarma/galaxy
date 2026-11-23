@@ -329,8 +329,10 @@ extension MainWindowController {
     func windowWillClose(_ notification: Notification) {
         autoSaveWorkItem?.cancel()
         autoSaveWorkItem = nil
-        // Closing the window is an intentional fresh start. If closing the
-        // last window also terminates the app, `saveSessionForQuit` sees this.
+        // Keep the project's tabs for Open Recent in a new window, even when
+        // closing this window intentionally starts a fresh app session.
+        saveWorkspaceSession()
+        // The app-wide session still starts fresh after the last window closes.
         didCloseWindow = true
         syntaxEvictionTimer?.invalidate()
         syntaxEvictionTimer = nil
