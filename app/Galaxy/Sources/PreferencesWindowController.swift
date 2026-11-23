@@ -66,6 +66,7 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
     private let autoClosingTagsBox = NSButton(checkboxWithTitle: "Auto close tags (HTML, PHP, JSX)", target: nil, action: nil)
     private let linkedEditingBox = NSButton(checkboxWithTitle: "Rename matching tag while editing", target: nil, action: nil)
     private let parameterHintsBox = NSButton(checkboxWithTitle: "Show parameter names before call arguments", target: nil, action: nil)
+    private let formatOnSaveBox = NSButton(checkboxWithTitle: "Format on save", target: nil, action: nil)
     private let autoSavePopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let autoSaveDelay = NSStepper(frame: .zero)
     private let autoSaveDelayLabel = NSTextField(labelWithString: "")
@@ -76,7 +77,7 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
     }
     private var editorControls: [NSControl] {
         [tabSizePopup, insertSpacesBox, whitespacePopup, parameterHintsBox, autoClosingTagsBox, linkedEditingBox,
-          autoSavePopup, autoSaveDelay, gitBlameBox] + excludeBoxes
+          formatOnSaveBox, autoSavePopup, autoSaveDelay, gitBlameBox] + excludeBoxes
     }
 
     // View tab: the same switches as the View menu.
@@ -159,6 +160,9 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
         stack.addArrangedSubview(row("", linkedEditingBox))
 
         stack.addArrangedSubview(section("Files"))
+        formatOnSaveBox.target = self; formatOnSaveBox.action = #selector(saveFormatOnSave(_:))
+        formatOnSaveBox.toolTip = "Uses the project's or PATH's rustfmt, gofmt, dart format, prettier, pint or php-cs-fixer."
+        stack.addArrangedSubview(row("", formatOnSaveBox))
         autoSavePopup.addItems(withTitles: Self.autoSaveModes.map(\.title))
         autoSavePopup.setAccessibilityLabel("Auto save")
         autoSavePopup.target = self; autoSavePopup.action = #selector(saveAutoSave(_:))
@@ -368,6 +372,7 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
         whitespacePopup.selectItem(at: Self.whitespaceModes.firstIndex { $0.value == settings.effectiveRenderWhitespace } ?? 2)
         autoClosingTagsBox.state = settings.effectiveAutoClosingTags ? .on : .off
         linkedEditingBox.state = settings.effectiveLinkedEditing ? .on : .off
+        formatOnSaveBox.state = settings.effectiveFormatOnSave ? .on : .off
         parameterHintsBox.state = settings.effectiveInlineParameterHints ? .on : .off
         gitBlameBox.state = settings.effectiveGitBlame ? .on : .off
         let hidden = Set(settings.effectiveFilesExclude)
@@ -408,6 +413,7 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
     @objc private func saveInsertSpaces(_ sender: Any?) { store(insertSpacesBox.state == .on, "insertSpaces") }
     @objc private func saveAutoClosingTags(_ sender: Any?) { store(autoClosingTagsBox.state == .on, "autoClosingTags") }
     @objc private func saveLinkedEditing(_ sender: Any?) { store(linkedEditingBox.state == .on, "linkedEditing") }
+    @objc private func saveFormatOnSave(_ sender: Any?) { store(formatOnSaveBox.state == .on, "formatOnSave") }
     @objc private func saveGitBlame(_ sender: Any?) { store(gitBlameBox.state == .on, "gitBlame") }
     @objc private func saveParameterHints(_ sender: Any?) {
         store(parameterHintsBox.state == .on, "inlineParameterHints")

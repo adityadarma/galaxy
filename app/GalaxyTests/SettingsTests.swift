@@ -334,6 +334,23 @@ final class SettingsTests: XCTestCase {
         XCTAssertGreaterThan(changes, 0, "open windows are told")
     }
 
+    func testFormatOnSaveIsOffByDefaultAndTheSettingsWindowWritesIt() throws {
+        XCTAssertFalse(GalaxySettings.empty.effectiveFormatOnSave)
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-prefs-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        let controller = PreferencesWindowController(settingsURL: url) {}
+        let box = try XCTUnwrap(Mirror(reflecting: controller).children.first { $0.label == "formatOnSaveBox" }?.value as? NSButton)
+        XCTAssertEqual(box.state, .off)
+        box.state = .on
+        _ = box.target?.perform(box.action, with: box)
+        let global = try GalaxySettings.load(from: url)
+        XCTAssertTrue(global.effectiveFormatOnSave)
+
+        try #"{"editor":{"formatOnSave":false}}"#.write(to: url, atomically: true, encoding: .utf8)
+        XCTAssertFalse(global.merged(with: try GalaxySettings.load(from: url)).effectiveFormatOnSave,
+                       "a workspace can turn it off")
+    }
+
     func testAutoSaveDefaultsStayConservative() {
         XCTAssertEqual(GalaxySettings.empty.effectiveAutoSave, .off)
         XCTAssertEqual(GalaxySettings.empty.effectiveAutoSaveDelay, 1.0, accuracy: 0.001)

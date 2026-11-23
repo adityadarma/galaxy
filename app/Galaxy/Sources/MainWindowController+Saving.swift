@@ -42,8 +42,56 @@ extension MainWindowController {
         return path.isEmpty ? "Untitled" : URL(fileURLWithPath: path).lastPathComponent
     }
 
+    /// With `editor.formatOnSave`, runs the file's formatter first. Saving
+    /// goes ahead without it when no formatter is installed or it fails.
     @objc func saveDocument(_ sender: Any?) {
-        _ = save()
+        guard formatOnSave, let tab = activeTab, tab.isDocument, !tab.isStagedDiff,
+              let doc = editorView.document, doc === tab.doc, !doc.path().isEmpty, !doc.isLarge() else {
+            _ = save()
+            return
+        }
+        guard formattingDocument !== doc else { return }
+        editorView.flushPendingUpdates()
+        formattingDocument = doc
+        let path = doc.path(), root = workspace?.root(), text = doc.text(), revision = doc.revision()
+        Task { [weak self] in
+            let outcome = await Task.detached(priority: .userInitiated) {
+                DocumentFormatter.format(path: path, root: root, text: text)
+            }.value
+            self?.finishFormattedSave(tab: tab, revision: revision, original: text, outcome: outcome)
+        }
+    }
+
+    func finishFormattedSave(tab: EditorTab, revision: UInt64, original: String, outcome: DocumentFormatter.Outcome?) {
+        let doc = tab.doc
+        formattingDocument = nil
+        guard allTabs.contains(where: { $0 === tab }) else { return }
+        var problem: String?
+        if let outcome {
+            switch outcome.result {
+            case .success where doc.revision() != revision:
+                problem = "not formatted, the file changed while \(outcome.name) ran"
+            case .success(let formatted):
+                if let edit = DocumentFormatter.edit(from: original, to: formatted),
+                   bridge.applyRenameEdits(document: doc, edits: [edit]) {
+                    for group in groups where group.pane?.editorView.document === doc {
+                        group.pane?.editorView.reloadDocument()
+                    }
+                    if editorView.document === doc { editorView.reloadDocument() }
+                }
+            case .failure(let error):
+                problem = "not formatted, \(error.localizedDescription)"
+            }
+        }
+        // `save()` checks the disk for the active tab only; another tab is
+        // left formatted but unsaved rather than written without that check.
+        guard activeTab === tab, editorView.document === doc else {
+            updateEditedState()
+            return
+        }
+        if save(), let problem {
+            statusLabel.stringValue = "\(URL(fileURLWithPath: doc.path()).lastPathComponent): saved, \(problem)"
+        }
     }
 
     @objc func saveDocumentAs(_ sender: Any?) {

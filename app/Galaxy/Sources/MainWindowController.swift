@@ -258,6 +258,9 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     var autoSaveMode: AutoSaveMode = .off
     var autoSaveDelay: TimeInterval = 1.0
     var autoSaveWorkItem: DispatchWorkItem?
+    /// `editor.formatOnSave`, and the document whose formatter is running.
+    var formatOnSave = false
+    var formattingDocument: DocumentHandle?
     static let syntaxEvictionInterval: TimeInterval = 5 * 60
     /// Command registry (M2-09); kept for the window so recency survives
     /// closing the palette.

@@ -56,4 +56,41 @@ final class GalaxyCLITests: XCTestCase {
         delegate.menuWillOpen(menu)
         XCTAssertEqual(item.isHidden, CommandLineTool.isInstalled())
     }
+
+    func testStatusSeparatesThisAppFromOtherBuildsAndFiles() throws {
+        let files = FileManager.default
+        let dir = files.temporaryDirectory.appendingPathComponent("galaxy-cli-\(UUID().uuidString)")
+        defer { try? files.removeItem(at: dir) }
+        try files.createDirectory(at: dir, withIntermediateDirectories: true)
+        let helper = Bundle(for: AppDelegate.self).bundleURL.appendingPathComponent("Contents/Resources/galaxy")
+        let link = dir.appendingPathComponent("galaxy")
+
+        XCTAssertEqual(CommandLineTool.status(helper: helper, link: link), .missing)
+        try files.createSymbolicLink(at: link, withDestinationURL: helper)
+        XCTAssertEqual(CommandLineTool.status(helper: helper, link: link), .current)
+        try files.removeItem(at: link)
+        let other = dir.appendingPathComponent("Other.app/Contents/Resources/galaxy")
+        try files.createSymbolicLink(at: link, withDestinationURL: other)
+        XCTAssertEqual(CommandLineTool.status(helper: helper, link: link), .other(other.standardizedFileURL.resolvingSymlinksInPath()),
+                       "a link to a removed build still reports its target")
+        try files.removeItem(at: link)
+        try "mine".write(to: link, atomically: true, encoding: .utf8)
+        XCTAssertEqual(CommandLineTool.status(helper: helper, link: link), .occupied)
+    }
+
+    @MainActor
+    func testInstallMenuOffersUpdateForAnotherBuild() {
+        let item = NSMenuItem(title: "", action: #selector(AppDelegate.installCommandLineTool(_:)), keyEquivalent: "")
+        AppDelegate.updateInstallItem(item, for: .other(URL(fileURLWithPath: "/tmp/Old.app/Contents/Resources/galaxy")))
+        XCTAssertFalse(item.isHidden)
+        XCTAssertEqual(item.title, "Update 'galaxy' Command to This App")
+        XCTAssertEqual(item.toolTip, "The 'galaxy' command opens /tmp/Old.app/Contents/Resources/galaxy")
+
+        AppDelegate.updateInstallItem(item, for: .current)
+        XCTAssertTrue(item.isHidden)
+        AppDelegate.updateInstallItem(item, for: .missing)
+        XCTAssertFalse(item.isHidden)
+        XCTAssertEqual(item.title, "Install 'galaxy' Command in PATH")
+        XCTAssertNil(item.toolTip)
+    }
 }

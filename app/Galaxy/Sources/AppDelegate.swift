@@ -164,7 +164,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
 
     func menuWillOpen(_ menu: NSMenu) {
         guard let item = menu.items.first(where: { $0.action == #selector(installCommandLineTool(_:)) }) else { return }
-        item.isHidden = CommandLineTool.isInstalled()
+        Self.updateInstallItem(item, for: CommandLineTool.status())
+    }
+
+    /// Hidden once the link opens this app. A link to another Galaxy build
+    /// stays visible as an update, naming where it points now.
+    static func updateInstallItem(_ item: NSMenuItem, for status: CommandLineTool.LinkStatus) {
+        item.isHidden = status == .current
+        if case .other(let target) = status {
+            item.title = "Update 'galaxy' Command to This App"
+            item.toolTip = "The 'galaxy' command opens \((target.path as NSString).abbreviatingWithTildeInPath)"
+        } else {
+            item.title = "Install 'galaxy' Command in PATH"
+            item.toolTip = nil
+        }
     }
 
     func canCheckForUpdates() -> Bool {

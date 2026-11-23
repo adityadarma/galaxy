@@ -23,6 +23,8 @@ struct GalaxySettings: Equatable {
     var rustCompilerRefreshEnabled: Bool? = nil
     /// PHP 8.x compatibility target; nil follows Composer or PHP 8.5.
     var phpVersion: String? = nil
+    /// Run the language's formatter before an explicit save (`editor.formatOnSave`).
+    var formatOnSave: Bool? = nil
 
     /// VSCode's defaults, plus the Flutter folders.
     static let defaultFilesExclude: [String] = [
@@ -46,12 +48,14 @@ struct GalaxySettings: Equatable {
             filesExclude: filesExclude.map { $0.merging(override.filesExclude ?? [:]) { _, new in new } }
                 ?? override.filesExclude,
             rustCompilerRefreshEnabled: override.rustCompilerRefreshEnabled ?? rustCompilerRefreshEnabled,
-            phpVersion: override.phpVersion ?? phpVersion
+            phpVersion: override.phpVersion ?? phpVersion,
+            formatOnSave: override.formatOnSave ?? formatOnSave
         )
     }
 
     var effectiveRenderWhitespace: WhitespaceRendering { renderWhitespace ?? .all }
     var effectiveAutoClosingTags: Bool { autoClosingTags ?? true }
+    var effectiveFormatOnSave: Bool { formatOnSave ?? false }
     var effectiveLinkedEditing: Bool { linkedEditing ?? true }
     var effectiveGitBlame: Bool { gitBlame ?? true }
     var effectiveInlineParameterHints: Bool { inlineParameterHints ?? true }
@@ -111,7 +115,8 @@ struct GalaxySettings: Equatable {
                                inlineParameterHints: editor["inlineParameterHints"] as? Bool,
                                filesExclude: filesExclude,
                                 rustCompilerRefreshEnabled: rust["compilerRefreshEnabled"] as? Bool,
-                                phpVersion: (php["version"] as? String).flatMap { $0.isEmpty ? nil : $0 })
+                                phpVersion: (php["version"] as? String).flatMap { $0.isEmpty ? nil : $0 },
+                                formatOnSave: editor["formatOnSave"] as? Bool)
     }
 
     static func completionItems() -> [CompletionInfo] {
@@ -124,6 +129,7 @@ struct GalaxySettings: Equatable {
             CompletionInfo(label: "linkedEditing", detail: "boolean: rename the matching tag", insertText: "linkedEditing", isSnippet: false),
             CompletionInfo(label: "gitBlame", detail: "boolean: show who last changed the caret line", insertText: "gitBlame", isSnippet: false),
             CompletionInfo(label: "inlineParameterHints", detail: "boolean: show parameter names before call arguments", insertText: "inlineParameterHints", isSnippet: false),
+            CompletionInfo(label: "formatOnSave", detail: "boolean: run rustfmt, gofmt, dart format, prettier, pint or php-cs-fixer when saving", insertText: "formatOnSave", isSnippet: false),
             CompletionInfo(label: "files.autoSave", detail: "off | afterDelay | onFocusChange", insertText: "files.autoSave", isSnippet: false),
             CompletionInfo(label: "files.autoSaveDelay", detail: "milliseconds", insertText: "files.autoSaveDelay", isSnippet: false),
             CompletionInfo(label: "files.exclude", detail: "object: globs hidden in the explorer, e.g. {\"**/.git\": true}", insertText: "files.exclude", isSnippet: false),
@@ -158,7 +164,7 @@ extension GalaxySettings {
     /// Keys `load` also accepts at the top level instead of under `editor`.
     private static let editorKeys: Set<String> = [
         "insertSpaces", "tabSize", "renderWhitespace", "autoClosingTags", "linkedEditing", "gitBlame",
-        "inlineParameterHints",
+        "inlineParameterHints", "formatOnSave",
     ]
 
     /// Sets `section.key` in the settings file at `url` (the Settings window

@@ -14,6 +14,59 @@ final class SourceControlTests: XCTestCase {
             current: "Fix bug", submitted: nil, didCommit: true), "non-commit operations leave the draft alone")
     }
 
+    private func git(_ dir: URL, _ args: String...) throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        process.arguments = ["-C", dir.path] + args
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        process.waitUntilExit()
+        XCTAssertEqual(process.terminationStatus, 0, "git \(args.joined(separator: " "))")
+    }
+
+    func testCommitAndPushClearsTheMessageBeforeThePushFinishes() throws {
+        let files = FileManager.default
+        let base = files.temporaryDirectory.appendingPathComponent("galaxy-push-\(UUID().uuidString)")
+        defer { try? files.removeItem(at: base) }
+        let remote = base.appendingPathComponent("remote.git"), repo = base.appendingPathComponent("repo")
+        try files.createDirectory(at: remote, withIntermediateDirectories: true)
+        try files.createDirectory(at: repo, withIntermediateDirectories: true)
+        try git(remote, "init", "--bare", "-b", "main")
+        try git(repo, "init", "-b", "main")
+        try git(repo, "config", "user.name", "T")
+        try git(repo, "config", "user.email", "t@example.com")
+        try git(repo, "remote", "add", "origin", remote.path)
+        try "one\n".write(to: repo.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+        try git(repo, "add", "-A")
+        try git(repo, "commit", "-m", "first")
+        try git(repo, "push", "-u", "origin", "main")
+        // A slow push, so the box can be checked while it is still running.
+        let hook = repo.appendingPathComponent(".git/hooks/pre-push")
+        try "#!/bin/sh\nsleep 2\n".write(to: hook, atomically: true, encoding: .utf8)
+        try files.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hook.path)
+        try "two\n".write(to: repo.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+
+        let sc = SourceControlController()
+        _ = sc.view
+        sc.workspace = try CoreBridge().core.openWorkspace(path: repo.path)
+        sc.refresh(status: GitStatusInfo(branch: "main", changedPaths: ["a.txt"],
+                                         changes: [GitChangeInfo(path: "a.txt", staged: false, code: " M")]))
+        let box = try XCTUnwrap(Mirror(reflecting: sc).children.first { $0.label == "messageContainer" }?.value
+            as? CommitMessageInputContainer)
+        box.text = "Second"
+        var message: String?
+        sc.onMessage = { message = $0 }
+
+        sc.commitAndPush()
+        let deadline = Date().addingTimeInterval(10)
+        while !box.text.isEmpty, Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.02)) }
+        XCTAssertEqual(box.text, "")
+        XCTAssertTrue(sc.isPerformingGitOperation, "cleared while the push is still running")
+        while message == nil, Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.02)) }
+        XCTAssertEqual(message, "Commit and push complete")
+    }
+
     func testSourceControlInitialState() {
         let sc = SourceControlController()
         sc.refresh(status: nil)

@@ -24,15 +24,32 @@ enum CommandLineTool {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/galaxy")
     }
 
+    enum LinkStatus: Equatable {
+        case missing
+        /// A link to this app's helper.
+        case current
+        /// A link to another executable, such as the helper of another Galaxy build.
+        case other(URL)
+        /// A regular file, which `install` never replaces.
+        case occupied
+    }
+
+    static func status(helper: URL = helperURL, link: URL = defaultLinkURL) -> LinkStatus {
+        let files = FileManager.default
+        guard let destination = try? files.destinationOfSymbolicLink(atPath: link.path) else {
+            return files.fileExists(atPath: link.path) ? .occupied : .missing
+        }
+        let resolved = URL(fileURLWithPath: destination, relativeTo: link.deletingLastPathComponent())
+            .standardizedFileURL.resolvingSymlinksInPath()
+        guard files.isExecutableFile(atPath: helper.path),
+              resolved == helper.standardizedFileURL.resolvingSymlinksInPath() else { return .other(resolved) }
+        return .current
+    }
+
     /// A link to this app's helper, not merely a command with the same name
     /// elsewhere on PATH. A stale link to another Galaxy build can be updated.
     static func isInstalled(helper: URL = helperURL, link: URL = defaultLinkURL) -> Bool {
-        let files = FileManager.default
-        guard files.isExecutableFile(atPath: helper.path),
-              let destination = try? files.destinationOfSymbolicLink(atPath: link.path) else { return false }
-        let resolved = URL(fileURLWithPath: destination, relativeTo: link.deletingLastPathComponent())
-            .standardizedFileURL.resolvingSymlinksInPath()
-        return resolved == helper.standardizedFileURL.resolvingSymlinksInPath()
+        status(helper: helper, link: link) == .current
     }
 
     /// Creates or replaces the symlink. A regular file at `link` is left alone.

@@ -1119,23 +1119,35 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         let message = messageContainer.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !message.isEmpty else { generateCommitMessage(); return }
         let stageEverything = stagedChanges.isEmpty
+        let submitted = messageContainer.text
         performGitOperation(
             sync ? "Committing & syncing…" : "Committing & pushing…",
             success: sync ? "Commit and sync complete" : "Commit and push complete",
-            submittedMessage: messageContainer.text
-        ) { workspace in
+            submittedMessage: submitted
+        ) { [weak self] workspace in
             do {
                 if stageEverything { try workspace.gitStageAll() }
                 try workspace.gitCommit(message: message)
             } catch {
                 return GitOperationResult(failure: Self.describe(error))
             }
+            // The message belongs to the commit, not the push: clear it now
+            // rather than after a push that can take a while.
+            Task { @MainActor [weak self] in self?.clearCommittedMessage(submitted) }
             if sync,
                let failure = Self.gitFailure(Self.runGit(root: root, args: ["pull", "--rebase"])) {
                 return GitOperationResult(failure: failure, didCommit: true)
             }
             return GitOperationResult(failure: Self.gitFailure(Self.runGit(root: root, args: ["push"])), didCommit: true)
         }
+    }
+
+    /// Clears the box unless a new draft has been typed since `submitted`.
+    private func clearCommittedMessage(_ submitted: String) {
+        guard Self.shouldClearCommitMessage(current: messageContainer.text, submitted: submitted, didCommit: true) else {
+            return
+        }
+        messageContainer.text = ""
     }
 
     private func performGitOperation(

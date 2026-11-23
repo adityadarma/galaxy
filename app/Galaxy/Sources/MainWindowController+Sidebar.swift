@@ -117,6 +117,7 @@ extension MainWindowController {
                 explorer.refresh()
             }
             autoSaveMode = settings.effectiveAutoSave
+            formatOnSave = settings.effectiveFormatOnSave
             autoSaveDelay = settings.effectiveAutoSaveDelay
             if autoSaveMode != .afterDelay { autoSaveWorkItem?.cancel(); autoSaveWorkItem = nil }
             for tab in allTabs {
