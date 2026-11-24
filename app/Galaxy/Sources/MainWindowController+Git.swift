@@ -267,7 +267,7 @@ extension MainWindowController {
     private func checkoutGitBranch(_ name: String) {
         guard let workspace else { return }
         guard bridge.gitCheckout(workspace: workspace, name: name) else {
-            statusLabel.stringValue = "Could not checkout \(name)."
+            notify("Could not checkout \(name).", severity: .error, source: "Git")
             return
         }
         closeGitBranchPicker()
@@ -286,7 +286,7 @@ extension MainWindowController {
         alert.addButton(withTitle: "Cancel")
         guard alert.runModal() == .alertFirstButtonReturn, let workspace else { return }
         guard bridge.gitCreateBranch(workspace: workspace, name: field.stringValue) else {
-            statusLabel.stringValue = "Could not create branch."
+            notify("Could not create branch.", severity: .error, source: "Git")
             return
         }
         closeGitBranchPicker()
@@ -315,7 +315,7 @@ extension MainWindowController {
             refreshGitStatus()
             statusLabel.stringValue = ""
         } catch {
-            statusLabel.stringValue = "Could not create branch from \(source.stringValue)."
+            notify("Could not create branch from \(source.stringValue).", severity: .error, source: "Git")
         }
     }
 
@@ -336,7 +336,7 @@ extension MainWindowController {
             refreshGitStatus()
             statusLabel.stringValue = ""
         } catch {
-            statusLabel.stringValue = "Could not checkout \(source.stringValue)."
+            notify("Could not checkout \(source.stringValue).", severity: .error, source: "Git")
         }
     }
 
@@ -438,7 +438,7 @@ extension MainWindowController {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 if let failure {
-                    self.statusLabel.stringValue = failure
+                    self.notify(failure, severity: .error, source: "Git")
                 } else {
                     self.statusLabel.stringValue = "Staged the change."
                     // The peek is for a working-tree change. Closing it gives
@@ -884,7 +884,11 @@ extension MainWindowController {
                     }
                     self.refreshGitStatus()
                 }
-                self.statusLabel.stringValue = failure ?? "Staged change."
+                if let failure {
+                    self.notify(failure, severity: .error, source: "Git")
+                } else {
+                    self.statusLabel.stringValue = "Staged change."
+                }
             }
         }
     }

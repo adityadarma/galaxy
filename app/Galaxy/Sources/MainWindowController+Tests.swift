@@ -71,7 +71,7 @@ extension MainWindowController {
         if testRunner.isRunning(test.key) { return }
         if let tab = activeTab, tab.doc.isModified(), !save() { return }
         guard testRunner.start(test) != nil else {
-            statusLabel.stringValue = "Could not start \(test.name)."
+            notify("Could not start \(test.name).", severity: .error, source: "Tests")
             return NSSound.beep()
         }
         revealBottomPanel(.testResults)

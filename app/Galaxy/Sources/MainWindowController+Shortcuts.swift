@@ -38,7 +38,10 @@ extension MainWindowController {
         }
         if let first = keybindings.problems.first {
             let more = keybindings.problems.count > 1 ? " (+\(keybindings.problems.count - 1) more)" : ""
-            statusLabel.stringValue = "Keyboard shortcuts: \(first)\(more)"
+            let url = keybindingsURL
+            notify("Keyboard shortcuts: \(first)\(more)", severity: .error, source: "keybindings.json", actions: [
+                .init(title: "Open keybindings.json") { [weak self] in try? self?.openFile(at: url) },
+            ])
         }
     }
 

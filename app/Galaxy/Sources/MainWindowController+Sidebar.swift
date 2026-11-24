@@ -134,7 +134,7 @@ extension MainWindowController {
             statusBar.show(document: activeTab?.doc, path: activeTab?.doc.path())
         } catch {
             settingsProblems = ["settings.json could not be read: \(error.localizedDescription)"]
-            statusLabel.stringValue = settingsProblems[0]
+            notify(settingsProblems[0], severity: .error, source: "Settings")
             Log.ui.error("settings: \(String(describing: error), privacy: .public)")
         }
     }

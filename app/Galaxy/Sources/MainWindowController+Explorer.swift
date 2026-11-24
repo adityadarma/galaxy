@@ -90,7 +90,7 @@ extension MainWindowController {
             let target = destination.appendingPathComponent(source.lastPathComponent).standardizedFileURL
             guard source != target else { continue }
             guard !manager.fileExists(atPath: target.path) else {
-                statusLabel.stringValue = "Cannot paste: \(target.lastPathComponent) already exists."
+                notify("Cannot paste: \(target.lastPathComponent) already exists.", severity: .warning)
                 continue
             }
             do {

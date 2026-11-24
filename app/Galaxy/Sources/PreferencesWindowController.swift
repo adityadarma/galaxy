@@ -63,9 +63,9 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
     private let tabSizePopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let insertSpacesBox = NSButton(checkboxWithTitle: "Insert spaces when pressing Tab", target: nil, action: nil)
     private let whitespacePopup = NSPopUpButton(frame: .zero, pullsDown: false)
-    private let autoClosingTagsBox = NSButton(checkboxWithTitle: "Auto close tags (HTML, PHP, JSX)", target: nil, action: nil)
-    private let linkedEditingBox = NSButton(checkboxWithTitle: "Rename matching tag while editing", target: nil, action: nil)
-    private let parameterHintsBox = NSButton(checkboxWithTitle: "Show parameter names before call arguments", target: nil, action: nil)
+    private let autoClosingTagsBox = NSButton(checkboxWithTitle: "Close tags automatically", target: nil, action: nil)
+    private let linkedEditingBox = NSButton(checkboxWithTitle: "Rename the matching tag", target: nil, action: nil)
+    private let parameterHintsBox = NSButton(checkboxWithTitle: "Show names before arguments", target: nil, action: nil)
     private let formatOnSaveBox = NSButton(checkboxWithTitle: "Format on save", target: nil, action: nil)
     private let autoSavePopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let autoSaveDelay = NSStepper(frame: .zero)
@@ -94,7 +94,7 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
     private let wordWrapBox = NSButton(checkboxWithTitle: "Word wrap", target: nil, action: nil)
     private let breadcrumbsBox = NSButton(checkboxWithTitle: "Breadcrumbs", target: nil, action: nil)
     private let stickyScrollBox = NSButton(checkboxWithTitle: "Sticky scroll", target: nil, action: nil)
-    private let gitBlameBox = NSButton(checkboxWithTitle: "Inline Git blame on the caret line", target: nil, action: nil)
+    private let gitBlameBox = NSButton(checkboxWithTitle: "Show blame on the caret line", target: nil, action: nil)
     private let folderIconsBox = NSButton(checkboxWithTitle: "Show folder icons", target: nil, action: nil)
 
     private static let tabSizes = [2, 4, 8]
@@ -149,6 +149,7 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
         tabSizePopup.addItems(withTitles: Self.tabSizes.map(String.init))
         tabSizePopup.setAccessibilityLabel("Tab size")
         tabSizePopup.target = self; tabSizePopup.action = #selector(saveTabSize(_:))
+        fixWidth(tabSizePopup)
         insertSpacesBox.target = self; insertSpacesBox.action = #selector(saveInsertSpaces(_:))
         addGroup("Indentation", to: stack, rows: [
             row("Tab size", tabSizePopup),
@@ -158,20 +159,29 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
         whitespacePopup.addItems(withTitles: Self.whitespaceModes.map(\.title))
         whitespacePopup.setAccessibilityLabel("Render whitespace")
         whitespacePopup.target = self; whitespacePopup.action = #selector(saveWhitespace(_:))
+        fixWidth(whitespacePopup)
         parameterHintsBox.target = self; parameterHintsBox.action = #selector(saveParameterHints(_:))
+        parameterHintsBox.setAccessibilityLabel("Show parameter names before call arguments")
         addGroup("Rendering", to: stack, rows: [
             row("Whitespace", whitespacePopup),
-            parameterHintsBox,
+            row("Parameter hints", parameterHintsBox),
         ])
 
         autoClosingTagsBox.target = self; autoClosingTagsBox.action = #selector(saveAutoClosingTags(_:))
+        autoClosingTagsBox.setAccessibilityLabel("Auto close tags")
         linkedEditingBox.target = self; linkedEditingBox.action = #selector(saveLinkedEditing(_:))
-        addGroup("Tags", to: stack, rows: [autoClosingTagsBox, linkedEditingBox])
+        linkedEditingBox.setAccessibilityLabel("Rename matching tag while editing")
+        addGroup("Tags", to: stack, rows: [
+            row("While typing", autoClosingTagsBox),
+            row("", linkedEditingBox),
+            footnote("Applies to HTML, PHP and JSX."),
+        ])
 
         formatOnSaveBox.target = self; formatOnSaveBox.action = #selector(saveFormatOnSave(_:))
         autoSavePopup.addItems(withTitles: Self.autoSaveModes.map(\.title))
         autoSavePopup.setAccessibilityLabel("Auto save")
         autoSavePopup.target = self; autoSavePopup.action = #selector(saveAutoSave(_:))
+        fixWidth(autoSavePopup)
         autoSaveDelay.minValue = 250; autoSaveDelay.maxValue = 10_000; autoSaveDelay.increment = 250
         autoSaveDelay.setAccessibilityLabel("Auto save delay")
         autoSaveDelay.target = self; autoSaveDelay.action = #selector(saveAutoSaveDelay(_:))
@@ -194,7 +204,7 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
     private func buildExplorerPane() -> NSView {
         let stack = NSStackView()
         folderIconsBox.target = self; folderIconsBox.action = #selector(saveFolderIcons(_:))
-        addGroup("Appearance", to: stack, rows: [folderIconsBox])
+        addGroup("Appearance", to: stack, rows: [row("Folders", folderIconsBox)])
 
         for (id, width) in [("hide", 22.0), ("glob", 250.0), ("kind", 60.0)] {
             let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(id))
@@ -249,11 +259,16 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
         for box in editorBoxes {
             box.target = self; box.action = #selector(saveViewToggle(_:))
         }
-        addGroup("Editor", to: stack, rows: editorBoxes + [
+        addGroup("Editor", to: stack, rows: [
+            row("Show", minimapBox),
+            row("", breadcrumbsBox),
+            row("", stickyScrollBox),
+            row("Long lines", wordWrapBox),
             footnote("The View menu toggles the same switches."),
         ])
         gitBlameBox.target = self; gitBlameBox.action = #selector(saveGitBlame(_:))
-        addGroup("Git", to: stack, rows: [gitBlameBox])
+        gitBlameBox.setAccessibilityLabel("Inline Git blame on the caret line")
+        addGroup("Git", to: stack, rows: [row("Blame", gitBlameBox)])
         return pane(stack)
     }
 
@@ -281,6 +296,7 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
         terminalLineHeight.selectItem(at: heightIndex)
         terminalLineHeight.setAccessibilityLabel("Terminal line height")
         terminalLineHeight.target = self; terminalLineHeight.action = #selector(saveTerminalLineHeight(_:))
+        fixWidth(terminalLineHeight)
         addGroup("Font", to: stack, rows: [
             row("Font family", terminalFont),
             row("Font size", valueControl(terminalFontSize, terminalFontSizeLabel)),
@@ -292,6 +308,7 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
         terminalCursorStyle.selectItem(at: Self.terminalCursorStyles.firstIndex { $0.value == current.cursorStyle } ?? 0)
         terminalCursorStyle.setAccessibilityLabel("Terminal cursor style")
         terminalCursorStyle.target = self; terminalCursorStyle.action = #selector(saveTerminalCursorStyle(_:))
+        fixWidth(terminalCursorStyle)
         terminalCursorBlink.state = current.cursorBlink ? .on : .off
         terminalCursorBlink.target = self; terminalCursorBlink.action = #selector(saveTerminalCursorBlink(_:))
         addGroup("Cursor", to: stack, rows: [

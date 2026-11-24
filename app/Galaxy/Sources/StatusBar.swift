@@ -30,6 +30,9 @@ final class StatusBar: NSView {
     var onIndentClick: (() -> Void)?
     let lineEnding = StatusBar.label("status-eol")
     let encoding = StatusBar.label("status-encoding")
+    /// Opens the notification list; a dot marks unread notifications.
+    let notifications = NSButton()
+    var onNotificationsClick: (() -> Void)?
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -84,7 +87,15 @@ final class StatusBar: NSView {
 
         let left = NSStackView(views: [git, gitGraph, workspaceScan, message, largeFileBadge])
         left.spacing = 8
-        let right = NSStackView(views: [cursor, language, indent, lineEnding, encoding])
+        notifications.isBordered = false
+        notifications.imagePosition = .imageOnly
+        notifications.contentTintColor = .secondaryLabelColor
+        notifications.setAccessibilityIdentifier("status-notifications")
+        notifications.target = self
+        notifications.action = #selector(notificationsClicked(_:))
+        showNotifications(unread: 0, isOpen: false)
+
+        let right = NSStackView(views: [cursor, language, indent, lineEnding, encoding, notifications])
         right.spacing = 14
         // The spacer takes the slack, so the facts sit on the right edge.
         let spacer = NSView()
@@ -225,6 +236,19 @@ final class StatusBar: NSView {
     @objc private func gitGraphClicked(_ sender: Any?) { onGitGraphClick?() }
     @objc private func languageClicked(_ sender: Any?) { onLanguageClick?() }
     @objc private func indentClicked(_ sender: Any?) { onIndentClick?() }
+    @objc private func notificationsClicked(_ sender: Any?) { onNotificationsClick?() }
+
+    func showNotifications(unread: Int, isOpen: Bool) {
+        let symbol = unread > 0 ? "bell.badge" : "bell"
+        let text = unread == 0 ? "No new notifications"
+            : unread == 1 ? "1 new notification" : "\(unread) new notifications"
+        notifications.image = NSImage(systemSymbolName: symbol, accessibilityDescription: "Notifications")?
+            .withSymbolConfiguration(.init(pointSize: 12, weight: .regular))
+        notifications.contentTintColor = isOpen ? .labelColor : .secondaryLabelColor
+        notifications.toolTip = text
+        notifications.setAccessibilityLabel("Notifications")
+        notifications.setAccessibilityValue(text)
+    }
 
     /// Brighter while the Git Graph tab is showing.
     func setGitGraphVisible(_ visible: Bool) {

@@ -137,7 +137,9 @@ final class KeybindingsTests: XCTestCase {
         XCTAssertTrue(c.save())
         XCTAssertEqual(c.keybindings.commandByKey["shift+cmd+o"], "workbench.action.gotoSymbol",
                        "a broken file falls back to the defaults")
-        XCTAssertTrue(c.statusLabel.stringValue.hasPrefix("Keyboard shortcuts: keybindings.json line 1"),
-                      c.statusLabel.stringValue)
+        let notice = try XCTUnwrap(c.notificationsView.history.last, "the problem is shown as a notification")
+        XCTAssertTrue(notice.message.hasPrefix("Keyboard shortcuts: keybindings.json line 1"), notice.message)
+        XCTAssertEqual(notice.severity, .error)
+        XCTAssertEqual(notice.actions.map(\.title), ["Open keybindings.json"])
     }
 }

@@ -118,7 +118,7 @@ extension MainWindowController {
         guard let path = (sender as? NSMenuItem)?.representedObject as? String else { return }
         var isDirectory: ObjCBool = false
         guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory), isDirectory.boolValue else {
-            statusLabel.stringValue = "Recent project no longer exists: \(path)"
+            notify("Recent project no longer exists: \(path)", severity: .warning)
             return
         }
         open(url: URL(fileURLWithPath: path))
@@ -131,7 +131,7 @@ extension MainWindowController {
 
     func openRecentPath(_ path: String) {
         guard FileManager.default.fileExists(atPath: path) else {
-            statusLabel.stringValue = "Recently opened item no longer exists: \(path)"
+            notify("Recently opened item no longer exists: \(path)", severity: .warning)
             return
         }
         open(url: URL(fileURLWithPath: path))
@@ -284,6 +284,6 @@ extension MainWindowController {
 
     func report(_ error: Error, while action: String) {
         Log.ui.error("\(action, privacy: .public) failed: \(String(describing: error), privacy: .public)")
-        if let window { NSAlert(error: error).beginSheetModal(for: window) }
+        notify("Could not \(action). \(error.localizedDescription)", severity: .error)
     }
 }

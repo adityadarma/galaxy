@@ -1,0 +1,71 @@
+import XCTest
+@testable import Galaxy
+
+@MainActor
+final class NotificationsTests: XCTestCase {
+    func testToastsStackUpToTheLimitAndStayInTheList() {
+        let view = NotificationsView()
+        for index in 1...5 { view.show(AppNotification("message \(index)", severity: .warning)) }
+        XCTAssertEqual(view.toastIDs.count, NotificationsView.maxToasts, "older toasts make room")
+        XCTAssertEqual(view.history.count, 5, "hidden toasts stay in the list")
+        XCTAssertEqual(view.unreadCount, 5)
+    }
+
+    func testTheSameMessageReplacesTheOldOne() {
+        let view = NotificationsView()
+        view.show(AppNotification("Could not checkout main.", severity: .error))
+        view.show(AppNotification("Could not checkout main.", severity: .error))
+        XCTAssertEqual(view.history.count, 1)
+        XCTAssertEqual(view.toastIDs.count, 1)
+    }
+
+    func testOpeningTheListHidesToastsAndMarksThemRead() {
+        let view = NotificationsView()
+        var changes = 0
+        view.onChange = { changes += 1 }
+        view.show(AppNotification("one", severity: .error))
+        view.toggleCenter()
+        XCTAssertTrue(view.isCenterVisible)
+        XCTAssertTrue(view.toastIDs.isEmpty)
+        XCTAssertEqual(view.unreadCount, 0)
+        XCTAssertEqual(view.history.count, 1)
+
+        view.show(AppNotification("two"))
+        XCTAssertTrue(view.toastIDs.isEmpty, "the open list shows new ones instead of a toast")
+        XCTAssertEqual(view.unreadCount, 0)
+        XCTAssertGreaterThan(changes, 0)
+    }
+
+    func testDismissAndClearAll() throws {
+        let view = NotificationsView()
+        view.show(AppNotification("one", severity: .error))
+        view.show(AppNotification("two", severity: .error))
+        let first = try XCTUnwrap(view.history.first)
+        view.dismiss(first.id)
+        XCTAssertEqual(view.history.map(\.message), ["two"])
+        XCTAssertEqual(view.unreadCount, 1)
+
+        view.hideToast(try XCTUnwrap(view.history.first).id)
+        XCTAssertTrue(view.toastIDs.isEmpty)
+        XCTAssertEqual(view.history.count, 1, "hiding a toast keeps it in the list")
+
+        view.clearAll()
+        XCTAssertTrue(view.history.isEmpty)
+        XCTAssertEqual(view.unreadCount, 0)
+        XCTAssertFalse(view.isCenterVisible)
+    }
+
+    func testGitFailuresBecomeNotificationsAndSuccessesStayInTheStatusBar() {
+        let c = MainWindowController(bridge: CoreBridge())
+        defer { c.window?.orderOut(nil) }
+        c.notifyGitMessage("Committed 1 file")
+        XCTAssertTrue(c.notificationsView.history.isEmpty)
+        XCTAssertEqual(c.statusLabel.stringValue, "Committed 1 file")
+
+        c.notifyGitMessage("Git: nothing to push")
+        XCTAssertEqual(c.notificationsView.history.last?.message, "nothing to push")
+        XCTAssertEqual(c.notificationsView.history.last?.source, "Git")
+        XCTAssertEqual(c.notificationsView.history.last?.severity, .error)
+        XCTAssertEqual(c.statusBar.notifications.accessibilityValue() as? String, "1 new notification")
+    }
+}

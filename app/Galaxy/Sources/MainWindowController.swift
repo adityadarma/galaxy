@@ -15,6 +15,7 @@ import os
 final class MainWindowController: NSWindowController, NSWindowDelegate {
     let bridge: CoreBridge
     let statusBar = StatusBar()
+    let notificationsView = NotificationsView()
     let pathBar = PathBar()
     let breadcrumbBar = BreadcrumbBar()
     let stickyScopeView = StickyScopeView()
@@ -483,7 +484,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             case .goModulesFinished:
                 self?.statusLabel.stringValue = "Go modules downloaded; reindexing..."
             case let .goModulesFailed(_, message):
-                self?.statusLabel.stringValue = "Go module download failed: \(message)"
+                self?.statusLabel.stringValue = ""
+                self?.notify("Go module download failed: \(message)", severity: .error, source: "Go")
             case let .workspaceIndexStarted(root, total):
                 self?.workspaceIndexState = (root, 0, total)
                 self?.statusBar.workspaceIndexStarted(root: root, total: total)
@@ -508,6 +510,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         statusBar.onGitGraphClick = { [weak self] in self?.toggleGitGraph(nil) }
         statusBar.onLanguageClick = { [weak self] in self?.showPHPAnalyzerTargetMenu() }
         statusBar.onIndentClick = { [weak self] in self?.showIndentationPicker() }
+        statusBar.onNotificationsClick = { [weak self] in self?.toggleNotifications(nil) }
+        notificationsView.onChange = { [weak self] in self?.updateNotificationsButton() }
     }
 
     private func installMemoryPressureHandler() {
@@ -572,7 +576,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         titleBar.onBack = { [weak self] in self?.navigateBack(nil) }
         titleBar.onForward = { [weak self] in self?.navigateForward(nil) }
         titleBar.onSearch = { [weak self] in self?.showQuickAccess(nil) }
-        gitGraphPanel.onMessage = { [weak self] message in self?.statusLabel.stringValue = message }
+        gitGraphPanel.onMessage = { [weak self] message in self?.notifyGitMessage(message) }
         gitGraphPanel.onRepositoryChanged = { [weak self] in self?.refreshGitStatus() }
         titleBar.setSidebarVisible(true)
         titleBar.setPanelVisible(false)
@@ -586,7 +590,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
         sourceControl.onRefresh = { [weak self] in self?.refreshGitStatus() }
         sourceControl.onCanCommitChange = { [weak self] can in self?.sectionHeader.scmCommitButton.isEnabled = can }
-        sourceControl.onMessage = { [weak self] message in self?.statusLabel.stringValue = message }
+        sourceControl.onMessage = { [weak self] message in self?.notifyGitMessage(message) }
         searchSidebar.onSearch = { [weak self] query, options in self?.searchSidebarWorkspace(query, options: options) }
         searchSidebar.onOpen = { [weak self] match in self?.openSearchSidebarMatch(match) }
         searchSidebar.onReplaceAll = { [weak self] query, replacement, options in
@@ -975,7 +979,11 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         content.addSubview(activityBar)
         content.addSubview(splitView)
         content.addSubview(statusBar)
+        // Last, so toasts float over the editor and panels.
+        content.addSubview(notificationsView)
         NSLayoutConstraint.activate([
+            notificationsView.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -Theme.cardGap * 3),
+            notificationsView.bottomAnchor.constraint(equalTo: statusBar.topAnchor, constant: -Theme.cardGap * 2),
             titleBar.topAnchor.constraint(equalTo: content.topAnchor),
             titleBar.leadingAnchor.constraint(equalTo: content.leadingAnchor),
             titleBar.trailingAnchor.constraint(equalTo: content.trailingAnchor),
@@ -1003,7 +1011,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             editorView.revealLine(Int(problem.line))
             editorView.window?.makeFirstResponder(editorView)
         } catch {
-            statusLabel.stringValue = "Cannot open problem location: \(url.path)"
+            notify("Cannot open problem location: \(url.path)", severity: .error)
         }
     }
 
@@ -1020,7 +1028,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             activeTab?.doc.goToLine(line: max(1, line) - 1, col: max(1, col) - 1)
             editorView.revealLine(Int(max(1, line) - 1))
         } catch {
-            statusLabel.stringValue = "Cannot open terminal link: \(path)"
+            notify("Cannot open terminal link: \(path)", severity: .error)
         }
     }
 
