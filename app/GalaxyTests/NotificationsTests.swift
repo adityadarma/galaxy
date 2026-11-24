@@ -66,6 +66,7 @@ final class NotificationsTests: XCTestCase {
         XCTAssertEqual(c.notificationsView.history.last?.message, "nothing to push")
         XCTAssertEqual(c.notificationsView.history.last?.source, "Git")
         XCTAssertEqual(c.notificationsView.history.last?.severity, .error)
+        XCTAssertEqual(c.statusLabel.stringValue, "Committed 1 file", "a failure is shown once, as a toast")
         XCTAssertEqual(c.statusBar.notifications.accessibilityValue() as? String, "1 new notification")
     }
 }

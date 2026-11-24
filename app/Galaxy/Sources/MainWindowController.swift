@@ -1084,6 +1084,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
         explorer.contextMenu = { [weak self] in self?.explorerContextMenu() }
         explorer.outlineView.onKey = { [weak self] event in self?.explorerKey(event) ?? false }
+        explorer.outlineView.onCopy = { [weak self] in self?.copyExplorerItem(nil) }
+        explorer.outlineView.onPaste = { [weak self] in self?.pasteExplorerItem(nil) }
         pathBar.menuForComponent = { [weak self] index in self?.pathBarMenu(for: index) }
 
         sidebar.addSubview(sectionHeader)

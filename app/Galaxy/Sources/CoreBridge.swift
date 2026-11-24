@@ -18,6 +18,9 @@ final class CoreBridge {
     private var analysisPollPending = false
     private var pendingCompletionRequest: DispatchWorkItem?
     private var pendingReferencesRequest: DispatchWorkItem?
+    private let navigationQueue = DispatchQueue(label: "dev.adityadarma.galaxy.navigation")
+    private var pendingHoverRequest: DispatchWorkItem?
+    private var pendingDefinitionRequests = 0
     private(set) var lastEvent: CoreEvent?
     var onEvent: ((CoreEvent) -> Void)?
 
@@ -115,6 +118,59 @@ final class CoreBridge {
 
     func hover(document: DocumentHandle) -> HoverInfo? {
         core.hover(document: document)
+    }
+
+    /// Hover and definition resolve through the workspace index and can parse
+    /// several files, so they run off the AppKit main thread. A newer hover
+    /// cancels one that has not started yet.
+    func requestHoverInBackground(
+        document: DocumentHandle,
+        line: UInt64,
+        character: UInt64,
+        completion: @escaping @MainActor @Sendable (Bool) -> Void
+    ) {
+        pendingHoverRequest?.cancel()
+        let item = Self.hoverWorkItem(
+            core: core, document: document, line: line, character: character, completion: completion
+        )
+        pendingHoverRequest = item
+        navigationQueue.async(execute: item)
+    }
+
+    nonisolated private static func hoverWorkItem(
+        core: Core, document: DocumentHandle, line: UInt64, character: UInt64,
+        completion: @escaping @MainActor @Sendable (Bool) -> Void
+    ) -> DispatchWorkItem {
+        DispatchWorkItem {
+            let answered = core.requestHover(document: document, line: line, character: character)
+            Task { @MainActor in completion(answered) }
+        }
+    }
+
+    /// True while a background definition request is queued or running. Its
+    /// result replaces the stored locations, so readers wait for it.
+    var isDefinitionPending: Bool { pendingDefinitionRequests > 0 }
+
+    func requestDefinitionInBackground(document: DocumentHandle, line: UInt64, character: UInt64) {
+        pendingDefinitionRequests += 1
+        let item = Self.definitionWorkItem(
+            core: core, document: document, line: line, character: character
+        ) { [weak self] in
+            self?.pendingDefinitionRequests -= 1
+        }
+        navigationQueue.async(execute: item)
+    }
+
+    nonisolated private static func definitionWorkItem(
+        core: Core, document: DocumentHandle, line: UInt64, character: UInt64,
+        completion: @escaping @MainActor @Sendable () -> Void
+    ) -> DispatchWorkItem {
+        DispatchWorkItem {
+            _ = core.requestDefinitionForNavigation(
+                document: document, line: line, character: character, navigationToken: "definition"
+            )
+            Task { @MainActor in completion() }
+        }
     }
 
     func requestCompletion(document: DocumentHandle, line: UInt64, character: UInt64) {

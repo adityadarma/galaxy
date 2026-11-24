@@ -12,9 +12,10 @@ extension MainWindowController {
 
     /// Git panels report successes and failures through one string; failures start with "Git: ".
     func notifyGitMessage(_ message: String) {
-        statusLabel.stringValue = message
         if message.hasPrefix("Git: ") {
             notify(String(message.dropFirst(5)), severity: .error, source: "Git")
+        } else {
+            statusLabel.stringValue = message
         }
     }
 

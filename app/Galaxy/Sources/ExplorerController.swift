@@ -529,6 +529,20 @@ final class ExplorerOutlineView: NSOutlineView {
     var onContextMenu: ((Int) -> NSMenu?)?
     /// Keys handled before the table's own (Return renames, ⌘⌫ deletes).
     var onKey: ((NSEvent) -> Bool)?
+    /// Edit menu Copy and Paste while the explorer has focus.
+    var onCopy: (() -> Void)?
+    var onPaste: (() -> Void)?
+
+    @objc func copy(_ sender: Any?) { onCopy?() }
+    @objc func paste(_ sender: Any?) { onPaste?() }
+
+    override func validateUserInterfaceItem(_ item: NSValidatedUserInterfaceItem) -> Bool {
+        switch item.action {
+        case #selector(copy(_:)): selectedRow >= 0
+        case #selector(paste(_:)): true
+        default: super.validateUserInterfaceItem(item)
+        }
+    }
 
     override func menu(for event: NSEvent) -> NSMenu? {
         let row = row(at: convert(event.locationInWindow, from: nil))

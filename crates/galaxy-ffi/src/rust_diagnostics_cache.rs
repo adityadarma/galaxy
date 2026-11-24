@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use galaxy_core::lang::Problem;
 
-const SCHEMA: u32 = 1;
+const SCHEMA: u32 = 2;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(super) struct CachedProblem {

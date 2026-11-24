@@ -48,8 +48,13 @@ extension MainWindowController {
         hoverRequestPosition = position
         // Only remember the position once a request actually went out, so
         // hovering the same spot again retries after the server is ready.
-        if !bridge.requestHover(document: document, line: position.line, character: position.colUtf16) {
-            hoverRequestPosition = nil
+        bridge.requestHoverInBackground(
+            document: document, line: position.line, character: position.colUtf16
+        ) { [weak self, weak document] answered in
+            guard !answered, let self, self.hoverDocument === document,
+                  self.hoverRequestPosition?.line == position.line,
+                  self.hoverRequestPosition?.colUtf16 == position.colUtf16 else { return }
+            self.hoverRequestPosition = nil
         }
     }
 

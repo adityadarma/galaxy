@@ -87,12 +87,7 @@ extension MainWindowController {
         var pasted: [String] = []
         for source in items {
             let source = source.standardizedFileURL
-            let target = destination.appendingPathComponent(source.lastPathComponent).standardizedFileURL
-            guard source != target else { continue }
-            guard !manager.fileExists(atPath: target.path) else {
-                notify("Cannot paste: \(target.lastPathComponent) already exists.", severity: .warning)
-                continue
-            }
+            let target = Self.uniquePasteTarget(for: source, in: destination)
             do {
                 try manager.copyItem(at: source, to: target)
                 let rel = target.path.replacingOccurrences(of: workspace.root() + "/", with: "")
@@ -106,6 +101,24 @@ extension MainWindowController {
         explorer.reveal(relPath: pasted[0])
         updateFileFinder(changed: pasted)
         refreshGitStatus()
+    }
+
+    /// `name.ext` becomes `name copy.ext`, then `name copy 2.ext`, when the
+    /// name is taken in `folder`.
+    static func uniquePasteTarget(for source: URL, in folder: URL) -> URL {
+        let manager = FileManager.default
+        let first = folder.appendingPathComponent(source.lastPathComponent).standardizedFileURL
+        guard manager.fileExists(atPath: first.path) else { return first }
+        let ext = source.pathExtension
+        let base = source.deletingPathExtension().lastPathComponent
+        var n = 1
+        while true {
+            let suffix = n == 1 ? " copy" : " copy \(n)"
+            let name = ext.isEmpty ? base + suffix : base + suffix + "." + ext
+            let candidate = folder.appendingPathComponent(name).standardizedFileURL
+            if !manager.fileExists(atPath: candidate.path) { return candidate }
+            n += 1
+        }
     }
 
     // MARK: Rename and delete (M2-05)
@@ -190,13 +203,14 @@ extension MainWindowController {
     /// Return renames, ⌘⌫ deletes, as in VSCode on macOS.
     func explorerKey(_ event: NSEvent) -> Bool {
         let mods = event.modifierFlags.intersection([.command, .shift, .control, .option])
+        if event.keyCode == 9, mods == [.command] { // ⌘V pastes into the root when nothing is selected
+            pasteExplorerItem(nil)
+            return true
+        }
         guard explorer.selectedEntry != nil else { return false }
         switch (event.keyCode, mods) {
         case (8, [.command]): // ⌘C
             copyExplorerItem(nil)
-            return true
-        case (9, [.command]): // ⌘V
-            pasteExplorerItem(nil)
             return true
         case (36, []), (76, []): // Return, keypad Enter
             renameExplorerItem(nil)

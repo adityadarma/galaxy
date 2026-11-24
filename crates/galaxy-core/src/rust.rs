@@ -133,6 +133,33 @@ pub struct RustEngine {
     canonical_paths: RwLock<HashMap<PathBuf, PathBuf>>,
     /// `crate_for` results, for the same reason: it scans every Cargo target.
     crate_names: RwLock<HashMap<PathBuf, String>>,
+    /// `member_declarations` results per file, type and member name. Hover and
+    /// definition on a method chain ask once per link, and each answer parsed
+    /// every candidate file again. Entries are checked against the file's
+    /// current stamp, so no explicit invalidation is needed.
+    member_cache: Mutex<HashMap<(PathBuf, String, String), (SourceStamp, Vec<Declaration>)>>,
+}
+
+/// Identifies one version of a source file: the hash of an open buffer, or
+/// the modification time and size of a file on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SourceStamp {
+    Open(u64),
+    Disk(std::time::SystemTime, u64),
+}
+
+const MEMBER_CACHE_LIMIT: usize = 4096;
+
+fn text_stamp(text: &str) -> SourceStamp {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    SourceStamp::Open(hasher.finish())
+}
+
+fn disk_stamp(path: &Path) -> Option<SourceStamp> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(SourceStamp::Disk(metadata.modified().ok()?, metadata.len()))
 }
 
 /// Result of a Cargo refresh requested manually or after saving Rust source.
@@ -741,6 +768,7 @@ impl RustEngine {
             ready: false,
             canonical_paths: RwLock::new(HashMap::new()),
             crate_names: RwLock::new(HashMap::new()),
+            member_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1424,12 +1452,16 @@ impl RustEngine {
         collect_errors(tree.root_node(), text, &mut errors);
         errors.extend(module_problems(path, text, &self.cfg_for(path)));
         let local_bindings = all_local_binding_names(tree.root_node(), text);
+        // The static index skips `#[cfg(test)]` modules, so imports declared
+        // there are only visible by reading this file's own text.
+        let file_uses = parse_use_bindings(text);
         collect_unresolved(
             self,
             path,
             text,
             tree.root_node(),
             &local_bindings,
+            &file_uses,
             &mut errors,
         );
         errors.sort_by_key(|problem| (problem.start_line, problem.start_column));
@@ -1688,7 +1720,9 @@ impl RustEngine {
 
     fn resolve_scoped_path(&self, path: &Path, text: &str, at: usize) -> Option<Vec<Declaration>> {
         let tree = parse_tree(text)?;
-        let scoped = scoped_path_at(tree.root_node(), at)?;
+        let Some(scoped) = scoped_path_at(tree.root_node(), at) else {
+            return self.resolve_macro_path(path, text, at);
+        };
         let scoped_text = scoped.utf8_text(text.as_bytes()).ok()?;
         let relative = at.saturating_sub(scoped.start_byte());
         let mut start = 0;
@@ -1703,9 +1737,142 @@ impl RustEngine {
                     }
                     return Some(self.resolve_nonlocal(path, segment));
                 }
-                return Some(self.resolve_path(path, &target));
+                let declarations = self.resolve_path(path, &target);
+                if !declarations.is_empty() {
+                    return Some(declarations);
+                }
+                return Some(self.resolve_associated_item(path, &target));
             }
             start = end + 2;
+        }
+        None
+    }
+
+    /// tree-sitter leaves the body of `vec![..]`, `json!{..}` and other macro
+    /// calls as a flat token tree, so `Table::create` there has no
+    /// `scoped_identifier` node. Read the path from the text instead.
+    fn resolve_macro_path(&self, path: &Path, text: &str, at: usize) -> Option<Vec<Declaration>> {
+        let bytes = text.as_bytes();
+        let is_word = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+        let mut end = at.min(bytes.len());
+        while end < bytes.len() && is_word(bytes[end]) {
+            end += 1;
+        }
+        let mut start = at.min(end);
+        while start > 0 && is_word(bytes[start - 1]) {
+            start -= 1;
+        }
+        if start == end {
+            return None;
+        }
+        let mut target = vec![text[start..end].to_owned()];
+        while start >= 2 && &bytes[start - 2..start] == b"::" {
+            let segment_end = start - 2;
+            let mut segment_start = segment_end;
+            while segment_start > 0 && is_word(bytes[segment_start - 1]) {
+                segment_start -= 1;
+            }
+            if segment_start == segment_end {
+                break;
+            }
+            target.insert(0, text[segment_start..segment_end].to_owned());
+            start = segment_start;
+        }
+        if target.len() < 2 {
+            return None;
+        }
+        let declarations = self.resolve_path(path, &target);
+        if !declarations.is_empty() {
+            return Some(declarations);
+        }
+        let associated = self.resolve_associated_item(path, &target);
+        (!associated.is_empty()).then_some(associated)
+    }
+
+    /// `Type::item` and `module::Type::item`: resolve the owner type, then
+    /// look for the item in that type's `impl` blocks.
+    fn resolve_associated_item(&self, path: &Path, target: &[String]) -> Vec<Declaration> {
+        let Some((name, owner)) = target.split_last() else {
+            return Vec::new();
+        };
+        let owners = match owner {
+            [] => return Vec::new(),
+            [single] => self.resolve_nonlocal(path, single),
+            _ => self.resolve_path(path, owner),
+        };
+        let mut matches = Vec::new();
+        for declaration in owners {
+            let source = self
+                .open
+                .get(&declaration.path)
+                .map(|(_, _, text)| text.clone())
+                .or_else(|| std::fs::read_to_string(&declaration.path).ok());
+            if let Some(source) = source {
+                matches.extend(member_declarations(
+                    &declaration.path,
+                    &source,
+                    &declaration.name,
+                    name,
+                ));
+            }
+        }
+        matches.sort_by(|left, right| {
+            (&left.path, left.line, left.column).cmp(&(&right.path, right.line, right.column))
+        });
+        matches.dedup_by(|left, right| {
+            left.path == right.path && left.line == right.line && left.column == right.column
+        });
+        matches
+    }
+
+    /// `pub use framework_database as database;` makes `framework::database`
+    /// a path into another crate. Switch to that crate when a module segment
+    /// is such a re-exported dependency.
+    fn follow_crate_reexports(
+        &self,
+        mut crate_name: String,
+        mut module: Vec<String>,
+    ) -> (String, Vec<String>) {
+        'outer: for _ in 0..8 {
+            for depth in 0..module.len() {
+                if let Some(package) =
+                    self.reexported_crate(&crate_name, &module[..depth], &module[depth])
+                {
+                    crate_name = package;
+                    module.drain(..=depth);
+                    continue 'outer;
+                }
+            }
+            break;
+        }
+        (crate_name, module)
+    }
+
+    fn reexported_crate(
+        &self,
+        crate_name: &str,
+        parent: &[String],
+        segment: &str,
+    ) -> Option<String> {
+        for (binding_path, bindings) in &self.uses {
+            if self.crate_for(binding_path) != crate_name {
+                continue;
+            }
+            for binding in bindings.iter().filter(|binding| {
+                binding.public
+                    && !binding.glob
+                    && binding.local == segment
+                    && binding.target.len() == 1
+                    && if binding.module.is_empty() {
+                        self.module_for(binding_path) == parent
+                    } else {
+                        binding.module == parent
+                    }
+            }) {
+                if let Some(dependency) = self.dependency_for(binding_path, &binding.target[0]) {
+                    return Some(dependency.package);
+                }
+            }
         }
         None
     }
@@ -1794,6 +1961,15 @@ impl RustEngine {
         at: usize,
     ) -> Option<Vec<Declaration>> {
         let tree = parse_tree(text)?;
+        if let Some(value) = member_access_at(tree.root_node(), at)
+            .and_then(|member| member.child_by_field_name("value"))
+            && value.kind() == "call_expression"
+        {
+            let mut sources = HashMap::new();
+            let ty = self.expression_type(path, text, value, &mut sources, 0)?;
+            let matches = self.member_matches(&ty, name);
+            return (matches.len() == 1).then_some(matches);
+        }
         let ast_receiver = member_access_at(tree.root_node(), at).and_then(|member| {
             member.child_by_field_name("value").and_then(|receiver| {
                 receiver
@@ -1817,23 +1993,52 @@ impl RustEngine {
             return None;
         }
         let ty = self.receiver_type(path, text, before, receiver)?;
+        let matches = self.member_matches(&ty, name);
+        (matches.len() == 1).then_some(matches)
+    }
+
+    fn member_matches(&self, ty: &str, name: &str) -> Vec<Declaration> {
         let mut paths: Vec<_> = self
             .declarations_named(name)
             .into_iter()
-            .chain(self.declarations_named(&ty))
+            .chain(self.declarations_named(ty))
             .map(|declaration| declaration.path)
             .collect();
         paths.sort();
         paths.dedup();
         let mut matches = Vec::new();
         for candidate in paths {
+            let stamp = match self.open.get(&candidate) {
+                Some((_, _, text)) => Some(text_stamp(text)),
+                None => disk_stamp(&candidate),
+            };
+            let key = (candidate.clone(), ty.to_owned(), name.to_owned());
+            if let Some(stamp) = &stamp
+                && let Some((cached, found)) = self
+                    .member_cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&key)
+                && cached == stamp
+            {
+                matches.extend(found.iter().cloned());
+                continue;
+            }
             let source = self
                 .open
                 .get(&candidate)
                 .map(|(_, _, text)| text.clone())
                 .or_else(|| std::fs::read_to_string(&candidate).ok());
             if let Some(source) = source {
-                matches.extend(member_declarations(&candidate, &source, &ty, name));
+                let found = member_declarations(&candidate, &source, ty, name);
+                if let Some(stamp) = stamp {
+                    let mut cache = self.member_cache.lock().unwrap_or_else(|e| e.into_inner());
+                    if cache.len() >= MEMBER_CACHE_LIMIT {
+                        cache.clear();
+                    }
+                    cache.insert(key, (stamp, found.clone()));
+                }
+                matches.extend(found);
             }
         }
         matches.sort_by(|left, right| {
@@ -1842,7 +2047,64 @@ impl RustEngine {
         matches.dedup_by(|left, right| {
             left.path == right.path && left.line == right.line && left.column == right.column
         });
-        (matches.len() == 1).then_some(matches)
+        matches
+    }
+
+    /// Type of a call chain such as `Type::new().name("x")`, from the written
+    /// return type of each single matching associated function or method.
+    fn expression_type(
+        &self,
+        path: &Path,
+        text: &str,
+        expression: Node<'_>,
+        sources: &mut HashMap<PathBuf, Option<String>>,
+        depth: usize,
+    ) -> Option<String> {
+        if depth > 16 {
+            return None;
+        }
+        if expression.kind() == "identifier" {
+            let name = expression.utf8_text(text.as_bytes()).ok()?;
+            let before = text.get(..expression.start_byte())?;
+            return self.receiver_type(path, text, before, name);
+        }
+        if expression.kind() != "call_expression" {
+            return None;
+        }
+        let function = expression.child_by_field_name("function")?;
+        let (owner, name) = match function.kind() {
+            "scoped_identifier" => {
+                let owner = function
+                    .child_by_field_name("path")?
+                    .utf8_text(text.as_bytes())
+                    .ok()?
+                    .rsplit("::")
+                    .next()?
+                    .to_owned();
+                let name = function
+                    .child_by_field_name("name")?
+                    .utf8_text(text.as_bytes())
+                    .ok()?;
+                (owner, name.to_owned())
+            }
+            "field_expression" => {
+                let receiver = function.child_by_field_name("value")?;
+                let owner = self.expression_type(path, text, receiver, sources, depth + 1)?;
+                let name = function
+                    .child_by_field_name("field")?
+                    .utf8_text(text.as_bytes())
+                    .ok()?;
+                (owner, name.to_owned())
+            }
+            _ => return None,
+        };
+        let declarations = self.member_matches(&owner, &name);
+        let [declaration] = declarations.as_slice() else {
+            return None;
+        };
+        let source = self.declaration_source(sources, path, text, declaration)?;
+        rust_return_type_at(source, declaration.line, declaration.column, Some(&owner))
+            .and_then(|ty| named_type(&ty))
     }
 
     fn receiver_type(
@@ -1860,6 +2122,9 @@ impl RustEngine {
                 .call_result_type(path, text, call, &mut sources)
                 .and_then(|ty| named_type(&ty))
             {
+                return Some(ty);
+            }
+            if let Some(ty) = self.expression_type(path, text, call, &mut sources, 0) {
                 return Some(ty);
             }
         }
@@ -2057,11 +2322,18 @@ impl RustEngine {
         let (crate_name, module) = match target.first().map(String::as_str) {
             Some("crate") => (
                 current_crate,
-                target[1..target.len().saturating_sub(1)].to_vec(),
+                target
+                    .get(1..target.len().saturating_sub(1))
+                    .unwrap_or_default()
+                    .to_vec(),
             ),
             Some("self") => {
                 let mut module = current;
-                module.extend_from_slice(&target[1..target.len().saturating_sub(1)]);
+                module.extend_from_slice(
+                    target
+                        .get(1..target.len().saturating_sub(1))
+                        .unwrap_or_default(),
+                );
                 (current_crate, module)
             }
             Some("super") => {
@@ -2073,7 +2345,11 @@ impl RustEngine {
                 for _ in 0..parents {
                     module.pop();
                 }
-                module.extend_from_slice(&target[parents..target.len().saturating_sub(1)]);
+                module.extend_from_slice(
+                    target
+                        .get(parents..target.len().saturating_sub(1))
+                        .unwrap_or_default(),
+                );
                 (current_crate, module)
             }
             _ if target.len() > 1 => {
@@ -2085,8 +2361,9 @@ impl RustEngine {
                     (current_crate, module)
                 }
             }
-            _ => return Vec::new(),
+            _ => return self.dependency_root(path, &target[0]).into_iter().collect(),
         };
+        let (crate_name, module) = self.follow_crate_reexports(crate_name, module);
         let matches: Vec<_> = self
             .declarations_named(name)
             .into_iter()
@@ -2597,6 +2874,22 @@ fn cargo_packages(root: &Path) -> Vec<CargoPackage> {
         .filter(|dependency| dependency.path.is_none())
         .filter_map(|dependency| cached_package(dependency, &locked))
         .collect();
+    let mut cached = cached;
+    // `pub use sea_query;` makes another crate part of this crate's public
+    // API, so its types are reachable from user code and must be indexed too.
+    let mut next = 0;
+    while next < cached.len() && cached.len() < MAX_REEXPORTED_PACKAGES {
+        let package = cached[next].clone();
+        next += 1;
+        for dependency in reexported_dependencies(&package) {
+            if let Some(found) = cached_package(&dependency, &locked)
+                && !packages.iter().any(|known| known.root == found.root)
+                && !cached.iter().any(|known| known.root == found.root)
+            {
+                cached.push(found);
+            }
+        }
+    }
     for package in cached {
         if !packages.iter().any(|known| known.root == package.root) {
             packages.push(package);
@@ -2604,6 +2897,38 @@ fn cargo_packages(root: &Path) -> Vec<CargoPackage> {
     }
     packages.sort_by(|left, right| left.root.cmp(&right.root));
     packages
+}
+
+const MAX_REEXPORTED_PACKAGES: usize = 64;
+
+/// Registry dependencies that `package` re-exports with a top-level
+/// `pub use dependency...;` in one of its target roots.
+fn reexported_dependencies(package: &CargoPackage) -> Vec<CargoDependency> {
+    let mut names = HashSet::new();
+    for target in &package.targets {
+        let Ok(source) = std::fs::read_to_string(&target.root) else {
+            continue;
+        };
+        for line in source.lines() {
+            let Some(rest) = line.strip_prefix("pub use ") else {
+                continue;
+            };
+            let name: String = rest.chars().take_while(|c| is_ident(*c)).collect();
+            if !name.is_empty() {
+                names.insert(name);
+            }
+        }
+    }
+    package
+        .dependencies
+        .iter()
+        .filter(|dependency| dependency.path.is_none() && !dependency.git)
+        .filter(|dependency| {
+            names.contains(&dependency.package)
+                || names.contains(&dependency.name.replace('-', "_"))
+        })
+        .cloned()
+        .collect()
 }
 
 fn cargo_package(root: &Path) -> Option<CargoPackage> {
@@ -2650,7 +2975,8 @@ fn cargo_dependencies(
 ) -> Vec<CargoDependency> {
     let mut section = "";
     let mut dependencies = Vec::new();
-    for line in contents.lines() {
+    let normalized = inline_dependency_tables(contents);
+    for line in normalized.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
         if line.starts_with('[') && line.ends_with(']') {
             section = line.trim_matches(&['[', ']'][..]);
@@ -2764,6 +3090,63 @@ fn forwarded_dependency_features(
         }
     }
     forwarded
+}
+
+/// Rewrites `[dependencies.name]` tables, as written by `cargo publish`, into
+/// the one-line `name = { ... }` form the dependency parser reads.
+fn inline_dependency_tables(contents: &str) -> String {
+    const SECTIONS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+    fn flush(out: &mut String, table: Option<(&'static str, String, Vec<String>)>) {
+        if let Some((section, name, entries)) = table {
+            out.push_str(&format!(
+                "[{section}]\n{name} = {{ {} }}\n",
+                entries.join(", ")
+            ));
+        }
+    }
+    let mut out = String::new();
+    let mut table: Option<(&'static str, String, Vec<String>)> = None;
+    let mut current = String::new();
+    let mut depth = 0i32;
+    for line in contents.lines() {
+        let code = line.split('#').next().unwrap_or("").trim();
+        if depth == 0 && code.starts_with('[') && code.ends_with(']') {
+            flush(&mut out, table.take());
+            let header = code.trim_matches(&['[', ']'][..]);
+            let named = SECTIONS.into_iter().find_map(|section| {
+                header
+                    .strip_prefix(section)
+                    .and_then(|rest| rest.strip_prefix('.'))
+                    .map(|name| (section, name.trim_matches('"').to_owned()))
+            });
+            if let Some((section, name)) = named {
+                table = Some((section, name, Vec::new()));
+            } else {
+                out.push_str(line);
+                out.push('\n');
+            }
+            continue;
+        }
+        let Some((_, _, entries)) = table.as_mut() else {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        };
+        if code.is_empty() {
+            continue;
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(code);
+        depth += code.matches('[').count() as i32 - code.matches(']').count() as i32;
+        if depth <= 0 {
+            depth = 0;
+            entries.push(std::mem::take(&mut current));
+        }
+    }
+    flush(&mut out, table.take());
+    out
 }
 
 fn dependency_section_active(section: &str) -> bool {
@@ -4284,6 +4667,7 @@ fn collect_unresolved(
     text: &str,
     node: Node<'_>,
     local_bindings: &HashSet<String>,
+    file_uses: &[UseBinding],
     out: &mut Vec<Problem>,
 ) {
     if out.len() >= MAX_PROBLEMS || node.has_error() {
@@ -4301,6 +4685,7 @@ fn collect_unresolved(
         && !is_lifetime_name(node, text)
         && !is_member_name(node, text)
         && !is_closure_binding(node, text)
+        && !file_uses.iter().any(|binding| binding.local == name)
         && !engine
             .use_bindings(path)
             .iter()
@@ -4322,7 +4707,7 @@ fn collect_unresolved(
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_unresolved(engine, path, text, child, local_bindings, out);
+        collect_unresolved(engine, path, text, child, local_bindings, file_uses, out);
     }
 }
 
@@ -4652,9 +5037,20 @@ fn local_call_binding<'tree>(
         if node.start_byte() >= before {
             continue;
         }
+        // A `let` that is still open at `before` is the one being read, as in
+        // `let a = a.next();`, so its value cannot type its own receiver.
+        if node.kind() == "let_declaration" && node.end_byte() > before {
+            let mut cursor = node.walk();
+            stack.extend(node.named_children(&mut cursor));
+            continue;
+        }
         if node.kind() == "let_declaration"
             && let Some(pattern) = node.child_by_field_name("pattern")
-            && pattern.utf8_text(text.as_bytes()).ok() == Some(receiver)
+            && pattern
+                .utf8_text(text.as_bytes())
+                .ok()
+                .map(|written| written.strip_prefix("mut ").unwrap_or(written).trim())
+                == Some(receiver)
             && let Some(value) = node.child_by_field_name("value")
             && value.kind() == "call_expression"
         {
@@ -6252,6 +6648,222 @@ mod tests {
 
         let completions = engine.complete(path, source, 0, 34);
         assert!(completions.iter().any(|item| item.label == "from"));
+    }
+
+    #[test]
+    fn definition_resolves_associated_function_on_scoped_type() {
+        let path = Path::new("/tmp/assoc-fn.rs");
+        let source = "struct Auth;\nimpl Auth { fn from_env() -> Self { Auth } }\nstruct Server;\nimpl Server { fn from_env() -> Self { Server } }\nfn main() { let a = Auth::from_env(); let s = Server::from_env(); }";
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        engine.install(Built::default());
+
+        let line = source.lines().nth(4).unwrap();
+        let auth = line.find("Auth::from_env").unwrap() as u32 + "Auth::".len() as u32 + 2;
+        let server = line.find("Server::from_env").unwrap() as u32 + "Server::".len() as u32 + 2;
+        assert_eq!(engine.definition(path, source, 4, auth)[0].line, 1);
+        assert_eq!(engine.definition(path, source, 4, server)[0].line, 3);
+    }
+
+    #[test]
+    fn definition_follows_reexported_crate_alias_and_builder_chain() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("database");
+        let framework = root.path().join("framework");
+        let app = root.path().join("app");
+        for directory in [&database, &framework, &app] {
+            std::fs::create_dir_all(directory.join("src")).unwrap();
+        }
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"database\", \"framework\", \"app\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            database.join("Cargo.toml"),
+            "[package]\nname = \"framework-database\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            database.join("src/lib.rs"),
+            "pub struct DatabaseConfig;\nimpl DatabaseConfig { pub fn new() -> Self { DatabaseConfig } }\npub fn connect() {}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            framework.join("Cargo.toml"),
+            "[package]\nname = \"framework\"\nversion = \"0.1.0\"\n[dependencies]\nframework-database = { path = \"../database\" }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            framework.join("src/lib.rs"),
+            "pub use framework_database as database;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[dependencies]\nframework = { path = \"../framework\" }\n",
+        )
+        .unwrap();
+        let source = "struct App;\nstruct AppBuilder;\nimpl App { fn new() -> AppBuilder { AppBuilder } }\nimpl AppBuilder { fn name(self, n: &str) -> Self { self } async fn build(self) -> App { App } }\nfn main() {\n    framework::database::connect();\n    framework::database::DatabaseConfig::new();\n    let a = App::new().name(\"x\").build();\n}\n";
+        let path = app.join("src/main.rs");
+        std::fs::write(&path, source).unwrap();
+        let mut engine = RustEngine::pending(root.path());
+        engine.install(RustEngine::build(root.path()));
+        let lib = database.join("src/lib.rs").canonicalize().unwrap();
+        let column = |line: usize, needle: &str| {
+            source.lines().nth(line).unwrap().find(needle).unwrap() as u32 + 1
+        };
+
+        let alias = engine.definition(&path, source, 5, column(5, "database"));
+        assert_eq!(alias.len(), 1);
+        assert_eq!(alias[0].path, lib);
+        let connect = engine.definition(&path, source, 5, column(5, "connect"));
+        assert_eq!(
+            (connect.len(), connect[0].path.clone(), connect[0].line),
+            (1, lib.clone(), 2)
+        );
+        let new = engine.definition(&path, source, 6, column(6, "new"));
+        assert_eq!((new.len(), new[0].path.clone(), new[0].line), (1, lib, 1));
+        let name = engine.definition(&path, source, 7, column(7, "name"));
+        assert_eq!((name.len(), name[0].line), (1, 3));
+        let build = engine.definition(&path, source, 7, column(7, "build"));
+        assert_eq!((build.len(), build[0].line), (1, 3));
+    }
+
+    #[test]
+    fn indexed_diagnostics_accept_imports_inside_cfg_test_module() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        let path = root.path().join("src/lib.rs");
+        let text = "pub fn connect() {}\n#[cfg(test)]\nmod tests {\n    use super::connect as open;\n    use std::mem::swap;\n    fn run() { open(); let (mut a, mut b) = (1, 2); swap(&mut a, &mut b); }\n}\n";
+        std::fs::write(&path, text).unwrap();
+        let snapshot = RustEngine::from_built(RustEngine::build(root.path()));
+        assert!(snapshot.diagnostics_indexed(&path, text).is_empty());
+    }
+
+    #[test]
+    fn definition_follows_method_chain_on_mut_let_binding() {
+        let path = Path::new("/tmp/chain.rs");
+        let source = "struct Column;\nimpl Column {\n    fn not_null(&mut self) -> &mut Self { self }\n    fn unique_key(&mut self) -> &mut Self { self }\n}\nstruct Schema;\nimpl Schema {\n    fn string(&self) -> Column { Column }\n}\nfn main() {\n    let schema = Schema;\n    let mut email = schema.string();\n    email.not_null().unique_key();\n}\nstruct Other;\nimpl Other {\n    fn not_null(&self) {}\n    fn unique_key(&self) {}\n}\n";
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        engine.install(Built::default());
+
+        let line = source.lines().nth(12).unwrap();
+        let not_null = line.find("not_null").unwrap() as u32 + 1;
+        let unique_key = line.find("unique_key").unwrap() as u32 + 1;
+        assert_eq!(engine.definition(path, source, 12, not_null)[0].line, 2);
+        assert_eq!(engine.definition(path, source, 12, unique_key)[0].line, 3);
+    }
+
+    #[test]
+    fn dependency_tables_in_published_manifests_are_read() {
+        let manifest = "[package]\nname = \"x\"\n[dependencies.sea-query]\nversion = \"0.32.5\"\nfeatures = [\n    \"a\",\n    \"b\",\n]\n[dependencies]\nserde = \"1\"\n";
+        let dependencies = cargo_dependencies(
+            Path::new("/tmp"),
+            manifest,
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        let mut names: Vec<_> = dependencies.iter().map(|d| d.package.as_str()).collect();
+        names.sort();
+        assert_eq!(names, ["sea_query", "serde"]);
+        let sea_query = dependencies
+            .iter()
+            .find(|d| d.package == "sea_query")
+            .unwrap();
+        assert!(sea_query.features.contains("a") && sea_query.features.contains("b"));
+    }
+
+    #[test]
+    fn reexported_dependencies_are_limited_to_pub_use_crates() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(
+            root.path().join("src/lib.rs"),
+            "pub use sea_query;\nuse serde as _;\n",
+        )
+        .unwrap();
+        let dependency = |name: &str| CargoDependency {
+            name: name.into(),
+            package: name.into(),
+            path: None,
+            git: false,
+            optional: false,
+            default_features: true,
+            features: HashSet::new(),
+        };
+        let package = CargoPackage {
+            name: "host".into(),
+            root: root.path().to_path_buf(),
+            targets: vec![CargoTarget {
+                name: "host".into(),
+                source_root: root.path().join("src"),
+                root: root.path().join("src/lib.rs"),
+            }],
+            dependencies: vec![dependency("sea_query"), dependency("serde")],
+            selected_features: HashSet::new(),
+            indexed: true,
+        };
+        let found = reexported_dependencies(&package);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].package, "sea_query");
+    }
+
+    #[test]
+    fn definition_resolves_associated_function_inside_macro_arguments() {
+        let path = Path::new("/tmp/macro-path.rs");
+        let source = "struct Table;\nimpl Table { fn create() -> Table { Table } }\nfn main() {\n    let rows = vec![Table::create()];\n}\n";
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        engine.install(Built::default());
+
+        let line = source.lines().nth(3).unwrap();
+        let create = line.find("create").unwrap() as u32 + 1;
+        let table = line.find("Table").unwrap() as u32 + 1;
+        assert_eq!(engine.definition(path, source, 3, create)[0].line, 1);
+        assert_eq!(engine.definition(path, source, 3, table)[0].line, 0);
+    }
+
+    #[test]
+    fn member_matches_reuses_parsed_members_until_the_buffer_changes() {
+        let path = Path::new("/tmp/member-cache.rs");
+        let source = "struct Table;\nimpl Table { fn create() -> Table { Table } }\n";
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        engine.install(Built::default());
+        engine.sync_document(path, source);
+
+        let first = engine.member_matches("Table", "create");
+        assert_eq!(first.len(), 1);
+        assert_eq!(engine.member_cache.lock().unwrap().len(), 1);
+        let again = engine.member_matches("Table", "create");
+        assert_eq!(
+            (again[0].line, again[0].column),
+            (first[0].line, first[0].column)
+        );
+
+        engine.sync_document(path, &format!("\n{source}"));
+        let moved = engine.member_matches("Table", "create");
+        assert_eq!(moved[0].line, first[0].line + 1);
+    }
+
+    #[test]
+    fn resolve_path_ignores_bare_path_keywords() {
+        let path = Path::new("/tmp/bare-keyword.rs");
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        engine.install(Built::default());
+
+        for target in [
+            vec!["crate"],
+            vec!["self"],
+            vec!["super"],
+            vec!["super", "super"],
+        ] {
+            let target: Vec<String> = target.into_iter().map(String::from).collect();
+            assert!(engine.resolve_path(path, &target).is_empty());
+        }
     }
 
     #[test]

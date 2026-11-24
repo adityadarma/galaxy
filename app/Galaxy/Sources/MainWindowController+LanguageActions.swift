@@ -21,15 +21,15 @@ extension MainWindowController {
             return true
         }
         definitionRequest = (document, position, Date().addingTimeInterval(10))
-        bridge.requestDefinition(document: document, line: position.line, character: position.colUtf16)
+        bridge.requestDefinitionInBackground(document: document, line: position.line, character: position.colUtf16)
         return true
     }
 
     func refreshDefinition() {
-        guard let request = definitionRequest else { return }
+        guard let request = definitionRequest, !bridge.isDefinitionPending else { return }
         let locations = bridge.definitionLocations(document: request.document)
         guard !locations.isEmpty || Date() >= request.deadline else {
-            bridge.requestDefinition(
+            bridge.requestDefinitionInBackground(
                 document: request.document,
                 line: request.position.line,
                 character: request.position.colUtf16
