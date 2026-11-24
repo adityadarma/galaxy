@@ -26,11 +26,33 @@ struct GalaxySettings: Equatable {
     /// Run the language's formatter before an explicit save (`editor.formatOnSave`).
     var formatOnSave: Bool? = nil
 
-    /// VSCode's defaults, plus the Flutter folders.
-    static let defaultFilesExclude: [String] = [
-        "**/.git", "**/.svn", "**/.hg", "**/.jj", "**/.DS_Store", "**/Thumbs.db",
+    /// Always hidden unless a file writes `false`; the Settings window cannot remove these.
+    static let defaultFilesExclude: [String] = ["**/.git", "**/.svn", "**/.DS_Store"]
+
+    /// Globs that used to be built in. They are written to the global
+    /// settings.json once, so they stay hidden but can be removed there.
+    static let starterFilesExclude: [String] = [
+        "**/.hg", "**/.jj", "**/Thumbs.db",
         "**/flutter/ephemeral", "**/Flutter/ephemeral", "**/.symlinks", "**/.plugin_symlinks",
     ]
+    static let starterFilesExcludeSeededKey = "FilesExcludeStarterSeeded"
+
+    /// Writes each `starterFilesExclude` glob the file does not mention yet,
+    /// once per user. An unreadable file is left alone and retried next launch.
+    static func seedStarterFilesExclude(to url: URL = globalURL, defaults: UserDefaults = .standard) {
+        guard !defaults.bool(forKey: starterFilesExcludeSeededKey) else { return }
+        do {
+            let data = (try? Data(contentsOf: url)) ?? Data()
+            let written = data.isEmpty ? [:] : try load(from: url).filesExclude ?? [:]
+            let missing = starterFilesExclude.filter { written[$0] == nil }
+            if !missing.isEmpty {
+                try updateFilesExclude(at: url) { current in missing.forEach { current[$0] = true } }
+            }
+            defaults.set(true, forKey: starterFilesExcludeSeededKey)
+        } catch {
+            Log.app.error("could not seed files.exclude: \(error.localizedDescription, privacy: .public)")
+        }
+    }
 
     static let empty = GalaxySettings(insertSpaces: nil, tabSize: nil, autoSave: nil, autoSaveDelay: nil)
 
@@ -197,6 +219,16 @@ extension GalaxySettings {
     /// Turns one `files.exclude` glob on or off in the file at `url`. The
     /// other entries stay as written, including ones this app does not read.
     static func writeFilesExclude(glob: String, enabled: Bool, to url: URL = globalURL) throws {
+        try updateFilesExclude(at: url) { $0[glob] = enabled }
+    }
+
+    /// Deletes `globs` from `files.exclude` in one write. A default glob is
+    /// hidden again, since the defaults apply to every glob the file omits.
+    static func removeFilesExclude(globs: [String], from url: URL = globalURL) throws {
+        try updateFilesExclude(at: url) { current in globs.forEach { current.removeValue(forKey: $0) } }
+    }
+
+    private static func updateFilesExclude(at url: URL, _ change: (inout [String: Any]) -> Void) throws {
         var current: [String: Any] = [:]
         if let data = try? Data(contentsOf: url), !data.isEmpty {
             guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
@@ -204,7 +236,7 @@ extension GalaxySettings {
             }
             current = (root["files"] as? [String: Any])?["exclude"] as? [String: Any] ?? [:]
         }
-        current[glob] = enabled
+        change(&current)
         try write(current, key: "exclude", section: "files", to: url)
     }
 }

@@ -533,9 +533,15 @@ final class CommitSplitButton: NSView {
     var isEnabled: Bool = true {
         didSet {
             mainButton.isEnabled = isEnabled
-            dropdownButton.isEnabled = isEnabled
+            dropdownButton.isEnabled = isEnabled || isDropdownEnabled
             alphaValue = isEnabled ? 1.0 : 0.6
         }
+    }
+
+    /// Keeps the dropdown usable while the main button is off, so actions
+    /// that need nothing staged (Commit Amend) stay reachable.
+    var isDropdownEnabled = false {
+        didSet { dropdownButton.isEnabled = isEnabled || isDropdownEnabled }
     }
 }
 
@@ -589,6 +595,8 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
     var onOpenDiff: ((String, Bool) -> Void)?
     var onRefresh: (() -> Void)?
     var onMessage: ((String) -> Void)?
+    /// Called whenever `canCommit` may have changed.
+    var onCanCommitChange: ((Bool) -> Void)?
 
     override init() {
         super.init()
@@ -749,14 +757,19 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         rebuildRows()
     }
 
+    /// Commit needs something staged; unstaged edits alone do not count.
+    var canCommit: Bool { !isPerformingGitOperation && !stagedChanges.isEmpty }
+
     private func updateCommitButtonState() {
-        let hasChanges = !stagedChanges.isEmpty || !unstagedChanges.isEmpty
         let hasMessage = !messageContainer.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         // Like VS Code: an unpublished branch with nothing staged and no
         // message offers "Publish Branch" in place of "Commit".
         let publish = isBranchUnpublished && stagedChanges.isEmpty && !hasMessage
         splitCommitButton.mode = publish ? .publish : .commit
-        splitCommitButton.isEnabled = !isPerformingGitOperation && (publish || hasChanges)
+        splitCommitButton.isEnabled = publish ? !isPerformingGitOperation : canCommit
+        splitCommitButton.isDropdownEnabled = !publish && !isPerformingGitOperation
+        splitCommitButton.mainButton.toolTip = !publish && stagedChanges.isEmpty ? "Stage changes to commit" : nil
+        onCanCommitChange?(canCommit)
     }
 
     /// Checks off the main thread whether the branch lacks an upstream.
@@ -1048,7 +1061,10 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
     }
 
     @objc func commit(_ sender: Any?) {
-        guard workspace != nil else { return }
+        guard workspace != nil, canCommit else {
+            if workspace != nil, !isPerformingGitOperation { onMessage?("No staged changes to commit") }
+            return
+        }
         if messageContainer.generateButton.isGenerating {
             cancelCommitMessageGeneration(restoreDraft: true)
         }
@@ -1064,10 +1080,8 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
         }
         let message = msg
 
-        let stageEverything = stagedChanges.isEmpty
         performGitOperation("Committing…", success: "Commit created", submittedMessage: messageContainer.text) { workspace in
             do {
-                if stageEverything { try workspace.gitStageAll() }
                 try workspace.gitCommit(message: message)
                 return GitOperationResult(didCommit: true)
             } catch {
@@ -1115,10 +1129,12 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
     }
 
     private func commitThenNetwork(sync: Bool) {
-        guard let root = workspace?.root() else { return }
+        guard let root = workspace?.root(), canCommit else {
+            if workspace != nil, !isPerformingGitOperation { onMessage?("No staged changes to commit") }
+            return
+        }
         let message = messageContainer.text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !message.isEmpty else { generateCommitMessage(); return }
-        let stageEverything = stagedChanges.isEmpty
         let submitted = messageContainer.text
         performGitOperation(
             sync ? "Committing & syncing…" : "Committing & pushing…",
@@ -1126,7 +1142,6 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
             submittedMessage: submitted
         ) { [weak self] workspace in
             do {
-                if stageEverything { try workspace.gitStageAll() }
                 try workspace.gitCommit(message: message)
             } catch {
                 return GitOperationResult(failure: Self.describe(error))
@@ -1244,6 +1259,10 @@ final class SourceControlController: NSObject, NSTableViewDataSource, NSTableVie
 
         let syncItem = menu.addItem(withTitle: "Commit & Sync", action: #selector(menuCommitAndSync(_:)), keyEquivalent: "")
         syncItem.target = self
+
+        // Amend can reword the last commit with nothing staged; the others cannot.
+        menu.autoenablesItems = false
+        for item in [commitItem, pushItem, syncItem] { item.isEnabled = canCommit }
 
         menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.maxY + 4), in: button)
     }

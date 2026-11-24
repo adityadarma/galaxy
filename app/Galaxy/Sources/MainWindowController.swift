@@ -585,6 +585,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             self.openWorkspaceDiff(workspace, relPath: relPath, staged: staged)
         }
         sourceControl.onRefresh = { [weak self] in self?.refreshGitStatus() }
+        sourceControl.onCanCommitChange = { [weak self] can in self?.sectionHeader.scmCommitButton.isEnabled = can }
         sourceControl.onMessage = { [weak self] message in self?.statusLabel.stringValue = message }
         searchSidebar.onSearch = { [weak self] query, options in self?.searchSidebarWorkspace(query, options: options) }
         searchSidebar.onOpen = { [weak self] match in self?.openSearchSidebarMatch(match) }

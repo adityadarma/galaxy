@@ -75,7 +75,8 @@ final class SettingsTests: XCTestCase {
         XCTAssertFalse(globs.contains("**/.git"), "the workspace shows .git again")
         XCTAssertTrue(globs.contains("**/dist"))
         XCTAssertTrue(globs.contains("**/node_modules"), "global entries still apply")
-        XCTAssertTrue(globs.contains("**/.hg"))
+        XCTAssertTrue(globs.contains("**/.DS_Store"))
+        XCTAssertFalse(globs.contains("**/.hg"), "former defaults only apply once written to a file")
     }
 
     func testTagEditingSettingsDefaultToOnAndWorkspaceCanTurnThemOff() throws {
@@ -319,19 +320,99 @@ final class SettingsTests: XCTestCase {
         try #"{"files":{"exclude":{"**/*.log":true,"**/.git":true}}}"#.write(to: url, atomically: true, encoding: .utf8)
         var changes = 0
         let controller = PreferencesWindowController(settingsURL: url) { changes += 1 }
-        let boxes = try XCTUnwrap(Mirror(reflecting: controller).children.first { $0.label == "excludeBoxes" }?.value as? [NSButton])
-        XCTAssertEqual(boxes.map(\.title), GalaxySettings.defaultFilesExclude, "every default is listed")
-        XCTAssertTrue(boxes.allSatisfy { $0.state == .on }, "defaults are on without being written to the file")
+        func entries() throws -> [PreferencesWindowController.ExcludeEntry] {
+            try XCTUnwrap(Mirror(reflecting: controller).children.first { $0.label == "excludeEntries" }?.value
+                as? [PreferencesWindowController.ExcludeEntry])
+        }
+        XCTAssertEqual(try entries().map(\.glob), ["**/*.log"] + GalaxySettings.defaultFilesExclude,
+                       "the user's own globs come first, then every default")
+        XCTAssertTrue(try entries().allSatisfy(\.hidden), "defaults are on without being written to the file")
 
-        let git = try XCTUnwrap(boxes.first { $0.title == "**/.git" })
-        git.state = .off
-        _ = git.target?.perform(git.action, with: git)
+        let toggle = NSButton(checkboxWithTitle: "", target: nil, action: nil)
+        toggle.tag = try XCTUnwrap(entries().firstIndex { $0.glob == "**/.git" })
+        toggle.state = .off
+        controller.perform(NSSelectorFromString("toggleFilesExclude:"), with: toggle)
         let settings = try GalaxySettings.load(from: url)
         XCTAssertEqual(settings.filesExclude?["**/.git"], false)
         XCTAssertEqual(settings.filesExclude?["**/*.log"], true, "the user's own entry survives")
         XCTAssertFalse(settings.effectiveFilesExclude.contains("**/.git"))
         XCTAssertTrue(settings.effectiveFilesExclude.contains("**/.DS_Store"))
         XCTAssertGreaterThan(changes, 0, "open windows are told")
+    }
+
+    func testSettingsWindowAddsAndRemovesExcludes() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-prefs-\(UUID().uuidString).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try #"{"files":{"exclude":{"**/.git":false}}}"#.write(to: url, atomically: true, encoding: .utf8)
+        let controller = PreferencesWindowController(settingsURL: url) {}
+        func child<T>(_ name: String) throws -> T {
+            try XCTUnwrap(Mirror(reflecting: controller).children.first { $0.label == name }?.value as? T, name)
+        }
+        let field: NSTextField = try child("excludeField")
+        let table: NSTableView = try child("excludeTable")
+        let remove: NSButton = try child("excludeRemoveButton")
+
+        field.stringValue = "  **/node_modules "
+        controller.perform(NSSelectorFromString("addFilesExclude:"), with: nil)
+        var settings = try GalaxySettings.load(from: url)
+        XCTAssertEqual(settings.filesExclude?["**/node_modules"], true, "the pattern is trimmed and hidden")
+        XCTAssertEqual(field.stringValue, "", "the field clears after adding")
+        let entries: [PreferencesWindowController.ExcludeEntry] = try child("excludeEntries")
+        XCTAssertEqual(entries.first, .init(glob: "**/node_modules", hidden: true, isDefault: false))
+        XCTAssertEqual(table.selectedRow, 0, "the new pattern is selected")
+        XCTAssertTrue(remove.isEnabled)
+
+        // Removing a built-in glob is not offered; only custom ones go.
+        let gitRow = try XCTUnwrap(entries.firstIndex { $0.glob == "**/.git" })
+        table.selectRowIndexes(IndexSet(integer: gitRow), byExtendingSelection: false)
+        XCTAssertFalse(remove.isEnabled)
+
+        table.selectRowIndexes(IndexSet([0, gitRow]), byExtendingSelection: false)
+        controller.perform(NSSelectorFromString("removeFilesExclude:"), with: nil)
+        settings = try GalaxySettings.load(from: url)
+        XCTAssertNil(settings.filesExclude?["**/node_modules"])
+        XCTAssertEqual(settings.filesExclude?["**/.git"], false, "the built-in toggle is kept")
+        let after: [PreferencesWindowController.ExcludeEntry] = try child("excludeEntries")
+        XCTAssertEqual(after.map(\.glob), GalaxySettings.defaultFilesExclude)
+    }
+
+    func testStarterExcludesAreWrittenOnceAndCanBeRemoved() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-seed-\(UUID().uuidString).json")
+        let suite = "galaxy-seed-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer {
+            try? FileManager.default.removeItem(at: url)
+            defaults.removePersistentDomain(forName: suite)
+        }
+        XCTAssertEqual(GalaxySettings.defaultFilesExclude, ["**/.git", "**/.svn", "**/.DS_Store"])
+        try #"{"files":{"exclude":{"**/.hg":false}},"tabSize":2}"#.write(to: url, atomically: true, encoding: .utf8)
+
+        GalaxySettings.seedStarterFilesExclude(to: url, defaults: defaults)
+        var settings = try GalaxySettings.load(from: url)
+        XCTAssertEqual(settings.filesExclude?["**/.hg"], false, "an existing entry is not overwritten")
+        XCTAssertEqual(settings.filesExclude?["**/Thumbs.db"], true)
+        XCTAssertEqual(settings.filesExclude?["**/flutter/ephemeral"], true)
+        XCTAssertEqual(settings.tabSize, 2, "other keys survive")
+
+        try GalaxySettings.removeFilesExclude(globs: ["**/Thumbs.db"], from: url)
+        GalaxySettings.seedStarterFilesExclude(to: url, defaults: defaults)
+        settings = try GalaxySettings.load(from: url)
+        XCTAssertNil(settings.filesExclude?["**/Thumbs.db"], "a removed starter glob is not written back")
+        XCTAssertFalse(settings.effectiveFilesExclude.contains("**/Thumbs.db"))
+    }
+
+    func testStarterExcludesSeedAMissingFile() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("galaxy-seed-\(UUID().uuidString).json")
+        let suite = "galaxy-seed-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer {
+            try? FileManager.default.removeItem(at: url)
+            defaults.removePersistentDomain(forName: suite)
+        }
+        GalaxySettings.seedStarterFilesExclude(to: url, defaults: defaults)
+        let written = try GalaxySettings.load(from: url).filesExclude ?? [:]
+        XCTAssertEqual(Set(written.keys), Set(GalaxySettings.starterFilesExclude))
+        XCTAssertTrue(defaults.bool(forKey: GalaxySettings.starterFilesExcludeSeededKey))
     }
 
     func testFormatOnSaveIsOffByDefaultAndTheSettingsWindowWritesIt() throws {

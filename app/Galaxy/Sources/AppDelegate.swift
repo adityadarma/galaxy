@@ -29,6 +29,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuItemValidation, 
         StartupProbe.mark("did_finish_launching")
         Log.app.info("launch started")
         bridge.start()
+        if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] == nil {
+            GalaxySettings.seedStarterFilesExclude()
+        }
         applyAppearancePreference()
         StartupProbe.mark("core_started")
 

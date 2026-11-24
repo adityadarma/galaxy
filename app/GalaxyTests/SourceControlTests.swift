@@ -46,12 +46,13 @@ final class SourceControlTests: XCTestCase {
         try "#!/bin/sh\nsleep 2\n".write(to: hook, atomically: true, encoding: .utf8)
         try files.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hook.path)
         try "two\n".write(to: repo.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+        try git(repo, "add", "a.txt")
 
         let sc = SourceControlController()
         _ = sc.view
         sc.workspace = try CoreBridge().core.openWorkspace(path: repo.path)
         sc.refresh(status: GitStatusInfo(branch: "main", changedPaths: ["a.txt"],
-                                         changes: [GitChangeInfo(path: "a.txt", staged: false, code: " M")]))
+                                         changes: [GitChangeInfo(path: "a.txt", staged: true, code: "M ")]))
         let box = try XCTUnwrap(Mirror(reflecting: sc).children.first { $0.label == "messageContainer" }?.value
             as? CommitMessageInputContainer)
         box.text = "Second"
@@ -65,6 +66,31 @@ final class SourceControlTests: XCTestCase {
         XCTAssertTrue(sc.isPerformingGitOperation, "cleared while the push is still running")
         while message == nil, Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.02)) }
         XCTAssertEqual(message, "Commit and push complete")
+    }
+
+    func testCommitNeedsStagedChanges() {
+        let sc = SourceControlController()
+        _ = sc.view
+        var reported: [Bool] = []
+        sc.onCanCommitChange = { reported.append($0) }
+
+        sc.refresh(status: GitStatusInfo(branch: "main", changedPaths: ["a.txt"],
+                                         changes: [GitChangeInfo(path: "a.txt", staged: false, code: " M")]))
+        XCTAssertFalse(sc.canCommit, "unstaged edits alone cannot be committed")
+        XCTAssertFalse(sc.splitCommitButton.mainButton.isEnabled)
+        XCTAssertTrue(sc.splitCommitButton.dropdownButton.isEnabled, "Commit (Amend) stays reachable")
+        XCTAssertEqual(sc.splitCommitButton.mainButton.toolTip, "Stage changes to commit")
+        XCTAssertEqual(reported.last, false)
+
+        sc.refresh(status: GitStatusInfo(branch: "main", changedPaths: ["a.txt"],
+                                         changes: [GitChangeInfo(path: "a.txt", staged: true, code: "M ")]))
+        XCTAssertTrue(sc.canCommit)
+        XCTAssertTrue(sc.splitCommitButton.mainButton.isEnabled)
+        XCTAssertNil(sc.splitCommitButton.mainButton.toolTip)
+        XCTAssertEqual(reported.last, true)
+
+        sc.refresh(status: nil)
+        XCTAssertFalse(sc.splitCommitButton.mainButton.isEnabled)
     }
 
     func testSourceControlInitialState() {

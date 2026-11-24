@@ -71,13 +71,22 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
     private let autoSaveDelay = NSStepper(frame: .zero)
     private let autoSaveDelayLabel = NSTextField(labelWithString: "")
     private let settingsStatus = NSTextField(wrappingLabelWithString: "")
-    /// One checkbox per default `files.exclude` glob, in `defaultFilesExclude` order.
-    private let excludeBoxes: [NSButton] = GalaxySettings.defaultFilesExclude.map {
-        NSButton(checkboxWithTitle: $0, target: nil, action: nil)
+    /// One `files.exclude` row in the Explorer tab: a built-in glob or one
+    /// written in settings.json.
+    struct ExcludeEntry: Equatable {
+        let glob: String
+        let hidden: Bool
+        let isDefault: Bool
     }
+    /// The user's own globs first, then the built-in ones in `defaultFilesExclude` order.
+    private var excludeEntries: [ExcludeEntry] = []
+    private let excludeTable = NSTableView()
+    private let excludeField = NSTextField()
+    private let excludeAddButton = NSButton(title: "Add", target: nil, action: nil)
+    private let excludeRemoveButton = NSButton(title: "Remove", target: nil, action: nil)
     private var editorControls: [NSControl] {
         [tabSizePopup, insertSpacesBox, whitespacePopup, parameterHintsBox, autoClosingTagsBox, linkedEditingBox,
-          formatOnSaveBox, autoSavePopup, autoSaveDelay, gitBlameBox] + excludeBoxes
+          formatOnSaveBox, autoSavePopup, autoSaveDelay, gitBlameBox, excludeTable, excludeField]
     }
 
     // View tab: the same switches as the View menu.
@@ -137,47 +146,46 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
 
     private func buildEditorPane() -> NSView {
         let stack = NSStackView()
-        stack.addArrangedSubview(section("Indentation"))
         tabSizePopup.addItems(withTitles: Self.tabSizes.map(String.init))
         tabSizePopup.setAccessibilityLabel("Tab size")
         tabSizePopup.target = self; tabSizePopup.action = #selector(saveTabSize(_:))
-        stack.addArrangedSubview(row("Tab size", tabSizePopup))
         insertSpacesBox.target = self; insertSpacesBox.action = #selector(saveInsertSpaces(_:))
-        stack.addArrangedSubview(row("", insertSpacesBox))
+        addGroup("Indentation", to: stack, rows: [
+            row("Tab size", tabSizePopup),
+            row("", insertSpacesBox),
+        ])
 
-        stack.addArrangedSubview(section("Rendering"))
         whitespacePopup.addItems(withTitles: Self.whitespaceModes.map(\.title))
         whitespacePopup.setAccessibilityLabel("Render whitespace")
         whitespacePopup.target = self; whitespacePopup.action = #selector(saveWhitespace(_:))
-        stack.addArrangedSubview(row("Whitespace", whitespacePopup))
         parameterHintsBox.target = self; parameterHintsBox.action = #selector(saveParameterHints(_:))
-        stack.addArrangedSubview(row("", parameterHintsBox))
+        addGroup("Rendering", to: stack, rows: [
+            row("Whitespace", whitespacePopup),
+            parameterHintsBox,
+        ])
 
-        stack.addArrangedSubview(section("Tags"))
         autoClosingTagsBox.target = self; autoClosingTagsBox.action = #selector(saveAutoClosingTags(_:))
         linkedEditingBox.target = self; linkedEditingBox.action = #selector(saveLinkedEditing(_:))
-        stack.addArrangedSubview(row("", autoClosingTagsBox))
-        stack.addArrangedSubview(row("", linkedEditingBox))
+        addGroup("Tags", to: stack, rows: [autoClosingTagsBox, linkedEditingBox])
 
-        stack.addArrangedSubview(section("Files"))
         formatOnSaveBox.target = self; formatOnSaveBox.action = #selector(saveFormatOnSave(_:))
-        formatOnSaveBox.toolTip = "Uses the project's or PATH's rustfmt, gofmt, dart format, prettier, pint or php-cs-fixer."
-        stack.addArrangedSubview(row("", formatOnSaveBox))
         autoSavePopup.addItems(withTitles: Self.autoSaveModes.map(\.title))
         autoSavePopup.setAccessibilityLabel("Auto save")
         autoSavePopup.target = self; autoSavePopup.action = #selector(saveAutoSave(_:))
-        stack.addArrangedSubview(row("Auto save", autoSavePopup))
         autoSaveDelay.minValue = 250; autoSaveDelay.maxValue = 10_000; autoSaveDelay.increment = 250
         autoSaveDelay.setAccessibilityLabel("Auto save delay")
         autoSaveDelay.target = self; autoSaveDelay.action = #selector(saveAutoSaveDelay(_:))
-        let delayControls = NSStackView(views: [autoSaveDelay, autoSaveDelayLabel])
-        delayControls.spacing = 8
-        stack.addArrangedSubview(row("Delay", delayControls))
+        addGroup("Files", to: stack, rows: [
+            row("Auto save", autoSavePopup),
+            row("Delay", valueControl(autoSaveDelay, autoSaveDelayLabel)),
+            row("", formatOnSaveBox),
+            footnote("Format on save uses the project's or PATH's rustfmt, gofmt, dart format, prettier, pint or php-cs-fixer."),
+        ])
 
         settingsStatus.font = .systemFont(ofSize: 11)
         settingsStatus.textColor = .secondaryLabelColor
-        settingsStatus.preferredMaxLayoutWidth = 370
-        settingsStatus.widthAnchor.constraint(equalToConstant: 370).isActive = true
+        settingsStatus.preferredMaxLayoutWidth = Self.groupWidth
+        settingsStatus.widthAnchor.constraint(equalToConstant: Self.groupWidth).isActive = true
         settingsStatus.stringValue = "Saved to settings.json. A folder's .galaxy/settings.json overrides these."
         stack.addArrangedSubview(settingsStatus)
         return pane(stack)
@@ -185,51 +193,79 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
 
     private func buildExplorerPane() -> NSView {
         let stack = NSStackView()
-        stack.addArrangedSubview(section("Appearance"))
         folderIconsBox.target = self; folderIconsBox.action = #selector(saveFolderIcons(_:))
-        stack.addArrangedSubview(folderIconsBox)
-        stack.addArrangedSubview(section("Hidden in the Explorer (files.exclude)"))
-        for box in excludeBoxes {
-            box.target = self; box.action = #selector(saveFilesExclude(_:))
-            box.setAccessibilityLabel("Hide \(box.title)")
-            stack.addArrangedSubview(box)
+        addGroup("Appearance", to: stack, rows: [folderIconsBox])
+
+        for (id, width) in [("hide", 22.0), ("glob", 250.0), ("kind", 60.0)] {
+            let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(id))
+            column.width = width
+            column.resizingMask = id == "glob" ? .autoresizingMask : []
+            excludeTable.addTableColumn(column)
         }
-        let hint = NSTextField(wrappingLabelWithString: "Uncheck a pattern to show it again. Add other patterns under files.exclude in settings.json, for example {\"**/*.log\": true}.")
-        hint.font = .systemFont(ofSize: 11)
-        hint.textColor = .secondaryLabelColor
-        hint.preferredMaxLayoutWidth = 370
-        hint.widthAnchor.constraint(equalToConstant: 370).isActive = true
-        stack.addArrangedSubview(hint)
+        excludeTable.headerView = nil
+        excludeTable.style = .plain
+        excludeTable.rowHeight = 22
+        excludeTable.usesAlternatingRowBackgroundColors = true
+        excludeTable.allowsMultipleSelection = true
+        excludeTable.columnAutoresizingStyle = .uniformColumnAutoresizingStyle
+        excludeTable.setAccessibilityLabel("Hidden file patterns")
+        excludeTable.dataSource = self
+        excludeTable.delegate = self
+        let scroll = NSScrollView()
+        scroll.documentView = excludeTable
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.widthAnchor.constraint(equalToConstant: 370).isActive = true
+        scroll.heightAnchor.constraint(equalToConstant: 200).isActive = true
+
+        excludeField.placeholderString = "**/*.log"
+        excludeField.font = .monospacedSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+        excludeField.setAccessibilityLabel("Pattern to hide")
+        excludeField.delegate = self
+        // Return adds the pattern; leaving the field does not.
+        excludeField.cell?.sendsActionOnEndEditing = false
+        excludeField.target = self; excludeField.action = #selector(addFilesExclude(_:))
+        excludeField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        excludeAddButton.target = self; excludeAddButton.action = #selector(addFilesExclude(_:))
+        excludeRemoveButton.target = self; excludeRemoveButton.action = #selector(removeFilesExclude(_:))
+        excludeRemoveButton.toolTip = "Remove the selected patterns. Built-in patterns can only be unchecked."
+        let editRow = NSStackView(views: [excludeField, excludeAddButton, excludeRemoveButton])
+        editRow.spacing = 8
+        editRow.translatesAutoresizingMaskIntoConstraints = false
+        editRow.widthAnchor.constraint(equalToConstant: 370).isActive = true
+
+        addGroup("Hidden Files", to: stack, rows: [
+            scroll,
+            editRow,
+            footnote("Checked patterns are hidden in the Explorer (files.exclude). Built-in patterns can be unchecked but not removed."),
+        ])
         return pane(stack)
     }
 
     private func buildViewPane() -> NSView {
         let stack = NSStackView()
-        stack.addArrangedSubview(section("Editor"))
-        for box in [minimapBox, wordWrapBox, breadcrumbsBox, stickyScrollBox] {
+        let editorBoxes = [minimapBox, wordWrapBox, breadcrumbsBox, stickyScrollBox]
+        for box in editorBoxes {
             box.target = self; box.action = #selector(saveViewToggle(_:))
-            stack.addArrangedSubview(row("", box))
         }
-        stack.addArrangedSubview(section("Git"))
+        addGroup("Editor", to: stack, rows: editorBoxes + [
+            footnote("The View menu toggles the same switches."),
+        ])
         gitBlameBox.target = self; gitBlameBox.action = #selector(saveGitBlame(_:))
-        stack.addArrangedSubview(row("", gitBlameBox))
-        let hint = NSTextField(wrappingLabelWithString: "The View menu toggles the same switches.")
-        hint.font = .systemFont(ofSize: 11)
-        hint.textColor = .secondaryLabelColor
-        stack.addArrangedSubview(hint)
+        addGroup("Git", to: stack, rows: [gitBlameBox])
         return pane(stack)
     }
 
     private func buildTerminalPane() -> NSView {
         let stack = NSStackView()
-        stack.addArrangedSubview(section("Font"))
         let installedFonts = Self.installedFontFamilies()
         terminalFont.addItems(withTitles: [Self.terminalSameAsEditor] + installedFonts)
         let saved = UserDefaults.standard.string(forKey: Self.terminalFontNameKey) ?? Self.terminalSameAsEditor
         terminalFont.selectItem(withTitle: installedFonts.contains(saved) ? saved : Self.terminalSameAsEditor)
         terminalFont.setAccessibilityLabel("Terminal font")
         terminalFont.target = self; terminalFont.action = #selector(saveTerminalFont(_:))
-        stack.addArrangedSubview(row("Font family", terminalFont))
+        fixWidth(terminalFont)
 
         let size = UserDefaults.standard.object(forKey: Self.terminalFontSizeKey) as? Double ?? 12
         terminalFontSize.minValue = 10; terminalFontSize.maxValue = 24; terminalFontSize.increment = 1
@@ -237,9 +273,6 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
         terminalFontSize.setAccessibilityLabel("Terminal font size")
         terminalFontSize.target = self; terminalFontSize.action = #selector(saveTerminalFontSize(_:))
         updateTerminalFontSizeLabel()
-        let sizeControls = NSStackView(views: [terminalFontSize, terminalFontSizeLabel])
-        sizeControls.spacing = 8
-        stack.addArrangedSubview(row("Font size", sizeControls))
 
         let current = TerminalSettings.current
         terminalLineHeight.addItems(withTitles: Self.terminalLineHeights.map { String(format: "%.1f×", $0) })
@@ -248,19 +281,24 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
         terminalLineHeight.selectItem(at: heightIndex)
         terminalLineHeight.setAccessibilityLabel("Terminal line height")
         terminalLineHeight.target = self; terminalLineHeight.action = #selector(saveTerminalLineHeight(_:))
-        stack.addArrangedSubview(row("Line height", terminalLineHeight))
+        addGroup("Font", to: stack, rows: [
+            row("Font family", terminalFont),
+            row("Font size", valueControl(terminalFontSize, terminalFontSizeLabel)),
+            row("Line height", terminalLineHeight),
+            footnote("\"Same as Editor\" follows the editor font family. Changes apply to open terminals right away."),
+        ])
 
-        stack.addArrangedSubview(section("Cursor"))
         terminalCursorStyle.addItems(withTitles: Self.terminalCursorStyles.map(\.title))
         terminalCursorStyle.selectItem(at: Self.terminalCursorStyles.firstIndex { $0.value == current.cursorStyle } ?? 0)
         terminalCursorStyle.setAccessibilityLabel("Terminal cursor style")
         terminalCursorStyle.target = self; terminalCursorStyle.action = #selector(saveTerminalCursorStyle(_:))
-        stack.addArrangedSubview(row("Style", terminalCursorStyle))
         terminalCursorBlink.state = current.cursorBlink ? .on : .off
         terminalCursorBlink.target = self; terminalCursorBlink.action = #selector(saveTerminalCursorBlink(_:))
-        stack.addArrangedSubview(row("", terminalCursorBlink))
+        addGroup("Cursor", to: stack, rows: [
+            row("Style", terminalCursorStyle),
+            row("", terminalCursorBlink),
+        ])
 
-        stack.addArrangedSubview(section("Padding"))
         for (stepper, value, label) in [
             (terminalPaddingH, current.paddingHorizontal, "Horizontal terminal padding"),
             (terminalPaddingV, current.paddingVertical, "Vertical terminal padding"),
@@ -273,19 +311,10 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
             stepper.target = self; stepper.action = #selector(saveTerminalPadding(_:))
         }
         updateTerminalPaddingLabels()
-        let hControls = NSStackView(views: [terminalPaddingH, terminalPaddingHLabel])
-        hControls.spacing = 8
-        stack.addArrangedSubview(row("Horizontal", hControls))
-        let vControls = NSStackView(views: [terminalPaddingV, terminalPaddingVLabel])
-        vControls.spacing = 8
-        stack.addArrangedSubview(row("Vertical", vControls))
-
-        let hint = NSTextField(wrappingLabelWithString: "Applies to open terminals right away. \"Same as Editor\" follows the editor font family.")
-        hint.font = .systemFont(ofSize: 11)
-        hint.textColor = .secondaryLabelColor
-        hint.preferredMaxLayoutWidth = 370
-        hint.widthAnchor.constraint(equalToConstant: 370).isActive = true
-        stack.addArrangedSubview(hint)
+        addGroup("Padding", to: stack, rows: [
+            row("Horizontal", valueControl(terminalPaddingH, terminalPaddingHLabel)),
+            row("Vertical", valueControl(terminalPaddingV, terminalPaddingVLabel)),
+        ])
         return pane(stack)
     }
 
@@ -360,6 +389,8 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
             // Leave a broken file for the user to fix rather than overwrite it.
             editorControls.forEach { $0.isEnabled = false }
             showSettingsError("settings.json could not be read, so these are locked. Fix the file to edit them here.")
+            excludeTable.reloadData()
+            updateExcludeButtons()
             return
         }
         editorControls.forEach { $0.isEnabled = true }
@@ -375,8 +406,7 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
         formatOnSaveBox.state = settings.effectiveFormatOnSave ? .on : .off
         parameterHintsBox.state = settings.effectiveInlineParameterHints ? .on : .off
         gitBlameBox.state = settings.effectiveGitBlame ? .on : .off
-        let hidden = Set(settings.effectiveFilesExclude)
-        for box in excludeBoxes { box.state = hidden.contains(box.title) ? .on : .off }
+        showExcludes(settings)
         autoSavePopup.selectItem(at: Self.autoSaveModes.firstIndex { $0.value == settings.effectiveAutoSave } ?? 0)
         autoSaveDelay.doubleValue = settings.effectiveAutoSaveDelay * 1000
         updateAutoSaveDelay()
@@ -419,15 +449,78 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
         store(parameterHintsBox.state == .on, "inlineParameterHints")
     }
 
-    @objc private func saveFilesExclude(_ sender: Any?) {
-        guard let box = sender as? NSButton else { return }
+    /// Refills the pattern list, keeping the selected patterns selected.
+    private func showExcludes(_ settings: GalaxySettings, selecting globs: Set<String>? = nil) {
+        let keep = globs ?? Set(excludeTable.selectedRowIndexes.compactMap {
+            excludeEntries.indices.contains($0) ? excludeEntries[$0].glob : nil
+        })
+        let hidden = Set(settings.effectiveFilesExclude)
+        let defaults = GalaxySettings.defaultFilesExclude
+        let custom = (settings.filesExclude ?? [:]).keys.filter { !defaults.contains($0) }.sorted()
+        excludeEntries = custom.map { ExcludeEntry(glob: $0, hidden: hidden.contains($0), isDefault: false) }
+            + defaults.map { ExcludeEntry(glob: $0, hidden: hidden.contains($0), isDefault: true) }
+        excludeTable.reloadData()
+        let rows = IndexSet(excludeEntries.indices.filter { keep.contains(excludeEntries[$0].glob) })
+        excludeTable.selectRowIndexes(rows, byExtendingSelection: false)
+        if let first = rows.first { excludeTable.scrollRowToVisible(first) }
+        updateExcludeButtons()
+    }
+
+    private var selectedCustomExcludes: [String] {
+        excludeTable.selectedRowIndexes.compactMap {
+            excludeEntries.indices.contains($0) && !excludeEntries[$0].isDefault ? excludeEntries[$0].glob : nil
+        }
+    }
+
+    private func updateExcludeButtons() {
+        let enabled = excludeTable.isEnabled
+        excludeAddButton.isEnabled = enabled
+            && !excludeField.stringValue.trimmingCharacters(in: .whitespaces).isEmpty
+        excludeRemoveButton.isEnabled = enabled && !selectedCustomExcludes.isEmpty
+    }
+
+    /// Runs one files.exclude write, then shows the file's new state.
+    @discardableResult
+    private func saveExcludes(selecting globs: Set<String>? = nil, _ write: () throws -> Void) -> Bool {
         do {
-            try GalaxySettings.writeFilesExclude(glob: box.title, enabled: box.state == .on, to: settingsURL)
+            try write()
             onChange()
         } catch {
             showSettingsError("Could not save files.exclude: \(error.localizedDescription)")
             syncControls()
+            return false
         }
+        let settings = (try? GalaxySettings.load(from: settingsURL)) ?? .empty
+        showExcludes(settings, selecting: globs)
+        return true
+    }
+
+    @objc private func toggleFilesExclude(_ sender: NSButton) {
+        guard excludeEntries.indices.contains(sender.tag) else { return }
+        let glob = excludeEntries[sender.tag].glob
+        let hide = sender.state == .on
+        saveExcludes { try GalaxySettings.writeFilesExclude(glob: glob, enabled: hide, to: settingsURL) }
+    }
+
+    @objc private func addFilesExclude(_ sender: Any?) {
+        let glob = excludeField.stringValue.trimmingCharacters(in: .whitespaces)
+        guard !glob.isEmpty, excludeTable.isEnabled else { return }
+        // Already hidden: point at the row instead of writing it again.
+        if excludeEntries.contains(where: { $0.glob == glob && $0.hidden }) {
+            excludeField.stringValue = ""
+            let settings = (try? GalaxySettings.load(from: settingsURL)) ?? .empty
+            return showExcludes(settings, selecting: [glob])
+        }
+        if saveExcludes(selecting: [glob], { try GalaxySettings.writeFilesExclude(glob: glob, enabled: true, to: settingsURL) }) {
+            excludeField.stringValue = ""
+            updateExcludeButtons()
+        }
+    }
+
+    @objc private func removeFilesExclude(_ sender: Any?) {
+        let globs = selectedCustomExcludes
+        guard !globs.isEmpty else { return }
+        saveExcludes(selecting: []) { try GalaxySettings.removeFilesExclude(globs: globs, from: settingsURL) }
     }
 
     @objc private func saveWhitespace(_ sender: Any?) {
@@ -502,16 +595,20 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
         lineSpacing.target = self; lineSpacing.action = #selector(saveLineSpacing(_:))
         updateLineSpacingLabel()
 
-        stack.addArrangedSubview(row("Theme", appearance))
-        stack.addArrangedSubview(row("Editor font", font))
-        let sizeRow = NSStackView(views: [NSTextField(labelWithString: "Font size"), fontSize, fontSizeLabel])
-        sizeRow.spacing = 12
-        sizeRow.arrangedSubviews[0].widthAnchor.constraint(equalToConstant: 120).isActive = true
-        stack.addArrangedSubview(sizeRow)
-        let spacingRow = NSStackView(views: [NSTextField(labelWithString: "Line spacing"), lineSpacing, lineSpacingLabel])
-        spacingRow.spacing = 12
-        spacingRow.arrangedSubviews[0].widthAnchor.constraint(equalToConstant: 120).isActive = true
-        stack.addArrangedSubview(spacingRow)
+        appearance.setAccessibilityLabel("Theme")
+        font.setAccessibilityLabel("Editor font")
+        fontSize.setAccessibilityLabel("Editor font size")
+        lineSpacing.setAccessibilityLabel("Editor line spacing")
+        fixWidth(appearance)
+        fixWidth(font)
+
+        addGroup("Appearance", to: stack, rows: [row("Theme", appearance)])
+        addGroup("Editor Font", to: stack, rows: [
+            row("Font family", font),
+            row("Font size", valueControl(fontSize, fontSizeLabel)),
+            row("Line spacing", valueControl(lineSpacing, lineSpacingLabel)),
+            footnote("The terminal can use its own font in the Terminal tab."),
+        ])
         return pane(stack)
     }
 
@@ -601,7 +698,24 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
         stack.setCustomSpacing(6, after: heading)
         stack.addArrangedSubview(box)
         stack.setCustomSpacing(18, after: box)
-        box.widthAnchor.constraint(equalToConstant: 398).isActive = true
+        box.widthAnchor.constraint(equalToConstant: Self.groupWidth).isActive = true
+    }
+
+    /// Width of every group box; rows inside are label (120) + control (238).
+    private static let groupWidth: CGFloat = 398
+
+    /// Gives long popups (fonts, themes) the same width as the AI fields.
+    private func fixWidth(_ control: NSView) {
+        control.translatesAutoresizingMaskIntoConstraints = false
+        control.widthAnchor.constraint(equalToConstant: 238).isActive = true
+    }
+
+    /// A stepper with its current value beside it.
+    private func valueControl(_ stepper: NSStepper, _ value: NSTextField) -> NSStackView {
+        value.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+        let controls = NSStackView(views: [stepper, value])
+        controls.spacing = 8
+        return controls
     }
 
     private static func makeNote() -> NSTextField {
@@ -873,6 +987,7 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
 
     /// Saves each AI field as it is typed; an empty field falls back to the default.
     func controlTextDidChange(_ obj: Notification) {
+        if obj.object as? NSTextField === excludeField { return updateExcludeButtons() }
         let generalKeys = [AIConnection.Keys.baseURL, AIConnection.Keys.apiKey]
         let completionKeys = [AIConnection.Keys.completionBaseURL, AIConnection.Keys.completionApiKey]
         guard let field = obj.object as? NSTextField, let key = field.identifier?.rawValue,
@@ -913,6 +1028,55 @@ final class PreferencesWindowController: NSWindowController, NSTextFieldDelegate
 
 extension PreferencesWindowController: NSWindowDelegate {
     func windowDidBecomeKey(_ notification: Notification) { syncControls() }
+}
+
+extension PreferencesWindowController: NSTableViewDataSource, NSTableViewDelegate {
+    func numberOfRows(in tableView: NSTableView) -> Int { excludeEntries.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard let id = tableColumn?.identifier.rawValue, excludeEntries.indices.contains(row) else { return nil }
+        let entry = excludeEntries[row]
+        switch id {
+        case "hide":
+            let box = NSButton(checkboxWithTitle: "", target: self, action: #selector(toggleFilesExclude(_:)))
+            box.state = entry.hidden ? .on : .off
+            box.tag = row
+            box.isEnabled = tableView.isEnabled
+            box.setAccessibilityLabel("Hide \(entry.glob)")
+            return centered(box)
+        case "glob":
+            let label = NSTextField(labelWithString: entry.glob)
+            label.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+            label.lineBreakMode = .byTruncatingMiddle
+            label.toolTip = entry.glob
+            label.textColor = entry.hidden ? .labelColor : .secondaryLabelColor
+            return centered(label)
+        default:
+            let label = NSTextField(labelWithString: entry.isDefault ? "Built-in" : "Custom")
+            label.font = .systemFont(ofSize: 11)
+            label.textColor = .tertiaryLabelColor
+            label.alignment = .right
+            return centered(label)
+        }
+    }
+
+    /// Wraps a cell's control so it sits in the middle of the row.
+    private func centered(_ view: NSView) -> NSView {
+        let cell = NSTableCellView()
+        view.translatesAutoresizingMaskIntoConstraints = false
+        cell.addSubview(view)
+        NSLayoutConstraint.activate([
+            view.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+            view.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 2),
+            view.trailingAnchor.constraint(lessThanOrEqualTo: cell.trailingAnchor, constant: -2),
+        ])
+        if view is NSTextField, (view as? NSTextField)?.alignment == .right {
+            view.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4).isActive = true
+        }
+        return cell
+    }
+
+    func tableViewSelectionDidChange(_ notification: Notification) { updateExcludeButtons() }
 }
 
 /// Toolbar tabs whose window grows or shrinks to the selected pane, keeping
