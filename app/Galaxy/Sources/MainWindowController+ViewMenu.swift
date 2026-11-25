@@ -52,6 +52,7 @@ extension MainWindowController {
         editorView.rightInset = editorRightInset
         editorView.applyRightInset()
         stickyTrailing?.constant = -editorRightInset
+        findBarTrailing?.constant = -(editorRightInset + 8)
         layoutMinimap()
     }
 

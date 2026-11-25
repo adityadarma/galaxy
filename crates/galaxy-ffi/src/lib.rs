@@ -7666,16 +7666,28 @@ impl DocumentHandle {
                 if line.line < diagnostic.start_line || line.line > diagnostic.end_line {
                     continue;
                 }
-                let start = if line.line == diagnostic.start_line {
+                let mut start = if line.line == diagnostic.start_line {
                     diagnostic.start_character
                 } else {
                     0
                 };
-                let end = if line.line == diagnostic.end_line {
+                let mut end = if line.line == diagnostic.end_line {
                     diagnostic.end_character
                 } else {
                     line.text.encode_utf16().count() as u64
                 };
+                // A missing token (`;` left out) has no width. Mark the
+                // character at it, or the one before it at the end of the line.
+                if start == end
+                    && diagnostic.start_line == diagnostic.end_line
+                    && diagnostic.start_character == diagnostic.end_character
+                {
+                    if start < line.text.encode_utf16().count() as u64 {
+                        end = start + 1;
+                    } else if start > 0 {
+                        start -= 1;
+                    }
+                }
                 if start < end {
                     line.diagnostics.push(DiagnosticSpan {
                         start,

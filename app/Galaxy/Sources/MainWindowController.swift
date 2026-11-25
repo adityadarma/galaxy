@@ -213,6 +213,8 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
     /// Shown for files over 20 MB (M1-14).
     var largeFileBanner: NSTextField { statusBar.largeFileBadge }
     var findBarHeight: NSLayoutConstraint!
+    var findBarTrailing: NSLayoutConstraint!
+    var findBarWidth: NSLayoutConstraint!
     /// Sidebar, VSCode style: "EXPLORER" view title, a collapsible
     /// section named after the folder, then the tree or an empty state.
     let sidebar = SidebarView()
@@ -735,6 +737,10 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         signaturePopup.translatesAutoresizingMaskIntoConstraints = false
         findBarSlot.isHidden = true
         findBarHeight = findBarSlot.heightAnchor.constraint(equalToConstant: 0)
+        findBarTrailing = findBarSlot.trailingAnchor.constraint(
+            equalTo: editorSplitView.trailingAnchor, constant: -(OverviewRulerView.width + 8))
+        findBarWidth = findBarSlot.widthAnchor.constraint(equalToConstant: FindBar.cardWidth)
+        findBarWidth.priority = .defaultHigh
         editorCard.translatesAutoresizingMaskIntoConstraints = false
         bottomPanelCard.translatesAutoresizingMaskIntoConstraints = false
         bottomPanelCard.isHidden = true
@@ -750,7 +756,6 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         groupChrome.addSubview(tabBar)
         groupChrome.addSubview(pathBar)
         groupChrome.addSubview(breadcrumbBar)
-        groupChrome.addSubview(findBarSlot)
         groupChrome.addSubview(editorSplitView)
         diffHunkActions.isHidden = true
         // A hunk scrolled partly above the editor must not draw its buttons
@@ -763,6 +768,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         diffHunkActions.configure(scrollView: scrollView, leftPane: secondaryScrollView)
         diffHunkActions.gutter = editorSplitView
         groupChrome.addSubview(stickyScopeView)
+        groupChrome.addSubview(findBarSlot)
         editorTerminalView.translatesAutoresizingMaskIntoConstraints = false
         editorTerminalView.isHidden = true
         groupChrome.addSubview(editorTerminalView)
@@ -793,6 +799,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         stickyTrailing = stickyScopeView.trailingAnchor.constraint(equalTo: editorSplitView.trailingAnchor)
         // `updateMinimap` ran before this constraint existed.
         stickyTrailing.constant = -editorRightInset
+        findBarTrailing.constant = -(editorRightInset + 8)
         bottomPanelGap = editorCard.bottomAnchor.constraint(equalTo: bottomPanelCard.topAnchor)
         NSLayoutConstraint.activate([
             editorCard.topAnchor.constraint(equalTo: detailView.topAnchor),
@@ -820,11 +827,13 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
             breadcrumbBar.topAnchor.constraint(equalTo: pathBar.bottomAnchor),
             breadcrumbBar.leadingAnchor.constraint(equalTo: groupChrome.leadingAnchor),
             breadcrumbBar.trailingAnchor.constraint(equalTo: groupChrome.trailingAnchor),
-            findBarSlot.topAnchor.constraint(equalTo: breadcrumbBar.bottomAnchor),
-            findBarSlot.leadingAnchor.constraint(equalTo: groupChrome.leadingAnchor),
-            findBarSlot.trailingAnchor.constraint(equalTo: groupChrome.trailingAnchor),
+            // The find bar floats over the editor's top right corner.
+            findBarSlot.topAnchor.constraint(equalTo: editorSplitView.topAnchor, constant: 6),
+            findBarTrailing,
+            findBarSlot.leadingAnchor.constraint(greaterThanOrEqualTo: editorSplitView.leadingAnchor, constant: 8),
+            findBarWidth,
             findBarHeight,
-            editorSplitView.topAnchor.constraint(equalTo: findBarSlot.bottomAnchor),
+            editorSplitView.topAnchor.constraint(equalTo: breadcrumbBar.bottomAnchor),
             editorSplitView.leadingAnchor.constraint(equalTo: groupChrome.leadingAnchor),
             editorSplitView.trailingAnchor.constraint(equalTo: groupChrome.trailingAnchor),
             editorSplitView.bottomAnchor.constraint(equalTo: groupChrome.bottomAnchor),

@@ -208,8 +208,12 @@ private final class ProblemRowCell: NSTableCellView {
         for view in [icon, message, metadata] { view.translatesAutoresizingMaskIntoConstraints = false; addSubview(view) }
         message.font = .systemFont(ofSize: 11)
         message.lineBreakMode = .byTruncatingTail
+        message.maximumNumberOfLines = 1
+        message.usesSingleLineMode = true
+        message.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         metadata.font = .systemFont(ofSize: 10)
         metadata.textColor = .secondaryLabelColor
+        metadata.setContentCompressionResistancePriority(.required, for: .horizontal)
         NSLayoutConstraint.activate([
             icon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 34), icon.centerYAnchor.constraint(equalTo: centerYAnchor), icon.widthAnchor.constraint(equalToConstant: 14), icon.heightAnchor.constraint(equalToConstant: 14),
             message.leadingAnchor.constraint(equalTo: icon.trailingAnchor, constant: 6), message.centerYAnchor.constraint(equalTo: centerYAnchor),
@@ -223,10 +227,30 @@ private final class ProblemRowCell: NSTableCellView {
         let symbol = problem.severity == 1 ? "xmark.circle" : "exclamationmark.triangle"
         icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
         icon.contentTintColor = Theme.diagnostic(problem.severity)
-        message.stringValue = problem.message
+        message.attributedStringValue = Self.summary(problem.message)
+        message.toolTip = problem.message
         let source = problem.source ?? ""
         let code = problem.code ?? ""
         let origin = source.isEmpty ? "" : code.isEmpty ? source : "\(source)(\(code))"
         metadata.stringValue = "\(origin)  [Ln \(problem.line + 1), Col \(problem.column + 1)]"
+    }
+
+    /// One row per problem: the first line of the message, then compiler
+    /// span labels in secondary text. Labels the first line already says are dropped.
+    static func summary(_ text: String) -> NSAttributedString {
+        let lines = text.split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        let head = lines.first ?? ""
+        let font = NSFont.systemFont(ofSize: 11)
+        let out = NSMutableAttributedString(string: head, attributes: [.font: font, .foregroundColor: NSColor.labelColor])
+        let details = lines.dropFirst().filter { !head.contains($0) }
+        if !details.isEmpty {
+            out.append(NSAttributedString(
+                string: "  " + details.joined(separator: " · "),
+                attributes: [.font: font, .foregroundColor: NSColor.secondaryLabelColor]
+            ))
+        }
+        return out
     }
 }

@@ -112,6 +112,9 @@ final class ActivityBar: NSView {
 
 @MainActor
 final class ActivityBarButton: NSButton {
+    /// Side of the rounded square behind the active icon, as in JetBrains' tool window bar.
+    static let activeSquareSide: CGFloat = 32
+
     let item: ActivityBar.Item
     var isActive = false { didSet { if isActive != oldValue { refresh() } } }
     var badgeValue = 0 { didSet { if badgeValue != oldValue { needsDisplay = true } } }
@@ -138,7 +141,7 @@ final class ActivityBarButton: NSButton {
         if !item.isAvailable {
             contentTintColor = .tertiaryLabelColor
         } else {
-            contentTintColor = isActive ? Theme.activityActive : .secondaryLabelColor
+            contentTintColor = isActive ? .labelColor : .secondaryLabelColor
         }
         setAccessibilityValue(isActive ? 1 : 0)
         needsDisplay = true
@@ -146,8 +149,10 @@ final class ActivityBarButton: NSButton {
 
     override func draw(_ dirtyRect: NSRect) {
         if isActive {
-            Theme.activityActive.setFill()
-            NSRect(x: 0, y: 8, width: 2, height: max(0, bounds.height - 16)).fill()
+            let side = min(Self.activeSquareSide, bounds.width, bounds.height)
+            let square = NSRect(x: bounds.midX - side / 2, y: bounds.midY - side / 2, width: side, height: side)
+            NSColor.labelColor.withAlphaComponent(0.12).setFill()
+            NSBezierPath(roundedRect: square, xRadius: 7, yRadius: 7).fill()
         }
         super.draw(dirtyRect)
         guard badgeValue > 0 else { return }

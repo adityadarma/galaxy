@@ -1125,7 +1125,7 @@ impl RustEngine {
                 .take(MAX_ITEMS)
                 .collect();
         }
-        let mut candidates = self.visible_declarations(path);
+        let mut candidates = self.visible_declarations(path, prefix);
         candidates.extend(local_declarations(
             path,
             text,
@@ -1314,6 +1314,7 @@ impl RustEngine {
                 type_name.to_owned()
             }
             "call_expression" => self.call_result_type(path, text, value, sources)?,
+            "macro_invocation" => vec_literal_type(text, declaration, value, name)?,
             _ => return None,
         };
         Some(ParameterHint {
@@ -1592,16 +1593,15 @@ impl RustEngine {
         .collect()
     }
 
-    fn all_declarations(&self) -> Vec<Declaration> {
-        let mut all = self.declarations.clone();
-        all.retain(|item| !self.open.contains_key(&item.path));
-        all.extend(
-            self.open
-                .values()
-                .flat_map(|(declarations, _, _)| declarations)
-                .cloned(),
-        );
-        all
+    fn all_declarations(&self) -> impl Iterator<Item = &Declaration> {
+        self.declarations
+            .iter()
+            .filter(|item| !self.open.contains_key(&item.path))
+            .chain(
+                self.open
+                    .values()
+                    .flat_map(|(declarations, _, _)| declarations),
+            )
     }
 
     fn declarations_named(&self, name: &str) -> Vec<Declaration> {
@@ -1626,20 +1626,27 @@ impl RustEngine {
         matches
     }
 
-    fn visible_declarations(&self, path: &Path) -> Vec<Declaration> {
+    fn visible_declarations(&self, path: &Path, prefix: &str) -> Vec<Declaration> {
+        let accessible = self.accessibility_filter(path);
         let mut visible: Vec<_> = self
             .all_declarations()
-            .into_iter()
-            .filter(|item| self.accessible_from(path, item))
+            .filter(|item| item.name.starts_with(prefix) && accessible(item))
+            .cloned()
             .collect();
         let aliases = self.use_bindings(path);
         for binding in aliases {
+            if !binding.glob && !binding.local.starts_with(prefix) {
+                continue;
+            }
             let targets = if binding.glob {
                 self.declarations_in_module(path, &binding.target)
             } else {
                 self.resolve_path(path, &binding.target)
             };
             for target in targets {
+                if binding.glob && !target.name.starts_with(prefix) {
+                    continue;
+                }
                 let mut alias = target.clone();
                 if !binding.glob {
                     alias.name = binding.local.clone();
@@ -2030,7 +2037,11 @@ impl RustEngine {
                 .map(|(_, _, text)| text.clone())
                 .or_else(|| std::fs::read_to_string(&candidate).ok());
             if let Some(source) = source {
-                let found = member_declarations(&candidate, &source, ty, name);
+                let found = if source.contains(ty) {
+                    member_declarations(&candidate, &source, ty, name)
+                } else {
+                    Vec::new()
+                };
                 if let Some(stamp) = stamp {
                     let mut cache = self.member_cache.lock().unwrap_or_else(|e| e.into_inner());
                     if cache.len() >= MEMBER_CACHE_LIMIT {
@@ -2114,17 +2125,21 @@ impl RustEngine {
         before: &str,
         receiver: &str,
     ) -> Option<String> {
-        if let Some(tree) = parse_tree(text)
-            && let Some(call) = local_call_binding(tree.root_node(), text, receiver, before.len())
-        {
-            let mut sources = HashMap::new();
-            if let Some(ty) = self
-                .call_result_type(path, text, call, &mut sources)
-                .and_then(|ty| named_type(&ty))
-            {
-                return Some(ty);
+        if let Some(tree) = parse_tree(text) {
+            let root = tree.root_node();
+            if let Some(call) = local_call_binding(root, text, receiver, before.len()) {
+                let mut sources = HashMap::new();
+                if let Some(ty) = self
+                    .call_result_type(path, text, call, &mut sources)
+                    .and_then(|ty| named_type(&ty))
+                {
+                    return Some(ty);
+                }
+                if let Some(ty) = self.expression_type(path, text, call, &mut sources, 0) {
+                    return Some(ty);
+                }
             }
-            if let Some(ty) = self.expression_type(path, text, call, &mut sources, 0) {
+            if let Some(ty) = for_binding_type(root, text, receiver, before.len()) {
                 return Some(ty);
             }
         }
@@ -2433,11 +2448,14 @@ impl RustEngine {
             }
             None => return Vec::new(),
         };
+        if !self.module_accessible_from(path, &crate_name, &module) {
+            return Vec::new();
+        }
+        let accessible = self.accessibility_filter(path);
         self.all_declarations()
-            .into_iter()
             .filter(|item| item.crate_name == crate_name && item.module == module)
-            .filter(|_| self.module_accessible_from(path, &crate_name, &module))
-            .filter(|item| self.accessible_from(path, item))
+            .filter(|item| accessible(item))
+            .cloned()
             .collect()
     }
 
@@ -2561,25 +2579,33 @@ impl RustEngine {
     /// Private items are kept within their defining module. This intentionally
     /// does not approximate Rust's wider parent/child private-item rules.
     fn accessible_from(&self, path: &Path, item: &Declaration) -> bool {
+        self.accessibility_filter(path)(item)
+    }
+
+    /// Resolves the caller's crate and module once, so filtering a whole
+    /// index does not repeat that lookup for every declaration.
+    fn accessibility_filter(&self, path: &Path) -> impl Fn(&Declaration) -> bool {
         let current_crate = self.crate_for(path);
-        if item.crate_name != current_crate {
-            return item.visibility == Visibility::Public;
-        }
         let current_module = self.module_for(path);
-        match &item.visibility {
-            Visibility::Public => true,
-            Visibility::Private => module_is_within(&current_module, &item.module),
-            Visibility::Restricted(scope) => module_is_within(&current_module, scope),
+        move |item| {
+            if item.crate_name != current_crate {
+                return item.visibility == Visibility::Public;
+            }
+            match &item.visibility {
+                Visibility::Public => true,
+                Visibility::Private => module_is_within(&current_module, &item.module),
+                Visibility::Restricted(scope) => module_is_within(&current_module, scope),
+            }
         }
     }
 
     /// Every named module on a path must itself be visible from the caller.
     fn module_accessible_from(&self, path: &Path, crate_name: &str, module: &[String]) -> bool {
-        let all = self.all_declarations();
         (1..=module.len()).all(|depth| {
             let parent = &module[..depth - 1];
             let name = &module[depth - 1];
-            all.iter()
+            self.declarations_named(name)
+                .iter()
                 .filter(|item| {
                     item.kind == ItemKind::Class
                         && item.name == *name
@@ -5062,6 +5088,276 @@ fn local_call_binding<'tree>(
     found
 }
 
+/// Element type of the loop variable in `for receiver in <collection>` when
+/// the cursor is inside that loop and the collection's type is written out
+/// (a parameter, a typed `let`, or a `self.field`).
+fn for_binding_type(root: Node<'_>, text: &str, receiver: &str, byte: usize) -> Option<String> {
+    let mut ancestors = Vec::new();
+    let mut node = root.descendant_for_byte_range(byte, byte);
+    while let Some(current) = node {
+        ancestors.push(current);
+        node = current.parent();
+    }
+    let mut collection = ancestors.iter().find_map(|node| match node.kind() {
+        "for_expression"
+            if node.child_by_field_name("pattern").is_some_and(|pattern| {
+                let written = pattern.utf8_text(text.as_bytes()).unwrap_or_default();
+                written.strip_prefix("mut ").unwrap_or(written).trim() == receiver
+            }) && node
+                .child_by_field_name("body")
+                .is_some_and(|body| body.start_byte() <= byte) =>
+        {
+            node.child_by_field_name("value")
+        }
+        "closure_expression" => closure_source(*node, text, receiver, byte),
+        _ => None,
+    })?;
+    loop {
+        match collection.kind() {
+            "reference_expression" | "parenthesized_expression" => {
+                collection = collection
+                    .child_by_field_name("value")
+                    .or_else(|| collection.named_child(0))?;
+            }
+            "call_expression" => {
+                let function = collection.child_by_field_name("function")?;
+                let method = function
+                    .child_by_field_name("field")?
+                    .utf8_text(text.as_bytes())
+                    .ok()?;
+                if !matches!(
+                    method,
+                    "iter"
+                        | "iter_mut"
+                        | "into_iter"
+                        | "rev"
+                        | "skip"
+                        | "take"
+                        | "by_ref"
+                        | "filter"
+                ) {
+                    return None;
+                }
+                collection = function.child_by_field_name("value")?;
+            }
+            _ => break,
+        }
+    }
+    let declared = match collection.kind() {
+        "identifier" => {
+            let name = collection.utf8_text(text.as_bytes()).ok()?;
+            declared_local_type(&ancestors, text, name, byte)?
+        }
+        "field_expression" => {
+            let owner = collection.child_by_field_name("value")?;
+            if owner.utf8_text(text.as_bytes()).ok()? != "self" {
+                return None;
+            }
+            let field = collection
+                .child_by_field_name("field")?
+                .utf8_text(text.as_bytes())
+                .ok()?;
+            declared_self_field_type(root, &ancestors, text, field)?
+        }
+        _ => return None,
+    };
+    element_type(&declared)
+}
+
+/// For `<source>.map(|receiver| ...)` and similar iterator methods, the
+/// expression the closure parameter's elements come from.
+fn closure_source<'tree>(
+    closure: Node<'tree>,
+    text: &str,
+    receiver: &str,
+    byte: usize,
+) -> Option<Node<'tree>> {
+    if closure.child_by_field_name("body")?.start_byte() > byte {
+        return None;
+    }
+    let parameters = closure.child_by_field_name("parameters")?;
+    let mut cursor = parameters.walk();
+    let mut named = parameters.named_children(&mut cursor);
+    let only = named.next().filter(|_| named.next().is_none())?;
+    if only.kind() != "identifier" || only.utf8_text(text.as_bytes()).ok()? != receiver {
+        return None;
+    }
+    let arguments = closure.parent().filter(|node| node.kind() == "arguments")?;
+    let call = arguments
+        .parent()
+        .filter(|node| node.kind() == "call_expression")?;
+    let function = call.child_by_field_name("function")?;
+    let method = function
+        .child_by_field_name("field")?
+        .utf8_text(text.as_bytes())
+        .ok()?;
+    matches!(
+        method,
+        "map"
+            | "filter"
+            | "any"
+            | "all"
+            | "find"
+            | "position"
+            | "for_each"
+            | "filter_map"
+            | "flat_map"
+            | "take_while"
+            | "skip_while"
+            | "inspect"
+            | "max_by_key"
+            | "min_by_key"
+    )
+    .then(|| function.child_by_field_name("value"))
+    .flatten()
+}
+
+fn declared_local_type(
+    ancestors: &[Node<'_>],
+    text: &str,
+    name: &str,
+    byte: usize,
+) -> Option<String> {
+    let matches_name = |pattern: Node<'_>| {
+        let written = pattern.utf8_text(text.as_bytes()).unwrap_or_default();
+        written.strip_prefix("mut ").unwrap_or(written).trim() == name
+    };
+    for ancestor in ancestors {
+        match ancestor.kind() {
+            "block" => {
+                let mut cursor = ancestor.walk();
+                let found = ancestor
+                    .named_children(&mut cursor)
+                    .filter(|child| child.kind() == "let_declaration" && child.end_byte() <= byte)
+                    .filter(|child| {
+                        child
+                            .child_by_field_name("pattern")
+                            .is_some_and(matches_name)
+                    })
+                    .filter_map(|child| child.child_by_field_name("type"))
+                    .last();
+                if let Some(ty) = found {
+                    return ty.utf8_text(text.as_bytes()).ok().map(str::to_owned);
+                }
+            }
+            "function_item" => {
+                let parameters = ancestor.child_by_field_name("parameters")?;
+                let mut cursor = parameters.walk();
+                let found = parameters
+                    .named_children(&mut cursor)
+                    .filter(|parameter| parameter.kind() == "parameter")
+                    .find(|parameter| {
+                        parameter
+                            .child_by_field_name("pattern")
+                            .is_some_and(matches_name)
+                    })
+                    .and_then(|parameter| parameter.child_by_field_name("type"));
+                return found.and_then(|ty| ty.utf8_text(text.as_bytes()).ok().map(str::to_owned));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn declared_self_field_type(
+    root: Node<'_>,
+    ancestors: &[Node<'_>],
+    text: &str,
+    field: &str,
+) -> Option<String> {
+    let owner = ancestors
+        .iter()
+        .find(|node| node.kind() == "impl_item")?
+        .child_by_field_name("type")?
+        .utf8_text(text.as_bytes())
+        .ok()
+        .and_then(named_type)?;
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        if node.kind() == "struct_item"
+            && node
+                .child_by_field_name("name")
+                .and_then(|name| name.utf8_text(text.as_bytes()).ok())
+                == Some(owner.as_str())
+            && let Some(body) = node.child_by_field_name("body")
+        {
+            let mut cursor = body.walk();
+            return body
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() == "field_declaration")
+                .find(|child| {
+                    child
+                        .child_by_field_name("name")
+                        .and_then(|name| name.utf8_text(text.as_bytes()).ok())
+                        == Some(field)
+                })
+                .and_then(|child| child.child_by_field_name("type"))
+                .and_then(|ty| ty.utf8_text(text.as_bytes()).ok().map(str::to_owned));
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.named_children(&mut cursor));
+    }
+    None
+}
+
+/// `Vec<Box<dyn Migration>>` and `&[Migration]` both give `Migration`.
+fn element_type(ty: &str) -> Option<String> {
+    let ty = ty
+        .trim()
+        .trim_start_matches('&')
+        .trim_start_matches("mut ")
+        .trim();
+    let mut inner = if let Some(slice) = ty.strip_prefix('[') {
+        slice.split([';', ']']).next()?.trim().to_owned()
+    } else {
+        generic_argument(ty)?
+    };
+    loop {
+        let trimmed = inner
+            .trim()
+            .trim_start_matches('&')
+            .trim_start_matches("mut ")
+            .trim_start_matches("dyn ")
+            .trim_start_matches("impl ")
+            .trim();
+        let wrapped = ["Box", "Arc", "Rc"].iter().find_map(|wrapper| {
+            trimmed
+                .strip_prefix(wrapper)
+                .filter(|rest| rest.starts_with('<'))
+                .and_then(|_| generic_argument(trimmed))
+        });
+        match wrapped {
+            Some(next) => inner = next,
+            None => return named_type(trimmed),
+        }
+    }
+}
+
+/// First top-level generic argument of `Name<A, B>`.
+fn generic_argument(ty: &str) -> Option<String> {
+    let open = ty.find('<')?;
+    let mut depth = 0usize;
+    let mut start = open + 1;
+    for (offset, character) in ty.char_indices().skip_while(|(offset, _)| *offset < open) {
+        match character {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(ty[start..offset].trim().to_owned());
+                }
+            }
+            ',' if depth == 1 => return Some(ty[start..offset].trim().to_owned()),
+            _ => {}
+        }
+        if depth == 1 && character == '<' {
+            start = offset + 1;
+        }
+    }
+    None
+}
+
 fn named_type(ty: &str) -> Option<String> {
     ty.trim()
         .trim_start_matches('&')
@@ -5360,7 +5656,9 @@ fn member_declarations(path: &Path, text: &str, ty: &str, name: &str) -> Vec<Dec
                 }
                 push_member_declaration(path, text, node, name, ItemKind::Variable, &mut members);
             }
-            "function_item" if impl_for_member(node, text).as_deref() == Some(ty) => {
+            "function_item" | "function_signature_item"
+                if impl_for_member(node, text).as_deref() == Some(ty) =>
+            {
                 push_member_declaration(path, text, node, name, ItemKind::Function, &mut members);
             }
             _ => {}
@@ -5428,7 +5726,11 @@ fn enum_variant_declarations(
 }
 
 fn struct_field_declarations(path: &Path, text: &str, ty: &str, name: &str) -> Vec<Declaration> {
-    let Some((_, rest)) = text.split_once(&format!("struct {ty}")) else {
+    let header = format!("struct {ty}");
+    let Some(rest) = text.match_indices(&header).find_map(|(start, _)| {
+        let rest = &text[start + header.len()..];
+        (!rest.starts_with(is_ident)).then_some(rest)
+    }) else {
         return Vec::new();
     };
     let Some((_, body)) = rest.split_once('{') else {
@@ -5518,6 +5820,13 @@ fn impl_for_member(node: Node<'_>, text: &str) -> Option<String> {
         if parent.kind() == "impl_item" {
             let ty = parent.child_by_field_name("type")?;
             return named_type(ty.utf8_text(text.as_bytes()).ok()?);
+        }
+        if parent.kind() == "trait_item" {
+            return parent
+                .child_by_field_name("name")?
+                .utf8_text(text.as_bytes())
+                .ok()
+                .map(str::to_owned);
         }
         current = parent.parent();
     }
@@ -5728,6 +6037,16 @@ fn numeric_literal_type(
     value: Node<'_>,
     name: &str,
 ) -> Option<String> {
+    numeric_literal_type_with(text, value, || only_printed_after(text, declaration, name))
+}
+
+/// The written suffix of a number, or `i32`/`f64` when `defaulted` says no
+/// later use can pick another type.
+fn numeric_literal_type_with(
+    text: &str,
+    value: Node<'_>,
+    defaulted: impl FnOnce() -> bool,
+) -> Option<String> {
     let mut literal = value;
     if matches!(value.kind(), "unary_expression" | "negative_literal") {
         if !text[value.start_byte()..value.end_byte()].starts_with('-') {
@@ -5749,19 +6068,172 @@ fn numeric_literal_type(
     if !hex && (source.ends_with("f32") || source.ends_with("f64")) {
         return Some(source[source.len() - 3..].to_owned());
     }
-    if !only_printed_after(text, declaration, name) {
+    if !defaulted() {
         return None;
     }
     let float = literal.kind() == "float_literal";
     Some(if float { "f64" } else { "i32" }.to_owned())
 }
 
-/// True when every later use of `name` in the enclosing block is an argument
-/// of a macro that only formats it.
-fn only_printed_after(text: &str, declaration: Node<'_>, name: &str) -> bool {
+/// `Vec<T>` for `vec![a, b, ...]` or `vec![a; n]` when every element is a
+/// literal of one type. Numbers follow the same rule as a plain `let`.
+fn vec_literal_type(
+    text: &str,
+    declaration: Node<'_>,
+    value: Node<'_>,
+    name: &str,
+) -> Option<String> {
+    let mac = value
+        .child_by_field_name("macro")?
+        .utf8_text(text.as_bytes())
+        .ok()?;
+    if mac.rsplit("::").next() != Some("vec") {
+        return None;
+    }
+    let mut cursor = value.walk();
+    let tokens = value
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "token_tree")?;
+    let mut cursor = tokens.walk();
+    let repeated = tokens
+        .children(&mut cursor)
+        .any(|child| child.kind() == ";");
+    let mut cursor = tokens.walk();
+    let mut elements = tokens.named_children(&mut cursor);
+    let mut element_type = None;
+    let mut count = 0;
+    let mut defaulted = None;
+    while let Some(element) = elements.next() {
+        if repeated && count == 1 {
+            break;
+        }
+        let label = match element.kind() {
+            "string_literal" | "raw_string_literal" => "&str".to_owned(),
+            "boolean_literal" => "bool".to_owned(),
+            "char_literal" => "char".to_owned(),
+            "integer_literal" | "float_literal" => {
+                numeric_literal_type_with(text, element, || {
+                    *defaulted
+                        .get_or_insert_with(|| vec_elements_defaulted(text, declaration, name))
+                })?
+            }
+            _ => return None,
+        };
+        if element_type.get_or_insert_with(|| label.clone()) != &label {
+            return None;
+        }
+        count += 1;
+    }
+    element_type.map(|element| format!("Vec<{element}>"))
+}
+
+/// True when no later use of the vector `name` can give its numbers a type
+/// other than the default. Allowed uses: formatting macros, a method
+/// statement whose arguments are plain numbers (`x.push(5);`, `x.sort();`),
+/// and `let y = x[i];` or `let y = &x[i];` where `y` is only printed.
+fn vec_elements_defaulted(text: &str, declaration: Node<'_>, name: &str) -> bool {
+    let Some(block) = declaration.parent() else {
+        return false;
+    };
+    let plain_number = |node: Node<'_>| {
+        matches!(node.kind(), "integer_literal" | "float_literal")
+            && node.utf8_text(text.as_bytes()).is_ok_and(|source| {
+                source
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || c == '_' || c == '.')
+            })
+    };
+    let allowed = |node: Node<'_>| {
+        if is_formatted(text, node) {
+            return true;
+        }
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        match parent.kind() {
+            "field_expression" if parent.child_by_field_name("value") == Some(node) => {
+                let Some(call) = parent.parent() else {
+                    return false;
+                };
+                if call.kind() != "call_expression"
+                    || call.child_by_field_name("function") != Some(parent)
+                    || call.parent().map(|statement| statement.kind())
+                        != Some("expression_statement")
+                {
+                    return false;
+                }
+                let Some(arguments) = call.child_by_field_name("arguments") else {
+                    return false;
+                };
+                let mut cursor = arguments.walk();
+                let all_plain = arguments
+                    .named_children(&mut cursor)
+                    .all(|argument| argument.is_extra() || plain_number(argument));
+                all_plain
+            }
+            "index_expression" if parent.named_child(0) == Some(node) => {
+                let mut value = parent;
+                if value
+                    .parent()
+                    .is_some_and(|up| up.kind() == "reference_expression")
+                {
+                    value = value.parent().unwrap_or(value);
+                }
+                let Some(binding) = value.parent() else {
+                    return false;
+                };
+                if binding.kind() != "let_declaration"
+                    || binding.child_by_field_name("value") != Some(value)
+                    || binding.child_by_field_name("type").is_some()
+                {
+                    return false;
+                }
+                binding
+                    .child_by_field_name("pattern")
+                    .filter(|pattern| pattern.kind() == "identifier")
+                    .and_then(|pattern| pattern.utf8_text(text.as_bytes()).ok())
+                    .is_some_and(|element| only_printed_after(text, binding, element))
+            }
+            _ => false,
+        }
+    };
+    let mut stack = vec![block];
+    while let Some(node) = stack.pop() {
+        if node.end_byte() <= declaration.end_byte() {
+            continue;
+        }
+        if node.kind() == "identifier"
+            && node.utf8_text(text.as_bytes()).ok() == Some(name)
+            && !allowed(node)
+        {
+            return false;
+        }
+        let mut cursor = node.walk();
+        stack.extend(node.children(&mut cursor));
+    }
+    true
+}
+
+/// True when `node` sits in the arguments of a macro that only formats them.
+fn is_formatted(text: &str, node: Node<'_>) -> bool {
     const FORMATTING: [&str; 8] = [
         "println", "print", "eprintln", "eprint", "format", "dbg", "write", "writeln",
     ];
+    let mut ancestor = node.parent();
+    while ancestor.is_some_and(|parent| parent.kind() == "token_tree") {
+        ancestor = ancestor.and_then(|parent| parent.parent());
+    }
+    ancestor
+        .filter(|parent| parent.kind() == "macro_invocation")
+        .and_then(|parent| parent.child_by_field_name("macro"))
+        .and_then(|mac| mac.utf8_text(text.as_bytes()).ok())
+        .and_then(|mac| mac.rsplit("::").next())
+        .is_some_and(|mac| FORMATTING.contains(&mac))
+}
+
+/// True when every later use of `name` in the enclosing block is an argument
+/// of a macro that only formats it.
+fn only_printed_after(text: &str, declaration: Node<'_>, name: &str) -> bool {
     let Some(block) = declaration.parent() else {
         return false;
     };
@@ -5770,20 +6242,11 @@ fn only_printed_after(text: &str, declaration: Node<'_>, name: &str) -> bool {
         if node.end_byte() <= declaration.end_byte() {
             continue;
         }
-        if node.kind() == "identifier" && node.utf8_text(text.as_bytes()).ok() == Some(name) {
-            let mut ancestor = node.parent();
-            while ancestor.is_some_and(|parent| parent.kind() == "token_tree") {
-                ancestor = ancestor.and_then(|parent| parent.parent());
-            }
-            let formatted = ancestor
-                .filter(|parent| parent.kind() == "macro_invocation")
-                .and_then(|parent| parent.child_by_field_name("macro"))
-                .and_then(|mac| mac.utf8_text(text.as_bytes()).ok())
-                .and_then(|mac| mac.rsplit("::").next())
-                .is_some_and(|mac| FORMATTING.contains(&mac));
-            if !formatted {
-                return false;
-            }
+        if node.kind() == "identifier"
+            && node.utf8_text(text.as_bytes()).ok() == Some(name)
+            && !is_formatted(text, node)
+        {
+            return false;
         }
         let mut cursor = node.walk();
         stack.extend(node.children(&mut cursor));
@@ -6513,6 +6976,46 @@ mod tests {
     }
 
     #[test]
+    fn definition_infers_for_loop_variable_from_declared_collection() {
+        let path = Path::new("/tmp/lib.rs");
+        let source = "pub trait Migration { fn name(&self) -> &'static str; }\n\
+pub struct Migrator { migrations: Vec<Box<dyn Migration>> }\n\
+impl Migrator {\n\
+    pub fn new(migrations: Vec<Box<dyn Migration>>) {\n\
+        for migration in &migrations { migration.name(); }\n\
+    }\n\
+    fn run(&self) {\n\
+        for migration in self.migrations.iter().rev() { migration.name(); }\n\
+    }\n\
+    fn check(&self) {\n\
+        self.migrations.iter().any(|migration| migration.name() == \"\");\n\
+    }\n\
+}\n";
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        engine.install(Built::default());
+        for line in [4_u32, 7, 10] {
+            let text = source.lines().nth(line as usize).unwrap();
+            let column = text.rfind("name").unwrap() as u32 + 1;
+            let found = engine.definition(path, source, line, column);
+            assert_eq!(found.len(), 1, "line {line}");
+            assert_eq!(found[0].line, 0);
+        }
+    }
+
+    #[test]
+    fn element_type_unwraps_collections_and_smart_pointers() {
+        assert_eq!(
+            element_type("Vec<Box<dyn Migration>>").as_deref(),
+            Some("Migration")
+        );
+        assert_eq!(element_type("&[Coffee]").as_deref(), Some("Coffee"));
+        assert_eq!(
+            element_type("HashMap<String, Coffee>").as_deref(),
+            Some("String")
+        );
+    }
+
+    #[test]
     fn project_completion_adds_import_for_public_item() {
         let root = Path::new("/project/src");
         let path = Path::new("/project/src/lib.rs");
@@ -6994,6 +7497,44 @@ mod tests {
                 .iter()
                 .any(|hint| hint.line == 1 && hint.label == ": i32")
         );
+    }
+
+    #[test]
+    fn type_hint_names_vec_of_literals() {
+        let path = Path::new("/tmp/vec-hints.rs");
+        let source = "fn main() {\n    let mut x = vec![1, 2, 3];\n    let names = vec![\"a\", \"b\"];\n    let zeros = vec![0u8; 4];\n    let mixed = vec![1, \"a\"];\n    let items = vec![];\n    let used = vec![1, 2];\n    let total: u64 = used.iter().sum();\n}\n";
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        let found = engine.parameter_hints(path, source, 0, 9);
+        let label = |line: u32| {
+            found
+                .iter()
+                .find(|hint| hint.line == line)
+                .map(|hint| hint.label.as_str())
+        };
+        assert_eq!(label(1), Some(": Vec<i32>"));
+        assert_eq!(label(2), Some(": Vec<&str>"));
+        assert_eq!(label(3), Some(": Vec<u8>"));
+        assert_eq!(label(4), None);
+        assert_eq!(label(5), None);
+        assert_eq!(label(6), None);
+    }
+
+    #[test]
+    fn vec_type_hint_survives_push_and_index() {
+        let path = Path::new("/tmp/vec-push-hints.rs");
+        let source = "fn main() {\n    let  mut x = vec![1,2,3,4,5];\n    let first = &x[50];\n    x.push(5);\n    let mut y = vec![1, 2];\n    y.push(5u8);\n    let mut z = vec![1, 2];\n    let n: u8 = z[0];\n    let mut w = vec![1.5];\n    w.push(2.0);\n    println!(\"{:?}\", w);\n}\n";
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        let found = engine.parameter_hints(path, source, 0, 12);
+        let label = |line: u32| {
+            found
+                .iter()
+                .find(|hint| hint.line == line)
+                .map(|hint| hint.label.as_str())
+        };
+        assert_eq!(label(1), Some(": Vec<i32>"));
+        assert_eq!(label(4), None);
+        assert_eq!(label(6), None);
+        assert_eq!(label(8), Some(": Vec<f64>"));
     }
 
     #[test]

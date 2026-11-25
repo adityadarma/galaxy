@@ -20,6 +20,8 @@ final class CoreBridge {
     private var pendingReferencesRequest: DispatchWorkItem?
     private let navigationQueue = DispatchQueue(label: "dev.adityadarma.galaxy.navigation")
     private var pendingHoverRequest: DispatchWorkItem?
+    private let symbolsQueue = DispatchQueue(label: "dev.adityadarma.galaxy.symbols")
+    private var documentSymbolsPending = false
     private var pendingDefinitionRequests = 0
     private(set) var lastEvent: CoreEvent?
     var onEvent: ((CoreEvent) -> Void)?
@@ -354,8 +356,32 @@ final class CoreBridge {
         _ = core.requestDocumentSymbols(document: document)
     }
 
-    func documentSymbols(document: DocumentHandle) -> [LspOutlineSymbol] {
-        core.documentSymbols(document: document)
+    /// Reading symbols takes the analysis lock, which a Rust check can hold
+    /// for a while. Read them off the AppKit main thread, one batch at a
+    /// time. Returns false when the previous batch has not finished.
+    @discardableResult
+    func loadDocumentSymbols(
+        documents: [DocumentHandle],
+        completion: @escaping @MainActor @Sendable ([[LspOutlineSymbol]]) -> Void
+    ) -> Bool {
+        guard !documentSymbolsPending else { return false }
+        documentSymbolsPending = true
+        let item = Self.documentSymbolsWorkItem(core: core, documents: documents) { [weak self] results in
+            self?.documentSymbolsPending = false
+            completion(results)
+        }
+        symbolsQueue.async(execute: item)
+        return true
+    }
+
+    nonisolated private static func documentSymbolsWorkItem(
+        core: Core, documents: [DocumentHandle],
+        completion: @escaping @MainActor @Sendable ([[LspOutlineSymbol]]) -> Void
+    ) -> DispatchWorkItem {
+        DispatchWorkItem {
+            let results = documents.map { core.documentSymbols(document: $0) }
+            Task { @MainActor in completion(results) }
+        }
     }
 
     func search(workspace: Workspace, query: String, options: WorkspaceSearchOptions, limit: UInt64) throws -> [WorkspaceSearchMatch] {

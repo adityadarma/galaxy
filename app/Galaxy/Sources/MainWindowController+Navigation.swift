@@ -145,27 +145,41 @@ extension MainWindowController {
     }
 
     func refreshDocumentSymbols() {
-        if let document = activeTab?.doc {
-            let symbols = bridge.documentSymbols(document: document)
-            documentSymbols = symbols.map {
-                OutlineSymbol(uri: $0.uri, name: $0.name, kind: $0.kind,
-                              line: $0.line, column: $0.column, depth: $0.depth)
-            }
-            let line = editorView.document?.primaryCursor().line ?? 0
-            pathBar.show(symbols: documentSymbols, atLine: line)
-        } else {
+        let active = activeTab?.doc
+        if active == nil {
             documentSymbols = []
             breadcrumbBar.clear()
             pathBar.show(symbols: [], atLine: 0)
         }
-        guard let document = outlineRequest else { return }
-        let symbols = bridge.documentSymbols(document: document)
-        guard !symbols.isEmpty else { return }
-        outlineRequest = nil
-        outlinePicker.reset(symbols: symbols.map {
-            OutlineSymbol(uri: $0.uri, name: $0.name, kind: $0.kind,
-                          line: $0.line, column: $0.column, depth: $0.depth)
-        })
+        let outline = outlineRequest
+        let documents = [active, outline].compactMap { $0 }
+        guard !documents.isEmpty else { return }
+        bridge.loadDocumentSymbols(documents: documents) { [weak self] results in
+            guard let self else { return }
+            func outlineSymbols(_ symbols: [LspOutlineSymbol]) -> [OutlineSymbol] {
+                symbols.map {
+                    OutlineSymbol(uri: $0.uri, name: $0.name, kind: $0.kind,
+                                  line: $0.line, column: $0.column, depth: $0.depth)
+                }
+            }
+            var next = 0
+            if let active {
+                let symbols = results[next]
+                next += 1
+                if self.activeTab?.doc === active {
+                    self.documentSymbols = outlineSymbols(symbols)
+                    let line = self.editorView.document?.primaryCursor().line ?? 0
+                    self.pathBar.show(symbols: self.documentSymbols, atLine: line)
+                }
+            }
+            if let outline {
+                let symbols = results[next]
+                if self.outlineRequest === outline, !symbols.isEmpty {
+                    self.outlineRequest = nil
+                    self.outlinePicker.reset(symbols: outlineSymbols(symbols))
+                }
+            }
+        }
     }
 
     /// Pins the header lines of the blocks around the top of the view.

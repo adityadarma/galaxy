@@ -8,6 +8,8 @@ import AppKit
 final class FindBar: NSView, NSTextFieldDelegate {
     static let findOnlyHeight: CGFloat = 36
     static let withReplaceHeight: CGFloat = 68
+    /// The bar floats over the editor's top right corner at this width.
+    static let cardWidth: CGFloat = 440
 
     let findField = NSTextField()
     let replaceField = NSTextField()
@@ -118,7 +120,8 @@ final class FindBar: NSView, NSTextFieldDelegate {
     override func updateLayer() {
         layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
         layer?.borderColor = NSColor.separatorColor.cgColor
-        layer?.borderWidth = 0
+        layer?.borderWidth = 1
+        layer?.cornerRadius = 8
     }
 
     // MARK: Showing and hiding

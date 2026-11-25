@@ -153,7 +153,9 @@ extension MainWindowController {
         editorView.flushPendingUpdates()
         // A document that another tab still shows is not closed: no prompt.
         let shared = isDocumentShared(tabs[index])
-        if tabs[index].doc.isModified(), !shared {
+        // A file deleted on disk with no edits of its own closes quietly.
+        let onlyDeleted = tabs[index].isDeletedOnDisk && !tabs[index].doc.hasUnsavedText()
+        if tabs[index].doc.isModified(), !shared, !onlyDeleted {
             if activeIndex != index { selectTab(index) }
             guard confirmDiscardActive() else { return false }
         }
@@ -218,7 +220,7 @@ extension MainWindowController {
                 status = .deleted
             }
             let isChanged = rel.map(gitPaths.contains) ?? (status != .none)
-            // A file only deleted on disk is "modified" so closing asks first,
+            // A file only deleted on disk is "modified" so Save recreates it,
             // but its tab keeps the close button: there is no unsaved text.
             let showsUnsavedDot = tab.isEdited && !(tab.isDeletedOnDisk && !tab.doc.hasUnsavedText())
             return TabBar.Item(

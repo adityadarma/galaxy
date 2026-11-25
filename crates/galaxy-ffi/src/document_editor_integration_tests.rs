@@ -827,6 +827,31 @@ fn diagnostics_are_clipped_to_visible_utf16_lines() {
     assert_eq!(snap.lines[1].diagnostics[0].end, 2);
 }
 
+#[test]
+fn zero_width_diagnostics_still_mark_a_character() {
+    let doc = Core::new().new_document();
+    doc.edit(EditCommand::InsertText {
+        text: "let x = 1\nlet y = 2;".into(),
+    });
+    let missing = |line: u64, character: u64| DiagnosticInfo {
+        start_line: line,
+        start_character: character,
+        end_line: line,
+        end_character: character,
+        severity: 1,
+        message: "Syntax error".into(),
+        source: None,
+        code: None,
+        unnecessary: false,
+    };
+    doc.set_diagnostics(vec![missing(0, 9), missing(1, 4)]);
+    let snap = doc.viewport(0, 2);
+    assert_eq!(snap.lines[0].diagnostics[0].start, 8);
+    assert_eq!(snap.lines[0].diagnostics[0].end, 9);
+    assert_eq!(snap.lines[1].diagnostics[0].start, 4);
+    assert_eq!(snap.lines[1].diagnostics[0].end, 5);
+}
+
 fn folding_doc() -> Arc<DocumentHandle> {
     let doc = Core::new().new_document();
     doc.edit(EditCommand::InsertText {
