@@ -129,12 +129,24 @@ final class DiskChangeTests: XCTestCase {
         c.checkOpenFiles()
         XCTAssertEqual(c.tabBar.items.map(\.title), ["a.txt (deleted)"])
         XCTAssertTrue(c.tabs[0].isEdited, "unsaved: closing asks first")
+        XCTAssertEqual(c.tabBar.items.map(\.isEdited), [false], "no typed text: the tab keeps its close button")
         XCTAssertEqual(text(c.editorView.document), "a.txt line 1\nline 2\n")
 
         XCTAssertTrue(c.save())
         XCTAssertEqual(c.tabBar.items.map(\.title), ["a.txt"])
         XCTAssertFalse(c.tabs[0].isEdited)
         XCTAssertTrue(FileManager.default.fileExists(atPath: file("a.txt").path))
+    }
+
+    func testADeletedFileWithTypedTextKeepsTheUnsavedDot() throws {
+        let c = makeController()
+        defer { c.window?.orderOut(nil) }
+        try c.openFile(at: file("a.txt"))
+        type(c, "x")
+        try FileManager.default.removeItem(at: file("a.txt"))
+        c.checkOpenFiles()
+        XCTAssertEqual(c.tabBar.items.map(\.title), ["a.txt (deleted)"])
+        XCTAssertEqual(c.tabBar.items.map(\.isEdited), [true])
     }
 
     func testTheWatcherReloadsOpenFiles() throws {

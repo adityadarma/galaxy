@@ -7743,6 +7743,12 @@ impl DocumentHandle {
         st.deleted_on_disk || st.has_unsaved_edits()
     }
 
+    /// `true` when the text itself has unsaved edits. Unlike `is_modified`,
+    /// a file that was only deleted on disk does not count.
+    pub fn has_unsaved_text(&self) -> bool {
+        self.lock().has_unsaved_edits()
+    }
+
     /// Compares the file on disk with what was last loaded or saved
     /// (M2-03). One `stat` when nothing changed. Errors other than "not
     /// found" (permissions) report `Unchanged`.

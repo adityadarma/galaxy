@@ -218,10 +218,13 @@ extension MainWindowController {
                 status = .deleted
             }
             let isChanged = rel.map(gitPaths.contains) ?? (status != .none)
+            // A file only deleted on disk is "modified" so closing asks first,
+            // but its tab keeps the close button: there is no unsaved text.
+            let showsUnsavedDot = tab.isEdited && !(tab.isDeletedOnDisk && !tab.doc.hasUnsavedText())
             return TabBar.Item(
                 title: tab.displayTitle,
                 isPreview: tab.isPreview,
-                isEdited: tab.isEdited,
+                isEdited: showsUnsavedDot,
                 isGitChanged: isChanged,
                 gitStatus: status,
                 isTerminal: tab.terminal != nil,
