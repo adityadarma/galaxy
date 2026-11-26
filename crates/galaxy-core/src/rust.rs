@@ -137,8 +137,11 @@ pub struct RustEngine {
     /// definition on a method chain ask once per link, and each answer parsed
     /// every candidate file again. Entries are checked against the file's
     /// current stamp, so no explicit invalidation is needed.
-    member_cache: Mutex<HashMap<(PathBuf, String, String), (SourceStamp, Vec<Declaration>)>>,
+    member_cache: Mutex<HashMap<MemberKey, (SourceStamp, Vec<Declaration>)>>,
 }
+
+/// File, type and member name of a `member_cache` entry.
+type MemberKey = (PathBuf, String, String);
 
 /// Identifies one version of a source file: the hash of an open buffer, or
 /// the modification time and size of a file on disk.
@@ -6430,14 +6433,13 @@ fn vec_literal_type(
         .children(&mut cursor)
         .any(|child| child.kind() == ";");
     let mut cursor = tokens.walk();
-    let mut elements = tokens.named_children(&mut cursor);
+    // `vec![value; n]` has one element; `n` is the length.
+    let elements = tokens
+        .named_children(&mut cursor)
+        .take(if repeated { 1 } else { usize::MAX });
     let mut element_type = None;
-    let mut count = 0;
     let mut defaulted = None;
-    while let Some(element) = elements.next() {
-        if repeated && count == 1 {
-            break;
-        }
+    for element in elements {
         let label = match element.kind() {
             "string_literal" | "raw_string_literal" => "&str".to_owned(),
             "boolean_literal" => "bool".to_owned(),
@@ -6453,7 +6455,6 @@ fn vec_literal_type(
         if element_type.get_or_insert_with(|| label.clone()) != &label {
             return None;
         }
-        count += 1;
     }
     element_type.map(|element| format!("Vec<{element}>"))
 }
@@ -6497,10 +6498,9 @@ fn vec_elements_defaulted(text: &str, declaration: Node<'_>, name: &str) -> bool
                     return false;
                 };
                 let mut cursor = arguments.walk();
-                let all_plain = arguments
+                arguments
                     .named_children(&mut cursor)
-                    .all(|argument| argument.is_extra() || plain_number(argument));
-                all_plain
+                    .all(|argument| argument.is_extra() || plain_number(argument))
             }
             "index_expression" if parent.named_child(0) == Some(node) => {
                 let mut value = parent;

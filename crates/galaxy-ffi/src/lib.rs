@@ -7684,8 +7684,8 @@ impl DocumentHandle {
                 {
                     if start < line.text.encode_utf16().count() as u64 {
                         end = start + 1;
-                    } else if start > 0 {
-                        start -= 1;
+                    } else {
+                        start = start.saturating_sub(1);
                     }
                 }
                 if start < end {
