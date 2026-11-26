@@ -75,6 +75,6 @@ extension MainWindowController {
             }
         }
         rustCompilerRefreshWorkItem = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: item)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: item)
     }
 }

@@ -67,6 +67,9 @@ final class ExplorerController: NSObject {
     var onRename: ((FileEntry, String) -> Void)?
     var onRenameCancelled: ((FileEntry) -> Void)?
     var onCreateNewItem: ((String, Bool, String) -> Void)?
+    /// Called with files dropped from Finder or another app, and the
+    /// workspace folder they go into (`""` is the root).
+    var onDropFiles: (([URL], String) -> Void)?
     /// Builds the right-click menu, after the clicked row was selected.
     var contextMenu: (() -> NSMenu?)?
 
@@ -90,6 +93,8 @@ final class ExplorerController: NSObject {
         outlineView.doubleAction = #selector(doubleClicked(_:))
         outlineView.onFolderClick = { [weak self] row in self?.folderClicked(row: row) ?? false }
         outlineView.onContextMenu = { [weak self] row in self?.menu(forRow: row) }
+        outlineView.registerForDraggedTypes([.fileURL])
+        outlineView.setDraggingSourceOperationMask(.copy, forLocal: false)
         outlineView.setAccessibilityLabel("File explorer")
         outlineView.setAccessibilityIdentifier("explorer")
 
@@ -463,6 +468,36 @@ extension ExplorerController: NSOutlineViewDataSource {
 
     func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool {
         (item as? ExplorerNode)?.entry.isDir ?? false
+    }
+
+    /// A drop lands in the folder under the pointer: the folder row itself,
+    /// the folder holding a file row, or the root below the rows.
+    func dropFolder(for item: Any?) -> ExplorerNode? {
+        guard let node = item as? ExplorerNode else { return nil }
+        if node.entry.isDir { return node }
+        return outlineView.parent(forItem: node) as? ExplorerNode
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, validateDrop info: NSDraggingInfo,
+                     proposedItem item: Any?, proposedChildIndex index: Int) -> NSDragOperation {
+        guard workspace != nil, !Self.droppedFileURLs(info).isEmpty else { return [] }
+        outlineView.setDropItem(dropFolder(for: item), dropChildIndex: NSOutlineViewDropOnItemIndex)
+        return .copy
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, acceptDrop info: NSDraggingInfo,
+                     item: Any?, childIndex index: Int) -> Bool {
+        let urls = Self.droppedFileURLs(info)
+        guard workspace != nil, !urls.isEmpty else { return false }
+        let folder = dropFolder(for: item)?.entry.relPath ?? ""
+        // Let the drag session finish first: copying may show an alert.
+        DispatchQueue.main.async { [weak self] in self?.onDropFiles?(urls, folder) }
+        return true
+    }
+
+    static func droppedFileURLs(_ info: NSDraggingInfo) -> [URL] {
+        let options: [NSPasteboard.ReadingOptionKey: Any] = [.urlReadingFileURLsOnly: true]
+        return (info.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: options) as? [URL]) ?? []
     }
 }
 

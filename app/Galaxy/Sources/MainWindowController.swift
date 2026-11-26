@@ -1082,11 +1082,17 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         explorer.scrollView.isHidden = true
         explorer.scrollView.translatesAutoresizingMaskIntoConstraints = false
         explorer.onOpenFile = { [weak self] workspace, entry in
-            self?.openWorkspaceFile(workspace, entry, preview: false)
+            guard let self else { return }
+            self.openWorkspaceFile(workspace, entry, preview: false)
+            // A single click or arrow key keeps focus in the explorer, so
+            // Return renames and arrows keep moving; a double click focuses
+            // the editor.
+            self.window?.makeFirstResponder(self.explorer.outlineView)
         }
         explorer.onPinFile = { [weak self] workspace, entry in
             self?.openWorkspaceFile(workspace, entry, preview: false)
         }
+        explorer.onDropFiles = { [weak self] urls, folder in self?.copyIntoExplorer(urls, folder: folder) }
         explorer.onRename = { [weak self] entry, name in self?.renameEntry(entry, to: name) }
         explorer.onCreateNewItem = { [weak self] parent, folder, name in
             self?.createExplorerItem(parent: parent, folder: folder, name: name)

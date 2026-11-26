@@ -377,6 +377,8 @@ fn valid_commit_id(rev: &str) -> bool {
 
 /// Local git operations finish quickly; this only stops a stuck one.
 const LOCAL_TIMEOUT: Duration = Duration::from_secs(60);
+/// A commit runs the repository's hooks, which may format or test the code.
+const COMMIT_TIMEOUT: Duration = Duration::from_secs(600);
 /// Remote operations give up sooner: offline must not hang the panel.
 const NETWORK_TIMEOUT: Duration = Duration::from_secs(20);
 /// Blame walks the file's whole history; a huge file may take a while.
@@ -1742,14 +1744,30 @@ pub fn commit(root: &Path, message: &str) -> io::Result<()> {
     if message.trim().is_empty() {
         return Err(io::Error::other("commit message is empty"));
     }
-    let status = Command::new("git")
-        .args(["-C", &root.to_string_lossy(), "commit", "-m", message])
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other("git commit failed"))
+    let output = git_output(root, &["commit", "-m", message], COMMIT_TIMEOUT)
+        .map_err(|e| io::Error::new(e.kind(), format!("git commit failed: {e}")))?;
+    if output.status.success() {
+        return Ok(());
     }
+    // Hooks write to stderr; "nothing to commit" goes to stdout.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let text = if stderr.trim().is_empty() {
+        stdout
+    } else {
+        stderr
+    };
+    let reason: Vec<&str> = text
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .take(12)
+        .collect();
+    Err(io::Error::other(if reason.is_empty() {
+        "git commit failed".to_owned()
+    } else {
+        format!("git commit failed:\n{}", reason.join("\n"))
+    }))
 }
 
 fn git_path_command<const N: usize>(root: &Path, args: [&str; N]) -> io::Result<()> {
@@ -1842,6 +1860,38 @@ mod tests {
                 "-m",
                 message,
             ],
+        );
+    }
+
+    #[test]
+    fn commit_failure_reports_hook_and_git_output() {
+        let dir = tempfile::tempdir().unwrap();
+        run(dir.path(), ["init", "-b", "main"]);
+        run(dir.path(), ["config", "user.name", "Test"]);
+        run(dir.path(), ["config", "user.email", "test@example.com"]);
+        fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        commit_all(dir.path(), "initial");
+
+        let error = commit(dir.path(), "nothing").unwrap_err().to_string();
+        assert!(error.contains("nothing to commit"), "{error}");
+
+        let hook = dir.path().join(".git/hooks/pre-commit");
+        fs::write(
+            &hook,
+            "#!/bin/sh\necho 'pre-commit: code is not formatted' >&2\nexit 1\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::write(dir.path().join("a.txt"), "two\n").unwrap();
+        run(dir.path(), ["add", "a.txt"]);
+        let error = commit(dir.path(), "change").unwrap_err().to_string();
+        assert_eq!(
+            error,
+            "git commit failed:\npre-commit: code is not formatted"
         );
     }
 

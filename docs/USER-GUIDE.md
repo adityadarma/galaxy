@@ -105,7 +105,7 @@ workspace or dependency code. The setting is stored as
 while it is active to cancel Cargo. Static navigation otherwise does not run
 Cargo, build scripts, or macro expansion.
 
-When that setting is enabled, saving a Rust source file waits 1.5 seconds and
+When that setting is enabled, saving a Rust source file waits 1 second and
 runs the same Cargo check in the background. It never runs while typing.
 Compiler diagnostics appear with source `rustc` alongside Galaxy's static
 diagnostics, and machine-applicable same-file rustc suggestions appear in Code

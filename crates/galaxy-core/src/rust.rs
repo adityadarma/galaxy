@@ -1117,12 +1117,14 @@ impl RustEngine {
     pub fn complete(&mut self, path: &Path, text: &str, line: u32, column: u32) -> Vec<Completion> {
         self.sync_document(path, text);
         let prefix = word_before(text, line, column);
+        let calls = adds_call_parentheses(text, line, column);
         if member_access_before(text, line, column) {
             return self
                 .member_completions(path, text, line, column)
                 .into_iter()
                 .filter(|item| item.label.starts_with(prefix))
                 .take(MAX_ITEMS)
+                .map(|item| if calls { with_call(item) } else { item })
                 .collect();
         }
         let mut candidates = self.visible_declarations(path, prefix);
@@ -1147,7 +1149,11 @@ impl RustEngine {
         );
         completions.sort_by(|left, right| left.label.cmp(&right.label));
         completions.dedup_by(|left, right| left.label == right.label && left.kind == right.kind);
-        completions.into_iter().take(MAX_ITEMS).collect()
+        completions
+            .into_iter()
+            .take(MAX_ITEMS)
+            .map(|item| if calls { with_call(item) } else { item })
+            .collect()
     }
 
     pub fn signature(
@@ -1688,7 +1694,9 @@ impl RustEngine {
             out.extend(struct_fields(&source, &ty));
             out.extend(impl_methods(&source, &ty));
         }
-        out.sort_by(|left, right| left.label.cmp(&right.label));
+        // Several `From` impls share the label `from`. Keep the one taking
+        // `&str`, so `String::from` completes to `from("")`.
+        out.sort_by_key(|item| (item.label.clone(), !takes_str(item)));
         out.dedup_by(|left, right| left.label == right.label);
         out
     }
@@ -1842,11 +1850,11 @@ impl RustEngine {
     ) -> (String, Vec<String>) {
         'outer: for _ in 0..8 {
             for depth in 0..module.len() {
-                if let Some(package) =
+                if let Some((package, inner)) =
                     self.reexported_crate(&crate_name, &module[..depth], &module[depth])
                 {
                     crate_name = package;
-                    module.drain(..=depth);
+                    module.splice(..=depth, inner);
                     continue 'outer;
                 }
             }
@@ -1860,7 +1868,7 @@ impl RustEngine {
         crate_name: &str,
         parent: &[String],
         segment: &str,
-    ) -> Option<String> {
+    ) -> Option<(String, Vec<String>)> {
         for (binding_path, bindings) in &self.uses {
             if self.crate_for(binding_path) != crate_name {
                 continue;
@@ -1869,15 +1877,24 @@ impl RustEngine {
                 binding.public
                     && !binding.glob
                     && binding.local == segment
-                    && binding.target.len() == 1
                     && if binding.module.is_empty() {
                         self.module_for(binding_path) == parent
                     } else {
                         binding.module == parent
                     }
             }) {
-                if let Some(dependency) = self.dependency_for(binding_path, &binding.target[0]) {
-                    return Some(dependency.package);
+                // `pub use framework_http as http;` names a crate, and
+                // `pub use axum::routing;` a module inside one.
+                let Some(dependency) = self.dependency_for(binding_path, &binding.target[0]) else {
+                    continue;
+                };
+                let inner = binding.target[1..].to_vec();
+                let is_module = inner.is_empty()
+                    || self.all_declarations().any(|item| {
+                        item.crate_name == dependency.package && item.module.starts_with(&inner)
+                    });
+                if is_module {
+                    return Some((dependency.package, inner));
                 }
             }
         }
@@ -2083,6 +2100,19 @@ impl RustEngine {
             return None;
         }
         let function = expression.child_by_field_name("function")?;
+        if function.kind() == "identifier" {
+            let name = function.utf8_text(text.as_bytes()).ok()?;
+            let declarations: Vec<_> = self
+                .resolve_nonlocal(path, name)
+                .into_iter()
+                .filter(|item| item.kind == ItemKind::Function)
+                .collect();
+            let [declaration] = declarations.as_slice() else {
+                return None;
+            };
+            let source = self.declaration_source(sources, path, text, declaration)?;
+            return named_return_type(source, declaration, None);
+        }
         let (owner, name) = match function.kind() {
             "scoped_identifier" => {
                 let owner = function
@@ -2109,13 +2139,47 @@ impl RustEngine {
             }
             _ => return None,
         };
-        let declarations = self.member_matches(&owner, &name);
+        let mut owner = owner;
+        let mut declarations = self.member_matches(&owner, &name);
+        if declarations.is_empty()
+            && let Some(target) = self.alias_target(&owner)
+        {
+            declarations = self.member_matches(&target, &name);
+            owner = target;
+        }
         let [declaration] = declarations.as_slice() else {
             return None;
         };
         let source = self.declaration_source(sources, path, text, declaration)?;
-        rust_return_type_at(source, declaration.line, declaration.column, Some(&owner))
-            .and_then(|ty| named_type(&ty))
+        named_return_type(source, declaration, Some(&owner))
+    }
+
+    /// `Router` for `pub type AppRouter = Router<Container>;`, when exactly
+    /// one type alias has that name.
+    fn alias_target(&self, ty: &str) -> Option<String> {
+        let aliases: Vec<_> = self
+            .declarations_named(ty)
+            .into_iter()
+            .filter_map(|item| {
+                let signature = item.signature.trim_start();
+                let signature = signature
+                    .strip_prefix("pub ")
+                    .or_else(|| {
+                        signature
+                            .strip_prefix("pub(")
+                            .and_then(|rest| rest.split_once(')'))
+                            .map(|(_, rest)| rest)
+                    })
+                    .unwrap_or(signature)
+                    .trim_start();
+                let (_, target) = signature.strip_prefix("type ")?.split_once('=')?;
+                named_type(target.trim().trim_end_matches(';'))
+            })
+            .collect();
+        match aliases.as_slice() {
+            [target] if target != ty => Some(target.clone()),
+            _ => None,
+        }
     }
 
     fn receiver_type(
@@ -3576,7 +3640,7 @@ pub struct RustIndexCache {
     files: HashMap<PathBuf, CachedRustFile>,
 }
 
-const RUST_INDEX_CACHE_SCHEMA: u32 = 1;
+const RUST_INDEX_CACHE_SCHEMA: u32 = 2;
 
 #[derive(serde::Serialize)]
 struct StoredRustIndexRef<'a> {
@@ -4099,16 +4163,147 @@ fn parse_declarations(
         return Vec::new();
     };
     let mut out = Vec::new();
+    let module = module.map_or_else(|| module_path(path, source_root), <[String]>::to_vec);
     collect_declarations(
         path,
         text,
         tree.root_node(),
         crate_name,
-        module.unwrap_or(&module_path(path, source_root)),
+        &module,
+        cfg,
+        &mut out,
+    );
+    collect_macro_functions(
+        path,
+        text,
+        tree.root_node(),
+        crate_name,
+        &module,
         cfg,
         &mut out,
     );
     out
+}
+
+/// Functions written by an item-level macro call, such as axum's
+/// `top_level_handler_fn!(get, GET);`. Only a `macro_rules!` in the same
+/// file whose body declares `fn $name` counts. The call's first identifier
+/// is the function name, and the declaration points at it.
+fn collect_macro_functions(
+    path: &Path,
+    text: &str,
+    root: Node<'_>,
+    crate_name: &str,
+    module: &[String],
+    cfg: &CfgContext,
+    out: &mut Vec<Declaration>,
+) {
+    let mut templates: HashMap<&str, Option<(String, String)>> = HashMap::new();
+    let mut cursor = root.walk();
+    for item in root.named_children(&mut cursor) {
+        // Tree-sitter wraps an item-level `mac!(...);` in an expression statement.
+        let call = match item.kind() {
+            "expression_statement" => match item.named_child(0) {
+                Some(call) => call,
+                None => continue,
+            },
+            _ => item,
+        };
+        if call.kind() != "macro_invocation" || cfg_disabled(item, text, cfg) {
+            continue;
+        }
+        let Some(mac) = call
+            .child_by_field_name("macro")
+            .filter(|mac| mac.kind() == "identifier")
+            .and_then(|mac| mac.utf8_text(text.as_bytes()).ok())
+        else {
+            continue;
+        };
+        let Some((variable, template)) = templates
+            .entry(mac)
+            .or_insert_with(|| macro_function_template(text, mac))
+        else {
+            continue;
+        };
+        let mut tokens_cursor = call.walk();
+        let Some(tokens) = call
+            .named_children(&mut tokens_cursor)
+            .find(|child| child.kind() == "token_tree")
+        else {
+            continue;
+        };
+        let mut name_cursor = tokens.walk();
+        let Some(name) = tokens
+            .named_children(&mut name_cursor)
+            .next()
+            .filter(|name| name.kind() == "identifier")
+        else {
+            continue;
+        };
+        let Ok(name_text) = name.utf8_text(text.as_bytes()) else {
+            continue;
+        };
+        let signature = template.replace(variable.as_str(), name_text);
+        if signature.contains('$') {
+            continue;
+        }
+        let prefix = signature.find("fn ").map_or("", |end| &signature[..end]);
+        let point = name.start_position();
+        out.push(Declaration {
+            name: name_text.to_owned(),
+            crate_name: crate_name.to_owned(),
+            module: module.to_vec(),
+            visibility: item_visibility(prefix, module),
+            kind: ItemKind::Function,
+            path: path.to_path_buf(),
+            line: point.row as u32,
+            column: utf16_column(text, name.start_byte()),
+            scope_depth: 0,
+            signature,
+        });
+    }
+}
+
+/// `("$name", "pub fn $name<H>(handler: H) -> MethodRouter")` for the
+/// `macro_rules! mac` in `text` that declares a function named by a
+/// macro variable.
+fn macro_function_template(text: &str, mac: &str) -> Option<(String, String)> {
+    let header = format!("macro_rules! {mac}");
+    let start = text
+        .match_indices(&header)
+        .map(|(start, _)| start + header.len())
+        .find(|end| !text[*end..].starts_with(is_ident))?;
+    let rest = &text[start..];
+    let open = rest.find('{')?;
+    let mut depth = 0usize;
+    let mut close = None;
+    for (offset, character) in rest[open..].char_indices() {
+        match character {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(open + offset);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let body = &rest[open..close?];
+    body.match_indices("fn $").find_map(|(at, _)| {
+        let variable = &body[at + 3..];
+        let length = 1 + variable[1..].find(|c: char| !is_ident(c))?;
+        let after = variable[length..].trim_start();
+        if length == 1 || !(after.starts_with('<') || after.starts_with('(')) {
+            return None;
+        }
+        let line_start = body[..at].rfind('\n').map_or(0, |newline| newline + 1);
+        let line = &body[line_start..];
+        let line_end = line.find(['\n', '{']).unwrap_or(line.len());
+        let signature = line[..line_end].trim().trim_end_matches("where").trim();
+        Some((variable[..length].to_owned(), signature.to_owned()))
+    })
 }
 
 fn collect_declarations(
@@ -5833,6 +6028,142 @@ fn impl_for_member(node: Node<'_>, text: &str) -> Option<String> {
     None
 }
 
+/// False where a completed function name must stay bare: inside a `use`
+/// declaration, or when `(` already follows the cursor.
+fn adds_call_parentheses(text: &str, line: u32, column: u32) -> bool {
+    let byte = cursor_byte(text, line, column);
+    let line_start = text[..byte].rfind('\n').map_or(0, |newline| newline + 1);
+    let written = text[line_start..byte].trim_start();
+    let in_use = ["use ", "pub use ", "pub(crate) use "]
+        .iter()
+        .any(|keyword| written.starts_with(keyword));
+    let after = text[byte..].trim_start_matches(is_ident);
+    !in_use && !after.starts_with('(')
+}
+
+/// The parameters of `fn name(...)` in `detail`, without `self`. `None`
+/// when the signature is cut off before its closing parenthesis.
+fn call_parameters(detail: &str, name: &str) -> Option<Vec<String>> {
+    let header = format!("fn {name}");
+    let start = detail
+        .match_indices(&header)
+        .map(|(at, _)| at + header.len())
+        .find(|end| !detail[*end..].starts_with(is_ident))?;
+    let rest = detail[start..].trim_start();
+    let mut depth = 0usize;
+    let mut open = None;
+    for (at, character) in rest.char_indices() {
+        match character {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            '(' if depth == 0 => {
+                open = Some(at);
+                break;
+            }
+            _ => {}
+        }
+    }
+    let rest = &rest[open? + 1..];
+    let mut parameters = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0usize;
+    for character in rest.chars() {
+        match character {
+            '(' | '<' | '[' | '{' => depth += 1,
+            ')' if depth == 0 => {
+                parameters.push(std::mem::take(&mut current));
+                return Some(
+                    parameters
+                        .into_iter()
+                        .map(|parameter| parameter.trim().to_owned())
+                        .filter(|parameter| {
+                            let receiver = parameter
+                                .trim_start_matches('&')
+                                .trim_start_matches(|c: char| c == '\'' || is_ident(c))
+                                .trim_start()
+                                .trim_start_matches("mut ")
+                                .trim_start();
+                            !parameter.is_empty()
+                                && receiver != "self"
+                                && !receiver.starts_with("self:")
+                                && parameter != "self"
+                                && parameter != "&self"
+                                && parameter != "&mut self"
+                                && parameter != "mut self"
+                        })
+                        .collect(),
+                );
+            }
+            ')' | '>' | ']' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parameters.push(std::mem::take(&mut current));
+                continue;
+            }
+            _ => {}
+        }
+        current.push(character);
+    }
+    None
+}
+
+/// The written type of a parameter, with lifetimes dropped: `&'a str` is
+/// `&str`.
+fn written_parameter_type(parameter: &str) -> String {
+    let ty = parameter
+        .split_once(':')
+        .map_or(parameter, |(_, ty)| ty)
+        .trim();
+    let mut out = String::new();
+    let mut rest = ty;
+    while let Some(at) = rest.find('\'') {
+        out.push_str(&rest[..at]);
+        rest = rest[at + 1..].trim_start_matches(is_ident).trim_start();
+    }
+    out.push_str(rest);
+    out
+}
+
+fn takes_str(item: &Completion) -> bool {
+    item.detail
+        .as_deref()
+        .and_then(|detail| call_parameters(detail, &item.label))
+        .is_some_and(|parameters| {
+            matches!(parameters.as_slice(), [only] if written_parameter_type(only) == "&str")
+        })
+}
+
+/// A function completes as a call: `len()`, `push($0)`, `from("$0")` for a
+/// single string parameter, or `from('$0')` for a single `char`.
+fn with_call(mut item: Completion) -> Completion {
+    if item.kind != ItemKind::Function || item.is_snippet || item.insert_text != item.label {
+        return item;
+    }
+    let parameters = item
+        .detail
+        .as_deref()
+        .and_then(|detail| call_parameters(detail, &item.label));
+    let name = &item.label;
+    item.insert_text = match parameters.as_deref() {
+        Some([]) => {
+            item.insert_text = format!("{name}()");
+            return item;
+        }
+        Some([only]) => match written_parameter_type(only).as_str() {
+            "&str"
+            | "impl Into<String>"
+            | "impl AsRef<str>"
+            | "impl AsRef<Path>"
+            | "impl AsRef<std::path::Path>"
+            | "impl Into<PathBuf>" => format!("{name}(\"$0\")"),
+            "char" => format!("{name}('$0')"),
+            _ => format!("{name}($0)"),
+        },
+        _ => format!("{name}($0)"),
+    };
+    item.is_snippet = true;
+    item
+}
+
 fn completion(name: &str, detail: &str, kind: ItemKind) -> Completion {
     Completion {
         label: name.to_owned(),
@@ -6308,6 +6639,80 @@ fn rust_return_type_at(text: &str, line: u32, column: u32, owner: Option<&str>) 
     Some(out)
 }
 
+/// The type name a call of `declaration` returns, for following a call
+/// chain. Unlike [`rust_return_type_at`], a generic function still answers
+/// when its return type is not one of its own type parameters
+/// (`fn route_layer<L>(self, layer: L) -> MethodRouter<S, E>`), and a
+/// function written by a macro answers from its signature.
+fn named_return_type(text: &str, declaration: &Declaration, owner: Option<&str>) -> Option<String> {
+    if let Some(ty) = rust_return_type_at(text, declaration.line, declaration.column, owner) {
+        return named_type(&ty);
+    }
+    let tree = parse_tree(text);
+    let function = tree.as_ref().and_then(|tree| {
+        let byte = cursor_byte(text, declaration.line, declaration.column);
+        let mut node = tree.root_node().descendant_for_byte_range(byte, byte)?;
+        while node.kind() != "function_item" {
+            node = node.parent()?;
+        }
+        Some(node)
+    });
+    let (parameters, written) = match function {
+        Some(node) => {
+            let mut cursor = node.walk();
+            let asynchronous = node.named_children(&mut cursor).any(|child| {
+                child.kind() == "function_modifiers"
+                    && child
+                        .utf8_text(text.as_bytes())
+                        .is_ok_and(|m| m.contains("async"))
+            });
+            if asynchronous {
+                return None;
+            }
+            let parameters = node
+                .child_by_field_name("type_parameters")
+                .and_then(|node| node.utf8_text(text.as_bytes()).ok())
+                .unwrap_or("")
+                .to_owned();
+            let written = node
+                .child_by_field_name("return_type")?
+                .utf8_text(text.as_bytes())
+                .ok()?
+                .to_owned();
+            (parameters, written)
+        }
+        None => {
+            let signature = declaration.signature.as_str();
+            if signature.contains("async ") {
+                return None;
+            }
+            let after_name = signature.split_once(&format!("fn {}", declaration.name))?.1;
+            let (parameters, rest) = match after_name.strip_prefix('<') {
+                Some(generic) => generic.split_once('>')?,
+                None => ("", after_name),
+            };
+            let written = rest.split_once("->")?.1;
+            let written = written.split(" where").next()?.trim_end_matches('{').trim();
+            (parameters.to_owned(), written.to_owned())
+        }
+    };
+    if written.contains("impl ") || written.contains("dyn ") {
+        return None;
+    }
+    let ty = named_type(&written)?;
+    if ty == "Self" {
+        return owner
+            .filter(|owner| owner.starts_with(|c: char| c.is_uppercase()) && *owner != "Self")
+            .map(str::to_owned);
+    }
+    let generic = parameters
+        .trim_matches(['<', '>'])
+        .split(',')
+        .filter_map(|parameter| parameter.trim().split([':', ' ', '=']).next())
+        .any(|parameter| parameter == ty);
+    (!generic).then_some(ty)
+}
+
 fn deepest_call(node: Node<'_>, byte: usize) -> Option<Node<'_>> {
     if node.start_byte() > byte || node.end_byte() < byte {
         return None;
@@ -6664,6 +7069,87 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn function_completions_insert_call_parentheses() {
+        let path = Path::new("/tmp/call-snippets.rs");
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        let insert = |engine: &mut RustEngine, source: &str, label: &str| {
+            let line = source.lines().count() as u32 - 1;
+            let column = source.lines().last().unwrap().len() as u32;
+            engine
+                .complete(path, source, line, column)
+                .into_iter()
+                .find(|item| item.label == label)
+                .map(|item| (item.insert_text, item.is_snippet))
+        };
+        assert_eq!(
+            insert(&mut engine, "fn main() {\n    String::from", "from"),
+            Some(("from(\"$0\")".to_owned(), true))
+        );
+        assert_eq!(
+            insert(&mut engine, "fn main() {\n    String::ne", "new"),
+            Some(("new()".to_owned(), false))
+        );
+        let source = "fn greet(name: u32, loud: bool) {}\nfn main() {\n    gre";
+        assert_eq!(
+            insert(&mut engine, source, "greet"),
+            Some(("greet($0)".to_owned(), true))
+        );
+        assert!(!adds_call_parentheses("use std::mem::sw", 0, 16));
+        assert!(!adds_call_parentheses("pub use crate::gre", 0, 18));
+        assert!(!adds_call_parentheses("    gre(1)", 0, 7));
+        assert!(adds_call_parentheses("    gre", 0, 7));
+    }
+
+    #[test]
+    fn call_parameters_skip_receivers_and_generics() {
+        assert_eq!(
+            call_parameters("pub fn push(&mut self, value: T)", "push"),
+            Some(vec!["value: T".to_owned()])
+        );
+        assert_eq!(
+            call_parameters(
+                "fn from_iter<I: IntoIterator<Item = char>>(iter: I) -> Self",
+                "from_iter"
+            ),
+            Some(vec!["iter: I".to_owned()])
+        );
+        assert_eq!(
+            call_parameters("pub fn len(&self) -> usize", "len"),
+            Some(vec![])
+        );
+        assert_eq!(
+            call_parameters("fn from_iter<I: IntoIterator<Item = C", "from_iter"),
+            None
+        );
+        assert_eq!(written_parameter_type("s: &'a str"), "&str");
+    }
+
+    #[test]
+    fn macro_written_functions_are_declared() {
+        let source = "macro_rules! handler_fn {\n    (\n        $(#[$m:meta])+\n        $name:ident, $method:ident\n    ) => {\n        $(#[$m])+\n        pub fn $name<H, T, S>(handler: H) -> MethodRouter<S, Infallible>\n        where\n            H: Handler<T, S>,\n        {\n            on(MethodFilter::$method, handler)\n        }\n    };\n}\n\nhandler_fn!(get, GET);\nhandler_fn!(post, POST);\n";
+        let found = parse_declarations(
+            Path::new("/tmp/routing/method_routing.rs"),
+            source,
+            Path::new("/tmp"),
+            "axum",
+            &CfgContext::default(),
+            None,
+        );
+        let get = found
+            .iter()
+            .find(|item| item.name == "get")
+            .expect("get declared");
+        assert_eq!((get.line, get.column), (15, 12));
+        assert_eq!(get.kind, ItemKind::Function);
+        assert_eq!(get.visibility, Visibility::Public);
+        assert_eq!(
+            get.signature,
+            "pub fn get<H, T, S>(handler: H) -> MethodRouter<S, Infallible>"
+        );
+        assert!(found.iter().any(|item| item.name == "post"));
+    }
 
     fn definition_at(
         engine: &mut RustEngine,

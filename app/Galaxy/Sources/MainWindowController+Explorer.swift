@@ -76,13 +76,20 @@ extension MainWindowController {
 
     /// Copies filesystem URLs from any app window into the selected folder.
     @objc func pasteExplorerItem(_ sender: Any?) {
-        guard let workspace else { return NSSound.beep() }
+        guard workspace != nil else { return NSSound.beep() }
         let items = NSPasteboard.general.readObjects(
             forClasses: [NSURL.self],
             options: [.urlReadingFileURLsOnly: true]
         ) as? [URL] ?? []
         guard !items.isEmpty else { return NSSound.beep() }
-        let destination = URL(fileURLWithPath: workspace.root()).appendingPathComponent(explorer.targetFolder)
+        copyIntoExplorer(items, folder: explorer.targetFolder)
+    }
+
+    /// Copies files and folders (pasted, or dropped from Finder) into the
+    /// workspace folder `folder` (`""` is the root).
+    func copyIntoExplorer(_ items: [URL], folder: String) {
+        guard let workspace else { return }
+        let destination = URL(fileURLWithPath: workspace.root()).appendingPathComponent(folder)
         let manager = FileManager.default
         var pasted: [String] = []
         for source in items {
