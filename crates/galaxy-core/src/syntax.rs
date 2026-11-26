@@ -623,7 +623,7 @@ fn rust_highlights() -> &'static str {
     static QUERY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     QUERY.get_or_init(|| {
         format!(
-            "(identifier) @variable\n{}\n[\"#\" \"[\" \"]\"] @punctuation\n(scoped_identifier path: (identifier) @type name: (identifier) @constant)\n",
+            "(identifier) @variable\n(shorthand_field_identifier) @variable\n{}\n[\"#\" \"[\" \"]\"] @punctuation\n(scoped_identifier path: (identifier) @type name: (identifier) @constant)\n",
             tree_sitter_rust::HIGHLIGHTS_QUERY
         )
     })
@@ -4183,6 +4183,33 @@ mod tests {
                 Some(expected),
                 "{needle}: {runs:?}"
             );
+        }
+    }
+
+    #[test]
+    fn rust_struct_destructuring_fields_use_variable_scope() {
+        let language = SyntaxLanguage::Rust;
+        let source = "fn run(self: Self) {\n    let Self {\n        app,\n        modules,\n        mut commands,\n        default_command,\n        bootstrap,\n    } = self;\n    for module in &modules {\n        commands.extend(module.commands());\n    }\n}\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let doc = Document::from_text(source);
+        let runs = style_runs_for_viewport(&doc, &tree, language, 0, 12);
+
+        for (line, needle) in [
+            (2, "app"),
+            (3, "modules"),
+            (4, "commands"),
+            (5, "default_command"),
+            (6, "bootstrap"),
+        ] {
+            let column = source.lines().nth(line).unwrap().find(needle).unwrap();
+            let scope = runs
+                .iter()
+                .filter(|run| run.line == line && run.start <= column && column < run.end)
+                .next_back()
+                .map(|run| run.scope);
+            assert_eq!(scope, Some(HighlightScope::Variable), "{needle}: {runs:?}");
         }
     }
 

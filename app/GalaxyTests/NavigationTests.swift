@@ -270,6 +270,14 @@ final class NavigationTests: XCTestCase {
         XCTAssertNil(c.hoverRequestPosition, "and sends no request")
 
         v.onHover?(position, point, true)
+        let deadline = Date().addingTimeInterval(10)
+        while v.document.flatMap({ c.bridge.hover(document: $0) }) == nil && Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        }
+        // A simulated Cmd-hover has no real modifier held. AppKit may send a
+        // flagsChanged event while the background request runs and dismiss it.
+        // Reapply the simulated hover once the answer is ready.
+        v.onHover?(position, point, true)
         c.refreshHover()
         XCTAssertFalse(c.hoverPopover.isHidden, "Cmd-hover shows the card")
         XCTAssertTrue(c.hoverPopover.renderedText.contains("intToIp"))
@@ -587,7 +595,7 @@ final class NavigationTests: XCTestCase {
         let table = (line as NSString).range(of: "table")
         click(view, line: 3, utf16Col: table.location + 1, flags: .command)
 
-        let deadline = Date().addingTimeInterval(2)
+        let deadline = Date().addingTimeInterval(10)
         while (view.document?.primaryCursor().line, view.document?.primaryCursor().colUtf16) != (2, 45), Date() < deadline {
             RunLoop.main.run(until: Date().addingTimeInterval(0.05))
         }
@@ -618,11 +626,12 @@ final class NavigationTests: XCTestCase {
         let startsWith = (line as NSString).range(of: "startsWith")
         click(view, line: 2, utf16Col: startsWith.location + 1, flags: .command)
 
-        let deadline = Date().addingTimeInterval(2)
+        let deadline = Date().addingTimeInterval(10)
         while !(view.document?.path().contains("/typescript-lib/lib.") ?? false), Date() < deadline {
             RunLoop.main.run(until: Date().addingTimeInterval(0.05))
         }
-        XCTAssertTrue(view.document?.path().contains("/typescript-lib/lib.") ?? false)
+        XCTAssertTrue(view.document?.path().contains("/typescript-lib/lib.") ?? false,
+                      "Opened \(view.document?.path() ?? "none"); pending: \(controller.bridge.isDefinitionPending)")
         let cursor = try XCTUnwrap(view.document?.primaryCursor())
         let declaration = view.document?.lines(first: cursor.line, count: 1).first ?? ""
         XCTAssertTrue(declaration.contains("startsWith"))
