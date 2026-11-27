@@ -432,6 +432,36 @@ impl Workspace {
         Ok(new_rel)
     }
 
+    /// Moves `rel` into folder `dest` (both relative, `""` is the root),
+    /// keeping its name, and returns the new relative path. Never
+    /// overwrites, and a folder cannot move into itself or its subfolders.
+    pub fn move_entry(&self, rel: &str, dest: &str) -> io::Result<String> {
+        let invalid = |why: &str| io::Error::new(io::ErrorKind::InvalidInput, why.to_string());
+        let rel = rel.trim_matches('/');
+        if rel.split('/').all(|p| p.is_empty() || p == ".") {
+            return Err(invalid("the workspace folder cannot be moved"));
+        }
+        let from = self.resolve(rel)?;
+        fs::symlink_metadata(&from)?;
+        let dest = dest.trim_matches('/');
+        if dest == rel || dest.starts_with(&format!("{rel}/")) {
+            return Err(invalid("a folder cannot be moved into itself"));
+        }
+        let name = rel.rsplit_once('/').map_or(rel, |(_, n)| n);
+        let (new_rel, to) = self.new_entry_path(dest, name)?;
+        if new_rel == rel {
+            return Ok(new_rel);
+        }
+        if fs::symlink_metadata(&to).is_ok() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{new_rel} already exists"),
+            ));
+        }
+        fs::rename(&from, &to)?;
+        Ok(new_rel)
+    }
+
     /// Validates a new name and returns `(relative path, absolute path)`.
     fn new_entry_path(&self, parent: &str, name: &str) -> io::Result<(String, PathBuf)> {
         let invalid = |why: &str| io::Error::new(io::ErrorKind::InvalidInput, why.to_string());
@@ -1247,6 +1277,47 @@ mod tests {
         assert!(ws.rename("", "x").is_err());
         assert_eq!(
             ws.rename("missing.txt", "x").unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn move_entry_changes_folder_and_never_overwrites() {
+        let (dir, ws) = tree();
+        let r = dir.path();
+        fs::create_dir_all(r.join("src/net")).unwrap();
+        fs::write(r.join("src/main.rs"), "main").unwrap();
+        fs::write(r.join("main.rs"), "root").unwrap();
+
+        assert_eq!(
+            ws.move_entry("src/main.rs", "src/net").unwrap(),
+            "src/net/main.rs"
+        );
+        assert_eq!(
+            fs::read_to_string(r.join("src/net/main.rs")).unwrap(),
+            "main"
+        );
+        // Same folder: nothing to do.
+        assert_eq!(
+            ws.move_entry("src/net/main.rs", "src/net").unwrap(),
+            "src/net/main.rs"
+        );
+        // A taken name is refused and left alone.
+        let err = ws.move_entry("src/net/main.rs", "").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(r.join("main.rs")).unwrap(), "root");
+        // Folders move with their contents, but never into themselves.
+        assert_eq!(ws.move_entry("src/net", "").unwrap(), "net");
+        assert!(r.join("net/main.rs").is_file());
+        for dest in ["net", "net/inner"] {
+            let err = ws.move_entry("net", dest).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{dest:?}");
+        }
+        assert!(ws.move_entry("", "src").is_err());
+        assert!(ws.move_entry("net", "../x").is_err());
+        assert!(ws.move_entry("main.rs", "missing").is_err());
+        assert_eq!(
+            ws.move_entry("missing.txt", "src").unwrap_err().kind(),
             io::ErrorKind::NotFound
         );
     }

@@ -2920,9 +2920,34 @@ fn cargo_packages(root: &Path) -> Vec<CargoPackage> {
             roots.push(pattern);
         }
     }
+    // A nested workspace (often an app) is intentionally absent from the
+    // parent's `members`, but its files and dependencies still belong to the
+    // opened folder. Only inspect immediate children to avoid indexing target/.
+    if let Ok(children) = std::fs::read_dir(root) {
+        for child in children.flatten() {
+            let package = child.path();
+            if let Ok(manifest) = std::fs::read_to_string(package.join("Cargo.toml"))
+                && manifest.lines().any(|line| line.trim() == "[workspace]")
+                && toml_section_value(&manifest, "package", "name").is_some()
+            {
+                roots.push(package);
+            }
+        }
+    }
     let mut packages = Vec::new();
     let mut processed = HashMap::new();
     let mut requested: HashMap<PathBuf, HashSet<String>> = HashMap::new();
+    // Process workspace members before nested apps. Feature requests from an
+    // app then reach its dependencies before their first visit, even if that
+    // app's name sorts ahead of the library names.
+    roots.sort_by_key(|path| {
+        std::fs::read_to_string(path.join("Cargo.toml"))
+            .ok()
+            .is_some_and(|manifest| {
+                manifest.lines().any(|line| line.trim() == "[workspace]")
+                    && toml_section_value(&manifest, "package", "name").is_some()
+            })
+    });
     while let Some(root) = roots.pop() {
         let root = root.canonicalize().unwrap_or(root);
         let requested_features = requested.get(&root).cloned().unwrap_or_default();
@@ -3128,7 +3153,10 @@ fn cargo_dependencies(
             default_features,
             features,
         };
-        if !dependency.optional || selected_features.contains(&dependency.name) {
+        if !dependency.optional
+            || selected_features.contains(&dependency.name)
+            || selected_features.contains(name)
+        {
             dependencies.push(dependency);
         }
     }
@@ -3207,10 +3235,10 @@ fn inline_dependency_tables(contents: &str) -> String {
             flush(&mut out, table.take());
             let header = code.trim_matches(&['[', ']'][..]);
             let named = SECTIONS.into_iter().find_map(|section| {
-                header
-                    .strip_prefix(section)
-                    .and_then(|rest| rest.strip_prefix('.'))
-                    .map(|name| (section, name.trim_matches('"').to_owned()))
+                header.strip_prefix(section).and_then(|rest| {
+                    rest.strip_prefix('.')
+                        .map(|name| (section, name.trim_matches('"').to_owned()))
+                })
             });
             if let Some((section, name)) = named {
                 table = Some((section, name, Vec::new()));
@@ -3389,17 +3417,44 @@ fn toml_section_value(contents: &str, section: &str, key: &str) -> Option<String
 
 fn toml_inline_value(value: &str, key: &str) -> Option<String> {
     let value = value.trim().trim_matches(&['{', '}'][..]);
-    value.split(',').find_map(|field| {
+    // Commas inside a feature array belong to the array, not the table.
+    // A substring search also accepts compact `features=[...]` syntax.
+    let mut depth = 0usize;
+    let mut start = 0;
+    let mut fields = Vec::new();
+    for (at, character) in value.char_indices() {
+        match character {
+            '[' => depth += 1,
+            ']' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                fields.push(&value[start..at]);
+                start = at + 1;
+            }
+            _ => {}
+        }
+    }
+    fields.push(&value[start..]);
+    fields.into_iter().find_map(|field| {
         let (found, value) = field.split_once('=')?;
         (found.trim() == key).then(|| value.trim().trim_matches('"').to_owned())
     })
 }
 
 fn toml_array_values_in_inline<'a>(value: &'a str, key: &str) -> Vec<&'a str> {
-    let Some((_, value)) = value.split_once(&format!("{key} =")) else {
+    let Some(at) = value.find(key) else {
         return Vec::new();
     };
-    toml_strings(value)
+    let rest = &value[at + key.len()..];
+    let Some(array) = rest.trim_start().strip_prefix('=') else {
+        return Vec::new();
+    };
+    let Some(array) = array.trim_start().strip_prefix('[') else {
+        return Vec::new();
+    };
+    let Some((array, _)) = array.split_once(']') else {
+        return Vec::new();
+    };
+    toml_strings(array)
 }
 
 fn toml_strings(source: &str) -> Vec<&str> {
@@ -8274,6 +8329,58 @@ impl Migrator {\n\
 
         std::fs::write(&lib, "pub fn run() {}\npub fn stop() {}\n").unwrap();
         assert_ne!(fingerprint(), original);
+    }
+
+    #[test]
+    fn use_path_module_segment_prefers_reexported_crate_over_local_function() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"oikos\", \"oikos-hash\"]\n",
+        )
+        .unwrap();
+        for package in ["app", "oikos", "oikos-hash"] {
+            std::fs::create_dir_all(root.path().join(package).join("src")).unwrap();
+        }
+        std::fs::write(
+            root.path().join("app/Cargo.toml"),
+            "[workspace]\n[package]\nname = \"app\"\n[dependencies]\noikos={path=\"../oikos\", features=[\"hash\", \"logging\"]}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("oikos/Cargo.toml"),
+            "[package]\nname = \"oikos\"\n[features]\nhash = [\"dep:oikos-hash\"]\n[dependencies]\noikos-hash = { path = \"../oikos-hash\", optional = true }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("oikos/src/lib.rs"),
+            "#[cfg(feature = \"hash\")]\npub use oikos_hash as hash;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.path().join("oikos-hash/Cargo.toml"),
+            "[package]\nname = \"oikos-hash\"\n",
+        )
+        .unwrap();
+        let hash_lib = root.path().join("oikos-hash/src/lib.rs");
+        std::fs::write(
+            &hash_lib,
+            "pub struct HashConfig;\npub struct HashSettings;\n",
+        )
+        .unwrap();
+        let app = root.path().join("app/src/lib.rs");
+        let source = "use oikos::hash::{HashConfig, HashSettings};\npub fn hash() {}\n";
+        std::fs::write(&app, source).unwrap();
+
+        let mut engine = RustEngine::pending(root.path());
+        engine.install(RustEngine::build(root.path()));
+        assert_eq!(engine.crate_for(&app), "app");
+        let column = source.lines().next().unwrap().find("hash").unwrap() as u32 + 1;
+        let definitions = engine.definition(&app, source, 0, column);
+        assert_eq!(definitions.len(), 1, "{definitions:?}");
+        assert_eq!(definitions[0].path, hash_lib.canonicalize().unwrap());
+        let hover = engine.hover(&app, source, 0, column).unwrap();
+        assert!(hover.markdown.contains("crate oikos_hash"), "{hover:?}");
     }
 
     #[test]

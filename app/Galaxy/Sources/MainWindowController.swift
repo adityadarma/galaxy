@@ -1094,6 +1094,7 @@ final class MainWindowController: NSWindowController, NSWindowDelegate {
         }
         explorer.onDropFiles = { [weak self] urls, folder in self?.copyIntoExplorer(urls, folder: folder) }
         explorer.onRename = { [weak self] entry, name in self?.renameEntry(entry, to: name) }
+        explorer.onMoveItems = { [weak self] rels, folder in self?.moveExplorerItems(rels, to: folder) }
         explorer.onCreateNewItem = { [weak self] parent, folder, name in
             self?.createExplorerItem(parent: parent, folder: folder, name: name)
         }

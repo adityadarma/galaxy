@@ -179,10 +179,23 @@ extension MainWindowController {
             return report(error, while: "rename \(entry.name)")
         }
         guard newRel != entry.relPath else { return }
+        followMove(from: entry.relPath, to: newRel)
+        explorer.refresh()
+        explorer.reveal(relPath: newRel)
+        refreshTabBar()
+        updateEditedState()
+        updateFileFinder(changed: [entry.relPath, newRel])
+        statusLabel.stringValue = "Renamed \(entry.relPath) to \(newRel)."
+    }
+
+    /// Points open tabs and the recent list at `newRel` after `oldRel`
+    /// (a file, or a folder and everything in it) moved there.
+    private func followMove(from oldRel: String, to newRel: String) {
+        guard let workspace else { return }
         let root = URL(fileURLWithPath: workspace.root())
         let moved = { (rel: String) -> String? in
-            if rel == entry.relPath { return newRel }
-            if rel.hasPrefix(entry.relPath + "/") { return newRel + rel.dropFirst(entry.relPath.count) }
+            if rel == oldRel { return newRel }
+            if rel.hasPrefix(oldRel + "/") { return newRel + rel.dropFirst(oldRel.count) }
             return nil
         }
         for tab in allTabs {
@@ -199,12 +212,35 @@ extension MainWindowController {
             if tab === activeTab { pathBar.show(tab.pathComponents) }
         }
         recentFiles = recentFiles.map { moved($0) ?? $0 }
+    }
+
+    /// Moves explorer items dragged onto `folder` (`""` is the root) and
+    /// follows them in the open tabs, the recent list and Go to File.
+    func moveExplorerItems(_ rels: [String], to folder: String) {
+        guard let workspace else { return }
+        var changed: [String] = []
+        var last: String?
+        for rel in rels {
+            do {
+                let newRel = try workspace.moveEntry(relPath: rel, destFolderRelPath: folder)
+                guard newRel != rel else { continue }
+                followMove(from: rel, to: newRel)
+                changed += [rel, newRel]
+                last = newRel
+            } catch {
+                report(error, while: "move \((rel as NSString).lastPathComponent)")
+            }
+        }
+        guard let last else { return }
         explorer.refresh()
-        explorer.reveal(relPath: newRel)
+        explorer.reveal(relPath: last)
         refreshTabBar()
         updateEditedState()
-        updateFileFinder(changed: [entry.relPath, newRel])
-        statusLabel.stringValue = "Renamed \(entry.relPath) to \(newRel)."
+        updateFileFinder(changed: changed)
+        refreshGitStatus()
+        statusLabel.stringValue = rels.count == 1
+            ? "Moved \(rels[0]) to \(last)."
+            : "Moved \(changed.count / 2) items to \(folder.isEmpty ? workspace.name() : folder)."
     }
 
     /// Return renames, ⌘⌫ deletes, as in VSCode on macOS.

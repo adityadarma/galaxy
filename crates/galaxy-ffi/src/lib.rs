@@ -6162,6 +6162,18 @@ impl Workspace {
         Ok(rel)
     }
 
+    /// Moves `rel_path` into `dest_folder_rel_path` (`""` is the root),
+    /// keeping its name; returns the new relative path. Never overwrites.
+    pub fn move_entry(
+        &self,
+        rel_path: String,
+        dest_folder_rel_path: String,
+    ) -> Result<String, CoreError> {
+        let rel = self.inner.move_entry(&rel_path, &dest_folder_rel_path)?;
+        tracing::info!(from = %rel_path, to = %rel, "moved");
+        Ok(rel)
+    }
+
     /// Creates folder `name` in `parent_rel_path`; returns its relative path.
     pub fn create_folder(
         &self,

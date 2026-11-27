@@ -197,6 +197,44 @@ final class ExplorerFileOpsTests: XCTestCase {
         XCTAssertEqual(pasteboard.string(forType: .string), "src/main.rs")
     }
 
+    func testDraggingItemsOntoAFolderMovesThemAndFollowsOpenTabs() throws {
+        let c = try makeController()
+        defer { c.window?.orderOut(nil) }
+        try c.openFile(at: root.appendingPathComponent("src/main.rs"))
+
+        c.moveExplorerItems(["src/main.rs"], to: "src/net")
+        XCTAssertTrue(exists("src/net/main.rs"))
+        XCTAssertFalse(exists("src/main.rs"))
+        XCTAssertEqual(c.activeTab?.relPath, "src/net/main.rs")
+        XCTAssertEqual(c.editorView.document?.path(), root.appendingPathComponent("src/net/main.rs").path)
+        XCTAssertEqual(c.explorer.selectedEntry?.relPath, "src/net/main.rs")
+
+        // A folder moves with everything in it, here to the root.
+        c.moveExplorerItems(["src/net"], to: "")
+        XCTAssertTrue(exists("net/tcp.rs"))
+        XCTAssertEqual(c.activeTab?.relPath, "net/main.rs")
+        XCTAssertEqual(c.activeTab?.pathComponents, ["net", "main.rs"])
+
+        // A taken name is never overwritten.
+        try "other".write(to: root.appendingPathComponent("src/README.md"), atomically: true, encoding: .utf8)
+        c.moveExplorerItems(["README.md"], to: "src")
+        XCTAssertEqual(try String(contentsOf: root.appendingPathComponent("src/README.md"), encoding: .utf8), "other")
+        XCTAssertTrue(exists("README.md"))
+        c.window?.attachedSheet.map { c.window?.endSheet($0) }
+    }
+
+    func testDropOperationRefusesNoOpsAndFoldersIntoThemselves() {
+        let op = ExplorerController.dropOperation
+        XCTAssertEqual(op(["src/main.rs"], "src/net", false), .move)
+        XCTAssertEqual(op(["src/main.rs"], "", false), .move)
+        XCTAssertEqual(op(["src/main.rs"], "src", false), [], "already there")
+        XCTAssertEqual(op(["src/main.rs"], "src", true), .copy, "Option copies next to it")
+        XCTAssertEqual(op(["src"], "src", false), [])
+        XCTAssertEqual(op(["src"], "src/net", false), [])
+        XCTAssertEqual(op(["src"], "src/net", true), [], "no copy into itself either")
+        XCTAssertEqual(op(["src"], "srcx", false), .move)
+    }
+
     func testCopyingExplorerFilePastesIntoAnotherWindow() throws {
         let source = try makeController()
         defer { source.window?.orderOut(nil) }

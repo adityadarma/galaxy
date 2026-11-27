@@ -70,6 +70,11 @@ final class ExplorerController: NSObject {
     /// Called with files dropped from Finder or another app, and the
     /// workspace folder they go into (`""` is the root).
     var onDropFiles: (([URL], String) -> Void)?
+    /// Called with explorer rows dragged onto another folder (`""` is the
+    /// root) to move them there.
+    var onMoveItems: (([String], String) -> Void)?
+    /// Relative paths of the rows being dragged from this explorer.
+    private(set) var draggedRelPaths: [String] = []
     /// Builds the right-click menu, after the clicked row was selected.
     var contextMenu: (() -> NSMenu?)?
 
@@ -92,9 +97,12 @@ final class ExplorerController: NSObject {
         outlineView.target = self
         outlineView.doubleAction = #selector(doubleClicked(_:))
         outlineView.onFolderClick = { [weak self] row in self?.folderClicked(row: row) ?? false }
+        outlineView.onDragStart = { [weak self] row in self?.selectForDrag(row: row) }
         outlineView.onContextMenu = { [weak self] row in self?.menu(forRow: row) }
         outlineView.registerForDraggedTypes([.fileURL])
         outlineView.setDraggingSourceOperationMask(.copy, forLocal: false)
+        // Inside the app a drag moves; Option makes it a copy, as in Finder.
+        outlineView.setDraggingSourceOperationMask([.move, .copy], forLocal: true)
         outlineView.setAccessibilityLabel("File explorer")
         outlineView.setAccessibilityIdentifier("explorer")
 
@@ -397,6 +405,15 @@ final class ExplorerController: NSObject {
         return true
     }
 
+    /// A drag is starting on `row`: select it without opening or toggling.
+    func selectForDrag(row: Int) {
+        if renamingEntry != nil { finishRename(commit: true) }
+        guard row >= 0, row != outlineView.selectedRow else { return }
+        quietSelection = true
+        outlineView.selectRowIndexes([row], byExtendingSelection: false)
+        quietSelection = false
+    }
+
     @objc private func doubleClicked(_ sender: Any?) {
         let row = outlineView.clickedRow
         guard row >= 0, let node = outlineView.item(atRow: row) as? ExplorerNode,
@@ -481,8 +498,17 @@ extension ExplorerController: NSOutlineViewDataSource {
     func outlineView(_ outlineView: NSOutlineView, validateDrop info: NSDraggingInfo,
                      proposedItem item: Any?, proposedChildIndex index: Int) -> NSDragOperation {
         guard workspace != nil, !Self.droppedFileURLs(info).isEmpty else { return [] }
-        outlineView.setDropItem(dropFolder(for: item), dropChildIndex: NSOutlineViewDropOnItemIndex)
-        return .copy
+        let target = dropFolder(for: item)
+        let folder = target?.entry.relPath ?? ""
+        let operation: NSDragOperation
+        if isInternalDrag(info) {
+            operation = internalDropOperation(info, into: folder)
+            guard !operation.isEmpty else { return [] }
+        } else {
+            operation = .copy
+        }
+        outlineView.setDropItem(target, dropChildIndex: NSOutlineViewDropOnItemIndex)
+        return operation
     }
 
     func outlineView(_ outlineView: NSOutlineView, acceptDrop info: NSDraggingInfo,
@@ -490,9 +516,55 @@ extension ExplorerController: NSOutlineViewDataSource {
         let urls = Self.droppedFileURLs(info)
         guard workspace != nil, !urls.isEmpty else { return false }
         let folder = dropFolder(for: item)?.entry.relPath ?? ""
+        if isInternalDrag(info) {
+            let operation = internalDropOperation(info, into: folder)
+            guard !operation.isEmpty else { return false }
+            if operation == .move {
+                let rels = draggedRelPaths
+                DispatchQueue.main.async { [weak self] in self?.onMoveItems?(rels, folder) }
+                return true
+            }
+        }
         // Let the drag session finish first: copying may show an alert.
         DispatchQueue.main.async { [weak self] in self?.onDropFiles?(urls, folder) }
         return true
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, pasteboardWriterForItem item: Any) -> NSPasteboardWriting? {
+        guard let workspace, let node = item as? ExplorerNode, renamingEntry == nil,
+              pendingNewItem?.entry.relPath != node.entry.relPath else { return nil }
+        return URL(fileURLWithPath: workspace.root()).appendingPathComponent(node.entry.relPath) as NSURL
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, draggingSession session: NSDraggingSession,
+                     willBeginAt screenPoint: NSPoint, forItems draggedItems: [Any]) {
+        draggedRelPaths = draggedItems.compactMap { ($0 as? ExplorerNode)?.entry.relPath }
+    }
+
+    func outlineView(_ outlineView: NSOutlineView, draggingSession session: NSDraggingSession,
+                     endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        draggedRelPaths = []
+    }
+
+    /// The drag started on rows of this explorer.
+    private func isInternalDrag(_ info: NSDraggingInfo) -> Bool {
+        (info.draggingSource as AnyObject?) === outlineView && !draggedRelPaths.isEmpty
+    }
+
+    /// `.move` (or `.copy` with Option) for explorer rows dropped on
+    /// `folder`, or none when nothing would change or a folder would go
+    /// into itself.
+    func internalDropOperation(_ info: NSDraggingInfo, into folder: String) -> NSDragOperation {
+        Self.dropOperation(moving: draggedRelPaths, into: folder,
+                           copy: !info.draggingSourceOperationMask.contains(.move))
+    }
+
+    static func dropOperation(moving rels: [String], into folder: String, copy: Bool) -> NSDragOperation {
+        guard !rels.isEmpty else { return [] }
+        for rel in rels where folder == rel || folder.hasPrefix(rel + "/") { return [] }
+        if copy { return .copy }
+        let parent = { (rel: String) in (rel as NSString).deletingLastPathComponent }
+        return rels.allSatisfy { parent($0) == folder } ? [] : .move
     }
 
     static func droppedFileURLs(_ info: NSDraggingInfo) -> [URL] {
@@ -560,6 +632,8 @@ final class ExplorerOutlineView: NSOutlineView {
 
     /// Handles a left click on `row`; returns `true` when it did.
     var onFolderClick: ((Int) -> Bool)?
+    /// The pointer moved far enough on `row` to start dragging it.
+    var onDragStart: ((Int) -> Void)?
     /// Right click on `row` (-1 below the rows).
     var onContextMenu: ((Int) -> NSMenu?)?
     /// Keys handled before the table's own (Return renames, ⌘⌫ deletes).
@@ -592,8 +666,38 @@ final class ExplorerOutlineView: NSOutlineView {
     override func mouseDown(with event: NSEvent) {
         let row = row(at: convert(event.locationInWindow, from: nil))
         let plain = event.modifierFlags.intersection([.command, .shift, .control, .option]).isEmpty
-        if row >= 0, plain, onFolderClick?(row) == true { return }
+        guard row >= 0, plain else { return super.mouseDown(with: event) }
+        if waitForDrag(from: event) {
+            // Select first, so starting a drag neither opens a file nor
+            // toggles a folder; the table then runs the drag itself.
+            onDragStart?(row)
+            return super.mouseDown(with: event)
+        }
+        if onFolderClick?(row) == true { return }
         super.mouseDown(with: event)
+    }
+
+    /// Waits for the button to go up (a click) or the pointer to move a
+    /// few points (a drag), leaving that event queued for the table.
+    private func waitForDrag(from event: NSEvent) -> Bool {
+        guard let window else { return false }
+        let start = event.locationInWindow
+        while true {
+            guard let next = window.nextEvent(matching: [.leftMouseUp, .leftMouseDragged],
+                                              until: Date(timeIntervalSinceNow: 0.05),
+                                              inMode: .eventTracking, dequeue: false)
+            else {
+                // No event yet. Keep waiting while the button is held; a
+                // posted click without a release (tests) counts as a click.
+                if NSEvent.pressedMouseButtons & 1 == 0 { return false }
+                continue
+            }
+            if next.type == .leftMouseUp { return false }
+            let p = next.locationInWindow
+            if hypot(p.x - start.x, p.y - start.y) >= 4 { return true }
+            _ = window.nextEvent(matching: [.leftMouseDragged], until: .distantFuture,
+                                 inMode: .eventTracking, dequeue: true)
+        }
     }
 
     /// The pointer is over the explorer. Indent guides are drawn only then.
