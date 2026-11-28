@@ -32,7 +32,7 @@ final class EditorTab {
     /// The Git Graph view as a tab. Like a terminal tab, `doc` is an empty,
     /// never-shown buffer.
     let isGitGraph: Bool
-    /// A picture or PDF opened from disk. `doc` is again an empty buffer.
+    /// A picture, PDF or SQLite database opened from disk. `doc` is again an empty buffer.
     let mediaURL: URL?
     /// A real text document: not a terminal, the Git Graph or a picture.
     var isDocument: Bool { terminal == nil && !isGitGraph && mediaURL == nil }

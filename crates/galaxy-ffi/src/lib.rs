@@ -55,6 +55,7 @@ use galaxy_core::workspace::{
 };
 
 mod rust_diagnostics_cache;
+mod sqlite;
 mod typescript_editor;
 mod typescript_globals;
 mod typescript_navigation;

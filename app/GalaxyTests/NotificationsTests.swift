@@ -69,4 +69,25 @@ final class NotificationsTests: XCTestCase {
         XCTAssertEqual(c.statusLabel.stringValue, "Committed 1 file", "a failure is shown once, as a toast")
         XCTAssertEqual(c.statusBar.notifications.accessibilityValue() as? String, "1 new notification")
     }
+
+    func testOpeningABinaryFileOffersTheDefaultAppInsteadOfARawError() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        // Not SQLite (those open in a database tab), just binary.
+        try Data("GDBM\0\0\u{1}\u{2}".utf8).write(to: root.appendingPathComponent("app.db"))
+        let c = MainWindowController(bridge: CoreBridge())
+        defer { c.window?.orderOut(nil) }
+        try c.openWorkspace(at: root, rememberRecent: false)
+        let ws = try XCTUnwrap(c.workspace)
+
+        c.openWorkspaceFile(ws, FileEntry(name: "app.db", relPath: "app.db", isDir: false),
+                            preview: false, rememberRecent: false)
+
+        let note = try XCTUnwrap(c.notificationsView.history.last)
+        XCTAssertEqual(note.message, "app.db is a binary file and cannot be shown in the editor.")
+        XCTAssertEqual(note.severity, .warning)
+        XCTAssertEqual(note.actions.map(\.title), ["Open in Default App", "Reveal in Finder"])
+        XCTAssertFalse(note.message.contains("CoreError"))
+    }
 }

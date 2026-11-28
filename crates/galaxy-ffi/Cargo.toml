@@ -23,6 +23,7 @@ serde.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+rusqlite.workspace = true
 
 # UniFFI scaffolding emits `extern "C"` symbols, which requires unsafe code.
 # This is the only crate allowed to contain it.

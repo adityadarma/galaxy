@@ -1,11 +1,13 @@
 import AppKit
 import PDFKit
 
-/// Files the editor shows as a picture instead of text. SVG is not here: it is
-/// XML, and developers want to edit it, so it opens as text.
+/// Files the editor shows in a viewer instead of as text. SVG is not here: it
+/// is XML, and developers want to edit it, so it opens as text.
 enum MediaKind: Equatable {
     case image
     case pdf
+    /// A SQLite 3 file, recognized by its header whatever its extension.
+    case database
 
     static let imageExtensions: Set<String> = [
         "png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff", "heic", "heif", "ico", "icns",
@@ -14,7 +16,8 @@ enum MediaKind: Equatable {
     static func kind(for url: URL) -> MediaKind? {
         let ext = url.pathExtension.lowercased()
         if ext == "pdf" { return .pdf }
-        return imageExtensions.contains(ext) ? .image : nil
+        if imageExtensions.contains(ext) { return .image }
+        return url.isFileURL && isSqliteDatabase(path: url.path) ? .database : nil
     }
 }
 
@@ -43,6 +46,7 @@ final class MediaViewerView: NSView {
     private let imageView = NSImageView()
     private let pdfView = PDFView()
     private let message = NSTextField(labelWithString: "")
+    let databaseView = DatabaseView()
     private var needsFit = false
     private var loadedStamp: Date?
 
@@ -76,7 +80,7 @@ final class MediaViewerView: NSView {
         message.alignment = .center
         message.lineBreakMode = .byTruncatingMiddle
 
-        for view in [imageScroll, pdfView, message] as [NSView] {
+        for view in [imageScroll, pdfView, databaseView, message] as [NSView] {
             view.isHidden = true
             addSubview(view)
         }
@@ -98,7 +102,9 @@ final class MediaViewerView: NSView {
 
     /// The file changed on disk since it was loaded.
     func isStale(for url: URL) -> Bool {
-        self.url != url || loadedStamp != Self.modified(url)
+        // A database changes with every edit made here; Refresh rereads it.
+        if kind == .database { return self.url != url }
+        return self.url != url || loadedStamp != Self.modified(url)
     }
 
     /// Loads `url`, replacing what was shown. A file that cannot be read shows
@@ -109,6 +115,7 @@ final class MediaViewerView: NSView {
         loadedStamp = Self.modified(url)
         imageScroll.isHidden = true
         pdfView.isHidden = true
+        databaseView.isHidden = true
         message.isHidden = true
         pdfView.document = nil
         imageView.image = nil
@@ -144,6 +151,15 @@ final class MediaViewerView: NSView {
             } else {
                 fail(url)
             }
+        case .database?:
+            if let error = databaseView.load(url: url) {
+                message.stringValue = error
+                message.isHidden = false
+                summary = error
+            } else {
+                databaseView.isHidden = false
+                summary = databaseView.summary
+            }
         case nil:
             fail(url)
         }
@@ -158,7 +174,11 @@ final class MediaViewerView: NSView {
 
     /// Moves keyboard focus to the picture, so arrows and paging keys scroll it.
     func focus() {
-        window?.makeFirstResponder(kind == .pdf ? pdfView : imageScroll)
+        switch kind {
+        case .pdf?: window?.makeFirstResponder(pdfView)
+        case .database?: databaseView.focus()
+        default: window?.makeFirstResponder(imageScroll)
+        }
     }
 
     override func viewDidChangeEffectiveAppearance() {
@@ -171,6 +191,7 @@ final class MediaViewerView: NSView {
         super.layout()
         imageScroll.frame = bounds
         pdfView.frame = bounds
+        databaseView.frame = bounds
         message.frame = NSRect(x: 20, y: bounds.midY - 12, width: max(0, bounds.width - 40), height: 24)
         if needsFit, bounds.width > 0, bounds.height > 0, !imageScroll.isHidden { fitImage() }
     }

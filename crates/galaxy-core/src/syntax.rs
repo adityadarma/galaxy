@@ -619,11 +619,13 @@ fn html_highlights() -> &'static str {
 
 /// The upstream Rust query styles attribute names but leaves `#[...]`
 /// delimiters unscoped, causing `#` to fall back to the plain foreground.
+/// It also skips `macro_rules!` metavariables (`$ty`), fragment specifiers
+/// (`ident`, `expr`) and most operators, which would all render plain.
 fn rust_highlights() -> &'static str {
     static QUERY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     QUERY.get_or_init(|| {
         format!(
-            "(identifier) @variable\n(shorthand_field_identifier) @variable\n{}\n[\"#\" \"[\" \"]\"] @punctuation\n(scoped_identifier path: (identifier) @type name: (identifier) @constant)\n",
+            "(identifier) @variable\n(shorthand_field_identifier) @variable\n{}\n[\"#\" \"[\" \"]\"] @punctuation\n(scoped_identifier path: (identifier) @type name: (identifier) @constant)\n(metavariable) @variable\n(fragment_specifier) @type\n[\"?\" \"=>\" \"->\"] @punctuation\n[\"=\" \"+=\" \"-=\" \"*=\" \"/=\" \"%=\" \"^=\" \"&=\" \"|=\" \"<<=\" \">>=\" \"+\" \"-\" \"/\" \"%\" \"==\" \"!=\" \"&&\" \"||\" \"^\" \"|\" \"<<\" \">>\" \"..\" \"..=\" \"...\" \"@\"] @operator\n(unary_expression \"!\" @operator)\n(binary_expression [\"<\" \">\" \"<=\" \">=\"] @operator)\n(token_tree [\"<\" \">\"] @operator)\n",
             tree_sitter_rust::HIGHLIGHTS_QUERY
         )
     })
@@ -5022,5 +5024,31 @@ mod tests {
             assert!(has(name, HighlightScope::Type), "{name} is not a type");
         }
         assert!(!has("static", HighlightScope::Variable));
+    }
+
+    #[test]
+    fn rust_macro_metavariables_and_operators_are_styled() {
+        let language = SyntaxLanguage::Rust;
+        let source = "macro_rules! m {\n    ($ty:ident, $n:expr) => {\n        pub struct $ty { len: usize }\n        fn new() -> Result<Self> { slice.get(..len).ok_or($n)?; Ok(Self) }\n    };\n}\n";
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).unwrap();
+        let tree = parser.parse(source, None).unwrap();
+        let doc = Document::from_text(source);
+        let runs = style_runs_for_viewport(&doc, &tree, language, 0, 10);
+        for token in [
+            "$ty", "ident", "$n", "expr", "=>", "->", "?", "<", ">", "..",
+        ] {
+            let (line, text) = source
+                .lines()
+                .enumerate()
+                .find(|(_, l)| l.contains(token))
+                .unwrap();
+            let start = text.find(token).unwrap();
+            assert!(
+                runs.iter()
+                    .any(|r| r.line == line && r.start <= start && start < r.end),
+                "`{token}` has no highlight scope"
+            );
+        }
     }
 }

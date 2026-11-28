@@ -40,6 +40,7 @@ pub mod rpc;
 pub mod rust;
 pub mod selection;
 pub mod snippets;
+pub mod sqlite;
 pub mod syntax;
 pub mod tags;
 pub mod terminal;

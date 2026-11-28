@@ -1,7 +1,7 @@
 import AppKit
 
 extension MainWindowController {
-    /// Opens a picture or PDF in its own tab, or shows the tab it already has.
+    /// Opens a picture, PDF or SQLite database in its own tab, or shows the tab it already has.
     func openMediaFile(at url: URL, preview: Bool = false) {
         if let i = tabIndex(forPath: url.path) {
             if !preview { tabs[i].isPreview = false }

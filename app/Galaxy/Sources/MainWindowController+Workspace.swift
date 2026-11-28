@@ -35,7 +35,7 @@ extension MainWindowController {
                 try openFile(at: url)
             }
         } catch {
-            report(error, while: "open \(url.lastPathComponent)")
+            reportOpenFailure(error, url: url, label: url.lastPathComponent)
         }
     }
 
@@ -233,7 +233,7 @@ extension MainWindowController {
             if !preview && rememberRecent { Self.rememberFile(path) }
             window?.makeFirstResponder(editorView)
         } catch {
-            report(error, while: "open \(entry.relPath)")
+            reportOpenFailure(error, url: fileURL, label: entry.relPath)
         }
     }
 
@@ -284,6 +284,32 @@ extension MainWindowController {
 
     func report(_ error: Error, while action: String) {
         Log.ui.error("\(action, privacy: .public) failed: \(String(describing: error), privacy: .public)")
-        notify("Could not \(action). \(error.localizedDescription)", severity: .error)
+        // uniffi's `localizedDescription` for `CoreError` is the Swift debug
+        // form (`Galaxy.CoreError.Io(message: ...)`); show the message itself.
+        let detail: String
+        if case CoreError.Io(let message) = error {
+            detail = message.prefix(1).uppercased() + message.dropFirst() + "."
+        } else {
+            detail = error.localizedDescription
+        }
+        notify("Could not \(action). \(detail)", severity: .error)
+    }
+
+    /// Binary files such as SQLite databases cannot be edited as text. Offer
+    /// the app macOS associates with them instead of a generic error.
+    func reportOpenFailure(_ error: Error, url: URL, label: String) {
+        guard case CoreError.Io(let message) = error, message == "binary file" else {
+            return report(error, while: "open \(label)")
+        }
+        Log.ui.info("open \(label, privacy: .public) skipped: binary file")
+        notify("\(url.lastPathComponent) is a binary file and cannot be shown in the editor.",
+               severity: .warning, actions: [
+                   AppNotification.Action(title: "Open in Default App") {
+                       NSWorkspace.shared.open(url)
+                   },
+                   AppNotification.Action(title: "Reveal in Finder") {
+                       NSWorkspace.shared.activateFileViewerSelecting([url])
+                   },
+               ])
     }
 }

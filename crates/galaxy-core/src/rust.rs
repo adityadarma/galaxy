@@ -1988,13 +1988,18 @@ impl RustEngine {
         at: usize,
     ) -> Option<Vec<Declaration>> {
         let tree = parse_tree(text)?;
+        // `config.size(1)` names a method while `config.size` names a field,
+        // and a struct may have both (`size: u32` and `fn size(self, ..)`).
+        let is_call = member_access_at(tree.root_node(), at)
+            .and_then(|member| member.parent())
+            .is_some_and(|parent| parent.kind() == "call_expression");
         if let Some(value) = member_access_at(tree.root_node(), at)
             .and_then(|member| member.child_by_field_name("value"))
             && value.kind() == "call_expression"
         {
             let mut sources = HashMap::new();
             let ty = self.expression_type(path, text, value, &mut sources, 0)?;
-            let matches = self.member_matches(&ty, name);
+            let matches = narrow_member_kind(self.member_matches(&ty, name), is_call);
             return (matches.len() == 1).then_some(matches);
         }
         let ast_receiver = member_access_at(tree.root_node(), at).and_then(|member| {
@@ -2019,8 +2024,13 @@ impl RustEngine {
         if !is_ident_text(receiver) {
             return None;
         }
-        let ty = self.receiver_type(path, text, before, receiver)?;
-        let matches = self.member_matches(&ty, name);
+        let ty = if receiver == "self" {
+            let member = member_access_at(tree.root_node(), at)?;
+            impl_for_member(member, text)?
+        } else {
+            self.receiver_type(path, text, before, receiver)?
+        };
+        let matches = narrow_member_kind(self.member_matches(&ty, name), is_call);
         (matches.len() == 1).then_some(matches)
     }
 
@@ -2143,11 +2153,11 @@ impl RustEngine {
             _ => return None,
         };
         let mut owner = owner;
-        let mut declarations = self.member_matches(&owner, &name);
+        let mut declarations = narrow_member_kind(self.member_matches(&owner, &name), true);
         if declarations.is_empty()
             && let Some(target) = self.alias_target(&owner)
         {
-            declarations = self.member_matches(&target, &name);
+            declarations = narrow_member_kind(self.member_matches(&target, &name), true);
             owner = target;
         }
         let [declaration] = declarations.as_slice() else {
@@ -2437,6 +2447,15 @@ impl RustEngine {
             _ if target.len() > 1 => {
                 if let Some(dependency) = self.dependency_for(path, &target[0]) {
                     (dependency.package, target[1..target.len() - 1].to_vec())
+                } else if let Some(binding) = self.use_bindings(path).into_iter().find(|binding| {
+                    !binding.glob
+                        && binding.local == target[0]
+                        && binding.target.first() != target.first()
+                }) {
+                    // `use oikos::core::env::{self};` then `env::string`.
+                    let mut expanded = binding.target;
+                    expanded.extend_from_slice(&target[1..]);
+                    return self.resolve_path_bounded(path, &expanded, seen, depth + 1);
                 } else {
                     let mut module = current;
                     module.extend_from_slice(&target[..target.len() - 1]);
@@ -2725,6 +2744,24 @@ impl RustEngine {
     }
 }
 
+/// Keeps methods for a call (`x.name()`) and fields otherwise, but only when
+/// both exist, so a lone declaration is never dropped.
+fn narrow_member_kind(matches: Vec<Declaration>, call: bool) -> Vec<Declaration> {
+    if matches.len() < 2 {
+        return matches;
+    }
+    let preferred: Vec<_> = matches
+        .iter()
+        .filter(|item| (item.kind == ItemKind::Function) == call)
+        .cloned()
+        .collect();
+    if preferred.is_empty() {
+        matches
+    } else {
+        preferred
+    }
+}
+
 fn member_access_at(node: Node<'_>, at: usize) -> Option<Node<'_>> {
     if node.start_byte() > at || node.end_byte() < at {
         return None;
@@ -2883,6 +2920,45 @@ fn cargo_source_roots(root: &Path) -> Vec<PathBuf> {
     roots
 }
 
+const NESTED_WORKSPACE_DEPTH: usize = 3;
+
+/// Packages below `root` that declare their own `[workspace]`, such as
+/// `app/` or `examples/app/`. Searches at most `depth` directory levels.
+fn nested_workspace_apps(root: &Path, depth: usize) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut pending = vec![(root.to_path_buf(), 0)];
+    while let Some((dir, level)) = pending.pop() {
+        if level >= depth {
+            continue;
+        }
+        let Ok(children) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for child in children.flatten() {
+            let path = child.path();
+            if !child.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let name = child.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.')
+                || matches!(name.as_ref(), "target" | "node_modules" | "vendor")
+            {
+                continue;
+            }
+            if let Ok(manifest) = std::fs::read_to_string(path.join("Cargo.toml"))
+                && manifest.lines().any(|line| line.trim() == "[workspace]")
+                && toml_section_value(&manifest, "package", "name").is_some()
+            {
+                found.push(path.clone());
+            }
+            pending.push((path, level + 1));
+        }
+    }
+    found.sort();
+    found
+}
+
 fn cargo_packages(root: &Path) -> Vec<CargoPackage> {
     let manifest = root.join("Cargo.toml");
     let Ok(contents) = std::fs::read_to_string(&manifest) else {
@@ -2922,18 +2998,9 @@ fn cargo_packages(root: &Path) -> Vec<CargoPackage> {
     }
     // A nested workspace (often an app) is intentionally absent from the
     // parent's `members`, but its files and dependencies still belong to the
-    // opened folder. Only inspect immediate children to avoid indexing target/.
-    if let Ok(children) = std::fs::read_dir(root) {
-        for child in children.flatten() {
-            let package = child.path();
-            if let Ok(manifest) = std::fs::read_to_string(package.join("Cargo.toml"))
-                && manifest.lines().any(|line| line.trim() == "[workspace]")
-                && toml_section_value(&manifest, "package", "name").is_some()
-            {
-                roots.push(package);
-            }
-        }
-    }
+    // opened folder. Look a few levels down (`examples/app`) and skip build
+    // output and vendored trees.
+    roots.extend(nested_workspace_apps(root, NESTED_WORKSPACE_DEPTH));
     let mut packages = Vec::new();
     let mut processed = HashMap::new();
     let mut requested: HashMap<PathBuf, HashSet<String>> = HashMap::new();
@@ -4453,12 +4520,16 @@ fn collect_use_bindings(source: &str, prefix: &str, public: bool, out: &mut Vec<
             }
             continue;
         }
-        let target: Vec<String> = format!("{prefix}{path}")
+        let mut target: Vec<String> = format!("{prefix}{path}")
             .split("::")
             .map(str::trim)
             .filter(|segment| !segment.is_empty())
             .map(str::to_owned)
             .collect();
+        // `use a::b::{self, C};` binds the module `b` itself.
+        if target.len() > 1 && target.last().is_some_and(|segment| segment == "self") {
+            target.pop();
+        }
         let local = if alias.is_empty() {
             target.last().map(String::as_str).unwrap_or("")
         } else {
@@ -7709,6 +7780,77 @@ impl Migrator {\n\
     }
 
     #[test]
+    fn nested_workspace_apps_are_found_below_examples_but_not_in_target() {
+        let root = tempfile::tempdir().unwrap();
+        let manifest = "[workspace]\n[package]\nname = \"app\"\nversion = \"0.1.0\"\n";
+        for dir in ["examples/app", "target/debug/app", "a/b/c/deep"] {
+            std::fs::create_dir_all(root.path().join(dir)).unwrap();
+            std::fs::write(root.path().join(dir).join("Cargo.toml"), manifest).unwrap();
+        }
+
+        assert_eq!(
+            nested_workspace_apps(root.path(), NESTED_WORKSPACE_DEPTH),
+            [root.path().join("examples/app")]
+        );
+    }
+
+    #[test]
+    fn use_group_self_binds_the_module_name() {
+        let root = tempfile::tempdir().unwrap();
+        let oikos = root.path().join("oikos");
+        let app = root.path().join("app");
+        std::fs::create_dir_all(oikos.join("src/core")).unwrap();
+        std::fs::create_dir_all(app.join("src")).unwrap();
+        std::fs::write(
+            root.path().join("Cargo.toml"),
+            "[workspace]\nmembers = [\"oikos\", \"app\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            oikos.join("Cargo.toml"),
+            "[package]\nname = \"oikos\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(oikos.join("src/http")).unwrap();
+        // A second `env` module makes a by-name lookup ambiguous, so only the
+        // `self` binding can resolve the path.
+        std::fs::write(oikos.join("src/lib.rs"), "pub mod core;\npub mod http;\n").unwrap();
+        std::fs::write(oikos.join("src/core/mod.rs"), "pub mod env;\n").unwrap();
+        std::fs::write(oikos.join("src/http/mod.rs"), "pub mod env;\n").unwrap();
+        std::fs::write(oikos.join("src/http/env.rs"), "pub fn string() {}\n").unwrap();
+        std::fs::write(
+            oikos.join("src/core/env.rs"),
+            "pub struct EnvError;\npub fn string(key: &str) -> String { key.to_owned() }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            app.join("Cargo.toml"),
+            "[package]\nname = \"app\"\nversion = \"0.1.0\"\n[dependencies]\noikos = { path = \"../oikos\" }\n",
+        )
+        .unwrap();
+        let source = "use oikos::core::env::{self, EnvError};\nfn main() {\n    env::string(\"APP_HOST\");\n}\n";
+        let path = app.join("src/main.rs");
+        std::fs::write(&path, source).unwrap();
+        let mut engine = RustEngine::pending(root.path());
+        engine.install(RustEngine::build(root.path()));
+        let env = oikos.join("src/core/env.rs").canonicalize().unwrap();
+        let column = |needle: &str| source.lines().nth(2).unwrap().find(needle).unwrap() as u32 + 1;
+
+        let module = engine.definition(&path, source, 2, column("env"));
+        assert_eq!(module.len(), 1, "{module:?}");
+        assert_eq!(
+            (module[0].path.canonicalize().unwrap(), module[0].line),
+            (oikos.join("src/core/mod.rs").canonicalize().unwrap(), 0)
+        );
+        let function = engine.definition(&path, source, 2, column("string"));
+        assert_eq!(function.len(), 1, "{function:?}");
+        assert_eq!(
+            (function[0].path.canonicalize().unwrap(), function[0].line),
+            (env, 1)
+        );
+    }
+
+    #[test]
     fn definition_follows_reexported_crate_alias_and_builder_chain() {
         let root = tempfile::tempdir().unwrap();
         let database = root.path().join("database");
@@ -7787,6 +7929,23 @@ impl Migrator {\n\
         std::fs::write(&path, text).unwrap();
         let snapshot = RustEngine::from_built(RustEngine::build(root.path()));
         assert!(snapshot.diagnostics_indexed(&path, text).is_empty());
+    }
+
+    #[test]
+    fn definition_prefers_method_over_same_named_field_in_builder_chain() {
+        let path = Path::new("/tmp/builder.rs");
+        let source = "pub struct Config {\n    size: u32,\n    count: u32,\n}\nimpl Config {\n    pub fn new() -> Self { Self::default() }\n    pub fn size(mut self, value: u32) -> Self { self.size = value; self }\n    pub fn count(mut self, value: u32) -> Self { self.count = value; self }\n}\nfn main() {\n    let a = Config::new()\n        .size(1)\n        .count(2);\n    let b = Config::new();\n    b.size(3);\n}\n";
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        engine.install(Built::default());
+        let at = |line: usize, needle: &str| {
+            source.lines().nth(line).unwrap().find(needle).unwrap() as u32 + 1
+        };
+        let size = engine.definition(path, source, 11, at(11, "size"));
+        assert_eq!((size.len(), size[0].line), (1, 6));
+        let count = engine.definition(path, source, 12, at(12, "count"));
+        assert_eq!((count.len(), count[0].line), (1, 7));
+        let direct = engine.definition(path, source, 14, at(14, "size"));
+        assert_eq!((direct.len(), direct[0].line), (1, 6));
     }
 
     #[test]
@@ -9432,5 +9591,18 @@ impl Migrator {\n\
             (0, 0)
         );
         assert_eq!(engine.format("fn main("), None);
+    }
+
+    #[test]
+    fn definition_of_self_field_skips_same_named_method() {
+        let path = Path::new("/tmp/auth.rs");
+        let source = "pub struct AuthConfig {\n    pub guard: String,\n}\nimpl AuthConfig {\n    pub fn guard(mut self, name: String) -> Self {\n        self\n    }\n    pub fn default_guard(&self) -> usize {\n        self.guard.len()\n    }\n    pub fn rebuild(self) -> Self {\n        self.guard(String::new())\n    }\n}\n";
+        let mut engine = RustEngine::pending(Path::new("/tmp"));
+        engine.install(Built::default());
+        let at = |line: usize| source.lines().nth(line).unwrap().find("guard").unwrap() as u32 + 1;
+        let field = engine.definition(path, source, 8, at(8));
+        assert_eq!((field.len(), field[0].line), (1, 1));
+        let method = engine.definition(path, source, 11, at(11));
+        assert_eq!((method.len(), method[0].line), (1, 4));
     }
 }

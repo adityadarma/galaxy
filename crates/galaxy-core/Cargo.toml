@@ -64,6 +64,8 @@ serde_json.workspace = true
 serde.workspace = true
 bincode.workspace = true
 portable-pty.workspace = true
+# SQLite database tabs.
+rusqlite.workspace = true
 alacritty_terminal.workspace = true
 
 [dev-dependencies]
