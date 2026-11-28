@@ -187,6 +187,10 @@ final class BottomPanelHeader: NSView {
 final class BottomPanelResizeHandle: NSView {
     var onResize: ((_ began: Bool, _ deltaY: CGFloat) -> Void)?
 
+    override func draw(_ dirtyRect: NSRect) {
+        GripDots.draw(centeredIn: bounds, vertical: false)
+    }
+
     override func resetCursorRects() {
         super.resetCursorRects()
         addCursorRect(bounds, cursor: .resizeUpDown)
